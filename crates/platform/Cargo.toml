@@ -1,0 +1,9 @@
+[package]
+name = "rc-platform"
+description = "OS integration for RustCommander: drives, opening files, (later) shell menus and icons"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+open.workspace = true

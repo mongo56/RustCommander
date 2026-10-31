@@ -1,0 +1,14 @@
+//! UI-agnostic core of RustCommander.
+//!
+//! Nothing in here knows about iced (or any other UI toolkit). The UI crate
+//! translates input into [`Command`]s and renders [`Panel`] state.
+
+pub mod command;
+pub mod entry;
+pub mod format;
+pub mod fs;
+pub mod panel;
+
+pub use command::Command;
+pub use entry::{Entry, EntryKind};
+pub use panel::{Activated, Panel, Sort, SortKey};

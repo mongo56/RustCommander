@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/platform", "crates/ui"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/mongo56/RustCommander"
+
+[workspace.dependencies]
+rc-core = { path = "crates/core" }
+rc-platform = { path = "crates/platform" }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+iced = { version = "0.13.1", features = ["lazy"] }
+open = "5"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

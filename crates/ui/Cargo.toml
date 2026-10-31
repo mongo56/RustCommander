@@ -1,0 +1,11 @@
+[package]
+name = "rustcommander"
+description = "A fast, keyboard-driven, dual-panel file manager"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rc-core.workspace = true
+rc-platform.workspace = true
+iced.workspace = true
