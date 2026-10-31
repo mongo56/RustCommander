@@ -9,6 +9,7 @@ license.workspace = true
 rc-core.workspace = true
 rc-platform.workspace = true
 iced.workspace = true
+image = "0.24"
 raw-window-handle = "0.6"
 notify = "8"
 serde = { version = "1", features = ["derive"] }

@@ -16,6 +16,10 @@ pub struct Session {
     /// Directory hotlist (Ctrl+D), in menu order.
     #[serde(default)]
     pub hotlist: Vec<PathBuf>,
+    /// Editor for F4: a program, optionally with arguments; `%1` stands for
+    /// the file (appended when missing). Empty = the platform default.
+    #[serde(default)]
+    pub editor: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -117,6 +121,7 @@ mod tests {
             },
             right: SideState::default(),
             hotlist: vec![dir.clone()],
+            editor: r#""my editor.exe" -n %1"#.into(),
         };
         let text = toml::to_string_pretty(&session).unwrap();
         let back: Session = toml::from_str(&text).unwrap();

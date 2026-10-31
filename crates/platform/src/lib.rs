@@ -61,6 +61,14 @@ pub fn open_default(path: &Path) -> io::Result<()> {
     open::that_detached(path)
 }
 
+/// Starts `program` with `args` in `dir` without waiting for it, letting
+/// it take the foreground.
+pub fn spawn_detached(program: &str, args: &[std::ffi::OsString], dir: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    win::allow_foreground();
+    std::process::Command::new(program).args(args).current_dir(dir).spawn().map(|_| ())
+}
+
 /// True for files that start a program rather than open a document.
 pub fn is_executable(path: &Path) -> bool {
     let ext = path

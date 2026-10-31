@@ -1,6 +1,7 @@
 //! Application state and update logic. Drawing lives in [`view`].
 
 mod view;
+mod viewer;
 
 use crate::keymap;
 use crate::session::{self, Session, SideState, TabState};
@@ -57,6 +58,8 @@ pub struct App {
     dialog: Option<Dialog>,
     /// Favourite folders (Ctrl+D), saved with the session.
     hotlist: Vec<PathBuf>,
+    /// F4 editor command line (`Session::editor`).
+    editor: String,
     jobs: Vec<RunningJob>,
     next_job_id: u64,
     path_edit: Option<PathEdit>,
@@ -84,6 +87,8 @@ pub struct App {
     /// Folder change per side still waiting for its listing (slow or
     /// network folders); see `start_nav`.
     nav: [Option<PendingNav>; 2],
+    /// Built-in viewer (F3), covering the whole window while open.
+    viewer: Option<viewer::Viewer>,
 }
 
 /// A navigation whose target folder is being listed in the background.
@@ -231,6 +236,10 @@ pub enum Message {
     FsChanged(PathBuf),
     /// A background listing of a folder finished (`u64`: request number).
     Listed(PathBuf, u64, Result<Vec<Entry>, String>),
+    ViewerLoaded(u64, Result<viewer::Loaded, String>),
+    ViewerWheel(f32),
+    ViewerSearch(String),
+    ViewerFind,
     /// Background listing for a pending navigation: (side, seq, listing).
     Navigated(usize, u64, Listing),
     /// Subfolders of a folder, for path bar suggestions.
@@ -267,6 +276,7 @@ impl App {
             last_tab_bar_click: None,
             dialog: None,
             hotlist: session.as_ref().map(|s| s.hotlist.clone()).unwrap_or_default(),
+            editor: session.as_ref().map(|s| s.editor.clone()).unwrap_or_default(),
             jobs: Vec::new(),
             next_job_id: 1,
             path_edit: None,
@@ -283,6 +293,7 @@ impl App {
             listings: HashMap::new(),
             next_listing: 0,
             nav: [None, None],
+            viewer: None,
         };
         (app, Task::none())
     }
@@ -584,6 +595,10 @@ impl App {
             }
             Message::FsChanged(path) => return self.list_in_background(path),
             Message::Listed(path, seq, result) => self.apply_listing(path, seq, result),
+            Message::ViewerLoaded(seq, result) => return self.viewer_loaded(seq, result),
+            Message::ViewerWheel(lines) => self.viewer_wheel(lines),
+            Message::ViewerSearch(text) => self.viewer_search_input(text),
+            Message::ViewerFind => return self.viewer_submit(),
             Message::Navigated(side, seq, result) => {
                 let current = self.sides[side].current;
                 let pending = self.nav[side].take_if(|p| p.seq == seq && p.tab == current);
@@ -615,6 +630,15 @@ impl App {
                 return self.update(Message::Answer(id, Resolution::Cancel));
             }
             return Task::none();
+        }
+        if self.viewer.is_some() {
+            // Keys the search box used must not act again: in a fast burst
+            // its submit (closing the box) is handled before the typed
+            // letters arrive here.
+            if named.is_some_and(is_modifier_key) || captured && !escape {
+                return Task::none();
+            }
+            return self.viewer_key(&key, mods);
         }
         if let Some(Dialog::Hotlist { selected }) = self.dialog {
             if !named.is_some_and(is_modifier_key) {
@@ -731,6 +755,17 @@ impl App {
         // Commands that touch more than the active panel or open dialogs.
         match cmd {
             Quit => return self.quit(),
+            View => return self.open_viewer(),
+            Edit => {
+                if let Some(e) = self.panel(active).current().filter(|e| e.kind == EntryKind::File) {
+                    let (path, name) = (e.path.clone(), e.name.clone());
+                    match crate::editor::launch(&self.editor, &path) {
+                        Ok(()) => self.status = Some((format!("Editing {name}"), Tone::Success)),
+                        Err(e) => self.status = Some((format!("Can't start the editor: {e}"), Tone::Error)),
+                    }
+                }
+                return Task::none();
+            }
             SwitchPanel => {
                 self.active = other;
                 return Task::none();
@@ -848,13 +883,6 @@ impl App {
             SelectAll => Ok(panel.select_all()),
             DeselectAll => Ok(panel.deselect_all()),
             SortBy(key) => Ok(panel.sort_by(key)),
-            // Until the built-in viewer/editor exist, hand off to the OS.
-            View | Edit => match panel.current() {
-                Some(e) if e.kind == EntryKind::File => {
-                    rc_platform::open_default(&e.path).map(|_| info = Some(format!("Opened {}", e.name)))
-                }
-                _ => Ok(()),
-            },
             _ => unreachable!("handled above"),
         };
         panel.ensure_visible(rows);
@@ -1585,6 +1613,7 @@ impl App {
             left: side(&self.sides[0]),
             right: side(&self.sides[1]),
             hotlist: self.hotlist.clone(),
+            editor: self.editor.clone(),
         }
     }
 

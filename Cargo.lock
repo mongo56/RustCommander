@@ -3065,6 +3065,7 @@ name = "rustcommander"
 version = "0.1.0"
 dependencies = [
  "iced",
+ "image",
  "notify",
  "raw-window-handle",
  "rc-core",

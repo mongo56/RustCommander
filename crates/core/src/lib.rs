@@ -9,6 +9,7 @@ pub mod format;
 pub mod fs;
 pub mod ops;
 pub mod panel;
+pub mod viewer;
 
 pub use command::Command;
 pub use entry::{Entry, EntryKind};

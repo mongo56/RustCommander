@@ -20,10 +20,14 @@ impl App {
     pub fn view(&self) -> Element<'_, Message> {
         let panels = row![self.side_view(0), vline(), self.side_view(1)].height(Length::Fill);
 
-        let base = container(column![panels, hline(), self.jobs_view(), self.bottom_bar()])
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .style(filled(theme::BG));
+        let base: Element<'_, Message> = match &self.viewer {
+            Some(v) => self.viewer_view(v),
+            None => container(column![panels, hline(), self.jobs_view(), self.bottom_bar()])
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .style(filled(theme::BG))
+                .into(),
+        };
 
         let modal = self
             .jobs
@@ -37,7 +41,7 @@ impl App {
         if let Some(label) = self.drag_label() {
             return stack![base, label].into();
         }
-        base.into()
+        base
     }
 
     fn dragging(&self) -> bool {
