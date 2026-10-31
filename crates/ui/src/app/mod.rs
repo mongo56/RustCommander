@@ -242,6 +242,8 @@ pub enum Message {
     ViewerWheel(f32),
     /// The zoomed image was scrolled (relative offset).
     ViewerPanned(iced::widget::scrollable::RelativeOffset),
+    /// Wheel anywhere while an image is shown (zooms when Ctrl is held).
+    ViewerZoomWheel(f32),
     ViewerSearch(String),
     ViewerFind,
     /// Background listing for a pending navigation: (side, seq, listing).
@@ -327,6 +329,18 @@ impl App {
             window::resize_events().map(|(_id, size)| Message::Resized(size)),
             window::close_requests().map(|_id| Message::CloseRequested),
         ];
+        // Ctrl+wheel zooms images; the zoomed image's scrollable captures the
+        // wheel, so listen globally instead of through the body's mouse_area.
+        if self.viewer.as_ref().is_some_and(|v| v.is_image()) {
+            subs.push(event::listen_with(|event, _status, _window| match event {
+                Event::Mouse(mouse::Event::WheelScrolled { delta }) => Some(Message::ViewerZoomWheel(match delta {
+                    mouse::ScrollDelta::Lines { y, .. } => y,
+                    // Touchpads: ~120 px per notch-equivalent.
+                    mouse::ScrollDelta::Pixels { y, .. } => y / 120.0,
+                })),
+                _ => None,
+            }));
+        }
         // Mouse moves re-render the window, so only listen while a drag may
         // be starting or in progress.
         if self.drag.is_some() {
@@ -602,6 +616,7 @@ impl App {
             Message::ViewerLoaded(seq, result) => return self.viewer_loaded(seq, result),
             Message::ViewerWheel(lines) => self.viewer_wheel(lines),
             Message::ViewerPanned(offset) => self.viewer_panned(offset),
+            Message::ViewerZoomWheel(lines) => return self.viewer_zoom_wheel(lines),
             Message::ViewerSearch(text) => self.viewer_search_input(text),
             Message::ViewerFind => return self.viewer_submit(),
             Message::Navigated(side, seq, result) => {

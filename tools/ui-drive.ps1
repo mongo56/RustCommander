@@ -1,5 +1,5 @@
 param([string[]]$Steps)
-# Steps: keys:<SendKeys> | wait:<ms> | shot:<name> | click:x,y | dclick:x,y | rclick:x,y | wheel:x,y,notches
+# Steps: keys:<SendKeys> | wait:<ms> | shot:<name> | click:x,y | dclick:x,y | rclick:x,y | wheel:x,y,notches[,ctrl]
 #        drag:x1,y1,x2,y2[,shift] + drop | rdrag:x1,y1,x2,y2 + rdrop (right button)
 # Coordinates are relative to the window's top-left corner (as in screenshots).
 Add-Type @"
@@ -29,7 +29,13 @@ foreach ($s in $Steps) {
     'wait' { Start-Sleep -Milliseconds ([int]$arg) }
     'click' { $x, $y = $arg -split ','; MoveTo $x $y; [W4]::mouse_event(2,0,0,0,[UIntPtr]::Zero); [W4]::mouse_event(4,0,0,0,[UIntPtr]::Zero); Start-Sleep -Milliseconds 300 }
     'dclick' { $x, $y = $arg -split ','; MoveTo $x $y; for ($i = 0; $i -lt 2; $i++) { [W4]::mouse_event(2,0,0,0,[UIntPtr]::Zero); [W4]::mouse_event(4,0,0,0,[UIntPtr]::Zero); Start-Sleep -Milliseconds 80 }; Start-Sleep -Milliseconds 300 }
-    'wheel' { $x, $y, $n = $arg -split ','; MoveTo $x $y; [W4]::mouse_event(0x800,0,0,[BitConverter]::ToUInt32([BitConverter]::GetBytes([int]$n * 120), 0),[UIntPtr]::Zero); Start-Sleep -Milliseconds 300 }
+    'wheel' {
+      # wheel:x,y,notches[,ctrl]
+      $x, $y, $n, $mod = $arg -split ','; MoveTo $x $y
+      if ($mod -eq 'ctrl') { [W4]::keybd_event(0x11,0,0,[UIntPtr]::Zero); Start-Sleep -Milliseconds 100 }
+      [W4]::mouse_event(0x800,0,0,[BitConverter]::ToUInt32([BitConverter]::GetBytes([int]$n * 120), 0),[UIntPtr]::Zero); Start-Sleep -Milliseconds 300
+      if ($mod -eq 'ctrl') { [W4]::keybd_event(0x11,0,2,[UIntPtr]::Zero); Start-Sleep -Milliseconds 100 }
+    }
     'rclick' { $x, $y = $arg -split ','; MoveTo $x $y; [W4]::mouse_event(8,0,0,0,[UIntPtr]::Zero); [W4]::mouse_event(16,0,0,0,[UIntPtr]::Zero); Start-Sleep -Milliseconds 500 }
     { $_ -in 'drag','rdrag' } {
       # drag:x1,y1,x2,y2[,x3,y3...][,shift] - press at the first point, move through the rest

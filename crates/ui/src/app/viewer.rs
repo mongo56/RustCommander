@@ -92,6 +92,10 @@ impl Viewer {
         }
     }
 
+    pub(super) fn is_image(&self) -> bool {
+        self.image_size().is_some()
+    }
+
     fn image_size(&self) -> Option<(u32, u32)> {
         match &self.content {
             Content::Loaded(Loaded::Image { width, height, .. }) => Some((*width, *height)),
@@ -258,26 +262,15 @@ impl App {
 
     /// Image-only keys: zoom and pan. `None` when the key is not one of them.
     fn viewer_image_key(&mut self, named: Option<Named>, typed: Option<&str>) -> Option<Task<Message>> {
-        let size = self.viewer.as_ref()?.image_size()?;
-        let fit = self.viewer_fit_scale(size);
+        self.viewer.as_ref()?.image_size()?;
         let page = (self.window_height - VIEWER_CHROME_H - 40.0).max(PAN_STEP);
-        let v = self.viewer.as_mut()?;
-        let current = v.zoom.unwrap_or(fit);
-        let set_zoom = |v: &mut Viewer, zoom: Option<f32>| {
-            if v.zoom.is_none() {
-                // Coming from "fit", the whole image was visible: zoom on its centre.
-                v.pan = RelativeOffset { x: 0.5, y: 0.5 };
-            }
-            v.zoom = zoom.map(|z| z.clamp(ZOOM_MIN, ZOOM_MAX));
-            if v.zoom.is_some() { scrollable::snap_to(image_scroll_id(), v.pan) } else { Task::none() }
-        };
         let pan = |x: f32, y: f32| scrollable::scroll_by(image_scroll_id(), AbsoluteOffset { x, y });
-        let zoomed = v.zoom.is_some();
+        let zoomed = self.viewer.as_ref()?.zoom.is_some();
         Some(match (named, typed) {
-            (_, Some("+" | "=")) => set_zoom(v, Some(current * ZOOM_STEP)),
-            (_, Some("-")) => set_zoom(v, Some(current / ZOOM_STEP)),
-            (_, Some("0" | "*")) => set_zoom(v, None),
-            (_, Some("1")) => set_zoom(v, Some(1.0)),
+            (_, Some("+" | "=")) => self.viewer_set_zoom(|z| Some(z * ZOOM_STEP)),
+            (_, Some("-")) => self.viewer_set_zoom(|z| Some(z / ZOOM_STEP)),
+            (_, Some("0" | "*")) => self.viewer_set_zoom(|_| None),
+            (_, Some("1")) => self.viewer_set_zoom(|_| Some(1.0)),
             (Some(Named::ArrowLeft), _) if zoomed => pan(-PAN_STEP, 0.0),
             (Some(Named::ArrowRight), _) if zoomed => pan(PAN_STEP, 0.0),
             (Some(Named::ArrowUp), _) if zoomed => pan(0.0, -PAN_STEP),
@@ -291,9 +284,39 @@ impl App {
     }
 
     pub(super) fn viewer_panned(&mut self, offset: RelativeOffset) {
+        // Ctrl+wheel zooms; the image scrollable also scrolls on that wheel
+        // event, which `viewer_zoom_wheel` undoes by snapping back to `pan`.
+        if self.modifiers.control() {
+            return;
+        }
         if let Some(v) = &mut self.viewer {
             v.pan = offset;
         }
+    }
+
+    /// Ctrl+wheel over an image: one zoom step per notch.
+    pub(super) fn viewer_zoom_wheel(&mut self, notches: f32) -> Task<Message> {
+        if !self.modifiers.control() || notches == 0.0 {
+            return Task::none();
+        }
+        self.viewer_set_zoom(|z| Some(z * ZOOM_STEP.powf(notches)))
+    }
+
+    /// Sets the image zoom from the current scale (the fit scale when
+    /// fitted); `None` = fit. No-op unless an image is shown.
+    fn viewer_set_zoom(&mut self, zoom: impl FnOnce(f32) -> Option<f32>) -> Task<Message> {
+        let Some(size) = self.viewer.as_ref().and_then(Viewer::image_size) else {
+            return Task::none();
+        };
+        let fit = self.viewer_fit_scale(size);
+        let Some(v) = self.viewer.as_mut() else { return Task::none() };
+        let zoom = zoom(v.zoom.unwrap_or(fit));
+        if v.zoom.is_none() {
+            // Coming from "fit", the whole image was visible: zoom on its centre.
+            v.pan = RelativeOffset { x: 0.5, y: 0.5 };
+        }
+        v.zoom = zoom.map(|z| z.clamp(ZOOM_MIN, ZOOM_MAX));
+        if v.zoom.is_some() { scrollable::snap_to(image_scroll_id(), v.pan) } else { Task::none() }
     }
 
     pub(super) fn viewer_wheel(&mut self, lines: f32) {
@@ -542,7 +565,7 @@ impl App {
             );
         }
         let help = if v.image_size().is_some() {
-            "Esc close · N/P next/prev file · +/- zoom · 0 fit · 1 actual size · arrows/PgUp/PgDn pan"
+            "Esc close · N/P next/prev file · +/- or Ctrl+wheel zoom · 0 fit · 1 actual size · arrows/PgUp/PgDn pan"
         } else {
             "Esc close · N/P next/prev file · 1 text · 3 hex · W wrap · F7 find · F3/Shift+F3 next/prev · C match case"
         };
