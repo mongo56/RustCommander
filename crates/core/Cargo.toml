@@ -8,3 +8,4 @@ license.workspace = true
 [dependencies]
 chrono.workspace = true
 trash.workspace = true
+memchr = "2.7"

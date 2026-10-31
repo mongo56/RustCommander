@@ -485,14 +485,30 @@ fn find_text(hay: &str, needle: &str, from: usize, case: bool, forward: bool) ->
     }
 }
 
+/// First match starting at or after `from` (forward) or the last one starting
+/// before it (backward); `case` false folds ASCII letters only.
 fn find_bytes(hay: &[u8], needle: &[u8], from: usize, case: bool, forward: bool) -> Option<(usize, usize)> {
-    let eq = |pos: usize| {
-        hay.get(pos..pos + needle.len())
-            .is_some_and(|w| if case { w == needle } else { w.eq_ignore_ascii_case(needle) })
-    };
+    let n = needle.len();
     let from = from.min(hay.len());
-    let pos = if forward { (from..hay.len()).find(|&p| eq(p))? } else { (0..from).rev().find(|&p| eq(p))? };
-    Some((pos, pos + needle.len()))
+    let &first = needle.first()?;
+    let pos = if case {
+        if forward {
+            from + memchr::memmem::find(&hay[from..], needle)?
+        } else {
+            // Matches starting before `from` may run past it.
+            memchr::memmem::rfind(&hay[..(from + n - 1).min(hay.len())], needle)?
+        }
+    } else {
+        // Candidates by the first byte in either case, then a folded compare.
+        let (lo, up) = (first.to_ascii_lowercase(), first.to_ascii_uppercase());
+        let eq = |p: usize| hay.get(p..p + n).is_some_and(|w| w.eq_ignore_ascii_case(needle));
+        if forward {
+            memchr::memchr2_iter(lo, up, &hay[from..]).map(|i| from + i).find(|&p| eq(p))?
+        } else {
+            memchr::memrchr2_iter(lo, up, &hay[..from]).find(|&p| eq(p))?
+        }
+    };
+    Some((pos, pos + n))
 }
 
 #[cfg(test)]
@@ -558,6 +574,23 @@ mod tests {
         assert_eq!(d.find(Mode::Text, "ČAO", 0, false, true).map(|h| h.start), Some(12));
         assert_eq!(d.find(Mode::Hex, "WORLD", 0, false, true).map(|h| (h.start, h.end)), Some((6, 11)));
         assert_eq!(d.find(Mode::Hex, "WORLD", 0, true, true), None);
+    }
+
+    #[test]
+    fn byte_search_edges() {
+        let hay = b"abXab-1ab";
+        let f = |n: &[u8], from, case, fwd| find_bytes(hay, n, from, case, fwd).map(|h| h.0);
+        assert_eq!(f(b"ab", 1, true, true), Some(3));
+        assert_eq!(f(b"AB", 1, false, true), Some(3));
+        assert_eq!(f(b"AB", 1, true, true), None);
+        // Backward: last match starting before `from`, even if it runs past it.
+        assert_eq!(f(b"ab", 4, true, false), Some(3));
+        assert_eq!(f(b"Ab", 4, false, false), Some(3));
+        assert_eq!(f(b"ab", 3, true, false), Some(0));
+        assert_eq!(f(b"ab", 0, true, false), None);
+        assert_eq!(f(b"-1", 9, false, false), Some(5));
+        assert_eq!(f(b"ab", 99, true, false), Some(7));
+        assert_eq!(f(b"abc", 0, false, true), None);
     }
 
     #[test]
