@@ -9,3 +9,4 @@ license.workspace = true
 rc-core.workspace = true
 rc-platform.workspace = true
 iced.workspace = true
+raw-window-handle = "0.6"

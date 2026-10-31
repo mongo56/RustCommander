@@ -12,7 +12,7 @@ repository = "https://github.com/mongo56/RustCommander"
 rc-core = { path = "crates/core" }
 rc-platform = { path = "crates/platform" }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-iced = { version = "0.13.1", features = ["lazy"] }
+iced = { version = "0.13.1", features = ["lazy", "image"] }
 open = "5"
 trash = "5"
 

@@ -1,9 +1,20 @@
 [package]
 name = "rc-platform"
-description = "OS integration for RustCommander: drives, opening files, (later) shell menus and icons"
+description = "OS integration for RustCommander: drives, icons, shell context menu, opening files"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 open.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_WindowsAndMessaging",
+] }

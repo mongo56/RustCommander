@@ -36,6 +36,7 @@ pub fn command_for(key: &Key, m: Modifiers) -> Option<Command> {
             Named::F4 => Edit,
             Named::F5 => Copy,
             Named::F6 if shift => Rename,
+            Named::F2 if !ctrl && !alt => Rename,
             Named::F6 => Move,
             Named::F7 => MakeDir,
             Named::F8 | Named::Delete if shift => DeletePermanent,

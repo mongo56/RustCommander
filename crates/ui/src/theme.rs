@@ -26,6 +26,9 @@ pub const SELECTED: Color = rgb(0xf2b75b);
 pub const ERROR: Color = rgb(0xf27474);
 pub const CURSOR: Color = rgb(0x263a58);
 pub const CURSOR_INACTIVE: Color = rgb(0x252a33);
+pub const SUCCESS: Color = rgb(0x6cc58a);
+/// Folder row under the mouse while dragging files onto it.
+pub const DROP: Color = rgb(0x24452f);
 
 pub fn theme() -> Theme {
     Theme::custom(
@@ -34,7 +37,7 @@ pub fn theme() -> Theme {
             background: BG,
             text: TEXT,
             primary: ACCENT,
-            success: rgb(0x6cc58a),
+            success: SUCCESS,
             danger: ERROR,
         },
     )
@@ -130,5 +133,29 @@ pub fn progress(_theme: &Theme) -> progress_bar::Style {
         background: Background::Color(PANEL),
         bar: Background::Color(ACCENT),
         border: Border { color: BORDER, width: 0.0, radius: 3.0.into() },
+    }
+}
+
+/// Drive bar button; `current` marks the drive the panel is on.
+pub fn drive(current: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_, status| button::Style {
+        background: Some(Background::Color(match (current, status) {
+            (true, _) => CURSOR,
+            (false, button::Status::Hovered | button::Status::Pressed) => CURSOR_INACTIVE,
+            _ => Color::TRANSPARENT,
+        })),
+        text_color: if current { TEXT } else { MUTED },
+        border: Border { color: if current { ACCENT } else { Color::TRANSPARENT }, width: 1.0, radius: 4.0.into() },
+        ..button::Style::default()
+    }
+}
+
+/// Floating label that follows the mouse while dragging.
+pub fn drag_label(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(CURSOR)),
+        text_color: Some(TEXT),
+        border: Border { color: ACCENT, width: 1.0, radius: 4.0.into() },
+        ..container::Style::default()
     }
 }

@@ -1,0 +1,531 @@
+//! Drawing. Everything here is a pure function of [`App`] state, apart from
+//! the lazily filled icon and disk-space caches.
+
+use super::*;
+use crate::theme::filled;
+use iced::widget::text::Wrapping;
+use iced::widget::{
+    button, center, column, container, image, mouse_area, opaque, progress_bar, responsive, row,
+    stack, text, text_input, Column, Row, Space,
+};
+use iced::{Alignment, Element, Length, Padding};
+use rc_core::format;
+use rc_core::panel::visible_start;
+
+const COL_EXT: f32 = 60.0;
+const COL_SIZE: f32 = 80.0;
+const COL_DATE: f32 = 120.0;
+const ICON: f32 = 16.0;
+
+impl App {
+    pub fn view(&self) -> Element<'_, Message> {
+        let panels = row![self.panel_view(0), vline(), self.panel_view(1)].height(Length::Fill);
+
+        let base = container(column![panels, hline(), self.jobs_view(), self.bottom_bar()])
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(filled(theme::BG));
+
+        let modal = self
+            .jobs
+            .iter()
+            .find_map(|j| j.conflict.as_ref().map(|c| self.conflict_view(j.id, c)))
+            .or_else(|| self.dialog.as_ref().map(|d| self.dialog_view(d)));
+
+        if let Some(card) = modal {
+            return stack![base, opaque(center(card).style(theme::backdrop))].into();
+        }
+        if let Some(label) = self.drag_label() {
+            return stack![base, label].into();
+        }
+        base.into()
+    }
+
+    /// Floating "Copy 3 items → target" label next to the mouse.
+    fn drag_label(&self) -> Option<Element<'_, Message>> {
+        let drag = self.drag.as_ref().filter(|d| d.active)?;
+        let verb = if self.modifiers.shift() { "Move" } else { "Copy" };
+        let what = describe(&drag.sources);
+        let label = match self.drop_target(drag) {
+            Some(target) => {
+                let name = target.file_name().map(|n| n.to_string_lossy().into_owned());
+                format!("{verb} {what} → {}", name.unwrap_or_else(|| target.display().to_string()))
+            }
+            None => format!("{verb} {what}"),
+        };
+        let tag = container(text(label).size(12)).padding([4, 8]).style(theme::drag_label);
+        Some(
+            container(tag)
+                .padding(Padding { top: self.mouse.y + 16.0, left: self.mouse.x + 14.0, ..Padding::ZERO })
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into(),
+        )
+    }
+
+    fn panel_view(&self, side: usize) -> Element<'_, Message> {
+        let panel = &self.panels[side];
+        let active = side == self.active;
+        let drop_here = self
+            .drag
+            .as_ref()
+            .is_some_and(|d| d.active && self.panel_under_mouse() == side && self.drop_target(d).is_some());
+
+        // Thin strip marks the active panel (green while it's a drop target).
+        let strip = if drop_here {
+            theme::SUCCESS
+        } else if active {
+            theme::ACCENT
+        } else {
+            theme::HEADER
+        };
+        let accent = container(Space::new(Length::Fill, Length::Fixed(2.0))).style(filled(strip));
+
+        let column_header = self.column_header(side);
+        let list = self.file_list(side, active);
+
+        let (sel, total, sel_bytes, total_bytes) = panel.summary();
+        let footer = container(
+            text(format!(
+                "{sel} of {total} selected  ·  {} of {}",
+                format::size(sel_bytes),
+                format::size(total_bytes)
+            ))
+            .size(12)
+            .color(theme::MUTED),
+        )
+        .padding([4, 10])
+        .width(Length::Fill)
+        .style(filled(theme::HEADER));
+
+        column![accent, self.drive_bar(side), self.path_bar(side), column_header, list, footer]
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    }
+
+    /// One button per drive, plus free space on the current one.
+    fn drive_bar(&self, side: usize) -> Element<'_, Message> {
+        let panel = &self.panels[side];
+        let buttons = Row::with_children(self.drives.iter().map(|drive| {
+            let current = panel.path.starts_with(drive.as_str());
+            let letter = drive.trim_end_matches(['\\', '/', ':']).to_string();
+            let letter = if letter.is_empty() { drive.clone() } else { letter };
+            let mut content = Row::new().spacing(4).align_y(Alignment::Center);
+            if let Some(icon) = self.icon(Path::new(drive), true) {
+                content = content.push(image(icon).width(ICON).height(ICON));
+            }
+            content = content.push(text(letter).size(12));
+            button(content)
+                .on_press(Message::Drive(side, drive.clone()))
+                .padding([2, 6])
+                .style(theme::drive(current))
+                .into()
+        }))
+        .spacing(2);
+
+        let space = self
+            .disk_space(&panel.path)
+            .map(|(free, total)| format!("{} free of {}", format::size(free), format::size(total)))
+            .unwrap_or_default();
+
+        container(
+            row![
+                buttons,
+                Space::with_width(Length::Fill),
+                text(space).size(12).color(theme::MUTED).wrapping(Wrapping::None),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center),
+        )
+        .padding([4, 8])
+        .width(Length::Fill)
+        .clip(true)
+        .style(filled(theme::HEADER))
+        .into()
+    }
+
+    /// Current path; click to edit it.
+    fn path_bar(&self, side: usize) -> Element<'_, Message> {
+        let panel = &self.panels[side];
+        let active = side == self.active;
+
+        let content: Element<'_, Message> = match &self.path_edit {
+            Some((edit_side, value)) if *edit_side == side => text_input("Path", value)
+                .id(path_input_id())
+                .on_input(Message::PathInput)
+                .on_submit(Message::PathSubmit)
+                .size(13)
+                .padding([3, 6])
+                .style(theme::input)
+                .into(),
+            _ => mouse_area(
+                container(
+                    text(elide_left(&panel.path.display().to_string(), self.path_chars()))
+                        .size(13)
+                        .color(if active { theme::TEXT } else { theme::MUTED })
+                        .wrapping(Wrapping::None),
+                )
+                .padding([4, 6])
+                .width(Length::Fill),
+            )
+            .on_press(Message::EditPath(side))
+            .interaction(mouse::Interaction::Text)
+            .into(),
+        };
+
+        container(content)
+            .padding([2, 4])
+            .width(Length::Fill)
+            .clip(true)
+            .style(filled(theme::HEADER))
+            .into()
+    }
+
+    fn column_header(&self, side: usize) -> Element<'_, Message> {
+        let panel = &self.panels[side];
+        let sort_button = |label: &str, key: SortKey, width: Length, right: bool| {
+            let arrow = match (panel.sort.key == key, panel.sort.descending) {
+                (true, false) => " ↑",
+                (true, true) => " ↓",
+                _ => "",
+            };
+            let label = text(format!("{label}{arrow}")).size(12).width(Length::Fill);
+            let label = if right { label.align_x(Alignment::End) } else { label };
+            button(label)
+                .on_press(Message::Sort(side, key))
+                .padding(0)
+                .width(width)
+                .style(theme::flat)
+        };
+        container(
+            row![
+                Space::with_width(ICON),
+                sort_button("Name", SortKey::Name, Length::Fill, false),
+                sort_button("Ext", SortKey::Ext, Length::Fixed(COL_EXT), false),
+                sort_button("Size", SortKey::Size, Length::Fixed(COL_SIZE), true),
+                sort_button("Modified", SortKey::Modified, Length::Fixed(COL_DATE), false),
+            ]
+            .spacing(10),
+        )
+        .padding([4, 10])
+        .style(filled(theme::PANEL))
+        .into()
+    }
+
+    /// Virtualised list: only the rows that fit on screen are built.
+    fn file_list(&self, side: usize, active: bool) -> Element<'_, Message> {
+        let panel = &self.panels[side];
+        let list = responsive(move |size| {
+            let rows = ((size.height / ROW_H).floor() as usize).max(1);
+            let len = panel.entries.len();
+            let start = visible_start(panel.scroll, panel.cursor, rows, len);
+            let end = (start + rows).min(len);
+            container(Column::with_children((start..end).map(|i| self.entry_row(side, i, active))))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .clip(true)
+                .style(filled(theme::PANEL))
+                .into()
+        });
+        mouse_area(list)
+            .on_scroll(move |delta| {
+                let lines = match delta {
+                    mouse::ScrollDelta::Lines { y, .. } => y,
+                    mouse::ScrollDelta::Pixels { y, .. } => y / ROW_H,
+                };
+                Message::Wheel(side, lines)
+            })
+            .on_right_press(Message::RightClickBackground(side))
+            .on_exit(Message::HoverEnd(side))
+            .into()
+    }
+
+    fn entry_row(&self, side: usize, index: usize, active: bool) -> Element<'_, Message> {
+        let panel = &self.panels[side];
+        let entry = &panel.entries[index];
+
+        let color = if panel.is_selected(entry) {
+            theme::SELECTED
+        } else if entry.is_dir() {
+            theme::DIR
+        } else if entry.hidden {
+            theme::MUTED
+        } else {
+            theme::TEXT
+        };
+        let cell = |s: String, width: Length| text(s).size(13).color(color).wrapping(Wrapping::None).width(width);
+
+        let (stem, ext) = entry.split_name();
+        let size = match entry.kind {
+            EntryKind::Parent => String::new(),
+            EntryKind::Dir => "<DIR>".into(),
+            EntryKind::File => format::size(entry.size),
+        };
+
+        let icon: Element<'_, Message> = match self.icon(&entry.path, entry.is_dir()) {
+            Some(handle) => image(handle)
+                .width(ICON)
+                .height(ICON)
+                .opacity(if entry.hidden { 0.5_f32 } else { 1.0 })
+                .into(),
+            None => Space::new(ICON, ICON).into(),
+        };
+
+        let content = row![
+            icon,
+            cell(stem.to_string(), Length::Fill),
+            cell(ext.to_string(), Length::Fixed(COL_EXT)),
+            cell(size, Length::Fixed(COL_SIZE)).align_x(Alignment::End),
+            cell(format::date(&entry.modified), Length::Fixed(COL_DATE)).color(theme::MUTED),
+        ]
+        .spacing(10)
+        .padding([0, 10])
+        .height(ROW_H)
+        .align_y(Alignment::Center);
+
+        let drop_target = self.drag.as_ref().is_some_and(|d| {
+            d.active && self.hover == Some((side, index)) && entry.is_dir() && !d.sources.contains(&entry.path)
+        });
+        let background = if drop_target {
+            theme::DROP
+        } else if index == panel.cursor {
+            if active { theme::CURSOR } else { theme::CURSOR_INACTIVE }
+        } else if index % 2 == 1 {
+            theme::ZEBRA
+        } else {
+            theme::PANEL
+        };
+
+        mouse_area(
+            container(content)
+                .width(Length::Fill)
+                .height(ROW_H)
+                .clip(true)
+                .style(filled(background)),
+        )
+        .on_press(Message::Click(side, index))
+        .on_right_press(Message::RightClick(side, index))
+        .on_enter(Message::Hover(side, index))
+        .into()
+    }
+
+    fn jobs_view(&self) -> Element<'_, Message> {
+        Column::with_children(self.jobs.iter().map(|job| {
+            let p = &job.progress;
+            let elapsed = job.started.elapsed().as_secs_f64().max(0.001);
+            let speed = if p.total_bytes > 0 {
+                format!("{}/s", format::size((p.done_bytes as f64 / elapsed) as u64))
+            } else {
+                format!("{} of {}", p.done_items, p.total_items)
+            };
+            let paused = job.handle.control.is_paused();
+            let current = p
+                .current
+                .as_ref()
+                .and_then(|c| c.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+
+            container(
+                row![
+                    column![
+                        text(&job.title).size(12).wrapping(Wrapping::None),
+                        text(current).size(11).color(theme::MUTED).wrapping(Wrapping::None),
+                    ]
+                    .width(Length::Fill)
+                    .clip(true),
+                    progress_bar(0.0..=1.0, p.fraction())
+                        .width(Length::Fixed(220.0))
+                        .height(Length::Fixed(6.0))
+                        .style(theme::progress),
+                    text(format!("{:>3.0}%", p.fraction() * 100.0)).size(12).width(Length::Fixed(40.0)),
+                    text(speed).size(12).color(theme::MUTED).width(Length::Fixed(90.0)),
+                    small_button(if paused { "Resume" } else { "Pause" }, Message::JobPause(job.id)),
+                    small_button("Cancel", Message::JobCancel(job.id)),
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center),
+            )
+            .padding([2, 10])
+            .height(JOB_ROW_H)
+            .style(filled(theme::HEADER))
+            .into()
+        }))
+        .into()
+    }
+
+    fn dialog_view<'a>(&'a self, dialog: &'a Dialog) -> Element<'a, Message> {
+        let input_field = |value: &'a str| {
+            text_input("", value)
+                .id(dialog_input_id())
+                .on_input(Message::DialogInput)
+                .on_submit(Message::DialogSubmit)
+                .padding(8)
+                .size(13)
+                .style(theme::input)
+        };
+
+        let (title, body, field, ok): (String, String, Option<_>, &str) = match dialog {
+            Dialog::Transfer { is_move, sources, input, .. } => {
+                let verb = if *is_move { "Move" } else { "Copy" };
+                (verb.into(), format!("{verb} {} to:", describe(sources)), Some(input_field(input)), verb)
+            }
+            Dialog::MakeDir { input } => (
+                "New folder".into(),
+                format!("Create folder in {}:", self.panels[self.active].path.display()),
+                Some(input_field(input)),
+                "Create",
+            ),
+            Dialog::Rename { src, input } => (
+                "Rename".into(),
+                format!("Rename '{}' to:", src.file_name().unwrap_or_default().to_string_lossy()),
+                Some(input_field(input)),
+                "Rename",
+            ),
+            Dialog::Delete { paths, to_trash } => (
+                if *to_trash { "Delete" } else { "Delete permanently" }.into(),
+                if *to_trash {
+                    format!("Move {} to the Recycle Bin?", describe(paths))
+                } else {
+                    format!("Permanently delete {}? This cannot be undone.", describe(paths))
+                },
+                None,
+                "Delete",
+            ),
+        };
+
+        let mut content = column![text(title).size(16), text(body).size(13).color(theme::MUTED)].spacing(12);
+        if let Some(field) = field {
+            content = content.push(field);
+        }
+        content = content.push(
+            row![
+                Space::with_width(Length::Fill),
+                dialog_button("Cancel", Message::DialogCancel, false),
+                dialog_button(ok, Message::DialogSubmit, true),
+            ]
+            .spacing(8),
+        );
+
+        container(content).padding(20).width(Length::Fixed(520.0)).style(theme::dialog).into()
+    }
+
+    fn conflict_view<'a>(&'a self, id: u64, c: &'a Conflict) -> Element<'a, Message> {
+        let name = c.dst.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        let line = |label: &'a str, size: u64, date: &Option<_>| {
+            row![
+                text(label).size(13).color(theme::MUTED).width(Length::Fixed(80.0)),
+                text(format::size(size)).size(13).width(Length::Fixed(90.0)),
+                text(format::date(date)).size(13),
+            ]
+        };
+        let answer = |label, r, primary| dialog_button(label, Message::Answer(id, r), primary);
+
+        let content = column![
+            text("File already exists").size(16),
+            text(name).size(13).color(theme::SELECTED),
+            text(c.dst.display().to_string()).size(12).color(theme::MUTED),
+            column![
+                line("New", c.src_size, &c.src_modified),
+                line("Existing", c.dst_size, &c.dst_modified),
+            ]
+            .spacing(4),
+            row![
+                answer("Overwrite", Resolution::Overwrite, true),
+                answer("Overwrite all", Resolution::OverwriteAll, false),
+                answer("Overwrite older", Resolution::OverwriteOlder, false),
+            ]
+            .spacing(8),
+            row![
+                answer("Skip", Resolution::Skip, false),
+                answer("Skip all", Resolution::SkipAll, false),
+                Space::with_width(Length::Fill),
+                answer("Cancel job", Resolution::Cancel, false),
+            ]
+            .spacing(8),
+        ]
+        .spacing(12);
+
+        container(content).padding(20).width(Length::Fixed(520.0)).style(theme::dialog).into()
+    }
+
+    fn bottom_bar(&self) -> Element<'_, Message> {
+        let status = match &self.status {
+            Some((msg, tone)) => text(msg.as_str()).size(12).color(match tone {
+                Tone::Info => theme::TEXT,
+                Tone::Success => theme::SUCCESS,
+                Tone::Error => theme::ERROR,
+            }),
+            None => text(
+                "Tab switch panel · Enter open · Backspace up · Ins/Space select · F2 rename · \
+                 Drag to copy (Shift = move) · Click path to edit · Right-click for menu",
+            )
+            .size(12)
+            .color(theme::MUTED),
+        };
+
+        let keys = [
+            ("F3", "View", Command::View),
+            ("F4", "Edit", Command::Edit),
+            ("F5", "Copy", Command::Copy),
+            ("F6", "Move", Command::Move),
+            ("F7", "MkDir", Command::MakeDir),
+            ("F8", "Delete", Command::Delete),
+            ("Alt+F4", "Exit", Command::Quit),
+        ];
+        let fkeys = Row::with_children(keys.into_iter().map(|(key, label, cmd)| {
+            button(
+                container(row![text(key).size(12).color(theme::ACCENT), text(label).size(12)].spacing(6))
+                    .center_x(Length::Fill),
+            )
+            .on_press(Message::Run(cmd))
+            .padding([4, 10])
+            .width(Length::Fill)
+            .style(theme::fkey)
+            .into()
+        }))
+        .spacing(6);
+
+        column![
+            container(status.wrapping(Wrapping::None)).padding([3, 10]).clip(true),
+            container(fkeys).padding(Padding { top: 0.0, right: 8.0, bottom: 8.0, left: 8.0 }),
+        ]
+        .into()
+    }
+
+    /// Roughly how many path characters fit in a panel's path bar.
+    fn path_chars(&self) -> usize {
+        ((self.window_width / 2.0 - 40.0) / 7.0).max(10.0) as usize
+    }
+}
+
+/// Keeps the end of a long path: `…\sandbox\B`.
+fn elide_left(s: &str, max_chars: usize) -> String {
+    let count = s.chars().count();
+    if count <= max_chars {
+        return s.to_string();
+    }
+    let tail: String = s.chars().skip(count - max_chars + 1).collect();
+    format!("…{tail}")
+}
+
+fn dialog_button(label: &str, message: Message, primary: bool) -> Element<'_, Message> {
+    button(text(label).size(13))
+        .on_press(message)
+        .padding([6, 14])
+        .style(if primary { theme::primary } else { theme::fkey })
+        .into()
+}
+
+fn small_button(label: &str, message: Message) -> Element<'_, Message> {
+    button(text(label).size(12)).on_press(message).padding([2, 10]).style(theme::fkey).into()
+}
+
+fn vline<'a>() -> Element<'a, Message> {
+    container(Space::new(Length::Fixed(1.0), Length::Fill)).style(filled(theme::BORDER)).into()
+}
+
+fn hline<'a>() -> Element<'a, Message> {
+    container(Space::new(Length::Fill, Length::Fixed(1.0))).style(filled(theme::BORDER)).into()
+}

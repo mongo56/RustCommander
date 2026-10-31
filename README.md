@@ -17,8 +17,8 @@ cargo test                          # core tests
 | Crate | Purpose |
 |---|---|
 | `crates/core` (`rc-core`) | UI-agnostic logic: `Panel` (listing, cursor, selection, sorting), `Entry`, `Command`, `ops` (copy/move/delete jobs). No UI dependencies. |
-| `crates/platform` (`rc-platform`) | OS integration: drives, opening files. Later: shell context menu, icons, recycle bin, drag-out. |
-| `crates/ui` (`rustcommander`) | iced front end: `app.rs` (state/update/view), `keymap.rs` (keys → `Command`), `theme.rs` (colours/styles). |
+| `crates/platform` (`rc-platform`) | OS integration via `windows-rs`: drives, disk space, system icons, Explorer context menu, launching files. |
+| `crates/ui` (`rustcommander`) | iced front end: `app/mod.rs` (state/update), `app/view.rs` (drawing), `keymap.rs` (keys → `Command`), `theme.rs` (colours/styles). |
 
 Every action is a `rc_core::Command` (`cm_*` ids like Total Commander), so key
 bindings, the F-key bar and a future command palette share one code path.
@@ -40,11 +40,19 @@ bindings, the F-key bar and a future command palette share one code path.
 | Alt+O | Show this folder in the other panel |
 | F3 / F4 | View / edit (opens with system default for now) |
 | F5 / F6 | Copy / move selection (or cursor item) to the other panel; target is editable, relative paths allowed, a single item can be given a new name |
-| Shift+F6 | Rename in place |
+| F2 / Shift+F6 | Rename in place |
 | F7 | New folder (nested paths like `a\b` work) |
 | F8 / Del | Delete to Recycle Bin |
 | Shift+F8 / Shift+Del | Delete permanently |
 | Esc | Close dialog / cancel job at an overwrite prompt |
+
+## Mouse
+
+- **Drive bar**: click a drive to jump to it; free space is shown on the right.
+- **Path bar**: click to edit the path (absolute, relative, `~`, or a file path to jump to that file). Enter to go, Esc to cancel.
+- **Drag and drop**: drag files onto the other panel to copy (hold Shift to move). Drop onto a folder row to copy into that folder. A confirmation dialog with the target follows.
+- **Right-click**: the Windows Explorer context menu for the item(s) (Open with, Send to, 7-Zip, …); on empty space, the folder's menu (New, Open in Terminal, …). Rename and Delete in the menu use RustCommander's own dialogs.
+- File and folder icons come from the system.
 
 File operations run as background jobs (several at once) with progress,
 speed, pause/resume and cancel. Existing files trigger an overwrite prompt:
@@ -60,5 +68,5 @@ drives. Skipped files stay in the source.
 4. Quick search (type to jump), quick filter
 5. Built-in viewer (F3), multi-rename, compare by content
 6. `Vfs` trait: archives, SFTP/FTP, plugins
-7. Windows shell integration: context menu, icons, drag & drop, recycle bin
+7. Windows shell integration: ~~context menu, icons, recycle bin~~ ✔, drag out to / in from Explorer
 8. Config file for keymap and theme
