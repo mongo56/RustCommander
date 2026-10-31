@@ -1,5 +1,6 @@
 param([string[]]$Steps)
-# Steps: keys:<SendKeys> | wait:<ms> | shot:<name> | click:x,y | rclick:x,y | drag:x1,y1,x2,y2[,shift]
+# Steps: keys:<SendKeys> | wait:<ms> | shot:<name> | click:x,y | dclick:x,y | rclick:x,y | wheel:x,y,notches
+#        drag:x1,y1,x2,y2[,shift] + drop | rdrag:x1,y1,x2,y2 + rdrop (right button)
 # Coordinates are relative to the window's top-left corner (as in screenshots).
 Add-Type @"
 using System; using System.Runtime.InteropServices;
@@ -27,11 +28,13 @@ foreach ($s in $Steps) {
     'keys' { $ws.SendKeys($arg); Start-Sleep -Milliseconds 300 }
     'wait' { Start-Sleep -Milliseconds ([int]$arg) }
     'click' { $x, $y = $arg -split ','; MoveTo $x $y; [W4]::mouse_event(2,0,0,0,[UIntPtr]::Zero); [W4]::mouse_event(4,0,0,0,[UIntPtr]::Zero); Start-Sleep -Milliseconds 300 }
+    'dclick' { $x, $y = $arg -split ','; MoveTo $x $y; for ($i = 0; $i -lt 2; $i++) { [W4]::mouse_event(2,0,0,0,[UIntPtr]::Zero); [W4]::mouse_event(4,0,0,0,[UIntPtr]::Zero); Start-Sleep -Milliseconds 80 }; Start-Sleep -Milliseconds 300 }
+    'wheel' { $x, $y, $n = $arg -split ','; MoveTo $x $y; [W4]::mouse_event(0x800,0,0,[BitConverter]::ToUInt32([BitConverter]::GetBytes([int]$n * 120), 0),[UIntPtr]::Zero); Start-Sleep -Milliseconds 300 }
     'rclick' { $x, $y = $arg -split ','; MoveTo $x $y; [W4]::mouse_event(8,0,0,0,[UIntPtr]::Zero); [W4]::mouse_event(16,0,0,0,[UIntPtr]::Zero); Start-Sleep -Milliseconds 500 }
-    'drag' {
+    { $_ -in 'drag','rdrag' } {
       # drag:x1,y1,x2,y2[,x3,y3...][,shift] - press at the first point, move through the rest
       $a = $arg -split ','; $shift = $a[-1] -eq 'shift'; if ($shift) { $a = $a[0..($a.Count-2)] }
-      MoveTo $a[0] $a[1]; [W4]::mouse_event(2,0,0,0,[UIntPtr]::Zero)
+      MoveTo $a[0] $a[1]; [W4]::mouse_event($(if ($kind -eq 'rdrag') { 8 } else { 2 }),0,0,0,[UIntPtr]::Zero)
       if ($shift) { [W4]::keybd_event(0x10,0,0,[UIntPtr]::Zero) }
       for ($k = 2; $k -lt $a.Count; $k += 2) {
         $x0 = [int]$a[$k-2]; $y0 = [int]$a[$k-1]; $x1 = [int]$a[$k]; $y1 = [int]$a[$k+1]
@@ -39,6 +42,7 @@ foreach ($s in $Steps) {
       }
       Start-Sleep -Milliseconds 200
     }
+    'rdrop' { [W4]::mouse_event(16,0,0,0,[UIntPtr]::Zero); Start-Sleep -Milliseconds 800 }
     'drop' { [W4]::mouse_event(4,0,0,0,[UIntPtr]::Zero); [W4]::keybd_event(0x10,0,2,[UIntPtr]::Zero); Start-Sleep -Milliseconds 400 }
     'shot' {
       [W4]::GetWindowRect($h, [ref]$r) | Out-Null

@@ -10,3 +10,5 @@ rc-core.workspace = true
 rc-platform.workspace = true
 iced.workspace = true
 raw-window-handle = "0.6"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"

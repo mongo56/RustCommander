@@ -10,7 +10,6 @@ use iced::widget::{
 };
 use iced::{Alignment, Element, Length, Padding};
 use rc_core::format;
-use rc_core::panel::visible_start;
 
 const COL_EXT: f32 = 60.0;
 const COL_SIZE: f32 = 80.0;
@@ -129,12 +128,17 @@ impl App {
             .padding([2, 8])
             .style(theme::flat);
 
-        container(row![tabs, new_tab].spacing(4).align_y(Alignment::Center))
-            .padding(Padding { top: 4.0, right: 8.0, bottom: 0.0, left: 8.0 })
-            .width(Length::Fill)
-            .clip(true)
-            .style(filled(theme::BG))
-            .into()
+        // Buttons capture their own clicks, so the mouse area only sees
+        // clicks on the empty part of the bar.
+        mouse_area(
+            container(row![tabs, new_tab].spacing(4).align_y(Alignment::Center))
+                .padding(Padding { top: 4.0, right: 8.0, bottom: 0.0, left: 8.0 })
+                .width(Length::Fill)
+                .clip(true)
+                .style(filled(theme::BG)),
+        )
+        .on_press(Message::TabBarClick(side))
+        .into()
     }
 
     /// One button per drive, plus free space on the current one.
@@ -309,7 +313,7 @@ impl App {
         let list = responsive(move |size| {
             let rows = ((size.height / ROW_H).floor() as usize).max(1);
             let len = panel.entries.len();
-            let start = visible_start(panel.scroll, panel.cursor, rows, len);
+            let start = panel.view_start(rows);
             let end = (start + rows).min(len);
             container(Column::with_children((start..end).map(|i| self.entry_row(side, i, active))))
                 .width(Length::Fill)
@@ -412,7 +416,7 @@ impl App {
         )
         .on_press(Message::Click(side, index))
         .on_middle_press(Message::MiddleClick(side, index))
-        .on_right_press(Message::RightClick(side, index));
+        .on_right_press(Message::RightPress(side, index));
         // Hover only matters for drop targets; skipping it otherwise avoids
         // a re-render every time the mouse crosses a row.
         if self.dragging() {

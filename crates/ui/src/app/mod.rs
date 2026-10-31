@@ -3,6 +3,7 @@
 mod view;
 
 use crate::keymap;
+use crate::session::{self, Session, SideState, TabState};
 use crate::theme;
 use iced::keyboard::key::Named;
 use iced::widget::{image, text_input};
@@ -49,6 +50,8 @@ pub struct App {
     window_width: f32,
     window_height: f32,
     last_click: Option<(usize, usize, Instant)>,
+    /// Last click on the empty part of a tab bar (double-click opens a tab).
+    last_tab_bar_click: Option<(usize, Instant)>,
     dialog: Option<Dialog>,
     jobs: Vec<RunningJob>,
     next_job_id: u64,
@@ -131,6 +134,11 @@ struct Drag {
     /// Becomes true once the mouse moved past the threshold.
     active: bool,
     sources: Vec<PathBuf>,
+    /// Started with the right button: a click shows the context menu, a
+    /// drop shows the shell's drop menu.
+    right: bool,
+    /// Row the right button went down on.
+    index: usize,
 }
 
 struct RunningJob {
@@ -154,23 +162,27 @@ pub enum Message {
     Run(Command),
     Click(usize, usize),
     MiddleClick(usize, usize),
-    RightClick(usize, usize),
+    RightPress(usize, usize),
     RightClickBackground(usize),
     ContextDone(usize, Result<MenuAction, String>),
     Hover(usize, usize),
     HoverEnd(usize),
     MouseMoved(Point),
-    MouseUp,
+    /// Mouse button released; `true` for the right button.
+    MouseUp(bool),
     DragOutDone(usize, Result<DragOutcome, String>),
+    DropMenuDone(usize, Result<DragOutcome, String>),
     FileDropped(PathBuf),
     DropPosition(Option<(f32, f32)>),
     Wheel(usize, f32),
     Drive(usize, String),
     Sort(usize, SortKey),
     Resized(Size),
+    CloseRequested,
     TabSelect(usize, usize),
     TabClose(usize, usize),
     TabNew(usize),
+    TabBarClick(usize),
     EditPath(usize),
     PathInput(String),
     PathSubmit,
@@ -189,22 +201,33 @@ pub enum Message {
 }
 
 impl App {
-    pub fn new() -> (Self, Task<Message>) {
+    pub fn new(session: Option<Session>) -> (Self, Task<Message>) {
         let home = rc_platform::home_dir();
         let left = std::env::current_dir().ok().or_else(|| home.clone());
         let right = home.clone().or_else(|| left.clone());
+        let restore = |state: Option<&SideState>, fallback: Option<PathBuf>| {
+            let tabs: Vec<Panel> = state.map(|s| s.tabs.iter().filter_map(TabState::open).collect()).unwrap_or_default();
+            if tabs.is_empty() {
+                Side { tabs: vec![open_panel(fallback)], current: 0 }
+            } else {
+                let current = state.map_or(0, |s| s.current).min(tabs.len() - 1);
+                Side { tabs, current }
+            }
+        };
+        let (width, height) = session.as_ref().map_or((1280.0, 800.0), |s| (s.width, s.height));
 
         let app = Self {
             sides: [
-                Side { tabs: vec![open_panel(left)], current: 0 },
-                Side { tabs: vec![open_panel(right)], current: 0 },
+                restore(session.as_ref().map(|s| &s.left), left),
+                restore(session.as_ref().map(|s| &s.right), right),
             ],
-            active: 0,
+            active: session.as_ref().map_or(0, |s| s.active.min(1)),
             drives: rc_platform::roots(),
             status: None,
-            window_width: 1280.0,
-            window_height: 800.0,
+            window_width: width,
+            window_height: height,
             last_click: None,
+            last_tab_bar_click: None,
             dialog: None,
             jobs: Vec::new(),
             next_job_id: 1,
@@ -233,11 +256,13 @@ impl App {
                     Message::Key(key, modifiers, text.map(|t| t.to_string()), status == event::Status::Captured),
                 ),
                 Event::Keyboard(keyboard::Event::ModifiersChanged(m)) => Some(Message::Modifiers(m)),
-                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => Some(Message::MouseUp),
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => Some(Message::MouseUp(false)),
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)) => Some(Message::MouseUp(true)),
                 Event::Window(window::Event::FileDropped(path)) => Some(Message::FileDropped(path)),
                 _ => None,
             }),
             window::resize_events().map(|(_id, size)| Message::Resized(size)),
+            window::close_requests().map(|_id| Message::CloseRequested),
         ];
         // Mouse moves re-render the window, so only listen while a drag may
         // be starting or in progress.
@@ -271,7 +296,7 @@ impl App {
                 self.leave_edits();
                 self.active = side;
                 self.panel_mut(side).set_cursor(index);
-                self.drag = Some(Drag { side, start: None, active: false, sources: Vec::new() });
+                self.drag = Some(Drag { side, start: None, active: false, sources: Vec::new(), right: false, index });
                 let now = Instant::now();
                 let double = matches!(
                     self.last_click,
@@ -291,21 +316,20 @@ impl App {
                     self.open_tab(side, path, false);
                 }
             }
-            Message::RightClick(side, index) => {
+            Message::RightPress(side, index) => {
                 self.leave_edits();
                 self.active = side;
                 let panel = self.panel_mut(side);
                 let Some(entry) = panel.entries.get(index) else { return Task::none() };
-                if entry.is_parent() {
-                    return self.context_menu(side, true);
-                }
                 // Explorer behaviour: right-clicking outside the selection
                 // makes the clicked item the only target.
-                if !panel.is_selected(entry) {
+                if !entry.is_parent() && !panel.is_selected(entry) {
                     panel.deselect_all();
                     panel.set_cursor(index);
                 }
-                return self.context_menu(side, false);
+                // The context menu opens on release, unless this turns into
+                // a right-button drag.
+                self.drag = Some(Drag { side, start: None, active: false, sources: Vec::new(), right: true, index });
             }
             Message::RightClickBackground(side) => {
                 self.leave_edits();
@@ -339,7 +363,7 @@ impl App {
                 self.mouse = position;
                 return self.update_drag();
             }
-            Message::MouseUp => return self.finish_drag(),
+            Message::MouseUp(right) => return self.finish_drag(right),
             Message::DragOutDone(side, result) => {
                 self.reload_panels();
                 // Dropped back onto our own window: that drop is handled as
@@ -366,6 +390,16 @@ impl App {
                 }
                 return delayed(Duration::from_millis(800), Message::ReloadPanels);
             }
+            Message::DropMenuDone(side, result) => {
+                self.reload_panels();
+                match result {
+                    Ok(DragOutcome::Moved) => self.panel_mut(side).deselect_all(),
+                    Ok(_) => {}
+                    Err(e) => self.status = Some((e, Tone::Error)),
+                }
+                // The shell (or a handler like 7-Zip) may finish later.
+                return delayed(Duration::from_millis(800), Message::ReloadPanels);
+            }
             Message::FileDropped(path) => {
                 self.dropped.push(path);
                 // Several events arrive for one drop; ask for the position once.
@@ -387,9 +421,7 @@ impl App {
             }
             Message::Wheel(side, lines) => {
                 let rows = self.page_rows();
-                let panel = self.panel_mut(side);
-                panel.move_cursor((-lines * 3.0).round() as isize);
-                panel.ensure_visible(rows);
+                self.panel_mut(side).scroll_by((-lines * 3.0).round() as isize, rows);
             }
             Message::Drive(side, drive) => {
                 self.leave_edits();
@@ -402,10 +434,13 @@ impl App {
                 self.active = side;
                 self.panel_mut(side).sort_by(key);
             }
-            Message::Resized(size) => {
+            Message::CloseRequested => return self.quit(),
+            // Minimising reports a zero size; keep the last real one.
+            Message::Resized(size) if size.width > 0.0 && size.height > 0.0 => {
                 self.window_width = size.width;
                 self.window_height = size.height;
             }
+            Message::Resized(_) => {}
             Message::TabSelect(side, index) => {
                 self.leave_edits();
                 self.active = side;
@@ -414,6 +449,14 @@ impl App {
             Message::TabClose(side, index) => {
                 self.leave_edits();
                 self.close_tab(side, index);
+            }
+            Message::TabBarClick(side) => {
+                let now = Instant::now();
+                let double = matches!(self.last_tab_bar_click, Some((s, t)) if s == side && now - t < DOUBLE_CLICK);
+                self.last_tab_bar_click = (!double).then_some((side, now));
+                if double {
+                    return self.update(Message::TabNew(side));
+                }
             }
             Message::TabNew(side) => {
                 self.leave_edits();
@@ -578,7 +621,7 @@ impl App {
 
         // Commands that touch more than the active panel or open dialogs.
         match cmd {
-            Quit => return iced::exit(),
+            Quit => return self.quit(),
             SwitchPanel => {
                 self.active = other;
                 return Task::none();
@@ -1040,15 +1083,41 @@ impl App {
         Task::none()
     }
 
-    fn finish_drag(&mut self) -> Task<Message> {
+    fn finish_drag(&mut self, right: bool) -> Task<Message> {
+        if self.drag.as_ref().is_none_or(|d| d.right != right) {
+            return Task::none();
+        }
         let Some(drag) = self.drag.take() else { return Task::none() };
         self.hover = None;
         if !drag.active {
+            if drag.right {
+                let on_parent = self.panel(drag.side).entries.get(drag.index).is_none_or(|e| e.is_parent());
+                return self.context_menu(drag.side, on_parent);
+            }
             return Task::none();
         }
         let Some(target) = self.drop_target(&drag) else { return Task::none() };
         self.active = drag.side;
+        if drag.right {
+            return self.drop_menu(drag, target);
+        }
         self.open_transfer(self.modifiers.shift(), drag.sources, &target)
+    }
+
+    /// Right-button drop inside our window: let the shell show its drop
+    /// menu for the target folder.
+    fn drop_menu(&self, drag: Drag, target: PathBuf) -> Task<Message> {
+        let side = drag.side;
+        let folder = self.panel(side).path.clone();
+        let items = drag.sources;
+        window::get_oldest()
+            .and_then(move |id| {
+                let (folder, items, target) = (folder.clone(), items.clone(), target.clone());
+                window::run_with_handle(id, move |handle| {
+                    rc_platform::drop_menu(native_handle(&handle), &folder, &items, &target)
+                })
+            })
+            .map(move |result| Message::DropMenuDone(side, result))
     }
 
     fn drag_out(&self, drag: Drag) -> Task<Message> {
@@ -1176,6 +1245,24 @@ impl App {
                 }
             }
         }
+    }
+
+    fn session(&self) -> Session {
+        let side = |s: &Side| SideState { current: s.current, tabs: s.tabs.iter().map(TabState::from_panel).collect() };
+        Session {
+            width: self.window_width,
+            height: self.window_height,
+            active: self.active,
+            left: side(&self.sides[0]),
+            right: side(&self.sides[1]),
+        }
+    }
+
+    fn quit(&self) -> Task<Message> {
+        if let Err(e) = session::save(&self.session()) {
+            eprintln!("could not save session: {e}");
+        }
+        iced::exit()
     }
 
     fn after_change(&mut self) {

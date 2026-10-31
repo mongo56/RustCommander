@@ -43,6 +43,9 @@ pub struct Panel {
     pub cursor: usize,
     /// Index of the first visible row.
     pub scroll: usize,
+    /// Set by mouse-wheel scrolling: while the cursor stays on this row the
+    /// view keeps `scroll` as is, even if the cursor is off screen.
+    wheel_anchor: Option<usize>,
     /// Selected entries, by name (survives re-sorting and refreshes).
     selected: HashSet<String>,
     pub sort: Sort,
@@ -56,6 +59,7 @@ impl Panel {
             entries: Vec::new(),
             cursor: 0,
             scroll: 0,
+            wheel_anchor: None,
             selected: HashSet::new(),
             sort: Sort::default(),
             show_hidden: false,
@@ -87,6 +91,7 @@ impl Panel {
         self.entries = entries;
         self.selected.clear();
         self.scroll = 0;
+        self.wheel_anchor = None;
         self.cursor = 0;
         self.focus_name(focus);
         Ok(())
@@ -149,7 +154,26 @@ impl Panel {
 
     /// Adjusts `scroll` so the cursor lies within `rows` visible rows.
     pub fn ensure_visible(&mut self, rows: usize) {
+        self.wheel_anchor = None;
         self.scroll = visible_start(self.scroll, self.cursor, rows, self.entries.len());
+    }
+
+    /// Scrolls the view by `delta` rows without moving the cursor.
+    pub fn scroll_by(&mut self, delta: isize, rows: usize) {
+        let start = self.view_start(rows);
+        let max = self.entries.len().saturating_sub(rows.max(1));
+        self.scroll = (start as isize + delta).clamp(0, max as isize) as usize;
+        self.wheel_anchor = Some(self.cursor);
+    }
+
+    /// First row to draw when `rows` rows fit on screen.
+    pub fn view_start(&self, rows: usize) -> usize {
+        let len = self.entries.len();
+        if self.wheel_anchor == Some(self.cursor) {
+            self.scroll.min(len.saturating_sub(rows.max(1)))
+        } else {
+            visible_start(self.scroll, self.cursor, rows, len)
+        }
     }
 
     /// Puts the cursor on the entry called `name`, if present.

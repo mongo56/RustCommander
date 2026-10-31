@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::ptr::null_mut;
 
 use windows::core::{Interface, PCSTR, PCWSTR, PSTR};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, POINTL, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     DeleteObject, GetDC, GetDIBits, GetObjectW, ReleaseDC, BITMAP, BITMAPINFO, BITMAPINFOHEADER,
     BI_RGB, DIB_RGB_COLORS, HBITMAP, HDC,
@@ -20,8 +20,9 @@ use windows::Win32::Storage::FileSystem::{
 use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::System::Com::{CoInitializeEx, IDataObject, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::Ole::{
-    DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_MOVE,
+    IDropTarget, DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_MOVE, DROPEFFECT_NONE,
 };
+use windows::Win32::System::SystemServices::MK_RBUTTON;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{
@@ -378,15 +379,48 @@ pub fn drag_out(window: isize, folder: &Path, items: &[PathBuf]) -> Result<DragO
         let allowed = DROPEFFECT(DROPEFFECT_COPY.0 | DROPEFFECT_MOVE.0 | DROPEFFECT_LINK.0);
         // The shell supplies the drop source and the drag image.
         let effect = SHDoDragDrop(Some(hwnd), &data, None, allowed).map_err(|e| e.message())?;
-        Ok(if effect.0 & DROPEFFECT_MOVE.0 != 0 {
-            DragOutcome::Moved
-        } else if effect.0 & DROPEFFECT_COPY.0 != 0 {
-            DragOutcome::Copied
-        } else if effect.0 & DROPEFFECT_LINK.0 != 0 {
-            DragOutcome::Linked
-        } else {
-            DragOutcome::Cancelled
-        })
+        Ok(outcome(effect))
+    }
+}
+
+/// Drops `items` (from `folder`) on the shell's drop target for `target`
+/// as a right-button drop, so the shell shows its drop menu (Copy here,
+/// Move here, Create shortcuts here, plus handlers such as 7-Zip's
+/// "Extract here"). Blocks until the menu closes.
+pub fn drop_menu(window: isize, folder: &Path, items: &[PathBuf], target: &Path) -> Result<DragOutcome, String> {
+    let hwnd = HWND(window as *mut c_void);
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let data: IDataObject = shell_folder(folder)
+            .and_then(|f| ui_object(hwnd, &f, items))
+            .map_err(|e| e.message())?;
+        let drop_target: IDropTarget =
+            shell_folder(target).and_then(|f| f.CreateViewObject(hwnd)).map_err(|e| e.message())?;
+        let mut pos = POINT::default();
+        let _ = GetCursorPos(&mut pos);
+        let pt = POINTL { x: pos.x, y: pos.y };
+        let allowed = DROPEFFECT(DROPEFFECT_COPY.0 | DROPEFFECT_MOVE.0 | DROPEFFECT_LINK.0);
+        let mut effect = allowed;
+        drop_target.DragEnter(&data, MK_RBUTTON, pt, &mut effect).map_err(|e| e.message())?;
+        if effect == DROPEFFECT_NONE {
+            let _ = drop_target.DragLeave();
+            return Err("Can't drop here".into());
+        }
+        let mut effect = allowed;
+        drop_target.Drop(&data, MK_RBUTTON, pt, &mut effect).map_err(|e| e.message())?;
+        Ok(outcome(effect))
+    }
+}
+
+fn outcome(effect: DROPEFFECT) -> DragOutcome {
+    if effect.0 & DROPEFFECT_MOVE.0 != 0 {
+        DragOutcome::Moved
+    } else if effect.0 & DROPEFFECT_COPY.0 != 0 {
+        DragOutcome::Copied
+    } else if effect.0 & DROPEFFECT_LINK.0 != 0 {
+        DragOutcome::Linked
+    } else {
+        DragOutcome::Cancelled
     }
 }
 

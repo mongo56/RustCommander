@@ -170,6 +170,21 @@ pub fn drag_out(window: isize, folder: &Path, items: &[PathBuf]) -> Result<DragO
     }
 }
 
+/// Right-button drop of `items` (all inside `folder`) onto the folder
+/// `target`: the OS shows its drop menu (copy/move/link here and handlers
+/// like archive extraction). Blocks until the menu closes.
+pub fn drop_menu(window: isize, folder: &Path, items: &[PathBuf], target: &Path) -> Result<DragOutcome, String> {
+    #[cfg(windows)]
+    {
+        win::drop_menu(window, folder, items, target)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (window, folder, items, target);
+        Err("The drop menu is not available on this platform yet".into())
+    }
+}
+
 /// Mouse position relative to the window's client area, in logical
 /// (DPI-independent) pixels.
 pub fn cursor_in_window(window: isize) -> Option<(f32, f32)> {
