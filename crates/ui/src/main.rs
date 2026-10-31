@@ -6,6 +6,7 @@ mod icon;
 mod keymap;
 mod session;
 mod theme;
+mod watch;
 
 fn main() -> iced::Result {
     let session = session::load();

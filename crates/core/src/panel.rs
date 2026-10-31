@@ -85,9 +85,21 @@ impl Panel {
 
     /// Re-reads the current folder, keeping cursor and selection by name.
     pub fn reload(&mut self) -> io::Result<()> {
+        let entries = list_dir(&self.path, self.show_hidden)?;
+        self.apply_listing(entries);
+        Ok(())
+    }
+
+    /// Replaces the entries with a fresh listing of the current folder (e.g.
+    /// read in the background), keeping cursor and selection by name. Hidden
+    /// entries are dropped unless the panel shows them, so one listing made
+    /// with `show_hidden = true` serves every panel on that folder.
+    pub fn apply_listing(&mut self, mut entries: Vec<Entry>) {
+        if !self.show_hidden {
+            entries.retain(|e| !e.hidden);
+        }
         let focus = self.current().map(|e| e.name.clone());
         let old_cursor = self.cursor;
-        let mut entries = list_dir(&self.path, self.show_hidden)?;
         sort_entries(&mut entries, self.sort);
         self.entries = entries;
         let names: HashSet<&str> = self.entries.iter().map(|e| e.name.as_str()).collect();
@@ -95,7 +107,6 @@ impl Panel {
         // If the cursor entry vanished (deleted/moved), stay at the same row.
         self.cursor = old_cursor;
         self.focus_name(focus.as_deref());
-        Ok(())
     }
 
     /// Changes folder and records it in the history. On error the panel is

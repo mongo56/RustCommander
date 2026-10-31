@@ -5,10 +5,12 @@ mod view;
 use crate::keymap;
 use crate::session::{self, Session, SideState, TabState};
 use crate::theme;
+use crate::watch;
 use iced::keyboard::key::Named;
 use iced::widget::{image, text_input};
 use iced::{event, keyboard, mouse, window, Event, Point, Size, Subscription, Task, Theme};
 use rc_core::ops::{self, Conflict, Job, JobEvent, JobHandle, Outcome, Progress, Resolution};
+use rc_core::entry::Entry;
 use rc_core::{Activated, Command, EntryKind, Panel, SortKey};
 use rc_platform::{DragOutcome, MenuAction};
 use std::cell::RefCell;
@@ -74,6 +76,9 @@ pub struct App {
     icons: RefCell<HashMap<String, Option<image::Handle>>>,
     /// Free/total space per volume root, refreshed every few seconds.
     disk: RefCell<HashMap<PathBuf, DiskEntry>>,
+    /// Latest background listing requested per folder (`Message::Listed`).
+    listings: HashMap<PathBuf, u64>,
+    next_listing: u64,
 }
 
 /// One side of the window: a set of tabs, one of them shown.
@@ -202,7 +207,10 @@ pub enum Message {
     JobPause(u64),
     JobCancel(u64),
     Answer(u64, Resolution),
-    ReloadPanels,
+    /// A watched folder changed on disk.
+    FsChanged(PathBuf),
+    /// A background listing of a folder finished (`u64`: request number).
+    Listed(PathBuf, u64, Result<Vec<Entry>, String>),
 }
 
 impl App {
@@ -247,6 +255,8 @@ impl App {
             modifiers: keyboard::Modifiers::default(),
             icons: RefCell::new(HashMap::new()),
             disk: RefCell::new(HashMap::new()),
+            listings: HashMap::new(),
+            next_listing: 0,
         };
         (app, Task::none())
     }
@@ -284,6 +294,10 @@ impl App {
                 _ => None,
             }));
         }
+        // Watch the folders the visible tabs show, to refresh them on change.
+        let mut dirs: Vec<PathBuf> = (0..2).map(|side| self.panel(side).path.clone()).collect();
+        dirs.dedup();
+        subs.push(watch::folders(dirs).map(Message::FsChanged));
         Subscription::batch(subs)
     }
 
@@ -359,9 +373,9 @@ impl App {
                     return self.run(Command::Delete);
                 }
                 Ok(MenuAction::Invoked(_verb)) => {
+                    // Verbs that finish later (paste, extract, ...) are
+                    // picked up by the folder watcher.
                     self.reload_panels();
-                    // Some shell verbs (paste, extract, ...) finish a moment later.
-                    return delayed(Duration::from_millis(800), Message::ReloadPanels);
                 }
                 Err(e) => self.status = Some((e, Tone::Error)),
             },
@@ -400,7 +414,6 @@ impl App {
                     }
                     Err(e) => self.status = Some((e, Tone::Error)),
                 }
-                return delayed(Duration::from_millis(800), Message::ReloadPanels);
             }
             Message::DropMenuDone(side, result) => {
                 self.reload_panels();
@@ -409,8 +422,6 @@ impl App {
                     Ok(_) => {}
                     Err(e) => self.status = Some((e, Tone::Error)),
                 }
-                // The shell (or a handler like 7-Zip) may finish later.
-                return delayed(Duration::from_millis(800), Message::ReloadPanels);
             }
             Message::FileDropped(path) => {
                 self.dropped.push(path);
@@ -538,7 +549,8 @@ impl App {
                     job.handle.answer(resolution);
                 }
             }
-            Message::ReloadPanels => self.reload_panels(),
+            Message::FsChanged(path) => return self.list_in_background(path),
+            Message::Listed(path, seq, result) => self.apply_listing(path, seq, result),
         }
         Task::none()
     }
@@ -1316,19 +1328,62 @@ impl App {
 
     /// Re-reads the visible tab on both sides after something changed.
     fn reload_panels(&mut self) {
-        for side in &mut self.sides {
-            let panel = &mut side.tabs[side.current];
-            if let Err(e) = panel.reload() {
-                // The folder itself may be gone: walk up to something that exists.
-                let existing = panel.path.ancestors().skip(1).find(|p| p.is_dir()).map(Path::to_path_buf);
-                match existing {
-                    Some(p) => {
-                        let _ = panel.navigate(p, None);
-                    }
-                    None => self.status = Some((e.to_string(), Tone::Error)),
-                }
+        for side in 0..2 {
+            if let Err(e) = self.panel_mut(side).reload() {
+                self.folder_unreadable(side, e.to_string());
             }
         }
+    }
+
+    /// The folder of `side` can't be listed any more: it may be gone, so walk
+    /// up to something that exists.
+    fn folder_unreadable(&mut self, side: usize, error: String) {
+        let panel = self.panel_mut(side);
+        let existing = panel.path.ancestors().skip(1).find(|p| p.is_dir()).map(Path::to_path_buf);
+        match existing {
+            Some(p) => {
+                let _ = panel.navigate(p, None);
+            }
+            None => self.status = Some((error, Tone::Error)),
+        }
+    }
+
+    /// Lists `path` on a worker thread; the result updates every visible tab
+    /// still showing it (`Message::Listed`).
+    fn list_in_background(&mut self, path: PathBuf) -> Task<Message> {
+        self.next_listing += 1;
+        let seq = self.next_listing;
+        self.listings.insert(path.clone(), seq);
+        Task::perform(
+            async move {
+                let (tx, rx) = iced::futures::channel::oneshot::channel();
+                let dir = path.clone();
+                std::thread::spawn(move || {
+                    let _ = tx.send(rc_core::fs::list_dir(&dir, true).map_err(|e| e.to_string()));
+                });
+                let result = rx.await.unwrap_or_else(|_| Err("listing thread failed".into()));
+                (path, result)
+            },
+            move |(path, result)| Message::Listed(path, seq, result),
+        )
+    }
+
+    fn apply_listing(&mut self, path: PathBuf, seq: u64, result: Result<Vec<Entry>, String>) {
+        // A newer listing of this folder is on its way.
+        if self.listings.get(&path) != Some(&seq) {
+            return;
+        }
+        self.listings.remove(&path);
+        for side in 0..2 {
+            if self.panel(side).path != path {
+                continue;
+            }
+            match &result {
+                Ok(entries) => self.panel_mut(side).apply_listing(entries.clone()),
+                Err(e) => self.folder_unreadable(side, e.clone()),
+            }
+        }
+        self.after_change();
     }
 
     fn session(&self) -> Session {
