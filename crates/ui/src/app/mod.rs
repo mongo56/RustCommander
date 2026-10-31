@@ -240,8 +240,10 @@ pub enum Message {
     Listed(PathBuf, u64, Result<Vec<Entry>, String>),
     ViewerLoaded(u64, Result<viewer::Loaded, String>),
     ViewerWheel(f32),
-    /// The zoomed image was scrolled (relative offset).
-    ViewerPanned(iced::widget::scrollable::RelativeOffset),
+    /// The zoomed image was scrolled (offset in pixels).
+    ViewerPanned(iced::widget::scrollable::AbsoluteOffset),
+    /// Pointer moved over (or left) the viewer body.
+    ViewerPointer(Option<iced::Point>),
     /// Wheel anywhere while an image is shown (zooms when Ctrl is held).
     ViewerZoomWheel(f32),
     ViewerSearch(String),
@@ -616,6 +618,7 @@ impl App {
             Message::ViewerLoaded(seq, result) => return self.viewer_loaded(seq, result),
             Message::ViewerWheel(lines) => self.viewer_wheel(lines),
             Message::ViewerPanned(offset) => self.viewer_panned(offset),
+            Message::ViewerPointer(at) => self.viewer_pointer(at),
             Message::ViewerZoomWheel(lines) => return self.viewer_zoom_wheel(lines),
             Message::ViewerSearch(text) => self.viewer_search_input(text),
             Message::ViewerFind => return self.viewer_submit(),

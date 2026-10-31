@@ -6,6 +6,7 @@ use super::*;
 use crate::theme::filled;
 use iced::widget::text::{Span, Wrapping};
 use iced::widget::scrollable::{self, AbsoluteOffset, Direction, RelativeOffset, Scrollbar};
+use iced::{Point, Size};
 use iced::widget::{center, column, container, mouse_area, responsive, rich_text, row, text, Column, Space};
 use iced::{Alignment, ContentFit, Element, Font, Length};
 use rc_core::viewer::{self, Document, Hit, Mode, HEX_WIDTH};
@@ -76,8 +77,10 @@ pub(super) struct Viewer {
     note: Option<(String, Tone)>,
     /// Image scale; `None` fits the window (never enlarging).
     zoom: Option<f32>,
-    /// Scroll position of a zoomed image.
-    pan: RelativeOffset,
+    /// Scroll position of a zoomed image, in pixels.
+    offset: AbsoluteOffset,
+    /// Mouse pointer over the image area (relative to it); zoom anchor.
+    pointer: Option<Point>,
 }
 
 impl Viewer {
@@ -171,7 +174,8 @@ impl App {
             hit: None,
             note: None,
             zoom: None,
-            pan: RelativeOffset::START,
+            offset: AbsoluteOffset { x: 0.0, y: 0.0 },
+            pointer: None,
         });
         self.viewer_show(index)
     }
@@ -188,7 +192,7 @@ impl App {
         v.hit = None;
         v.note = None;
         v.zoom = None;
-        v.pan = RelativeOffset::START;
+        v.offset = AbsoluteOffset { x: 0.0, y: 0.0 };
         load(v.path().to_path_buf(), seq)
     }
 
@@ -283,40 +287,65 @@ impl App {
         })
     }
 
-    pub(super) fn viewer_panned(&mut self, offset: RelativeOffset) {
+    pub(super) fn viewer_panned(&mut self, offset: AbsoluteOffset) {
         // Ctrl+wheel zooms; the image scrollable also scrolls on that wheel
-        // event, which `viewer_zoom_wheel` undoes by snapping back to `pan`.
+        // event, which `viewer_set_zoom` overrides with its own offset.
         if self.modifiers.control() {
             return;
         }
         if let Some(v) = &mut self.viewer {
-            v.pan = offset;
+            v.offset = offset;
         }
     }
 
-    /// Ctrl+wheel over an image: one zoom step per notch.
+    pub(super) fn viewer_pointer(&mut self, at: Option<Point>) {
+        if let Some(v) = &mut self.viewer {
+            v.pointer = at;
+        }
+    }
+
+    /// Ctrl+wheel over an image: one zoom step per notch, around the pointer.
     pub(super) fn viewer_zoom_wheel(&mut self, notches: f32) -> Task<Message> {
         if !self.modifiers.control() || notches == 0.0 {
             return Task::none();
         }
-        self.viewer_set_zoom(|z| Some(z * ZOOM_STEP.powf(notches)))
+        let anchor = self.viewer.as_ref().and_then(|v| v.pointer);
+        self.viewer_zoom_at(anchor, |z| Some(z * ZOOM_STEP.powf(notches)))
+    }
+
+    /// Sets the image zoom from the current scale, keeping the view centre in place.
+    fn viewer_set_zoom(&mut self, zoom: impl FnOnce(f32) -> Option<f32>) -> Task<Message> {
+        self.viewer_zoom_at(None, zoom)
     }
 
     /// Sets the image zoom from the current scale (the fit scale when
-    /// fitted); `None` = fit. No-op unless an image is shown.
-    fn viewer_set_zoom(&mut self, zoom: impl FnOnce(f32) -> Option<f32>) -> Task<Message> {
-        let Some(size) = self.viewer.as_ref().and_then(Viewer::image_size) else {
+    /// fitted); `None` = fit. The image point under `anchor` (view
+    /// coordinates; `None` = the view centre) stays where it is.
+    /// No-op unless an image is shown.
+    fn viewer_zoom_at(&mut self, anchor: Option<Point>, zoom: impl FnOnce(f32) -> Option<f32>) -> Task<Message> {
+        let Some((w, h)) = self.viewer.as_ref().and_then(Viewer::image_size) else {
             return Task::none();
         };
-        let fit = self.viewer_fit_scale(size);
+        let fit = self.viewer_fit_scale((w, h));
+        let view = self.viewer_body_size();
         let Some(v) = self.viewer.as_mut() else { return Task::none() };
-        let zoom = zoom(v.zoom.unwrap_or(fit));
-        if v.zoom.is_none() {
-            // Coming from "fit", the whole image was visible: zoom on its centre.
-            v.pan = RelativeOffset { x: 0.5, y: 0.5 };
-        }
-        v.zoom = zoom.map(|z| z.clamp(ZOOM_MIN, ZOOM_MAX));
-        if v.zoom.is_some() { scrollable::snap_to(image_scroll_id(), v.pan) } else { Task::none() }
+        let old = v.zoom.unwrap_or(fit);
+        // In fit mode nothing is scrolled.
+        let offset = if v.zoom.is_some() { v.offset } else { AbsoluteOffset { x: 0.0, y: 0.0 } };
+        v.zoom = zoom(old).map(|z| z.clamp(ZOOM_MIN, ZOOM_MAX));
+        let Some(new) = v.zoom else { return Task::none() };
+        let p = anchor.unwrap_or(Point::new(view.width / 2.0, view.height / 2.0));
+        v.offset = AbsoluteOffset {
+            x: zoom_offset(w as f32, view.width, old, new, offset.x, p.x),
+            y: zoom_offset(h as f32, view.height, old, new, offset.y, p.y),
+        };
+        scrollable::scroll_to(image_scroll_id(), v.offset)
+    }
+
+    /// Size of the area between the header and the footer / find box.
+    fn viewer_body_size(&self) -> Size {
+        let search = if self.viewer.as_ref().is_some_and(|v| v.search.is_some()) { SEARCH_H } else { 0.0 };
+        Size::new(self.window_width.max(1.0), (self.window_height - VIEWER_CHROME_H - search).max(1.0))
     }
 
     pub(super) fn viewer_wheel(&mut self, lines: f32) {
@@ -534,6 +563,8 @@ impl App {
             Content::Loaded(Loaded::Doc(doc)) => self.text_body(v, doc),
         };
         let body = mouse_area(container(body).width(Length::Fill).height(Length::Fill).style(filled(theme::PANEL)))
+            .on_move(|at| Message::ViewerPointer(Some(at)))
+            .on_exit(Message::ViewerPointer(None))
             .on_scroll(|delta| {
                 Message::ViewerWheel(match delta {
                     mouse::ScrollDelta::Lines { y, .. } => y,
@@ -644,7 +675,7 @@ fn zoomed_image<'a>(handle: &'a image::Handle, w: f32, h: f32, zoom: f32) -> Ele
         scrollable::Scrollable::new(container(picture).center_x(w.max(size.width)).center_y(h.max(size.height)))
             .id(image_scroll_id())
             .direction(Direction::Both { vertical: Scrollbar::default(), horizontal: Scrollbar::default() })
-            .on_scroll(|viewport| Message::ViewerPanned(viewport.relative_offset()))
+            .on_scroll(|viewport| Message::ViewerPanned(viewport.absolute_offset()))
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
@@ -691,4 +722,43 @@ fn highlight<'a>(s: &str, marks: &[(usize, usize)]) -> Vec<Span<'a, Message, Fon
         spans.push(Span::new(chars[pos..].iter().collect::<String>()));
     }
     spans
+}
+
+/// New scroll offset along one axis when an image `size` pixels long, shown
+/// in a view `view` long (centred when smaller), goes from scale `old` to
+/// `new`, keeping the image point under view position `p` in place.
+fn zoom_offset(size: f32, view: f32, old: f32, new: f32, offset: f32, p: f32) -> f32 {
+    let lead = |scale: f32| ((view - size * scale) / 2.0).max(0.0);
+    let content = |scale: f32| (size * scale).max(view);
+    let u = ((offset + p - lead(old)) / old).clamp(0.0, size);
+    (u * new + lead(new) - p).clamp(0.0, content(new) - view)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::zoom_offset;
+
+    #[test]
+    fn zoom_keeps_point_under_pointer() {
+        // 1000 px image, 500 px view, 1x -> 2x with the pointer at 100 px and
+        // offset 200: image point 300 must stay at view position 100.
+        let o = zoom_offset(1000.0, 500.0, 1.0, 2.0, 200.0, 100.0);
+        assert_eq!(o, 500.0);
+    }
+
+    #[test]
+    fn zoom_from_centred_small_image() {
+        // 100 px image in a 500 px view sits at 200..300; pointer at its
+        // centre (250) zoomed 10x: image centre (50 -> 500) under 250.
+        let o = zoom_offset(100.0, 500.0, 1.0, 10.0, 0.0, 250.0);
+        assert_eq!(o, 250.0);
+    }
+
+    #[test]
+    fn zoom_clamps_to_content() {
+        assert_eq!(zoom_offset(1000.0, 500.0, 1.0, 2.0, 0.0, 0.0), 0.0);
+        assert_eq!(zoom_offset(1000.0, 500.0, 1.0, 2.0, 500.0, 500.0), 1500.0);
+        // Zooming out below the view size: nothing to scroll.
+        assert_eq!(zoom_offset(1000.0, 500.0, 1.0, 0.25, 500.0, 250.0), 0.0);
+    }
 }
