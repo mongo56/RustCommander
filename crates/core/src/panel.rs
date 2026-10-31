@@ -68,6 +68,10 @@ pub struct Panel {
     selected: HashSet<String>,
     pub sort: Sort,
     pub show_hidden: bool,
+    /// Quick filter (Ctrl+S): only entries matching it are in `entries`.
+    filter: String,
+    /// The whole sorted listing while a filter is active.
+    unfiltered: Option<Vec<Entry>>,
     /// Folders visited before / after the current one (Alt+Left/Right).
     back: Vec<Visit>,
     forward: Vec<Visit>,
@@ -94,6 +98,8 @@ impl Panel {
             selected: HashSet::new(),
             sort: Sort::default(),
             show_hidden: false,
+            filter: String::new(),
+            unfiltered: None,
             back: Vec::new(),
             forward: Vec::new(),
         };
@@ -119,7 +125,7 @@ impl Panel {
         let focus = self.current().map(|e| e.name.clone());
         let old_cursor = self.cursor;
         sort_entries(&mut entries, self.sort);
-        self.entries = entries;
+        self.set_listing(entries);
         let names: HashSet<&str> = self.entries.iter().map(|e| e.name.as_str()).collect();
         self.selected.retain(|n| names.contains(n.as_str()));
         // If the cursor entry vanished (deleted/moved), stay at the same row.
@@ -229,7 +235,9 @@ impl Panel {
         }
         sort_entries(&mut entries, self.sort);
         self.path = path;
-        self.entries = entries;
+        // A new folder starts unfiltered, like in TC.
+        self.filter.clear();
+        self.set_listing(entries);
         self.selected.clear();
         self.scroll = 0;
         self.wheel_anchor = None;
@@ -432,8 +440,53 @@ impl Panel {
         }
         let focus = self.current().map(|e| e.name.clone());
         sort_entries(&mut self.entries, self.sort);
+        if let Some(all) = &mut self.unfiltered {
+            sort_entries(all, self.sort);
+        }
         self.cursor = 0;
         self.focus_name(focus.as_deref());
+    }
+
+    /// The quick filter text ("" when off).
+    pub fn filter(&self) -> &str {
+        &self.filter
+    }
+
+    /// Entries in the folder, ignoring the quick filter (hidden ones are
+    /// still left out unless shown).
+    pub fn unfiltered_len(&self) -> usize {
+        self.unfiltered.as_ref().unwrap_or(&self.entries).len()
+    }
+
+    /// Shows only entries matching `filter` (see [`filter_matches`]); ""
+    /// shows everything. The cursor stays on its entry if it remains
+    /// visible, and entries that get hidden are deselected so operations
+    /// never touch files the user can't see.
+    pub fn set_filter(&mut self, filter: &str) {
+        if filter == self.filter {
+            return;
+        }
+        let focus = self.current().map(|e| e.name.clone());
+        let all = self.unfiltered.take().unwrap_or_else(|| std::mem::take(&mut self.entries));
+        self.filter = filter.to_owned();
+        self.set_listing(all);
+        let names: HashSet<&str> = self.entries.iter().map(|e| e.name.as_str()).collect();
+        self.selected.retain(|n| names.contains(n.as_str()));
+        self.cursor = 0;
+        self.focus_name(focus.as_deref());
+        self.wheel_anchor = None;
+    }
+
+    /// Stores a sorted listing, applying the quick filter.
+    fn set_listing(&mut self, all: Vec<Entry>) {
+        if self.filter.is_empty() {
+            self.unfiltered = None;
+            self.entries = all;
+        } else {
+            self.entries =
+                all.iter().filter(|e| e.is_parent() || filter_matches(&self.filter, &e.name)).cloned().collect();
+            self.unfiltered = Some(all);
+        }
     }
 
     pub fn toggle_hidden(&mut self) -> io::Result<()> {
@@ -468,6 +521,44 @@ pub fn visible_start(scroll: usize, cursor: usize, rows: usize, len: usize) -> u
 
 /// `..` first, then folders, then files. Folders are always ordered by name
 /// unless sorting by date (same as Total Commander).
+/// Quick-filter match, case-insensitive. `filter` holds one or more
+/// patterns separated by `;` (any may match). A pattern with `*` or `?` is
+/// a wildcard over the whole name (`*.rs`); otherwise it matches anywhere
+/// in the name (`main` matches `domain.rs`).
+pub fn filter_matches(filter: &str, name: &str) -> bool {
+    let name: Vec<char> = name.to_lowercase().chars().collect();
+    filter.split(';').map(str::trim).filter(|p| !p.is_empty()).any(|p| {
+        let p: Vec<char> = p.to_lowercase().chars().collect();
+        if p.iter().any(|&c| c == '*' || c == '?') {
+            wildcard(&p, &name)
+        } else {
+            name.windows(p.len()).any(|w| w == p.as_slice())
+        }
+    })
+}
+
+/// `*` = any run of characters, `?` = exactly one.
+fn wildcard(p: &[char], s: &[char]) -> bool {
+    let (mut pi, mut si) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while si < s.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == s[si]) {
+            pi += 1;
+            si += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some((pi, si));
+            pi += 1;
+        } else if let Some((sp, ss)) = star {
+            pi = sp + 1;
+            si = ss + 1;
+            star = Some((sp, ss + 1));
+        } else {
+            return false;
+        }
+    }
+    p[pi..].iter().all(|&c| c == '*')
+}
+
 fn sort_entries(entries: &mut [Entry], sort: Sort) {
     entries.sort_by(|a, b| {
         let rank = |e: &Entry| match e.kind {
@@ -576,6 +667,39 @@ mod tests {
         let files: Vec<_> = panel.entries.iter().skip(2).map(|e| e.name.as_str()).collect();
         assert_eq!(files, ["C.rs", "a.txt"]);
 
+        // Quick filter keeps "..", the cursor entry and only visible selections.
+        panel.sort_by(SortKey::Name);
+        panel.select_all();
+        panel.focus("C.rs");
+        panel.set_filter("*.RS");
+        let names: Vec<_> = panel.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["..", "C.rs"]);
+        assert_eq!(panel.current().unwrap().name, "C.rs");
+        assert_eq!(panel.selected_count(), 1);
+        assert_eq!(panel.unfiltered_len(), 4);
+        panel.reload().unwrap(); // refresh keeps the filter
+        assert_eq!(panel.entries.len(), 2);
+        panel.set_filter("");
+        assert_eq!(panel.entries.len(), 4);
+        panel.set_filter("dir");
+        panel.set_cursor(1);
+        let Activated::Navigate(nav) = panel.activate() else { panic!("not a folder") };
+        panel.go(nav).unwrap();
+        assert_eq!(panel.filter(), ""); // navigation clears it
+
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn filter_patterns() {
+        assert!(filter_matches("main", "Domain.rs"));
+        assert!(!filter_matches("main", "lib.rs"));
+        assert!(filter_matches("*.rs", "lib.RS"));
+        assert!(!filter_matches("*.rs", "lib.rs.bak"));
+        assert!(filter_matches("*.txt; *.rs", "lib.rs"));
+        assert!(filter_matches("a?c*", "abcdef"));
+        assert!(!filter_matches("a?c*", "acdef"));
+        assert!(filter_matches("*a*b*", "xxaYYbzz"));
+        assert!(!filter_matches(";", "x"));
     }
 }

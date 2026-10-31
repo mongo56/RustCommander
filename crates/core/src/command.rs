@@ -28,6 +28,8 @@ pub enum Command {
     DeselectAll,
     Refresh,
     ToggleHidden,
+    /// Show only entries matching a typed filter (Ctrl+S).
+    QuickFilter,
     SortBy(SortKey),
     /// Make the other panel show the same folder.
     SyncOtherPanel,
@@ -75,6 +77,7 @@ impl Command {
             DeselectAll => "cm_ClearAll",
             Refresh => "cm_RereadSource",
             ToggleHidden => "cm_SwitchHidSys",
+            QuickFilter => "cm_QuickFilter",
             SortBy(SortKey::Name) => "cm_SortByName",
             SortBy(SortKey::Ext) => "cm_SortByExt",
             SortBy(SortKey::Size) => "cm_SortBySize",

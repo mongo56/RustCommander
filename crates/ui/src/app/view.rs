@@ -265,6 +265,28 @@ impl App {
             .style(filled(theme::HEADER))
             .into();
         }
+        let editing = self.filter_edit == Some(side) && self.active == side;
+        if editing || !panel.filter().is_empty() {
+            let shown = panel.entries.iter().filter(|e| !e.is_parent()).count();
+            let all = panel.unfiltered_len() - panel.entries.iter().filter(|e| e.is_parent()).count();
+            let hint = if editing { "type to filter · *.ext; wildcards · Esc clear" } else { "Ctrl+S edit · Esc clear" };
+            return container(
+                row![
+                    text("Filter").size(12).color(theme::MUTED),
+                    container(text(panel.filter()).size(12))
+                        .padding([1, 6])
+                        .style(theme::drag_label),
+                    text(format!("{shown} of {all}")).size(12),
+                    text(hint).size(11).color(theme::MUTED),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            )
+            .padding([2, 10])
+            .width(Length::Fill)
+            .style(filled(theme::HEADER))
+            .into();
+        }
         let (sel, total, sel_bytes, total_bytes) = panel.summary();
         container(
             text(format!(

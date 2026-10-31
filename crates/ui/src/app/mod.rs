@@ -62,6 +62,8 @@ pub struct App {
     path_edit: Option<PathEdit>,
     rename: Option<InlineRename>,
     quick_search: Option<QuickSearch>,
+    /// Side whose quick filter (Ctrl+S) is being typed.
+    filter_edit: Option<usize>,
     drag: Option<Drag>,
     /// Files dropped in from other apps, waiting for the drop position.
     dropped: Vec<PathBuf>,
@@ -270,6 +272,7 @@ impl App {
             path_edit: None,
             rename: None,
             quick_search: None,
+            filter_edit: None,
             drag: None,
             dropped: Vec::new(),
             mouse: Point::ORIGIN,
@@ -658,6 +661,38 @@ impl App {
         // Quick search: plain typing jumps to matching names.
         let plain = !mods.control() && !mods.alt() && !mods.logo();
         let typed = text.filter(|t| plain && !t.is_empty() && !t.chars().any(char::is_control));
+        if self.filter_edit == Some(self.active) {
+            let mut filter = self.panel(self.active).filter().to_owned();
+            if let Some(t) = &typed {
+                filter.push_str(t);
+                return self.set_filter(filter);
+            }
+            match named {
+                Some(Named::Backspace) => {
+                    filter.pop();
+                    return self.set_filter(filter);
+                }
+                Some(Named::Escape) => {
+                    self.filter_edit = None;
+                    return self.set_filter(String::new());
+                }
+                // Moving the cursor keeps the filter box open.
+                Some(
+                    Named::ArrowUp | Named::ArrowDown | Named::PageUp | Named::PageDown | Named::Home | Named::End,
+                ) if !mods.control() && !mods.alt() => {}
+                _ => {
+                    self.filter_edit = None;
+                    // Ctrl+S again just closes the box, keeping the filter.
+                    if keymap::command_for(&key, mods) == Some(Command::QuickFilter) {
+                        return Task::none();
+                    }
+                }
+            }
+        } else if escape && !self.panel(self.active).filter().is_empty() {
+            // Esc drops an active filter before it clears the selection.
+            return self.set_filter(String::new());
+        }
+
         let searching = self.quick_search.as_ref().is_some_and(|q| q.side == self.active);
         if let Some(t) = typed {
             if t != " " || searching {
@@ -751,6 +786,15 @@ impl App {
                 let path = self.panel(active).path.clone();
                 return self.list_in_background(path);
             }
+            QuickFilter => {
+                if self.filter_edit == Some(active) {
+                    self.filter_edit = None;
+                } else {
+                    self.leave_edits();
+                    self.filter_edit = Some(active);
+                }
+                return Task::none();
+            }
             ToggleHidden => {
                 let panel = self.panel_mut(active);
                 panel.show_hidden = !panel.show_hidden;
@@ -831,6 +875,7 @@ impl App {
     fn leave_edits(&mut self) {
         self.path_edit = None;
         self.quick_search = None;
+        self.filter_edit = None;
         if self.rename.is_some() {
             self.commit_rename();
         }
@@ -943,6 +988,17 @@ impl App {
 
     fn quick_search_timer(&self, seq: u64) -> Task<Message> {
         delayed(QUICK_SEARCH_TIMEOUT, Message::QuickSearchTimeout(seq))
+    }
+
+    // ---- quick filter -----------------------------------------------------
+
+    /// Sets the active panel's quick filter and keeps the cursor in view.
+    fn set_filter(&mut self, filter: String) -> Task<Message> {
+        let rows = self.page_rows();
+        let panel = self.panel_mut(self.active);
+        panel.set_filter(&filter);
+        panel.ensure_visible(rows);
+        Task::none()
     }
 
     fn jump_to(&mut self, side: usize, index: usize) {

@@ -55,6 +55,7 @@ pub fn command_for(key: &Key, m: Modifiers) -> Option<Command> {
             "d" => Hotlist,
             "r" => Refresh,
             "h" => ToggleHidden,
+            "s" => QuickFilter,
             "\\" => GoRoot,
             "q" => Quit,
             _ => return None,
