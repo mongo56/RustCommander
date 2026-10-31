@@ -9,7 +9,8 @@ use iced::widget::scrollable::{self, AbsoluteOffset, Direction, RelativeOffset, 
 use iced::{Point, Size};
 use iced::widget::{center, column, container, mouse_area, responsive, rich_text, row, text, Column, Space};
 use iced::{Alignment, ContentFit, Element, Font, Length};
-use rc_core::viewer::{self, Document, Hit, Mode, HEX_WIDTH};
+use rc_core::viewer::{self, Document, Hit, Mode, HEX_WIDTH, WINDOW};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 const LINE_H: f32 = 18.0;
@@ -39,6 +40,10 @@ fn image_scroll_id() -> scrollable::Id {
 fn search_input_id() -> text_input::Id {
     text_input::Id::new("viewer-search")
 }
+
+/// A match found in a large file: the window holding it, the match in
+/// that window, and whether the search wrapped around.
+pub type Found = (Arc<Document>, Hit, bool);
 
 /// What a file was loaded as.
 #[derive(Debug, Clone)]
@@ -81,6 +86,8 @@ pub(super) struct Viewer {
     offset: AbsoluteOffset,
     /// Mouse pointer over the image area (relative to it); zoom anchor.
     pointer: Option<Point>,
+    /// Stops the running search of a large file.
+    cancel: Arc<AtomicBool>,
 }
 
 impl Viewer {
@@ -110,6 +117,43 @@ impl Viewer {
         match &self.content {
             Content::Loaded(Loaded::Doc(doc)) => Some(doc),
             _ => None,
+        }
+    }
+
+    /// Stops a running search, if any.
+    fn cancel_search(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+
+    /// Replaces the window of a large file with one whose text starts at
+    /// or after `want`; the row holding file offset `keep` becomes the top
+    /// row and the hit carries over.
+    fn load_window(&mut self, want: u64, keep: u64) {
+        let Some(old) = self.doc_arc() else { return };
+        match Document::open_window(&self.files[self.index], want, Some(old.encoding)) {
+            Ok(doc) => {
+                let hit = self.hit.and_then(|h| move_hit(&old, &doc, h));
+                self.top = doc.row_of(self.mode, keep);
+                self.hit = hit;
+                self.content = Content::Loaded(Loaded::Doc(Arc::new(doc)));
+            }
+            Err(e) => self.note = Some((format!("Can't read: {e}"), Tone::Error)),
+        }
+    }
+}
+
+/// `hit` of `from` as a hit in `to`, if that window holds it.
+fn move_hit(from: &Document, to: &Document, hit: Hit) -> Option<Hit> {
+    match hit.mode {
+        Mode::Text => {
+            let (a, b) = (from.byte_of(hit.start), from.byte_of(hit.end));
+            let (start, end) = to.text_span();
+            (a >= start && b <= end).then(|| Hit { start: to.text_of(a), end: to.text_of(b), ..hit })
+        }
+        Mode::Hex => {
+            let (a, b) = (from.base() + hit.start as u64, from.base() + hit.end as u64);
+            (a >= to.base() && b <= to.end())
+                .then(|| Hit { start: (a - to.base()) as usize, end: (b - to.base()) as usize, ..hit })
         }
     }
 }
@@ -176,6 +220,7 @@ impl App {
             zoom: None,
             offset: AbsoluteOffset { x: 0.0, y: 0.0 },
             pointer: None,
+            cancel: Arc::new(AtomicBool::new(false)),
         });
         self.viewer_show(index)
     }
@@ -184,6 +229,7 @@ impl App {
         self.next_listing += 1;
         let seq = self.next_listing;
         let Some(v) = &mut self.viewer else { return Task::none() };
+        v.cancel_search();
         v.index = index;
         v.seq = seq;
         v.content = Content::Loading;
@@ -211,7 +257,8 @@ impl App {
     }
 
     pub(super) fn close_viewer(&mut self) {
-        let Some(v) = self.viewer.take() else { return };
+        let Some(mut v) = self.viewer.take() else { return };
+        v.cancel_search();
         // Leave the panel cursor on the file viewed last.
         let path = v.path();
         let panel = self.panel_mut(v.side);
@@ -240,6 +287,41 @@ impl App {
         let total = v.doc().map_or(0, |d| d.rows(v.mode));
         let max = total.saturating_sub(if v.wrap { 1 } else { rows });
         v.top = v.top.saturating_add_signed(delta).min(max);
+        self.viewer_slide();
+    }
+
+    /// In a large file, moves the window along when the view nears its
+    /// edge, centring it on the top row.
+    fn viewer_slide(&mut self) {
+        let rows = self.viewer_rows();
+        let Some(v) = &mut self.viewer else { return };
+        let Some(doc) = v.doc_arc() else { return };
+        let margin = rows * 2;
+        let near_start = v.top < margin && doc.has_before();
+        let near_end = v.top + rows + margin > doc.rows(v.mode) && doc.has_after();
+        if near_start || near_end {
+            let keep = doc.row_byte(v.mode, v.top);
+            v.load_window(keep.saturating_sub(WINDOW / 2), keep);
+        }
+    }
+
+    /// Home / End: the first or last rows of the file.
+    fn viewer_home_end(&mut self, end: bool) {
+        let Some(v) = &mut self.viewer else { return };
+        let Some(doc) = v.doc_arc() else { return };
+        v.left = 0;
+        if end {
+            if doc.has_after() {
+                let want = doc.size.saturating_sub(WINDOW - 64 * 1024);
+                v.load_window(want, want);
+            }
+            self.viewer_scroll(isize::MAX);
+        } else {
+            if doc.has_before() {
+                v.load_window(0, 0);
+            }
+            v.top = 0;
+        }
     }
 
     /// Furthest `left` that still shows the end of the longest visible line.
@@ -390,11 +472,8 @@ impl App {
             (Some(Named::ArrowUp), _) => self.viewer_scroll(-1),
             (Some(Named::PageDown), _) => self.viewer_scroll(rows),
             (Some(Named::PageUp), _) => self.viewer_scroll(-rows),
-            (Some(Named::Home), _) => {
-                v.top = 0;
-                v.left = 0;
-            }
-            (Some(Named::End), _) => self.viewer_scroll(isize::MAX),
+            (Some(Named::Home), _) => self.viewer_home_end(false),
+            (Some(Named::End), _) => self.viewer_home_end(true),
             (Some(Named::ArrowRight), _) if !v.wrap => v.left = (v.left + H_STEP).min(max_left.max(v.left)),
             (Some(Named::ArrowLeft), _) if !v.wrap => v.left = v.left.saturating_sub(H_STEP),
             (Some(Named::Space), _) | (_, Some("n")) => {
@@ -436,10 +515,7 @@ impl App {
             return;
         }
         // Keep roughly the same place in the file.
-        v.top = match mode {
-            Mode::Hex => doc.line_start(v.top) / HEX_WIDTH,
-            Mode::Text => doc.line_of(v.top * HEX_WIDTH),
-        };
+        v.top = doc.row_of(mode, doc.row_byte(v.mode, v.top));
         v.mode = mode;
         v.left = 0;
         v.hit = None;
@@ -474,6 +550,9 @@ impl App {
             return text_input::focus(search_input_id());
         }
         let Some(doc) = v.doc_arc() else { return Task::none() };
+        if !doc.is_whole() {
+            return self.viewer_find_in_file(doc, forward);
+        }
         let row_start = |row: usize| match v.mode {
             Mode::Text => doc.line_start(row),
             Mode::Hex => row * HEX_WIDTH,
@@ -492,6 +571,67 @@ impl App {
             v.note = Some((format!("\"{}\" not found", v.query), Tone::Error));
             return Task::none();
         };
+        self.viewer_show_hit(hit, wrapped, (rows, cols));
+        Task::none()
+    }
+
+    /// Searches a large file on a worker thread, window by window.
+    fn viewer_find_in_file(&mut self, doc: Arc<Document>, forward: bool) -> Task<Message> {
+        let Some(v) = &mut self.viewer else { return Task::none() };
+        let from = match v.hit.filter(|h| h.mode == v.mode) {
+            Some(h) => match h.mode {
+                Mode::Text => doc.byte_of(if forward { h.start + 1 } else { h.start }),
+                Mode::Hex => doc.base() + h.start as u64 + u64::from(forward),
+            },
+            None => doc.row_byte(v.mode, v.top),
+        };
+        v.cancel_search();
+        let cancel = Arc::new(AtomicBool::new(false));
+        v.cancel = cancel.clone();
+        let token = cancel.clone();
+        v.note = Some((format!("Searching for \"{}\"…", v.query), Tone::Info));
+        let (path, encoding, mode, query, case, size, seq) =
+            (v.path().to_path_buf(), doc.encoding, v.mode, v.query.clone(), v.case, doc.size, v.seq);
+        Task::perform(
+            async move {
+                let (tx, rx) = iced::futures::channel::oneshot::channel();
+                std::thread::spawn(move || {
+                    let find = |from| viewer::find_in_file(&path, encoding, mode, &query, from, case, forward, &cancel);
+                    let result = find(from).and_then(|found| match found {
+                        Some((doc, hit)) => Ok(Some((Arc::new(doc), hit, false))),
+                        None if cancel.load(Ordering::Relaxed) => Ok(None),
+                        None => Ok(find(if forward { 0 } else { size })?.map(|(doc, hit)| (Arc::new(doc), hit, true))),
+                    });
+                    let _ = tx.send(result.map_err(|e| e.to_string()));
+                });
+                rx.await.unwrap_or_else(|_| Err("search thread failed".into()))
+            },
+            move |result| Message::ViewerFound(seq, result, token.clone()),
+        )
+    }
+
+    /// Result of a large-file search; `search` tells it from older ones.
+    pub(super) fn viewer_found(&mut self, seq: u64, result: Result<Option<Found>, String>, search: &Arc<AtomicBool>) {
+        let dims = (self.viewer_rows(), self.viewer_cols());
+        let Some(v) = self.viewer.as_mut().filter(|v| v.seq == seq) else { return };
+        if !Arc::ptr_eq(&v.cancel, search) || search.load(Ordering::Relaxed) {
+            return;
+        }
+        match result {
+            Ok(Some((doc, hit, wrapped))) => {
+                v.content = Content::Loaded(Loaded::Doc(doc));
+                v.mode = hit.mode;
+                self.viewer_show_hit(hit, wrapped, dims);
+            }
+            Ok(None) => v.note = Some((format!("\"{}\" not found", v.query), Tone::Error)),
+            Err(e) => v.note = Some((format!("Search failed: {e}"), Tone::Error)),
+        }
+    }
+
+    /// Scrolls `hit` (in the current document) into view and marks it.
+    fn viewer_show_hit(&mut self, hit: Hit, wrapped: bool, (rows, cols): (usize, usize)) {
+        let Some(v) = &mut self.viewer else { return };
+        let Some(doc) = v.doc_arc() else { return };
         let row = match v.mode {
             Mode::Text => doc.line_of(hit.start),
             Mode::Hex => hit.start / HEX_WIDTH,
@@ -508,7 +648,6 @@ impl App {
         }
         v.hit = Some(hit);
         v.note = wrapped.then(|| ("Search wrapped around".to_string(), Tone::Info));
-        Task::none()
     }
 
     pub(super) fn viewer_view<'a>(&'a self, v: &'a Viewer) -> Element<'a, Message> {
@@ -524,8 +663,9 @@ impl App {
                 if v.wrap && v.mode == Mode::Text {
                     info.push("Wrap".into());
                 }
-                if doc.truncated {
-                    info.push(format!("first {} shown", rc_core::format::size(viewer::LOAD_LIMIT)));
+                if !doc.is_whole() && doc.size > 0 {
+                    let at = doc.row_byte(v.mode, v.top);
+                    info.push(format!("{}%", at * 100 / doc.size));
                 }
             }
             Content::Loaded(Loaded::Image { width, height, .. }) => {

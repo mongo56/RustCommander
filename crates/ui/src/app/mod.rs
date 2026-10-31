@@ -239,6 +239,9 @@ pub enum Message {
     /// A background listing of a folder finished (`u64`: request number).
     Listed(PathBuf, u64, Result<Vec<Entry>, String>),
     ViewerLoaded(u64, Result<viewer::Loaded, String>),
+    /// Search result in a large file: the window holding the match, the
+    /// match, and whether the search wrapped around.
+    ViewerFound(u64, Result<Option<viewer::Found>, String>, std::sync::Arc<std::sync::atomic::AtomicBool>),
     ViewerWheel(f32),
     /// The zoomed image was scrolled (offset in pixels).
     ViewerPanned(iced::widget::scrollable::AbsoluteOffset),
@@ -616,6 +619,7 @@ impl App {
             Message::FsChanged(path) => return self.list_in_background(path),
             Message::Listed(path, seq, result) => self.apply_listing(path, seq, result),
             Message::ViewerLoaded(seq, result) => return self.viewer_loaded(seq, result),
+            Message::ViewerFound(seq, result, cancel) => self.viewer_found(seq, result, &cancel),
             Message::ViewerWheel(lines) => self.viewer_wheel(lines),
             Message::ViewerPanned(offset) => self.viewer_panned(offset),
             Message::ViewerPointer(at) => self.viewer_pointer(at),
