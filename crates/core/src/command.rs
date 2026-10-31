@@ -16,6 +16,11 @@ pub enum Command {
     Open,
     GoParent,
     GoRoot,
+    /// Previous / next folder in the panel's history (Alt+Left/Right).
+    HistoryBack,
+    HistoryForward,
+    /// Directory hotlist popup (Ctrl+D).
+    Hotlist,
     SwitchPanel,
     /// Toggle selection on the cursor entry, optionally moving down.
     ToggleSelect { advance: bool },
@@ -61,6 +66,9 @@ impl Command {
             Open => "cm_Return",
             GoParent => "cm_GoToParent",
             GoRoot => "cm_GoToRoot",
+            HistoryBack => "cm_PrevDir",
+            HistoryForward => "cm_NextDir",
+            Hotlist => "cm_DirectoryHotlist",
             SwitchPanel => "cm_FocusSwap",
             ToggleSelect { .. } => "cm_Select",
             SelectAll => "cm_SelectAll",

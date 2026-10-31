@@ -50,7 +50,20 @@ pub struct Panel {
     selected: HashSet<String>,
     pub sort: Sort,
     pub show_hidden: bool,
+    /// Folders visited before / after the current one (Alt+Left/Right).
+    back: Vec<Visit>,
+    forward: Vec<Visit>,
 }
+
+/// A history entry: the folder and the entry the cursor was on.
+#[derive(Debug, Clone)]
+struct Visit {
+    path: PathBuf,
+    focus: Option<String>,
+}
+
+/// Most folders kept in each history direction.
+const HISTORY_LIMIT: usize = 100;
 
 impl Panel {
     pub fn open(path: impl Into<PathBuf>) -> io::Result<Self> {
@@ -63,6 +76,8 @@ impl Panel {
             selected: HashSet::new(),
             sort: Sort::default(),
             show_hidden: false,
+            back: Vec::new(),
+            forward: Vec::new(),
         };
         panel.reload()?;
         Ok(panel)
@@ -83,8 +98,63 @@ impl Panel {
         Ok(())
     }
 
-    /// Changes folder. On error the panel is left untouched.
+    /// Changes folder and records it in the history. On error the panel is
+    /// left untouched.
     pub fn navigate(&mut self, path: PathBuf, focus: Option<&str>) -> io::Result<()> {
+        let leaving = self.visit();
+        let same = path == self.path;
+        self.load(path, focus)?;
+        if !same {
+            push_limited(&mut self.back, leaving);
+            self.forward.clear();
+        }
+        Ok(())
+    }
+
+    pub fn can_go_back(&self) -> bool {
+        !self.back.is_empty()
+    }
+
+    pub fn can_go_forward(&self) -> bool {
+        !self.forward.is_empty()
+    }
+
+    /// Goes to the previous folder in the history, skipping folders that no
+    /// longer exist.
+    pub fn go_back(&mut self) -> io::Result<()> {
+        self.step_history(true)
+    }
+
+    pub fn go_forward(&mut self) -> io::Result<()> {
+        self.step_history(false)
+    }
+
+    fn step_history(&mut self, back: bool) -> io::Result<()> {
+        let mut last_err = None;
+        loop {
+            let from = if back { &mut self.back } else { &mut self.forward };
+            let Some(target) = from.pop() else {
+                return last_err.map_or(Ok(()), Err);
+            };
+            let leaving = self.visit();
+            match self.load(target.path, target.focus.as_deref()) {
+                Ok(()) => {
+                    let to = if back { &mut self.forward } else { &mut self.back };
+                    push_limited(to, leaving);
+                    return Ok(());
+                }
+                // Gone (deleted, drive removed): drop it and try the next one.
+                Err(e) => last_err = Some(e),
+            }
+        }
+    }
+
+    fn visit(&self) -> Visit {
+        Visit { path: self.path.clone(), focus: self.current().map(|e| e.name.clone()) }
+    }
+
+    /// Lists `path` and makes it the current folder.
+    fn load(&mut self, path: PathBuf, focus: Option<&str>) -> io::Result<()> {
         let mut entries = list_dir(&path, self.show_hidden)?;
         sort_entries(&mut entries, self.sort);
         self.path = path;
@@ -301,6 +371,16 @@ impl Panel {
     }
 }
 
+fn push_limited(stack: &mut Vec<Visit>, visit: Visit) {
+    if stack.last().is_some_and(|v| v.path == visit.path) {
+        stack.pop();
+    }
+    stack.push(visit);
+    if stack.len() > HISTORY_LIMIT {
+        stack.remove(0);
+    }
+}
+
 /// First visible row so that `cursor` is on screen, moving as little as
 /// possible from `scroll`.
 pub fn visible_start(scroll: usize, cursor: usize, rows: usize, len: usize) -> usize {
@@ -357,6 +437,40 @@ mod tests {
         assert_eq!(visible_start(20, 15, 10, 100), 15);
         assert_eq!(visible_start(95, 99, 10, 100), 90);
         assert_eq!(visible_start(3, 2, 10, 5), 0);
+    }
+
+    #[test]
+    fn history_back_and_forward() {
+        let root = std::env::temp_dir().join(format!("rc-core-hist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("a").join("deep")).unwrap();
+        std::fs::create_dir_all(root.join("b")).unwrap();
+
+        let mut panel = Panel::open(&root).unwrap();
+        assert!(!panel.can_go_back());
+        panel.navigate(root.join("a"), None).unwrap();
+        panel.navigate(root.join("a").join("deep"), None).unwrap();
+        panel.go_parent().unwrap();
+        assert_eq!(panel.current().unwrap().name, "deep");
+
+        panel.go_back().unwrap();
+        assert_eq!(panel.path, root.join("a").join("deep"));
+        panel.go_back().unwrap();
+        assert_eq!(panel.path, root.join("a"));
+        // The cursor returns to where it was when we left.
+        assert_eq!(panel.current().unwrap().name, "..");
+        panel.go_forward().unwrap();
+        assert_eq!(panel.path, root.join("a").join("deep"));
+
+        // A new navigation drops the forward history.
+        panel.navigate(root.join("b"), None).unwrap();
+        assert!(!panel.can_go_forward());
+
+        // Vanished folders are skipped.
+        std::fs::remove_dir_all(root.join("a")).unwrap();
+        panel.go_back().unwrap();
+        assert_eq!(panel.path, root);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

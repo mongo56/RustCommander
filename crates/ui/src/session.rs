@@ -13,6 +13,9 @@ pub struct Session {
     pub active: usize,
     pub left: SideState,
     pub right: SideState,
+    /// Directory hotlist (Ctrl+D), in menu order.
+    #[serde(default)]
+    pub hotlist: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -113,10 +116,12 @@ mod tests {
                 tabs: vec![TabState { path: dir.clone(), sort: "size".into(), descending: true, show_hidden: true }],
             },
             right: SideState::default(),
+            hotlist: vec![dir.clone()],
         };
         let text = toml::to_string_pretty(&session).unwrap();
         let back: Session = toml::from_str(&text).unwrap();
         assert_eq!(back.active, 1);
+        assert_eq!(back.hotlist, std::slice::from_ref(&dir));
         let panel = back.left.tabs[0].open().unwrap();
         assert_eq!(panel.sort.key, SortKey::Size);
         assert!(panel.sort.descending && panel.show_hidden);

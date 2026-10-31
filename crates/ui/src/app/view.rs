@@ -471,6 +471,9 @@ impl App {
     }
 
     fn dialog_view<'a>(&'a self, dialog: &'a Dialog) -> Element<'a, Message> {
+        if let Dialog::Hotlist { selected } = dialog {
+            return self.hotlist_view(*selected);
+        }
         let input_field = |value: &'a str| {
             text_input("", value)
                 .id(dialog_input_id())
@@ -502,6 +505,7 @@ impl App {
                 None,
                 "Delete",
             ),
+            Dialog::Hotlist { .. } => unreachable!("drawn by hotlist_view"),
         };
 
         let mut content = column![text(title).size(16), text(body).size(13).color(theme::MUTED)].spacing(12);
@@ -518,6 +522,46 @@ impl App {
         );
 
         container(content).padding(20).width(Length::Fixed(520.0)).style(theme::dialog).into()
+    }
+
+    fn hotlist_view(&self, selected: usize) -> Element<'_, Message> {
+        let here = &self.panel(self.active).path;
+        let row_button = |content: Row<'static, Message>, i: usize| {
+            button(content)
+                .on_press(Message::HotlistPick(i))
+                .width(Length::Fill)
+                .padding([4, 8])
+                .style(theme::suggestion(selected == i))
+        };
+        let mut items = Column::new();
+        for (i, path) in self.hotlist.iter().enumerate() {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string());
+            let key = if i < 9 { (i + 1).to_string() } else { String::new() };
+            let mut content = Row::new().spacing(8).align_y(Alignment::Center);
+            content = content.push(text(key).size(12).color(theme::MUTED).width(Length::Fixed(12.0)));
+            if let Some(icon) = self.icon(path, true) {
+                content = content.push(image(icon).width(ICON).height(ICON));
+            }
+            let color = if path == here { theme::SELECTED } else { theme::TEXT };
+            content = content
+                .push(text(name).size(13).color(color).wrapping(Wrapping::None))
+                .push(text(elide_left(&path.display().to_string(), 60)).size(11).color(theme::MUTED).wrapping(Wrapping::None));
+            items = items.push(row_button(content, i));
+        }
+        let n = self.hotlist.len();
+        let toggle = if self.hotlist.contains(here) { "Remove current folder" } else { "Add current folder" };
+        let toggle_row = Row::new()
+            .spacing(8)
+            .push(text("A").size(12).color(theme::MUTED).width(Length::Fixed(12.0)))
+            .push(text(toggle).size(13));
+        items = items.push(row_button(toggle_row, n));
+        let empty = (n == 0).then(|| text("No folders yet.").size(13).color(theme::MUTED));
+        let hint = text("Enter go \u{b7} 1-9 jump \u{b7} Del remove \u{b7} Esc close").size(11).color(theme::MUTED);
+        let content = column![text("Hotlist").size(16)].push_maybe(empty).push(items).push(hint).spacing(10);
+        container(content).padding(16).width(Length::Fixed(520.0)).style(theme::dialog).into()
     }
 
     fn conflict_view<'a>(&'a self, id: u64, c: &'a Conflict) -> Element<'a, Message> {
