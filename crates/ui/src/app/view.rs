@@ -197,12 +197,17 @@ impl App {
                 .style(theme::input)
                 .into(),
             _ => mouse_area(
-                container(
-                    text(elide_left(&panel.path.display().to_string(), self.path_chars()))
+                container(match self.pending_nav(side) {
+                    // Waiting for a slow folder: show where we're going.
+                    Some(target) => text(elide_left(&format!("{}  (reading…)", target.display()), self.path_chars()))
+                        .size(13)
+                        .color(theme::MUTED)
+                        .wrapping(Wrapping::None),
+                    None => text(elide_left(&panel.path.display().to_string(), self.path_chars()))
                         .size(13)
                         .color(if active { theme::TEXT } else { theme::MUTED })
                         .wrapping(Wrapping::None),
-                )
+                })
                 .padding([4, 6])
                 .width(Length::Fill),
             )

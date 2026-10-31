@@ -11,7 +11,7 @@ use iced::widget::{image, text_input};
 use iced::{event, keyboard, mouse, window, Event, Point, Size, Subscription, Task, Theme};
 use rc_core::ops::{self, Conflict, Job, JobEvent, JobHandle, Outcome, Progress, Resolution};
 use rc_core::entry::Entry;
-use rc_core::{Activated, Command, EntryKind, Panel, SortKey};
+use rc_core::{Activated, Command, EntryKind, Nav, Panel, SortKey};
 use rc_platform::{DragOutcome, MenuAction};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -79,7 +79,24 @@ pub struct App {
     /// Latest background listing requested per folder (`Message::Listed`).
     listings: HashMap<PathBuf, u64>,
     next_listing: u64,
+    /// Folder change per side still waiting for its listing (slow or
+    /// network folders); see `start_nav`.
+    nav: [Option<PendingNav>; 2],
 }
+
+/// A navigation whose target folder is being listed in the background.
+struct PendingNav {
+    seq: u64,
+    /// Tab it was started in; switching tabs abandons it.
+    tab: usize,
+    nav: Nav,
+    path: PathBuf,
+}
+
+/// How long navigation waits for a listing before showing the folder as
+/// loading and finishing in the background. Local folders list well within
+/// this, so keys typed right after Enter still apply to the new folder.
+const SYNC_LISTING_WAIT: Duration = Duration::from_millis(150);
 
 /// One side of the window: a set of tabs, one of them shown.
 struct Side {
@@ -114,8 +131,9 @@ struct PathEdit {
     text: String,
     suggestions: Vec<PathBuf>,
     selected: Option<usize>,
-    /// Last folder listed for suggestions, to avoid re-reading it per key.
-    cache: Option<(PathBuf, Vec<String>)>,
+    /// Last folder listed for suggestions, to avoid re-reading it per key;
+    /// `None` names while it's being read in the background.
+    cache: Option<(PathBuf, Option<Vec<String>>)>,
 }
 
 /// A file being renamed in place.
@@ -211,6 +229,10 @@ pub enum Message {
     FsChanged(PathBuf),
     /// A background listing of a folder finished (`u64`: request number).
     Listed(PathBuf, u64, Result<Vec<Entry>, String>),
+    /// Background listing for a pending navigation: (side, seq, listing).
+    Navigated(usize, u64, Listing),
+    /// Subfolders of a folder, for path bar suggestions.
+    Subfolders(PathBuf, Vec<String>),
 }
 
 impl App {
@@ -257,6 +279,7 @@ impl App {
             disk: RefCell::new(HashMap::new()),
             listings: HashMap::new(),
             next_listing: 0,
+            nav: [None, None],
         };
         (app, Task::none())
     }
@@ -339,7 +362,7 @@ impl App {
                 self.leave_edits();
                 let entry = self.panel(side).entries.get(index);
                 if let Some(path) = entry.filter(|e| e.is_dir()).map(|e| e.path.clone()) {
-                    self.open_tab(side, path, false);
+                    return self.open_tab(side, path, false);
                 }
             }
             Message::RightPress(side, index) => {
@@ -450,8 +473,7 @@ impl App {
                 self.leave_edits();
                 self.active = side;
                 self.drives = rc_platform::roots();
-                let result = self.panel_mut(side).navigate(PathBuf::from(drive), None);
-                self.report(result);
+                return self.start_nav(side, Nav::to(drive));
             }
             Message::Sort(side, key) => {
                 self.active = side;
@@ -467,11 +489,11 @@ impl App {
             Message::TabSelect(side, index) => {
                 self.leave_edits();
                 self.active = side;
-                self.select_tab(side, index);
+                return self.select_tab(side, index);
             }
             Message::TabClose(side, index) => {
                 self.leave_edits();
-                self.close_tab(side, index);
+                return self.close_tab(side, index);
             }
             Message::TabBarClick(side) => {
                 let now = Instant::now();
@@ -485,7 +507,7 @@ impl App {
                 self.leave_edits();
                 self.active = side;
                 let path = self.panel(side).path.clone();
-                self.open_tab(side, path, true);
+                return self.open_tab(side, path, true);
             }
             Message::EditPath(side) => {
                 self.leave_edits();
@@ -498,19 +520,27 @@ impl App {
                 if let Some(edit) = &mut self.path_edit {
                     edit.text = value;
                 }
-                self.refresh_suggestions();
+                return self.refresh_suggestions();
+            }
+            Message::Subfolders(dir, names) => {
+                if let Some(edit) = &mut self.path_edit {
+                    if edit.cache.as_ref().is_some_and(|(cached, _)| *cached == dir) {
+                        edit.cache = Some((dir, Some(names)));
+                        return self.refresh_suggestions();
+                    }
+                }
             }
             Message::PathSubmit => {
                 let picked = self
                     .path_edit
                     .as_ref()
                     .and_then(|e| e.selected.and_then(|i| e.suggestions.get(i).cloned()));
-                match picked {
+                return match picked {
                     Some(path) => self.go_to_path(path),
                     None => self.submit_path(),
-                }
+                };
             }
-            Message::PathPick(path) => self.go_to_path(path),
+            Message::PathPick(path) => return self.go_to_path(path),
             Message::RenameInput(value) => {
                 if let Some(rename) = &mut self.rename {
                     rename.text = value;
@@ -529,7 +559,7 @@ impl App {
             }
             Message::DialogSubmit => return self.submit_dialog(),
             Message::DialogCancel => self.dialog = None,
-            Message::HotlistPick(i) => self.hotlist_pick(i),
+            Message::HotlistPick(i) => return self.hotlist_pick(i),
             Message::Job(id, event) => self.on_job_event(id, event),
             Message::JobPause(id) => {
                 if let Some(job) = self.job(id) {
@@ -551,6 +581,14 @@ impl App {
             }
             Message::FsChanged(path) => return self.list_in_background(path),
             Message::Listed(path, seq, result) => self.apply_listing(path, seq, result),
+            Message::Navigated(side, seq, result) => {
+                let current = self.sides[side].current;
+                let pending = self.nav[side].take_if(|p| p.seq == seq && p.tab == current);
+                // Abandoned, superseded, or the history changed meanwhile.
+                if let Some(p) = pending.filter(|p| self.panel(side).nav_target(&p.nav).as_ref() == Some(&p.path)) {
+                    return self.finish_nav(side, p.nav, result);
+                }
+            }
         }
         Task::none()
     }
@@ -577,7 +615,7 @@ impl App {
         }
         if let Some(Dialog::Hotlist { selected }) = self.dialog {
             if !named.is_some_and(is_modifier_key) {
-                self.hotlist_key(selected, named, text.as_deref());
+                return self.hotlist_key(selected, named, text.as_deref());
             }
             return Task::none();
         }
@@ -597,6 +635,11 @@ impl App {
         }
         if self.path_edit.is_some() {
             return self.path_edit_key(named);
+        }
+        if escape && self.nav[self.active].is_some() {
+            self.nav[self.active] = None;
+            self.status = Some(("Cancelled".into(), Tone::Info));
+            return Task::none();
         }
         if escape && self.drag.as_ref().is_some_and(|d| d.active) {
             self.drag = None;
@@ -659,9 +702,7 @@ impl App {
             }
             SyncOtherPanel => {
                 let path = self.panel(active).path.clone();
-                let result = self.panel_mut(other).navigate(path, None);
-                self.report(result);
-                return Task::none();
+                return self.start_nav(other, Nav::to(path));
             }
             Copy | Move => {
                 let sources = self.target_paths(active);
@@ -691,32 +732,50 @@ impl App {
             }
             NewTab => {
                 let path = self.panel(active).path.clone();
-                self.open_tab(active, path, true);
-                return Task::none();
+                return self.open_tab(active, path, true);
             }
-            CloseTab => {
-                self.close_tab(active, self.sides[active].current);
-                return Task::none();
-            }
+            CloseTab => return self.close_tab(active, self.sides[active].current),
             NextTab | PrevTab => {
                 let s = &self.sides[active];
                 let n = s.tabs.len();
                 let next = if cmd == NextTab { (s.current + 1) % n } else { (s.current + n - 1) % n };
-                self.select_tab(active, next);
-                return Task::none();
+                return self.select_tab(active, next);
             }
             OpenInNewTab => {
                 let dir = self.panel(active).current().filter(|e| e.is_dir()).map(|e| e.path.clone());
-                if let Some(path) = dir {
-                    self.open_tab(active, path, true);
-                }
-                return Task::none();
+                return dir.map_or(Task::none(), |path| self.open_tab(active, path, true));
             }
             Refresh => {
                 self.drives = rc_platform::roots();
                 self.disk.borrow_mut().clear();
+                let path = self.panel(active).path.clone();
+                return self.list_in_background(path);
+            }
+            ToggleHidden => {
+                let panel = self.panel_mut(active);
+                panel.show_hidden = !panel.show_hidden;
+                let state = if panel.show_hidden { "shown" } else { "hidden" };
+                self.status = Some((format!("Hidden files {state}"), Tone::Info));
+                let path = self.panel(active).path.clone();
+                return self.list_in_background(path);
             }
             _ => {}
+        }
+
+        // Folder changes list the target first, maybe in the background.
+        let nav = match cmd {
+            Open => match self.panel(active).activate() {
+                Activated::Navigate(nav) => Some(nav),
+                _ => None,
+            },
+            GoParent => self.panel(active).parent_nav(),
+            GoRoot => self.panel(active).root_nav(),
+            HistoryBack => Some(Nav::Back),
+            HistoryForward => Some(Nav::Forward),
+            _ => None,
+        };
+        if let Some(nav) = nav {
+            return self.start_nav(active, nav);
         }
 
         let panel = self.panel_mut(active);
@@ -730,14 +789,11 @@ impl App {
             CursorEnd => Ok(panel.cursor_end()),
             CursorBy(n) => Ok(panel.move_cursor(n as isize)),
             Open => match panel.activate() {
-                Ok(Activated::File(path)) => launch(&path).map(|msg| info = Some(msg)),
-                Ok(_) => Ok(()),
-                Err(e) => Err(e),
+                Activated::File(path) => launch(&path).map(|msg| info = Some(msg)),
+                _ => Ok(()),
             },
-            GoParent => panel.go_parent(),
-            GoRoot => panel.go_root(),
-            HistoryBack => panel.go_back(),
-            HistoryForward => panel.go_forward(),
+            // At the root / no history: nothing to do.
+            GoParent | GoRoot | HistoryBack | HistoryForward => Ok(()),
             ToggleSelect { advance } => {
                 panel.toggle_select_current();
                 if advance {
@@ -747,13 +803,6 @@ impl App {
             }
             SelectAll => Ok(panel.select_all()),
             DeselectAll => Ok(panel.deselect_all()),
-            Refresh => panel.reload(),
-            ToggleHidden => {
-                let r = panel.toggle_hidden();
-                let state = if panel.show_hidden { "shown" } else { "hidden" };
-                info = Some(format!("Hidden files {state}"));
-                r
-            }
             SortBy(key) => Ok(panel.sort_by(key)),
             // Until the built-in viewer/editor exist, hand off to the OS.
             View | Edit => match panel.current() {
@@ -789,43 +838,55 @@ impl App {
 
     // ---- tabs -------------------------------------------------------------
 
-    fn open_tab(&mut self, side: usize, path: PathBuf, switch: bool) {
-        let mut panel = self.panel(side).clone();
-        let result = if panel.path == path { panel.reload() } else { panel.navigate(path, None) };
-        match result {
-            Ok(()) => {
-                let s = &mut self.sides[side];
-                s.tabs.insert(s.current + 1, panel);
-                if switch {
-                    s.current += 1;
-                    self.active = side;
+    fn open_tab(&mut self, side: usize, path: PathBuf, switch: bool) -> Task<Message> {
+        if !switch {
+            // Opened in the background: list it now, as there's nowhere to
+            // show progress.
+            let mut panel = self.panel(side).clone();
+            let result = if panel.path == path { panel.reload() } else { panel.navigate(path, None) };
+            match result {
+                Ok(()) => {
+                    let s = &mut self.sides[side];
+                    s.tabs.insert(s.current + 1, panel);
                 }
+                Err(e) => self.status = Some((e.to_string(), Tone::Error)),
             }
-            Err(e) => self.status = Some((e.to_string(), Tone::Error)),
+            return Task::none();
         }
+        self.nav[side] = None;
+        let panel = self.panel(side).clone();
+        let same = panel.path == path;
+        let s = &mut self.sides[side];
+        s.tabs.insert(s.current + 1, panel);
+        s.current += 1;
+        self.active = side;
+        if same { self.list_in_background(path) } else { self.start_nav(side, Nav::to(path)) }
     }
 
-    fn close_tab(&mut self, side: usize, index: usize) {
+    fn close_tab(&mut self, side: usize, index: usize) -> Task<Message> {
         let s = &mut self.sides[side];
         if s.tabs.len() <= 1 || index >= s.tabs.len() {
-            return;
+            return Task::none();
         }
         s.tabs.remove(index);
         if s.current > index || s.current >= s.tabs.len() {
             s.current = s.current.saturating_sub(1);
         }
-        let result = self.panel_mut(side).reload();
-        self.report(result);
+        self.nav[side] = None;
+        let path = self.panel(side).path.clone();
+        self.list_in_background(path)
     }
 
-    fn select_tab(&mut self, side: usize, index: usize) {
-        if index < self.sides[side].tabs.len() {
-            self.sides[side].current = index;
-            // Tabs in the background may be stale.
-            let result = self.panel_mut(side).reload();
-            self.report(result);
-            self.after_change();
+    fn select_tab(&mut self, side: usize, index: usize) -> Task<Message> {
+        if index >= self.sides[side].tabs.len() {
+            return Task::none();
         }
+        self.sides[side].current = index;
+        self.nav[side] = None;
+        self.after_change();
+        // Tabs in the background may be stale.
+        let path = self.panel(side).path.clone();
+        self.list_in_background(path)
     }
 
     // ---- quick search -----------------------------------------------------
@@ -948,24 +1009,26 @@ impl App {
                     text.push(MAIN_SEPARATOR);
                 }
                 edit.text = text;
-                self.refresh_suggestions();
-                return text_input::move_cursor_to_end(path_input_id());
+                return Task::batch([self.refresh_suggestions(), text_input::move_cursor_to_end(path_input_id())]);
             }
             _ => {}
         }
         Task::none()
     }
 
-    fn refresh_suggestions(&mut self) {
-        let Some(side) = self.path_edit.as_ref().map(|e| e.side) else { return };
+    /// Recomputes the folder suggestions for the typed path. Folders are
+    /// read in the background (`Message::Subfolders`): typing a network
+    /// path must not block.
+    fn refresh_suggestions(&mut self) -> Task<Message> {
+        let Some(side) = self.path_edit.as_ref().map(|e| e.side) else { return Task::none() };
         let base = self.panel(side).path.clone();
-        let Some(edit) = &mut self.path_edit else { return };
+        let Some(edit) = &mut self.path_edit else { return Task::none() };
         edit.selected = None;
         edit.suggestions.clear();
 
         let raw = edit.text.trim().trim_matches('"');
         if raw.is_empty() {
-            return;
+            return Task::none();
         }
         let path = resolve_typed_path(raw, &base);
         let ends_with_sep = raw.ends_with(['\\', '/']) || (raw.len() == 2 && raw.ends_with(':'));
@@ -974,14 +1037,25 @@ impl App {
         } else {
             match (path.parent(), path.file_name()) {
                 (Some(parent), Some(name)) => (parent.to_path_buf(), name.to_string_lossy().to_lowercase()),
-                _ => return,
+                _ => return Task::none(),
             }
         };
 
         if edit.cache.as_ref().is_none_or(|(cached, _)| *cached != dir) {
-            edit.cache = Some((dir.clone(), list_subfolders(&dir)));
+            edit.cache = Some((dir.clone(), None));
+            return Task::perform(
+                async move {
+                    let (tx, rx) = iced::futures::channel::oneshot::channel();
+                    let d = dir.clone();
+                    std::thread::spawn(move || {
+                        let _ = tx.send(list_subfolders(&d));
+                    });
+                    (dir, rx.await.unwrap_or_default())
+                },
+                |(dir, names)| Message::Subfolders(dir, names),
+            );
         }
-        let Some((_, names)) = &edit.cache else { return };
+        let Some((_, Some(names))) = &edit.cache else { return Task::none() };
         edit.suggestions = names
             .iter()
             .filter(|n| n.to_lowercase().starts_with(&prefix))
@@ -992,42 +1066,29 @@ impl App {
         if edit.suggestions.len() == 1 && normalize_lexically(&edit.suggestions[0]) == normalize_lexically(&path) {
             edit.suggestions.clear();
         }
+        Task::none()
     }
 
-    fn submit_path(&mut self) {
-        let Some(edit) = self.path_edit.as_ref() else { return };
+    fn submit_path(&mut self) -> Task<Message> {
+        let Some(edit) = self.path_edit.as_ref() else { return Task::none() };
         let raw = edit.text.trim().trim_matches('"').to_string();
         if raw.is_empty() {
             self.path_edit = None;
-            return;
+            return Task::none();
         }
         let path = resolve_typed_path(&raw, &self.panel(edit.side).path);
-        self.go_to_path(path);
+        self.go_to_path(path)
     }
 
-    /// Navigates the edited side to `path` (a folder, or a file to focus).
-    fn go_to_path(&mut self, path: PathBuf) {
-        let Some(edit) = self.path_edit.take() else { return };
-        let path = normalize_lexically(&path);
-        let panel = self.panel_mut(edit.side);
-        let result = if path.is_dir() {
-            panel.navigate(path, None)
-        } else if path.is_file() {
-            let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
-            match path.parent() {
-                Some(parent) => panel.navigate(parent.to_path_buf(), name.as_deref()),
-                None => Ok(()),
-            }
-        } else {
-            Err(io::Error::new(io::ErrorKind::NotFound, format!("Path not found: {}", path.display())))
-        };
-        self.after_change();
-        self.report(result);
+    /// Navigates the edited side to `path`: a folder, or a file to focus.
+    fn go_to_path(&mut self, path: PathBuf) -> Task<Message> {
+        let Some(edit) = self.path_edit.take() else { return Task::none() };
+        self.start_nav_to(edit.side, Nav::to(normalize_lexically(&path)), true)
     }
 
     // ---- hotlist ----------------------------------------------------------
 
-    fn hotlist_key(&mut self, selected: usize, named: Option<Named>, text: Option<&str>) {
+    fn hotlist_key(&mut self, selected: usize, named: Option<Named>, text: Option<&str>) -> Task<Message> {
         let count = self.hotlist.len() + 1;
         let mut select = |i: usize| self.dialog = Some(Dialog::Hotlist { selected: i });
         match named {
@@ -1036,7 +1097,7 @@ impl App {
             Some(Named::ArrowDown) => select((selected + 1) % count),
             Some(Named::Home | Named::PageUp) => select(0),
             Some(Named::End | Named::PageDown) => select(count - 1),
-            Some(Named::Enter) => self.hotlist_pick(selected),
+            Some(Named::Enter) => return self.hotlist_pick(selected),
             Some(Named::Delete) if selected < self.hotlist.len() => {
                 self.hotlist.remove(selected);
                 self.dialog = Some(Dialog::Hotlist { selected: selected.min(self.hotlist.len()) });
@@ -1047,25 +1108,23 @@ impl App {
                 Some(d @ ("1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")) => {
                     let i = d.parse::<usize>().unwrap_or(1) - 1;
                     if i < self.hotlist.len() {
-                        self.hotlist_pick(i);
+                        return self.hotlist_pick(i);
                     }
                 }
-                Some("a" | "+") => self.hotlist_pick(self.hotlist.len()),
+                Some("a" | "+") => return self.hotlist_pick(self.hotlist.len()),
                 _ => {}
             },
         }
+        Task::none()
     }
 
     /// Opens hotlist entry `i`; the index past the entries adds or removes
     /// the active panel's folder.
-    fn hotlist_pick(&mut self, i: usize) {
+    fn hotlist_pick(&mut self, i: usize) -> Task<Message> {
         self.dialog = None;
         let active = self.active;
         if let Some(path) = self.hotlist.get(i).cloned() {
-            let result = self.panel_mut(active).navigate(path, None);
-            self.after_change();
-            self.report(result);
-            return;
+            return self.start_nav(active, Nav::to(path));
         }
         let here = self.panel(active).path.clone();
         let msg = if let Some(pos) = self.hotlist.iter().position(|p| *p == here) {
@@ -1077,6 +1136,7 @@ impl App {
         };
         self.status = Some((msg, Tone::Info));
         self.save_session();
+        Task::none()
     }
 
     // ---- dialogs ----------------------------------------------------------
@@ -1138,7 +1198,7 @@ impl App {
                 let title = format!("{verb} {}", describe(&paths));
                 return self.start_job(Job::Delete { paths, to_trash }, title);
             }
-            Dialog::Hotlist { selected } => self.hotlist_pick(selected),
+            Dialog::Hotlist { selected } => return self.hotlist_pick(selected),
         }
         Task::none()
     }
@@ -1338,6 +1398,7 @@ impl App {
     /// The folder of `side` can't be listed any more: it may be gone, so walk
     /// up to something that exists.
     fn folder_unreadable(&mut self, side: usize, error: String) {
+        self.nav[side] = None;
         let panel = self.panel_mut(side);
         let existing = panel.path.ancestors().skip(1).find(|p| p.is_dir()).map(Path::to_path_buf);
         match existing {
@@ -1366,6 +1427,79 @@ impl App {
             },
             move |(path, result)| Message::Listed(path, seq, result),
         )
+    }
+
+    /// Changes the folder of `side`. The target is listed on a worker
+    /// thread; if that takes longer than `SYNC_LISTING_WAIT` the panel keeps
+    /// showing the old folder (path bar says "reading") until
+    /// `Message::Navigated` arrives. Esc or another navigation abandons it.
+    fn start_nav(&mut self, side: usize, nav: Nav) -> Task<Message> {
+        self.start_nav_to(side, nav, false)
+    }
+
+    /// `start_nav`; with `file_ok` a target that is a file opens its folder
+    /// with the cursor on it.
+    fn start_nav_to(&mut self, side: usize, nav: Nav, file_ok: bool) -> Task<Message> {
+        use std::sync::mpsc;
+        self.nav[side] = None;
+        let Some(path) = self.panel(side).nav_target(&nav) else { return Task::none() };
+        self.next_listing += 1;
+        let seq = self.next_listing;
+        let (tx, rx) = mpsc::channel();
+        let dir = path.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(list_nav_target(&dir, file_ok));
+        });
+        let failed = || Err("listing thread failed".to_string());
+        match rx.recv_timeout(SYNC_LISTING_WAIT) {
+            Ok(result) => self.finish_nav(side, nav, result),
+            Err(mpsc::RecvTimeoutError::Disconnected) => self.finish_nav(side, nav, failed()),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                self.nav[side] = Some(PendingNav { seq, tab: self.sides[side].current, nav, path });
+                Task::perform(
+                    async move {
+                        // Hand the blocking receive to a thread of its own.
+                        let (tx, done) = iced::futures::channel::oneshot::channel();
+                        std::thread::spawn(move || {
+                            let _ = tx.send(rx.recv().unwrap_or_else(|_| failed()));
+                        });
+                        done.await.unwrap_or_else(|_| failed())
+                    },
+                    move |result| Message::Navigated(side, seq, result),
+                )
+            }
+        }
+    }
+
+    fn finish_nav(&mut self, side: usize, nav: Nav, result: Listing) -> Task<Message> {
+        match result {
+            Ok(Listed { file: Some(name), entries }) => {
+                // The target was a file: show its folder, cursor on it.
+                let panel = self.panel_mut(side);
+                if let Some(parent) = panel.nav_target(&nav).as_deref().and_then(Path::parent) {
+                    let nav = Nav::To { path: parent.to_path_buf(), focus: Some(name) };
+                    panel.arrive(&nav, entries);
+                }
+                self.after_change();
+                Task::none()
+            }
+            Ok(Listed { file: None, entries }) => {
+                self.panel_mut(side).arrive(&nav, entries);
+                self.after_change();
+                Task::none()
+            }
+            // A vanished history folder: try the one before it.
+            Err(_) if self.panel_mut(side).forget_target(&nav) => self.start_nav(side, nav),
+            Err(e) => {
+                self.status = Some((e, Tone::Error));
+                Task::none()
+            }
+        }
+    }
+
+    /// Target of the navigation `side` is waiting for, if any.
+    pub(super) fn pending_nav(&self, side: usize) -> Option<&Path> {
+        self.nav[side].as_ref().map(|p| p.path.as_path())
     }
 
     fn apply_listing(&mut self, path: PathBuf, seq: u64, result: Result<Vec<Entry>, String>) {
@@ -1503,6 +1637,32 @@ fn resolve_typed_path(raw: &str, base: &Path) -> PathBuf {
 }
 
 /// Names of the sub-folders of `dir`, sorted case-insensitively.
+/// Result of listing a navigation target (`App::start_nav`).
+type Listing = Result<Listed, String>;
+
+#[derive(Debug, Clone)]
+pub struct Listed {
+    /// Set when the target was a file: `entries` are its folder's.
+    file: Option<String>,
+    entries: Vec<Entry>,
+}
+
+/// Lists a navigation target (with hidden entries); runs on a worker
+/// thread. With `file_ok`, a file lists its parent folder instead.
+fn list_nav_target(path: &Path, file_ok: bool) -> Listing {
+    match rc_core::fs::list_dir(path, true) {
+        Ok(entries) => Ok(Listed { file: None, entries }),
+        Err(_) if file_ok && path.is_file() => {
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+            let parent = path.parent().ok_or("No parent folder")?;
+            let entries = rc_core::fs::list_dir(parent, true).map_err(|e| e.to_string())?;
+            Ok(Listed { file: name, entries })
+        }
+        Err(e) if file_ok && e.kind() == io::ErrorKind::NotFound => Err(format!("Path not found: {}", path.display())),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 fn list_subfolders(dir: &Path) -> Vec<String> {
     let Ok(read) = std::fs::read_dir(dir) else { return Vec::new() };
     let mut names: Vec<String> = read

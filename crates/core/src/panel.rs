@@ -3,7 +3,7 @@ use crate::fs::list_dir;
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortKey {
@@ -25,14 +25,32 @@ impl Default for Sort {
     }
 }
 
-/// What happened when the user pressed Enter on an entry.
+/// What pressing Enter on an entry asks for.
 #[derive(Debug)]
 pub enum Activated {
-    /// Navigated into a directory (or up).
-    Navigated,
+    /// A directory (or `..`): the caller performs the navigation, possibly
+    /// listing the folder in the background first.
+    Navigate(Nav),
     /// The entry is a file; the caller decides how to open it.
     File(PathBuf),
     Nothing,
+}
+
+/// A change of folder. Callers list the target (`Panel::nav_target`) and
+/// then commit with `Panel::arrive`, so slow folders can be read off the UI
+/// thread; `Panel::go` does both synchronously.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Nav {
+    /// Go to `path`, putting the cursor on `focus` if present.
+    To { path: PathBuf, focus: Option<String> },
+    Back,
+    Forward,
+}
+
+impl Nav {
+    pub fn to(path: impl Into<PathBuf>) -> Self {
+        Nav::To { path: path.into(), focus: None }
+    }
 }
 
 /// One file panel: a folder listing plus cursor, selection and scroll state.
@@ -112,14 +130,74 @@ impl Panel {
     /// Changes folder and records it in the history. On error the panel is
     /// left untouched.
     pub fn navigate(&mut self, path: PathBuf, focus: Option<&str>) -> io::Result<()> {
-        let leaving = self.visit();
-        let same = path == self.path;
-        self.load(path, focus)?;
-        if !same {
-            push_limited(&mut self.back, leaving);
-            self.forward.clear();
+        self.go(Nav::To { path, focus: focus.map(str::to_owned) })
+    }
+
+    /// Performs `nav` synchronously. History steps skip folders that no
+    /// longer exist.
+    pub fn go(&mut self, nav: Nav) -> io::Result<()> {
+        let mut last_err = None;
+        while let Some(path) = self.nav_target(&nav) {
+            match list_dir(&path, true) {
+                Ok(entries) => {
+                    self.arrive(&nav, entries);
+                    return Ok(());
+                }
+                Err(e) => {
+                    if !self.forget_target(&nav) {
+                        return Err(e);
+                    }
+                    last_err = Some(e);
+                }
+            }
         }
-        Ok(())
+        last_err.map_or(Ok(()), Err)
+    }
+
+    /// The folder `nav` leads to; `None` if the history is empty.
+    pub fn nav_target(&self, nav: &Nav) -> Option<PathBuf> {
+        match nav {
+            Nav::To { path, .. } => Some(path.clone()),
+            Nav::Back => self.back.last().map(|v| v.path.clone()),
+            Nav::Forward => self.forward.last().map(|v| v.path.clone()),
+        }
+    }
+
+    /// The history target of `nav` can't be listed (deleted, drive
+    /// removed): drops it so the next attempt tries the one before. Returns
+    /// false if there is nothing to retry.
+    pub fn forget_target(&mut self, nav: &Nav) -> bool {
+        match nav {
+            Nav::To { .. } => false,
+            Nav::Back => self.back.pop().is_some(),
+            Nav::Forward => self.forward.pop().is_some(),
+        }
+    }
+
+    /// Commits `nav` with a listing of its target folder (made with or
+    /// without hidden entries) and records it in the history.
+    pub fn arrive(&mut self, nav: &Nav, entries: Vec<Entry>) {
+        let leaving = self.visit();
+        let target = match nav {
+            Nav::To { path, focus } => {
+                if *path != self.path {
+                    push_limited(&mut self.back, leaving);
+                    self.forward.clear();
+                }
+                Visit { path: path.clone(), focus: focus.clone() }
+            }
+            Nav::Back | Nav::Forward => {
+                let (from, to) = if *nav == Nav::Back {
+                    (&mut self.back, &mut self.forward)
+                } else {
+                    (&mut self.forward, &mut self.back)
+                };
+                let Some(target) = from.pop() else { return };
+                push_limited(to, leaving);
+                target
+            }
+        };
+        self.load(target.path, target.focus.as_deref(), entries);
     }
 
     pub fn can_go_back(&self) -> bool {
@@ -133,40 +211,22 @@ impl Panel {
     /// Goes to the previous folder in the history, skipping folders that no
     /// longer exist.
     pub fn go_back(&mut self) -> io::Result<()> {
-        self.step_history(true)
+        self.go(Nav::Back)
     }
 
     pub fn go_forward(&mut self) -> io::Result<()> {
-        self.step_history(false)
-    }
-
-    fn step_history(&mut self, back: bool) -> io::Result<()> {
-        let mut last_err = None;
-        loop {
-            let from = if back { &mut self.back } else { &mut self.forward };
-            let Some(target) = from.pop() else {
-                return last_err.map_or(Ok(()), Err);
-            };
-            let leaving = self.visit();
-            match self.load(target.path, target.focus.as_deref()) {
-                Ok(()) => {
-                    let to = if back { &mut self.forward } else { &mut self.back };
-                    push_limited(to, leaving);
-                    return Ok(());
-                }
-                // Gone (deleted, drive removed): drop it and try the next one.
-                Err(e) => last_err = Some(e),
-            }
-        }
+        self.go(Nav::Forward)
     }
 
     fn visit(&self) -> Visit {
         Visit { path: self.path.clone(), focus: self.current().map(|e| e.name.clone()) }
     }
 
-    /// Lists `path` and makes it the current folder.
-    fn load(&mut self, path: PathBuf, focus: Option<&str>) -> io::Result<()> {
-        let mut entries = list_dir(&path, self.show_hidden)?;
+    /// Makes `path` the current folder, showing `entries`.
+    fn load(&mut self, path: PathBuf, focus: Option<&str>, mut entries: Vec<Entry>) {
+        if !self.show_hidden {
+            entries.retain(|e| !e.hidden);
+        }
         sort_entries(&mut entries, self.sort);
         self.path = path;
         self.entries = entries;
@@ -175,34 +235,34 @@ impl Panel {
         self.wheel_anchor = None;
         self.cursor = 0;
         self.focus_name(focus);
-        Ok(())
+    }
+
+    /// Up one level, with the cursor on the folder we came out of.
+    pub fn parent_nav(&self) -> Option<Nav> {
+        let parent = self.path.parent()?.to_path_buf();
+        let focus = self.path.file_name().map(|n| n.to_string_lossy().into_owned());
+        Some(Nav::To { path: parent, focus })
+    }
+
+    pub fn root_nav(&self) -> Option<Nav> {
+        let root = self.path.ancestors().last()?;
+        (root != self.path).then(|| Nav::to(root))
     }
 
     pub fn go_parent(&mut self) -> io::Result<()> {
-        let Some(parent) = self.path.parent().map(Path::to_path_buf) else {
-            return Ok(());
-        };
-        // Put the cursor on the folder we just came out of.
-        let came_from = self.path.file_name().map(|n| n.to_string_lossy().into_owned());
-        self.navigate(parent, came_from.as_deref())
+        self.parent_nav().map_or(Ok(()), |nav| self.go(nav))
     }
 
     pub fn go_root(&mut self) -> io::Result<()> {
-        match self.path.ancestors().last() {
-            Some(root) if root != self.path => self.navigate(root.to_path_buf(), None),
-            _ => Ok(()),
-        }
+        self.root_nav().map_or(Ok(()), |nav| self.go(nav))
     }
 
-    pub fn activate(&mut self) -> io::Result<Activated> {
-        let Some(entry) = self.current() else { return Ok(Activated::Nothing) };
+    pub fn activate(&self) -> Activated {
+        let Some(entry) = self.current() else { return Activated::Nothing };
         match entry.kind {
-            EntryKind::Parent => self.go_parent().map(|_| Activated::Navigated),
-            EntryKind::Dir => {
-                let path = entry.path.clone();
-                self.navigate(path, None).map(|_| Activated::Navigated)
-            }
-            EntryKind::File => Ok(Activated::File(entry.path.clone())),
+            EntryKind::Parent => self.parent_nav().map_or(Activated::Nothing, Activated::Navigate),
+            EntryKind::Dir => Activated::Navigate(Nav::to(entry.path.clone())),
+            EntryKind::File => Activated::File(entry.path.clone()),
         }
     }
 
@@ -497,7 +557,8 @@ mod tests {
         assert_eq!(names, ["..", "b_dir", "a.txt", "C.rs"]);
 
         panel.set_cursor(1);
-        assert!(matches!(panel.activate().unwrap(), Activated::Navigated));
+        let Activated::Navigate(nav) = panel.activate() else { panic!("not a folder") };
+        panel.go(nav).unwrap();
         assert_eq!(panel.path, root.join("b_dir"));
 
         panel.go_parent().unwrap();

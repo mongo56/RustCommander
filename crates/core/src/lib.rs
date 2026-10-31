@@ -12,4 +12,4 @@ pub mod panel;
 
 pub use command::Command;
 pub use entry::{Entry, EntryKind};
-pub use panel::{Activated, Panel, Sort, SortKey};
+pub use panel::{Activated, Nav, Panel, Sort, SortKey};
