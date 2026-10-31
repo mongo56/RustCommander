@@ -6,6 +6,7 @@ use chrono::{DateTime, Local};
 use std::fs;
 use std::io;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub fn list_dir(path: &Path, show_hidden: bool) -> io::Result<Vec<Entry>> {
     let mut entries = Vec::new();
@@ -71,4 +72,44 @@ fn is_hidden(_name: &str, meta: &fs::Metadata) -> bool {
 #[cfg(not(windows))]
 fn is_hidden(name: &str, _meta: &fs::Metadata) -> bool {
     name.starts_with('.')
+}
+
+/// Total size of the files under `path`, recursively. Links and junctions
+/// count as themselves and are not followed; unreadable parts are skipped.
+/// Returns early (with a partial sum) once `cancel` is set.
+pub fn dir_size(path: &Path, cancel: &AtomicBool) -> u64 {
+    let mut total = 0;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(items) = fs::read_dir(&dir) else { continue };
+        for item in items.flatten() {
+            if cancel.load(Ordering::Relaxed) {
+                return total;
+            }
+            let Ok(meta) = item.metadata() else { continue };
+            if meta.is_dir() {
+                stack.push(item.path());
+            } else {
+                total += meta.len();
+            }
+        }
+    }
+    total
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dir_size_sums_nested_files() {
+        let root = std::env::temp_dir().join(format!("rc-dirsize-{}", std::process::id()));
+        fs::create_dir_all(root.join("a/b")).unwrap();
+        fs::write(root.join("x"), [0u8; 10]).unwrap();
+        fs::write(root.join("a/y"), [0u8; 20]).unwrap();
+        fs::write(root.join("a/b/z"), [0u8; 30]).unwrap();
+        assert_eq!(dir_size(&root, &AtomicBool::new(false)), 60);
+        assert_eq!(dir_size(&root, &AtomicBool::new(true)), 0);
+        fs::remove_dir_all(&root).unwrap();
+    }
 }

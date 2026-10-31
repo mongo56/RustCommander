@@ -1,7 +1,7 @@
 use crate::entry::{Entry, EntryKind};
 use crate::fs::list_dir;
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
 
@@ -75,6 +75,9 @@ pub struct Panel {
     /// Folders visited before / after the current one (Alt+Left/Right).
     back: Vec<Visit>,
     forward: Vec<Visit>,
+    /// Folder sizes computed on request (Space), by name; `None` while
+    /// counting. Kept across refreshes, cleared on navigation.
+    dir_sizes: HashMap<String, Option<u64>>,
 }
 
 /// A history entry: the folder and the entry the cursor was on.
@@ -102,6 +105,7 @@ impl Panel {
             unfiltered: None,
             back: Vec::new(),
             forward: Vec::new(),
+            dir_sizes: HashMap::new(),
         };
         panel.reload()?;
         Ok(panel)
@@ -128,6 +132,7 @@ impl Panel {
         self.set_listing(entries);
         let names: HashSet<&str> = self.entries.iter().map(|e| e.name.as_str()).collect();
         self.selected.retain(|n| names.contains(n.as_str()));
+        self.dir_sizes.retain(|n, _| names.contains(n.as_str()));
         // If the cursor entry vanished (deleted/moved), stay at the same row.
         self.cursor = old_cursor;
         self.focus_name(focus.as_deref());
@@ -239,6 +244,7 @@ impl Panel {
         self.filter.clear();
         self.set_listing(entries);
         self.selected.clear();
+        self.dir_sizes.clear();
         self.scroll = 0;
         self.wheel_anchor = None;
         self.cursor = 0;
@@ -413,6 +419,39 @@ impl Panel {
         }
     }
 
+    /// The computed size of folder `name`: `None` if never asked for,
+    /// `Some(None)` while counting.
+    pub fn dir_size(&self, name: &str) -> Option<Option<u64>> {
+        self.dir_sizes.get(name).copied()
+    }
+
+    /// Marks folder `name` as being counted; false if its size is already
+    /// known or being counted.
+    pub fn start_dir_size(&mut self, name: &str) -> bool {
+        if self.dir_sizes.contains_key(name) {
+            return false;
+        }
+        self.dir_sizes.insert(name.to_owned(), None);
+        true
+    }
+
+    pub fn set_dir_size(&mut self, name: &str, size: u64) {
+        self.dir_sizes.insert(name.to_owned(), Some(size));
+    }
+
+    /// Forgets sizes still being counted (the counts were stopped).
+    pub fn drop_pending_dir_sizes(&mut self) {
+        self.dir_sizes.retain(|_, size| size.is_some());
+    }
+
+    /// Size shown for `e`: file size, or a computed folder size (else 0).
+    pub fn size_of(&self, e: &Entry) -> u64 {
+        match e.kind {
+            EntryKind::Dir => self.dir_sizes.get(&e.name).copied().flatten().unwrap_or(0),
+            _ => e.size,
+        }
+    }
+
     /// (selected files+dirs, total files+dirs, selected bytes, total bytes)
     pub fn summary(&self) -> (usize, usize, u64, u64) {
         let mut total = 0;
@@ -420,9 +459,10 @@ impl Panel {
         let mut sel_bytes = 0;
         for e in self.entries.iter().filter(|e| !e.is_parent()) {
             total += 1;
-            total_bytes += e.size;
+            let size = self.size_of(e);
+            total_bytes += size;
             if self.is_selected(e) {
-                sel_bytes += e.size;
+                sel_bytes += size;
             }
         }
         (self.selected.len(), total, sel_bytes, total_bytes)

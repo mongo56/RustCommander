@@ -22,6 +22,7 @@ pub fn command_for(key: &Key, m: Modifiers) -> Option<Command> {
             Named::ArrowRight if alt => HistoryForward,
             Named::Home => CursorHome,
             Named::End => CursorEnd,
+            Named::Enter if alt && shift => CountDirSizes,
             Named::Enter => Open,
             Named::Backspace => GoParent,
             Named::Tab if ctrl && shift => PrevTab,

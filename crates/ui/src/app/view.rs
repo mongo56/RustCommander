@@ -386,7 +386,11 @@ impl App {
         let (stem, ext) = entry.split_name();
         let size = match entry.kind {
             EntryKind::Parent => String::new(),
-            EntryKind::Dir => "<DIR>".into(),
+            EntryKind::Dir => match panel.dir_size(&entry.name) {
+                Some(Some(bytes)) => format::size(bytes),
+                Some(None) => "…".into(),
+                None => "<DIR>".into(),
+            },
             EntryKind::File => format::size(entry.size),
         };
 

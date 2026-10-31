@@ -24,6 +24,8 @@ pub enum Command {
     SwitchPanel,
     /// Toggle selection on the cursor entry, optionally moving down.
     ToggleSelect { advance: bool },
+    /// Compute the size of every folder in the panel (Alt+Shift+Enter).
+    CountDirSizes,
     SelectAll,
     DeselectAll,
     Refresh,
@@ -75,6 +77,7 @@ impl Command {
             Hotlist => "cm_DirectoryHotlist",
             SwitchPanel => "cm_FocusSwap",
             ToggleSelect { .. } => "cm_Select",
+            CountDirSizes => "cm_CountDirContent",
             SelectAll => "cm_SelectAll",
             DeselectAll => "cm_ClearAll",
             Refresh => "cm_RereadSource",

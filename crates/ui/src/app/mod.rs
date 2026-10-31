@@ -18,6 +18,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io;
 use std::path::{Component, Path, PathBuf, MAIN_SEPARATOR};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const ROW_H: f32 = 22.0;
@@ -62,6 +64,9 @@ pub struct App {
     editor: String,
     jobs: Vec<RunningJob>,
     next_job_id: u64,
+    /// Folder size counts running (Space / Alt+Shift+Enter): the folder
+    /// listed and the batch's cancel flag.
+    counts: Vec<(PathBuf, Arc<AtomicBool>)>,
     path_edit: Option<PathEdit>,
     rename: Option<InlineRename>,
     quick_search: Option<QuickSearch>,
@@ -255,6 +260,8 @@ pub enum Message {
     Navigated(usize, u64, Listing),
     /// Subfolders of a folder, for path bar suggestions.
     Subfolders(PathBuf, Vec<String>),
+    /// A folder size: (folder listed, entry name, size).
+    DirSize(PathBuf, String, u64),
 }
 
 impl App {
@@ -290,6 +297,7 @@ impl App {
             editor: session.as_ref().map(|s| s.editor.clone()).unwrap_or_default(),
             jobs: Vec::new(),
             next_job_id: 1,
+            counts: Vec::new(),
             path_edit: None,
             rename: None,
             quick_search: None,
@@ -374,6 +382,9 @@ impl App {
     // ---- update -----------------------------------------------------------
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        if !self.counts.is_empty() {
+            self.prune_counts();
+        }
         match message {
             Message::Key(key, mods, text, captured) => return self.on_key(key, mods, text, captured),
             Message::Modifiers(m) => self.modifiers = m,
@@ -558,6 +569,11 @@ impl App {
                     edit.text = value;
                 }
                 return self.refresh_suggestions();
+            }
+            Message::DirSize(dir, name, size) => {
+                for panel in self.sides.iter_mut().flat_map(|s| s.tabs.iter_mut()).filter(|p| p.path == dir) {
+                    panel.set_dir_size(&name, size);
+                }
             }
             Message::Subfolders(dir, names) => {
                 if let Some(edit) = &mut self.path_edit {
@@ -865,6 +881,22 @@ impl App {
                 }
                 return Task::none();
             }
+            ToggleSelect { advance } => {
+                let panel = self.panel_mut(active);
+                // Space also counts a folder's size, like in TC.
+                let dir = panel.current().filter(|e| !advance && e.kind == EntryKind::Dir).map(|e| e.name.clone());
+                panel.toggle_select_current();
+                if advance {
+                    panel.move_cursor(1);
+                }
+                panel.ensure_visible(rows);
+                return self.count_dirs(active, dir.into_iter().collect());
+            }
+            CountDirSizes => {
+                let names = self.panel(active).entries.iter().filter(|e| e.kind == EntryKind::Dir);
+                let names = names.map(|e| e.name.clone()).collect();
+                return self.count_dirs(active, names);
+            }
             ToggleHidden => {
                 let panel = self.panel_mut(active);
                 panel.show_hidden = !panel.show_hidden;
@@ -892,6 +924,9 @@ impl App {
             return self.start_nav(active, nav);
         }
 
+        if cmd == DeselectAll {
+            self.cancel_counts();
+        }
         let panel = self.panel_mut(active);
         let mut info = None;
         let result: io::Result<()> = match cmd {
@@ -908,13 +943,6 @@ impl App {
             },
             // At the root / no history: nothing to do.
             GoParent | GoRoot | HistoryBack | HistoryForward => Ok(()),
-            ToggleSelect { advance } => {
-                panel.toggle_select_current();
-                if advance {
-                    panel.move_cursor(1);
-                }
-                Ok(())
-            }
             SelectAll => Ok(panel.select_all()),
             DeselectAll => Ok(panel.deselect_all()),
             SortBy(key) => Ok(panel.sort_by(key)),
@@ -1558,6 +1586,53 @@ impl App {
 
     /// Lists `path` on a worker thread; the result updates every visible tab
     /// still showing it (`Message::Listed`).
+    /// Counts the sizes of folders `names` of `side`'s folder on a worker
+    /// thread, one `Message::DirSize` each. Folders already counted (or
+    /// being counted) are skipped.
+    fn count_dirs(&mut self, side: usize, names: Vec<String>) -> Task<Message> {
+        let panel = self.panel_mut(side);
+        let names: Vec<String> = names.into_iter().filter(|n| panel.start_dir_size(n)).collect();
+        if names.is_empty() {
+            return Task::none();
+        }
+        let dir = panel.path.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.counts.push((dir.clone(), cancel.clone()));
+        let (tx, rx) = iced::futures::channel::mpsc::unbounded();
+        std::thread::spawn(move || {
+            for name in names {
+                let size = rc_core::fs::dir_size(&dir.join(&name), &cancel);
+                if cancel.load(Ordering::Relaxed) || tx.unbounded_send((dir.clone(), name, size)).is_err() {
+                    break;
+                }
+            }
+        });
+        Task::run(rx, |(dir, name, size)| Message::DirSize(dir, name, size))
+    }
+
+    /// Stops counts whose folder no panel shows any more and forgets
+    /// finished ones (their thread dropped its flag).
+    fn prune_counts(&mut self) {
+        let shown: Vec<&Path> = self.sides.iter().flat_map(|s| s.tabs.iter()).map(|p| p.path.as_path()).collect();
+        self.counts.retain(|(dir, cancel)| {
+            let keep = Arc::strong_count(cancel) > 1 && shown.contains(&dir.as_path());
+            if !keep {
+                cancel.store(true, Ordering::Relaxed);
+            }
+            keep
+        });
+    }
+
+    /// Esc: stops all folder size counts.
+    fn cancel_counts(&mut self) {
+        for (_, cancel) in self.counts.drain(..) {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        for panel in self.sides.iter_mut().flat_map(|s| s.tabs.iter_mut()) {
+            panel.drop_pending_dir_sizes();
+        }
+    }
+
     fn list_in_background(&mut self, path: PathBuf) -> Task<Message> {
         self.next_listing += 1;
         let seq = self.next_listing;
