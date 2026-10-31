@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod config;
 mod editor;
 mod icon;
 mod keymap;
@@ -11,6 +12,9 @@ mod watch;
 
 fn main() -> iced::Result {
     let session = session::load();
+    if let Err(e) = config::create_if_missing(session.as_ref().map_or("", |s| &s.editor)) {
+        eprintln!("could not create config.toml: {e}");
+    }
     let size = session.as_ref().map_or(iced::Size::new(1280.0, 800.0), |s| {
         iced::Size::new(s.width.max(400.0), s.height.max(300.0))
     });

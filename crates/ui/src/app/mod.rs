@@ -60,8 +60,6 @@ pub struct App {
     dialog: Option<Dialog>,
     /// Favourite folders (Ctrl+D), saved with the session.
     hotlist: Vec<PathBuf>,
-    /// F4 editor command line (`Session::editor`).
-    editor: String,
     jobs: Vec<RunningJob>,
     next_job_id: u64,
     /// Folder size counts running (Space / Alt+Shift+Enter): the folder
@@ -294,7 +292,6 @@ impl App {
             last_tab_bar_click: None,
             dialog: None,
             hotlist: session.as_ref().map(|s| s.hotlist.clone()).unwrap_or_default(),
-            editor: session.as_ref().map(|s| s.editor.clone()).unwrap_or_default(),
             jobs: Vec::new(),
             next_job_id: 1,
             counts: Vec::new(),
@@ -802,10 +799,7 @@ impl App {
             Edit => {
                 if let Some(e) = self.panel(active).current().filter(|e| e.kind == EntryKind::File) {
                     let (path, name) = (e.path.clone(), e.name.clone());
-                    match crate::editor::launch(&self.editor, &path) {
-                        Ok(()) => self.status = Some((format!("Editing {name}"), Tone::Success)),
-                        Err(e) => self.status = Some((format!("Can't start the editor: {e}"), Tone::Error)),
-                    }
+                    self.edit_file(&path, &name);
                 }
                 return Task::none();
             }
@@ -1363,10 +1357,7 @@ impl App {
                     }
                     self.after_change();
                 }
-                match crate::editor::launch(&self.editor, &path) {
-                    Ok(()) => self.status = Some((format!("Editing {name}"), Tone::Success)),
-                    Err(e) => self.status = Some((format!("Can't start the editor: {e}"), Tone::Error)),
-                }
+                self.edit_file(&path, name);
             }
             Dialog::Delete { paths, to_trash } => {
                 let verb = if to_trash { "Recycling" } else { "Deleting" };
@@ -1751,8 +1742,23 @@ impl App {
             left: side(&self.sides[0]),
             right: side(&self.sides[1]),
             hotlist: self.hotlist.clone(),
-            editor: self.editor.clone(),
+            editor: String::new(),
         }
+    }
+
+    /// Opens `path` in the editor from `config.toml` (F4, Shift+F4).
+    fn edit_file(&mut self, path: &Path, name: &str) {
+        let config = match crate::config::load() {
+            Ok(config) => config,
+            Err(e) => {
+                self.status = Some((format!("Bad config: {e}"), Tone::Error));
+                return;
+            }
+        };
+        self.status = Some(match crate::editor::launch(&config.editor, path) {
+            Ok(()) => (format!("Editing {name}"), Tone::Success),
+            Err(e) => (format!("Can't start the editor: {e}"), Tone::Error),
+        });
     }
 
     fn save_session(&self) {

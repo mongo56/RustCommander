@@ -16,9 +16,8 @@ pub struct Session {
     /// Directory hotlist (Ctrl+D), in menu order.
     #[serde(default)]
     pub hotlist: Vec<PathBuf>,
-    /// Editor for F4: a program, optionally with arguments; `%1` stands for
-    /// the file (appended when missing). Empty = the platform default.
-    #[serde(default)]
+    /// Editor setting from older versions; read once to seed `config.toml`.
+    #[serde(default, skip_serializing)]
     pub editor: String,
 }
 
@@ -77,14 +76,7 @@ impl TabState {
 }
 
 fn file() -> Option<PathBuf> {
-    let base = if cfg!(windows) {
-        std::env::var_os("APPDATA").map(PathBuf::from)
-    } else {
-        std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-    }?;
-    Some(base.join("RustCommander").join("session.toml"))
+    Some(crate::config::dir()?.join("session.toml"))
 }
 
 pub fn load() -> Option<Session> {

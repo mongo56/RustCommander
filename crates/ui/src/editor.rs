@@ -1,5 +1,5 @@
 //! External editor for F4. The command line comes from `editor` in
-//! `session.toml`, e.g. `"C:\Program Files\Notepad++\notepad++.exe" -multiInst %1`.
+//! `config.toml`, e.g. `"C:\Program Files\Notepad++\notepad++.exe" -multiInst %1`.
 
 use std::ffi::OsString;
 use std::io;
