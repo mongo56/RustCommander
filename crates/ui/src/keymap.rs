@@ -12,7 +12,7 @@ pub fn command_for(key: &Key, m: Modifiers) -> Option<Command> {
 
     let cmd = match key.as_ref() {
         Key::Named(named) => match named {
-            Named::ArrowUp => CursorUp,
+            Named::ArrowUp if !ctrl => CursorUp,
             Named::ArrowDown => CursorDown,
             Named::PageUp if ctrl => GoParent,
             Named::PageUp => PageUp,
@@ -22,7 +22,10 @@ pub fn command_for(key: &Key, m: Modifiers) -> Option<Command> {
             Named::End => CursorEnd,
             Named::Enter => Open,
             Named::Backspace => GoParent,
+            Named::Tab if ctrl && shift => PrevTab,
+            Named::Tab if ctrl => NextTab,
             Named::Tab => SwitchPanel,
+            Named::ArrowUp if ctrl => OpenInNewTab,
             Named::Insert => ToggleSelect { advance: true },
             Named::Space => ToggleSelect { advance: false },
             Named::Escape => DeselectAll,
@@ -45,6 +48,8 @@ pub fn command_for(key: &Key, m: Modifiers) -> Option<Command> {
         },
         Key::Character(c) if ctrl => match c.to_ascii_lowercase().as_str() {
             "a" => SelectAll,
+            "t" => NewTab,
+            "w" => CloseTab,
             "d" => DeselectAll,
             "r" => Refresh,
             "h" => ToggleHidden,

@@ -159,3 +159,35 @@ pub fn drag_label(_theme: &Theme) -> container::Style {
         ..container::Style::default()
     }
 }
+
+/// Tab in a panel's tab bar.
+pub fn tab(current: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_, status| button::Style {
+        background: Some(Background::Color(match (current, status) {
+            (true, _) => HEADER,
+            (false, button::Status::Hovered | button::Status::Pressed) => ZEBRA,
+            _ => BG,
+        })),
+        text_color: if current { TEXT } else { MUTED },
+        border: Border {
+            color: if current { BORDER } else { Color::TRANSPARENT },
+            width: 1.0,
+            radius: iced::border::Radius::default().top(6.0),
+        },
+        ..button::Style::default()
+    }
+}
+
+/// Row in the path autocomplete list.
+pub fn suggestion(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_, status| button::Style {
+        background: Some(Background::Color(match (selected, status) {
+            (true, _) => CURSOR,
+            (false, button::Status::Hovered | button::Status::Pressed) => CURSOR_INACTIVE,
+            _ => Color::TRANSPARENT,
+        })),
+        text_color: if selected { TEXT } else { DIR },
+        border: Border { radius: 4.0.into(), ..Border::default() },
+        ..button::Style::default()
+    }
+}

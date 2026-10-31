@@ -36,7 +36,7 @@ pub enum Activated {
 }
 
 /// One file panel: a folder listing plus cursor, selection and scroll state.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Panel {
     pub path: PathBuf,
     pub entries: Vec<Entry>,
@@ -163,6 +163,37 @@ impl Panel {
             self.cursor = i;
         }
         self.set_cursor(self.cursor);
+    }
+
+    /// Index of the next entry whose name starts with `prefix` (case-
+    /// insensitive), searching from `from` in the given direction and
+    /// wrapping around. `..` never matches.
+    pub fn find_prefix(&self, prefix: &str, from: usize, forward: bool) -> Option<usize> {
+        let prefix = prefix.to_lowercase();
+        let len = self.entries.len();
+        if len == 0 || prefix.is_empty() {
+            return None;
+        }
+        (0..len)
+            .map(|step| {
+                if forward {
+                    (from + step) % len
+                } else {
+                    (from + len - step % len) % len
+                }
+            })
+            .find(|&i| {
+                let e = &self.entries[i];
+                !e.is_parent() && e.name.to_lowercase().starts_with(&prefix)
+            })
+    }
+
+    /// Short label for a tab: the folder name, or the whole path for roots.
+    pub fn title(&self) -> String {
+        self.path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.path.display().to_string())
     }
 
     // ---- selection --------------------------------------------------------
@@ -322,6 +353,13 @@ mod tests {
 
         panel.go_parent().unwrap();
         assert_eq!(panel.current().unwrap().name, "b_dir");
+
+        assert_eq!(panel.find_prefix("c", 0, true), Some(3));
+        assert_eq!(panel.find_prefix("B_", 0, true), Some(1));
+        assert_eq!(panel.find_prefix("a", 3, true), Some(2)); // wraps
+        assert_eq!(panel.find_prefix("a", 1, false), Some(2)); // backwards, wraps
+        assert_eq!(panel.find_prefix("zz", 0, true), None);
+        assert_eq!(panel.find_prefix(".", 0, true), None); // ".." never matches
 
         panel.sort_by(SortKey::Size);
         panel.sort_by(SortKey::Size); // descending

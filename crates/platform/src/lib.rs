@@ -29,6 +29,15 @@ pub enum MenuAction {
     Delete,
 }
 
+/// How a drag to another application ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DragOutcome {
+    Cancelled,
+    Copied,
+    Moved,
+    Linked,
+}
+
 /// Mounted roots: drive letters on Windows, `/` elsewhere.
 pub fn roots() -> Vec<String> {
     #[cfg(windows)]
@@ -143,5 +152,34 @@ pub fn show_context_menu(
     {
         let _ = (window, folder, items, extended);
         Err("Context menu is not available on this platform yet".into())
+    }
+}
+
+/// Starts a native drag of `items` (all inside `folder`) so they can be
+/// dropped on Explorer, the desktop or any other app. Blocks until the
+/// drop; must run on the UI thread while the mouse button is held.
+pub fn drag_out(window: isize, folder: &Path, items: &[PathBuf]) -> Result<DragOutcome, String> {
+    #[cfg(windows)]
+    {
+        win::drag_out(window, folder, items)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (window, folder, items);
+        Err("Dragging to other apps is not available on this platform yet".into())
+    }
+}
+
+/// Mouse position relative to the window's client area, in logical
+/// (DPI-independent) pixels.
+pub fn cursor_in_window(window: isize) -> Option<(f32, f32)> {
+    #[cfg(windows)]
+    {
+        win::cursor_in_window(window)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = window;
+        None
     }
 }

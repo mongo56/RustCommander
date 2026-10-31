@@ -19,7 +19,7 @@ const ICON: f32 = 16.0;
 
 impl App {
     pub fn view(&self) -> Element<'_, Message> {
-        let panels = row![self.panel_view(0), vline(), self.panel_view(1)].height(Length::Fill);
+        let panels = row![self.side_view(0), vline(), self.side_view(1)].height(Length::Fill);
 
         let base = container(column![panels, hline(), self.jobs_view(), self.bottom_bar()])
             .width(Length::Fill)
@@ -39,6 +39,10 @@ impl App {
             return stack![base, label].into();
         }
         base.into()
+    }
+
+    fn dragging(&self) -> bool {
+        self.drag.as_ref().is_some_and(|d| d.active)
     }
 
     /// Floating "Copy 3 items → target" label next to the mouse.
@@ -63,13 +67,13 @@ impl App {
         )
     }
 
-    fn panel_view(&self, side: usize) -> Element<'_, Message> {
-        let panel = &self.panels[side];
+    fn side_view(&self, side: usize) -> Element<'_, Message> {
+        let panel = self.panel(side);
         let active = side == self.active;
         let drop_here = self
             .drag
             .as_ref()
-            .is_some_and(|d| d.active && self.panel_under_mouse() == side && self.drop_target(d).is_some());
+            .is_some_and(|d| d.active && self.side_under_mouse() == side && self.drop_target(d).is_some());
 
         // Thin strip marks the active panel (green while it's a drop target).
         let strip = if drop_here {
@@ -81,32 +85,61 @@ impl App {
         };
         let accent = container(Space::new(Length::Fill, Length::Fixed(2.0))).style(filled(strip));
 
-        let column_header = self.column_header(side);
-        let list = self.file_list(side, active);
+        // The suggestions dropdown floats over the file list.
+        let mut list = stack![column![self.column_header(side), self.file_list(side, active)]];
+        if let Some(dropdown) = self.suggestions_view(side) {
+            list = list.push(dropdown);
+        }
 
-        let (sel, total, sel_bytes, total_bytes) = panel.summary();
-        let footer = container(
-            text(format!(
-                "{sel} of {total} selected  ·  {} of {}",
-                format::size(sel_bytes),
-                format::size(total_bytes)
-            ))
-            .size(12)
-            .color(theme::MUTED),
-        )
-        .padding([4, 10])
-        .width(Length::Fill)
-        .style(filled(theme::HEADER));
-
-        column![accent, self.drive_bar(side), self.path_bar(side), column_header, list, footer]
+        column![accent, self.tab_bar(side), self.drive_bar(side), self.path_bar(side), list, self.footer(side, panel)]
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
     }
 
+    fn tab_bar(&self, side: usize) -> Element<'_, Message> {
+        let s = &self.sides[side];
+        let closable = s.tabs.len() > 1;
+        let tabs = Row::with_children(s.tabs.iter().enumerate().map(|(i, panel)| {
+            let current = i == s.current;
+            let mut label = row![text(panel.title()).size(12).wrapping(Wrapping::None)]
+                .spacing(6)
+                .align_y(Alignment::Center);
+            if closable {
+                label = label.push(
+                    button(text("×").size(12))
+                        .on_press(Message::TabClose(side, i))
+                        .padding([0, 4])
+                        .style(theme::flat),
+                );
+            }
+            mouse_area(
+                button(label)
+                    .on_press(Message::TabSelect(side, i))
+                    .padding([3, 10])
+                    .style(theme::tab(current)),
+            )
+            .on_middle_press(Message::TabClose(side, i))
+            .into()
+        }))
+        .spacing(2);
+
+        let new_tab = button(text("+").size(13))
+            .on_press(Message::TabNew(side))
+            .padding([2, 8])
+            .style(theme::flat);
+
+        container(row![tabs, new_tab].spacing(4).align_y(Alignment::Center))
+            .padding(Padding { top: 4.0, right: 8.0, bottom: 0.0, left: 8.0 })
+            .width(Length::Fill)
+            .clip(true)
+            .style(filled(theme::BG))
+            .into()
+    }
+
     /// One button per drive, plus free space on the current one.
     fn drive_bar(&self, side: usize) -> Element<'_, Message> {
-        let panel = &self.panels[side];
+        let panel = self.panel(side);
         let buttons = Row::with_children(self.drives.iter().map(|drive| {
             let current = panel.path.starts_with(drive.as_str());
             let letter = drive.trim_end_matches(['\\', '/', ':']).to_string();
@@ -147,11 +180,11 @@ impl App {
 
     /// Current path; click to edit it.
     fn path_bar(&self, side: usize) -> Element<'_, Message> {
-        let panel = &self.panels[side];
+        let panel = self.panel(side);
         let active = side == self.active;
 
         let content: Element<'_, Message> = match &self.path_edit {
-            Some((edit_side, value)) if *edit_side == side => text_input("Path", value)
+            Some(edit) if edit.side == side => text_input("Path", &edit.text)
                 .id(path_input_id())
                 .on_input(Message::PathInput)
                 .on_submit(Message::PathSubmit)
@@ -182,8 +215,65 @@ impl App {
             .into()
     }
 
+    /// Folder suggestions under the path bar while it's being edited.
+    fn suggestions_view(&self, side: usize) -> Option<Element<'_, Message>> {
+        let edit = self.path_edit.as_ref().filter(|e| e.side == side && !e.suggestions.is_empty())?;
+        let items = Column::with_children(edit.suggestions.iter().enumerate().map(|(i, path)| {
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let mut content = Row::new().spacing(8).align_y(Alignment::Center);
+            if let Some(icon) = self.icon(path, true) {
+                content = content.push(image(icon).width(ICON).height(ICON));
+            }
+            content = content.push(text(name).size(13).wrapping(Wrapping::None));
+            button(content)
+                .on_press(Message::PathPick(path.clone()))
+                .width(Length::Fill)
+                .padding([3, 8])
+                .style(theme::suggestion(edit.selected == Some(i)))
+                .into()
+        }));
+        let hint = text("Tab completes · ↑↓ choose · Enter go").size(11).color(theme::MUTED);
+        let card = container(column![items, container(hint).padding([4, 8])])
+            .padding(4)
+            .width(Length::Fill)
+            .style(theme::dialog);
+        Some(container(card).padding([0, 8]).width(Length::Fill).into())
+    }
+
+    fn footer<'a>(&'a self, side: usize, panel: &'a Panel) -> Element<'a, Message> {
+        if let Some(q) = self.quick_search.as_ref().filter(|q| q.side == side) {
+            return container(
+                row![
+                    text("Find").size(12).color(theme::MUTED),
+                    container(text(&q.text).size(12)).padding([1, 6]).style(theme::drag_label),
+                    text("↑↓ next match · Esc close").size(11).color(theme::MUTED),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            )
+            .padding([2, 10])
+            .width(Length::Fill)
+            .style(filled(theme::HEADER))
+            .into();
+        }
+        let (sel, total, sel_bytes, total_bytes) = panel.summary();
+        container(
+            text(format!(
+                "{sel} of {total} selected  ·  {} of {}",
+                format::size(sel_bytes),
+                format::size(total_bytes)
+            ))
+            .size(12)
+            .color(theme::MUTED),
+        )
+        .padding([4, 10])
+        .width(Length::Fill)
+        .style(filled(theme::HEADER))
+        .into()
+    }
+
     fn column_header(&self, side: usize) -> Element<'_, Message> {
-        let panel = &self.panels[side];
+        let panel = self.panel(side);
         let sort_button = |label: &str, key: SortKey, width: Length, right: bool| {
             let arrow = match (panel.sort.key == key, panel.sort.descending) {
                 (true, false) => " ↑",
@@ -215,7 +305,7 @@ impl App {
 
     /// Virtualised list: only the rows that fit on screen are built.
     fn file_list(&self, side: usize, active: bool) -> Element<'_, Message> {
-        let panel = &self.panels[side];
+        let panel = self.panel(side);
         let list = responsive(move |size| {
             let rows = ((size.height / ROW_H).floor() as usize).max(1);
             let len = panel.entries.len();
@@ -228,7 +318,7 @@ impl App {
                 .style(filled(theme::PANEL))
                 .into()
         });
-        mouse_area(list)
+        let mut area = mouse_area(list)
             .on_scroll(move |delta| {
                 let lines = match delta {
                     mouse::ScrollDelta::Lines { y, .. } => y,
@@ -236,13 +326,15 @@ impl App {
                 };
                 Message::Wheel(side, lines)
             })
-            .on_right_press(Message::RightClickBackground(side))
-            .on_exit(Message::HoverEnd(side))
-            .into()
+            .on_right_press(Message::RightClickBackground(side));
+        if self.dragging() {
+            area = area.on_exit(Message::HoverEnd(side));
+        }
+        area.into()
     }
 
     fn entry_row(&self, side: usize, index: usize, active: bool) -> Element<'_, Message> {
-        let panel = &self.panels[side];
+        let panel = self.panel(side);
         let entry = &panel.entries[index];
 
         let color = if panel.is_selected(entry) {
@@ -272,17 +364,31 @@ impl App {
             None => Space::new(ICON, ICON).into(),
         };
 
-        let content = row![
-            icon,
-            cell(stem.to_string(), Length::Fill),
-            cell(ext.to_string(), Length::Fixed(COL_EXT)),
-            cell(size, Length::Fixed(COL_SIZE)).align_x(Alignment::End),
-            cell(format::date(&entry.modified), Length::Fixed(COL_DATE)).color(theme::MUTED),
-        ]
-        .spacing(10)
-        .padding([0, 10])
-        .height(ROW_H)
-        .align_y(Alignment::Center);
+        // While renaming, the name and extension columns become one input.
+        let renaming = self.rename.as_ref().filter(|r| r.side == side && r.src == entry.path);
+        let mut content = Row::new().push(icon);
+        content = match renaming {
+            Some(r) => content.push(
+                text_input("", &r.text)
+                    .id(rename_input_id())
+                    .on_input(Message::RenameInput)
+                    .on_submit(Message::RenameSubmit)
+                    .size(13)
+                    .padding([1, 4])
+                    .width(Length::Fill)
+                    .style(theme::input),
+            ),
+            None => content
+                .push(cell(stem.to_string(), Length::Fill))
+                .push(cell(ext.to_string(), Length::Fixed(COL_EXT))),
+        };
+        let content = content
+            .push(cell(size, Length::Fixed(COL_SIZE)).align_x(Alignment::End))
+            .push(cell(format::date(&entry.modified), Length::Fixed(COL_DATE)).color(theme::MUTED))
+            .spacing(10)
+            .padding([0, 10])
+            .height(ROW_H)
+            .align_y(Alignment::Center);
 
         let drop_target = self.drag.as_ref().is_some_and(|d| {
             d.active && self.hover == Some((side, index)) && entry.is_dir() && !d.sources.contains(&entry.path)
@@ -297,7 +403,7 @@ impl App {
             theme::PANEL
         };
 
-        mouse_area(
+        let mut area = mouse_area(
             container(content)
                 .width(Length::Fill)
                 .height(ROW_H)
@@ -305,9 +411,14 @@ impl App {
                 .style(filled(background)),
         )
         .on_press(Message::Click(side, index))
-        .on_right_press(Message::RightClick(side, index))
-        .on_enter(Message::Hover(side, index))
-        .into()
+        .on_middle_press(Message::MiddleClick(side, index))
+        .on_right_press(Message::RightClick(side, index));
+        // Hover only matters for drop targets; skipping it otherwise avoids
+        // a re-render every time the mouse crosses a row.
+        if self.dragging() {
+            area = area.on_enter(Message::Hover(side, index));
+        }
+        area.into()
     }
 
     fn jobs_view(&self) -> Element<'_, Message> {
@@ -373,15 +484,9 @@ impl App {
             }
             Dialog::MakeDir { input } => (
                 "New folder".into(),
-                format!("Create folder in {}:", self.panels[self.active].path.display()),
+                format!("Create folder in {}:", self.panel(self.active).path.display()),
                 Some(input_field(input)),
                 "Create",
-            ),
-            Dialog::Rename { src, input } => (
-                "Rename".into(),
-                format!("Rename '{}' to:", src.file_name().unwrap_or_default().to_string_lossy()),
-                Some(input_field(input)),
-                "Rename",
             ),
             Dialog::Delete { paths, to_trash } => (
                 if *to_trash { "Delete" } else { "Delete permanently" }.into(),
@@ -458,8 +563,8 @@ impl App {
                 Tone::Error => theme::ERROR,
             }),
             None => text(
-                "Tab switch panel · Enter open · Backspace up · Ins/Space select · F2 rename · \
-                 Drag to copy (Shift = move) · Click path to edit · Right-click for menu",
+                "Type to find · Tab switch panel · Ctrl+T new tab · F2 rename · Drag to copy (Shift = move, \
+                 out of the window = other apps) · Click path to edit · Right-click for menu",
             )
             .size(12)
             .color(theme::MUTED),

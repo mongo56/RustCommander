@@ -1,6 +1,6 @@
 //! Windows implementation (shell icons, context menu, disk space).
 
-use crate::{Icon, MenuAction};
+use crate::{DragOutcome, Icon, MenuAction};
 use std::cell::RefCell;
 use std::ffi::{c_void, OsStr};
 use std::mem::size_of;
@@ -17,10 +17,15 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::Storage::FileSystem::{
     GetDiskFreeSpaceExW, GetLogicalDrives, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
 };
-use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+use windows::Win32::Graphics::Gdi::ScreenToClient;
+use windows::Win32::System::Com::{CoInitializeEx, IDataObject, COINIT_APARTMENTTHREADED};
+use windows::Win32::System::Ole::{
+    DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_MOVE,
+};
+use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{
-    DefSubclassProc, ILFree, IContextMenu, IContextMenu2, IContextMenu3, IShellFolder,
+    DefSubclassProc, ILFree, SHDoDragDrop, IContextMenu, IContextMenu2, IContextMenu3, IShellFolder,
     RemoveWindowSubclass, SHGetDesktopFolder, SHGetFileInfoW, SHParseDisplayName,
     SetWindowSubclass, CMF_CANRENAME, CMF_EXTENDEDVERBS, CMF_NORMAL, CMINVOKECOMMANDINFO,
     CMINVOKECOMMANDINFOEX, CMIC_MASK_PTINVOKE, GCS_VERBW, SHFILEINFOW,
@@ -240,18 +245,35 @@ unsafe fn context_menu_for(
     items: &[PathBuf],
 ) -> windows::core::Result<IContextMenu> {
     unsafe {
-        let desktop = SHGetDesktopFolder()?;
-        let folder_w = wide(folder.as_os_str());
-        let mut folder_pidl: *mut ITEMIDLIST = null_mut();
-        SHParseDisplayName(PCWSTR(folder_w.as_ptr()), None, &mut folder_pidl, 0, None)?;
-        let shell_folder: windows::core::Result<IShellFolder> = desktop.BindToObject(folder_pidl, None);
-        ILFree(Some(folder_pidl));
-        let shell_folder = shell_folder?;
+        let shell_folder = shell_folder(folder)?;
 
         if items.is_empty() {
             return shell_folder.CreateViewObject(hwnd);
         }
+        ui_object(hwnd, &shell_folder, items)
+    }
+}
 
+/// Binds to `folder` in the shell namespace.
+unsafe fn shell_folder(folder: &Path) -> windows::core::Result<IShellFolder> {
+    unsafe {
+        let desktop = SHGetDesktopFolder()?;
+        let folder_w = wide(folder.as_os_str());
+        let mut folder_pidl: *mut ITEMIDLIST = null_mut();
+        SHParseDisplayName(PCWSTR(folder_w.as_ptr()), None, &mut folder_pidl, 0, None)?;
+        let result = desktop.BindToObject(folder_pidl, None);
+        ILFree(Some(folder_pidl));
+        result
+    }
+}
+
+/// A shell UI object (context menu, data object, ...) for items of one folder.
+unsafe fn ui_object<T: Interface>(
+    hwnd: HWND,
+    shell_folder: &IShellFolder,
+    items: &[PathBuf],
+) -> windows::core::Result<T> {
+    unsafe {
         let mut children: Vec<*mut ITEMIDLIST> = Vec::with_capacity(items.len());
         let mut result = Ok(());
         for item in items {
@@ -268,7 +290,7 @@ unsafe fn context_menu_for(
         }
         let menu = result.and_then(|_| {
             let ptrs: Vec<*const ITEMIDLIST> = children.iter().map(|c| *c as *const _).collect();
-            shell_folder.GetUIObjectOf::<IContextMenu>(hwnd, &ptrs, None)
+            shell_folder.GetUIObjectOf::<T>(hwnd, &ptrs, None)
         });
         for child in children {
             ILFree(Some(child));
@@ -342,4 +364,41 @@ unsafe extern "system" fn subclass_proc(
         }
     }
     unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
+}
+
+// ---- drag & drop to other apps -------------------------------------------------
+
+pub fn drag_out(window: isize, folder: &Path, items: &[PathBuf]) -> Result<DragOutcome, String> {
+    let hwnd = HWND(window as *mut c_void);
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let data: IDataObject = shell_folder(folder)
+            .and_then(|f| ui_object(hwnd, &f, items))
+            .map_err(|e| e.message())?;
+        let allowed = DROPEFFECT(DROPEFFECT_COPY.0 | DROPEFFECT_MOVE.0 | DROPEFFECT_LINK.0);
+        // The shell supplies the drop source and the drag image.
+        let effect = SHDoDragDrop(Some(hwnd), &data, None, allowed).map_err(|e| e.message())?;
+        Ok(if effect.0 & DROPEFFECT_MOVE.0 != 0 {
+            DragOutcome::Moved
+        } else if effect.0 & DROPEFFECT_COPY.0 != 0 {
+            DragOutcome::Copied
+        } else if effect.0 & DROPEFFECT_LINK.0 != 0 {
+            DragOutcome::Linked
+        } else {
+            DragOutcome::Cancelled
+        })
+    }
+}
+
+pub fn cursor_in_window(window: isize) -> Option<(f32, f32)> {
+    let hwnd = HWND(window as *mut c_void);
+    let mut pt = POINT::default();
+    unsafe {
+        GetCursorPos(&mut pt).ok()?;
+        if !ScreenToClient(hwnd, &mut pt).as_bool() {
+            return None;
+        }
+        let scale = GetDpiForWindow(hwnd).max(96) as f32 / 96.0;
+        Some((pt.x as f32 / scale, pt.y as f32 / scale))
+    }
 }

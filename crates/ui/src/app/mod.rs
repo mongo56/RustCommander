@@ -9,7 +9,7 @@ use iced::widget::{image, text_input};
 use iced::{event, keyboard, mouse, window, Event, Point, Size, Subscription, Task, Theme};
 use rc_core::ops::{self, Conflict, Job, JobEvent, JobHandle, Outcome, Progress, Resolution};
 use rc_core::{Activated, Command, EntryKind, Panel, SortKey};
-use rc_platform::MenuAction;
+use rc_platform::{DragOutcome, MenuAction};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io;
@@ -17,13 +17,16 @@ use std::path::{Component, Path, PathBuf, MAIN_SEPARATOR};
 use std::time::{Duration, Instant};
 
 const ROW_H: f32 = 22.0;
-/// Approximate height of everything that isn't file rows (headers, footers,
-/// function-key bar). Only used to size PageUp/PageDown jumps.
-const CHROME_H: f32 = 180.0;
+/// Approximate height of everything that isn't file rows (tabs, headers,
+/// footers, function-key bar). Only used to size PageUp/PageDown jumps.
+const CHROME_H: f32 = 206.0;
 const JOB_ROW_H: f32 = 30.0;
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 /// How far the mouse must move with the button down before a drag starts.
 const DRAG_THRESHOLD: f32 = 6.0;
+/// Quick search closes after this long without typing.
+const QUICK_SEARCH_TIMEOUT: Duration = Duration::from_secs(4);
+const MAX_SUGGESTIONS: usize = 12;
 
 fn dialog_input_id() -> text_input::Id {
     text_input::Id::new("dialog-input")
@@ -33,8 +36,13 @@ fn path_input_id() -> text_input::Id {
     text_input::Id::new("path-input")
 }
 
+fn rename_input_id() -> text_input::Id {
+    text_input::Id::new("rename-input")
+}
+
 pub struct App {
-    panels: [Panel; 2],
+    /// Left and right side, each with its tabs.
+    sides: [Side; 2],
     active: usize,
     drives: Vec<String>,
     status: Option<(String, Tone)>,
@@ -44,12 +52,16 @@ pub struct App {
     dialog: Option<Dialog>,
     jobs: Vec<RunningJob>,
     next_job_id: u64,
-    /// Panel whose path bar is being edited, and the text.
-    path_edit: Option<(usize, String)>,
+    path_edit: Option<PathEdit>,
+    rename: Option<InlineRename>,
+    quick_search: Option<QuickSearch>,
     drag: Option<Drag>,
-    /// Last known mouse position (window coordinates).
+    /// Files dropped in from other apps, waiting for the drop position.
+    dropped: Vec<PathBuf>,
+    /// Last known mouse position (window coordinates); tracked while a
+    /// mouse button is down.
     mouse: Point,
-    /// Row under the mouse: (panel, index).
+    /// Row under the mouse while dragging: (side, index).
     hover: Option<(usize, usize)>,
     modifiers: keyboard::Modifiers,
     /// Icon cache keyed by `rc_platform::icon_key`. Filled lazily from
@@ -57,6 +69,12 @@ pub struct App {
     icons: RefCell<HashMap<String, Option<image::Handle>>>,
     /// Free/total space per volume root, refreshed every few seconds.
     disk: RefCell<HashMap<PathBuf, DiskEntry>>,
+}
+
+/// One side of the window: a set of tabs, one of them shown.
+struct Side {
+    tabs: Vec<Panel>,
+    current: usize,
 }
 
 /// When the space was read, and (free, total) bytes.
@@ -74,14 +92,42 @@ enum Tone {
 enum Dialog {
     Transfer { is_move: bool, sources: Vec<PathBuf>, base: PathBuf, input: String },
     MakeDir { input: String },
-    Rename { src: PathBuf, input: String },
     Delete { paths: Vec<PathBuf>, to_trash: bool },
+}
+
+/// The path bar of one side being edited, with folder suggestions.
+#[derive(Debug)]
+struct PathEdit {
+    side: usize,
+    text: String,
+    suggestions: Vec<PathBuf>,
+    selected: Option<usize>,
+    /// Last folder listed for suggestions, to avoid re-reading it per key.
+    cache: Option<(PathBuf, Vec<String>)>,
+}
+
+/// A file being renamed in place.
+#[derive(Debug)]
+struct InlineRename {
+    side: usize,
+    src: PathBuf,
+    text: String,
+}
+
+/// Type-to-jump in the active panel.
+#[derive(Debug)]
+struct QuickSearch {
+    side: usize,
+    text: String,
+    /// Bumped on every keystroke so stale timeouts are ignored.
+    seq: u64,
 }
 
 #[derive(Debug)]
 struct Drag {
     side: usize,
-    start: Point,
+    /// Where the drag started; set by the first mouse move after the press.
+    start: Option<Point>,
     /// Becomes true once the mouse moved past the threshold.
     active: bool,
     sources: Vec<PathBuf>,
@@ -91,8 +137,8 @@ struct RunningJob {
     id: u64,
     title: String,
     done_verb: &'static str,
-    /// Panel whose selection is cleared when the job succeeds.
-    source_panel: usize,
+    /// Side whose selection is cleared when the job succeeds.
+    source_side: usize,
     handle: JobHandle,
     progress: Progress,
     conflict: Option<Conflict>,
@@ -101,11 +147,13 @@ struct RunningJob {
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    /// Key press; `bool` is true if a widget (e.g. a text input) used it.
-    Key(keyboard::Key, keyboard::Modifiers, bool),
+    /// Key press with the text it produced; `bool` is true if a widget
+    /// (e.g. a text input) already used it.
+    Key(keyboard::Key, keyboard::Modifiers, Option<String>, bool),
     Modifiers(keyboard::Modifiers),
     Run(Command),
     Click(usize, usize),
+    MiddleClick(usize, usize),
     RightClick(usize, usize),
     RightClickBackground(usize),
     ContextDone(usize, Result<MenuAction, String>),
@@ -113,13 +161,23 @@ pub enum Message {
     HoverEnd(usize),
     MouseMoved(Point),
     MouseUp,
+    DragOutDone(usize, Result<DragOutcome, String>),
+    FileDropped(PathBuf),
+    DropPosition(Option<(f32, f32)>),
     Wheel(usize, f32),
     Drive(usize, String),
     Sort(usize, SortKey),
     Resized(Size),
+    TabSelect(usize, usize),
+    TabClose(usize, usize),
+    TabNew(usize),
     EditPath(usize),
     PathInput(String),
     PathSubmit,
+    PathPick(PathBuf),
+    RenameInput(String),
+    RenameSubmit,
+    QuickSearchTimeout(u64),
     DialogInput(String),
     DialogSubmit,
     DialogCancel,
@@ -137,7 +195,10 @@ impl App {
         let right = home.clone().or_else(|| left.clone());
 
         let app = Self {
-            panels: [open_panel(left), open_panel(right)],
+            sides: [
+                Side { tabs: vec![open_panel(left)], current: 0 },
+                Side { tabs: vec![open_panel(right)], current: 0 },
+            ],
             active: 0,
             drives: rc_platform::roots(),
             status: None,
@@ -148,7 +209,10 @@ impl App {
             jobs: Vec::new(),
             next_job_id: 1,
             path_edit: None,
+            rename: None,
+            quick_search: None,
             drag: None,
+            dropped: Vec::new(),
             mouse: Point::ORIGIN,
             hover: None,
             modifiers: keyboard::Modifiers::default(),
@@ -163,32 +227,51 @@ impl App {
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
-        Subscription::batch([
+        let mut subs = vec![
             event::listen_with(|event, status, _window| match event {
-                Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) => {
-                    Some(Message::Key(key, modifiers, status == event::Status::Captured))
-                }
+                Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, text, .. }) => Some(
+                    Message::Key(key, modifiers, text.map(|t| t.to_string()), status == event::Status::Captured),
+                ),
                 Event::Keyboard(keyboard::Event::ModifiersChanged(m)) => Some(Message::Modifiers(m)),
-                Event::Mouse(mouse::Event::CursorMoved { position }) => Some(Message::MouseMoved(position)),
                 Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => Some(Message::MouseUp),
+                Event::Window(window::Event::FileDropped(path)) => Some(Message::FileDropped(path)),
                 _ => None,
             }),
             window::resize_events().map(|(_id, size)| Message::Resized(size)),
-        ])
+        ];
+        // Mouse moves re-render the window, so only listen while a drag may
+        // be starting or in progress.
+        if self.drag.is_some() {
+            subs.push(event::listen_with(|event, _status, _window| match event {
+                Event::Mouse(mouse::Event::CursorMoved { position }) => Some(Message::MouseMoved(position)),
+                _ => None,
+            }));
+        }
+        Subscription::batch(subs)
+    }
+
+    fn panel(&self, side: usize) -> &Panel {
+        let s = &self.sides[side];
+        &s.tabs[s.current]
+    }
+
+    fn panel_mut(&mut self, side: usize) -> &mut Panel {
+        let s = &mut self.sides[side];
+        &mut s.tabs[s.current]
     }
 
     // ---- update -----------------------------------------------------------
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::Key(key, mods, captured) => return self.on_key(key, mods, captured),
+            Message::Key(key, mods, text, captured) => return self.on_key(key, mods, text, captured),
             Message::Modifiers(m) => self.modifiers = m,
             Message::Run(cmd) => return self.run(cmd),
             Message::Click(side, index) => {
-                self.path_edit = None;
+                self.leave_edits();
                 self.active = side;
-                self.panels[side].set_cursor(index);
-                self.drag = Some(Drag { side, start: self.mouse, active: false, sources: Vec::new() });
+                self.panel_mut(side).set_cursor(index);
+                self.drag = Some(Drag { side, start: None, active: false, sources: Vec::new() });
                 let now = Instant::now();
                 let double = matches!(
                     self.last_click,
@@ -201,10 +284,17 @@ impl App {
                 }
                 self.last_click = Some((side, index, now));
             }
+            Message::MiddleClick(side, index) => {
+                self.leave_edits();
+                let entry = self.panel(side).entries.get(index);
+                if let Some(path) = entry.filter(|e| e.is_dir()).map(|e| e.path.clone()) {
+                    self.open_tab(side, path, false);
+                }
+            }
             Message::RightClick(side, index) => {
-                self.path_edit = None;
+                self.leave_edits();
                 self.active = side;
-                let panel = &mut self.panels[side];
+                let panel = self.panel_mut(side);
                 let Some(entry) = panel.entries.get(index) else { return Task::none() };
                 if entry.is_parent() {
                     return self.context_menu(side, true);
@@ -218,7 +308,7 @@ impl App {
                 return self.context_menu(side, false);
             }
             Message::RightClickBackground(side) => {
-                self.path_edit = None;
+                self.leave_edits();
                 self.active = side;
                 return self.context_menu(side, true);
             }
@@ -247,48 +337,127 @@ impl App {
             }
             Message::MouseMoved(position) => {
                 self.mouse = position;
-                self.update_drag();
+                return self.update_drag();
             }
             Message::MouseUp => return self.finish_drag(),
+            Message::DragOutDone(side, result) => {
+                self.reload_panels();
+                // Dropped back onto our own window: that drop is handled as
+                // FileDropped, and the effect reported by the window's drop
+                // target isn't meaningful.
+                let dropped_on_self = !self.dropped.is_empty() || matches!(self.dialog, Some(Dialog::Transfer { .. }));
+                if dropped_on_self {
+                    return Task::none();
+                }
+                match result {
+                    Ok(DragOutcome::Cancelled) => {}
+                    Ok(outcome) => {
+                        let verb = match outcome {
+                            DragOutcome::Moved => "Moved",
+                            DragOutcome::Linked => "Linked",
+                            _ => "Copied",
+                        };
+                        self.status = Some((format!("{verb} to another app"), Tone::Success));
+                        if outcome == DragOutcome::Moved {
+                            self.panel_mut(side).deselect_all();
+                        }
+                    }
+                    Err(e) => self.status = Some((e, Tone::Error)),
+                }
+                return delayed(Duration::from_millis(800), Message::ReloadPanels);
+            }
+            Message::FileDropped(path) => {
+                self.dropped.push(path);
+                // Several events arrive for one drop; ask for the position once.
+                if self.dropped.len() == 1 {
+                    return window::get_oldest()
+                        .and_then(|id| {
+                            window::run_with_handle(id, |h| rc_platform::cursor_in_window(native_handle(&h)))
+                        })
+                        .map(Message::DropPosition);
+                }
+            }
+            Message::DropPosition(position) => {
+                let sources = std::mem::take(&mut self.dropped);
+                self.status = None;
+                let side = position.map(|(x, _)| usize::from(x >= self.window_width / 2.0)).unwrap_or(self.active);
+                self.active = side;
+                let target = self.panel(side).path.clone();
+                return self.open_transfer(false, sources, &target);
+            }
             Message::Wheel(side, lines) => {
                 let rows = self.page_rows();
-                let panel = &mut self.panels[side];
+                let panel = self.panel_mut(side);
                 panel.move_cursor((-lines * 3.0).round() as isize);
                 panel.ensure_visible(rows);
             }
             Message::Drive(side, drive) => {
+                self.leave_edits();
                 self.active = side;
-                self.path_edit = None;
                 self.drives = rc_platform::roots();
-                let result = self.panels[side].navigate(PathBuf::from(drive), None);
+                let result = self.panel_mut(side).navigate(PathBuf::from(drive), None);
                 self.report(result);
             }
             Message::Sort(side, key) => {
                 self.active = side;
-                self.panels[side].sort_by(key);
+                self.panel_mut(side).sort_by(key);
             }
             Message::Resized(size) => {
                 self.window_width = size.width;
                 self.window_height = size.height;
             }
-            Message::EditPath(side) => {
+            Message::TabSelect(side, index) => {
+                self.leave_edits();
                 self.active = side;
-                self.path_edit = Some((side, self.panels[side].path.display().to_string()));
+                self.select_tab(side, index);
+            }
+            Message::TabClose(side, index) => {
+                self.leave_edits();
+                self.close_tab(side, index);
+            }
+            Message::TabNew(side) => {
+                self.leave_edits();
+                self.active = side;
+                let path = self.panel(side).path.clone();
+                self.open_tab(side, path, true);
+            }
+            Message::EditPath(side) => {
+                self.leave_edits();
+                self.active = side;
+                let text = self.panel(side).path.display().to_string();
+                self.path_edit = Some(PathEdit { side, text, suggestions: Vec::new(), selected: None, cache: None });
                 return Task::batch([text_input::focus(path_input_id()), text_input::select_all(path_input_id())]);
             }
             Message::PathInput(value) => {
-                if let Some((_, text)) = &mut self.path_edit {
-                    *text = value;
+                if let Some(edit) = &mut self.path_edit {
+                    edit.text = value;
+                }
+                self.refresh_suggestions();
+            }
+            Message::PathSubmit => {
+                let picked = self
+                    .path_edit
+                    .as_ref()
+                    .and_then(|e| e.selected.and_then(|i| e.suggestions.get(i).cloned()));
+                match picked {
+                    Some(path) => self.go_to_path(path),
+                    None => self.submit_path(),
                 }
             }
-            Message::PathSubmit => self.submit_path(),
+            Message::PathPick(path) => self.go_to_path(path),
+            Message::RenameInput(value) => {
+                if let Some(rename) = &mut self.rename {
+                    rename.text = value;
+                }
+            }
+            Message::RenameSubmit => self.commit_rename(),
+            Message::QuickSearchTimeout(seq) => {
+                if self.quick_search.as_ref().is_some_and(|q| q.seq == seq) {
+                    self.quick_search = None;
+                }
+            }
             Message::DialogInput(value) => {
-                if let Some(
-                    Dialog::Transfer { input, .. }
-                    | Dialog::MakeDir { input }
-                    | Dialog::Rename { input, .. },
-                ) = &mut self.dialog
-                {
+                if let Some(Dialog::Transfer { input, .. } | Dialog::MakeDir { input }) = &mut self.dialog {
                     *input = value;
                 }
             }
@@ -318,9 +487,18 @@ impl App {
         Task::none()
     }
 
-    fn on_key(&mut self, key: keyboard::Key, mods: keyboard::Modifiers, captured: bool) -> Task<Message> {
-        let escape = key == keyboard::Key::Named(Named::Escape);
-        let enter = key == keyboard::Key::Named(Named::Enter);
+    fn on_key(
+        &mut self,
+        key: keyboard::Key,
+        mods: keyboard::Modifiers,
+        text: Option<String>,
+        captured: bool,
+    ) -> Task<Message> {
+        let named = match &key {
+            keyboard::Key::Named(n) => Some(*n),
+            _ => None,
+        };
+        let escape = named == Some(Named::Escape);
 
         // A pending overwrite question blocks everything else.
         if let Some(id) = self.jobs.iter().find(|j| j.conflict.is_some()).map(|j| j.id) {
@@ -332,16 +510,19 @@ impl App {
         if self.dialog.is_some() {
             if escape {
                 self.dialog = None;
-            } else if enter && !captured {
+            } else if named == Some(Named::Enter) && !captured {
                 return self.submit_dialog();
             }
             return Task::none();
         }
-        if self.path_edit.is_some() {
+        if self.rename.is_some() {
             if escape {
-                self.path_edit = None;
+                self.rename = None;
             }
             return Task::none();
+        }
+        if self.path_edit.is_some() {
+            return self.path_edit_key(named);
         }
         if escape && self.drag.as_ref().is_some_and(|d| d.active) {
             self.drag = None;
@@ -350,6 +531,35 @@ impl App {
         if captured {
             return Task::none();
         }
+
+        // Modifier and lock keys on their own (e.g. Shift before a capital
+        // letter) must not end a quick search or trigger anything.
+        if named.is_some_and(is_modifier_key) {
+            return Task::none();
+        }
+
+        // Quick search: plain typing jumps to matching names.
+        let plain = !mods.control() && !mods.alt() && !mods.logo();
+        let typed = text.filter(|t| plain && !t.is_empty() && !t.chars().any(char::is_control));
+        let searching = self.quick_search.as_ref().is_some_and(|q| q.side == self.active);
+        if let Some(t) = typed {
+            if t != " " || searching {
+                return self.quick_search_type(&t);
+            }
+        }
+        if searching {
+            match named {
+                Some(Named::Backspace) => return self.quick_search_back(),
+                Some(Named::Escape) => {
+                    self.quick_search = None;
+                    return Task::none();
+                }
+                Some(Named::ArrowDown) => return self.quick_search_step(true),
+                Some(Named::ArrowUp) => return self.quick_search_step(false),
+                _ => self.quick_search = None,
+            }
+        }
+
         match keymap::command_for(&key, mods) {
             Some(cmd) => self.run(cmd),
             None => Task::none(),
@@ -360,9 +570,11 @@ impl App {
     fn run(&mut self, cmd: Command) -> Task<Message> {
         use Command::*;
         self.status = None;
+        self.quick_search = None;
         let rows = self.page_rows();
         let page = rows.saturating_sub(1).max(1) as isize;
-        let other = 1 - self.active;
+        let active = self.active;
+        let other = 1 - active;
 
         // Commands that touch more than the active panel or open dialogs.
         match cmd {
@@ -372,33 +584,50 @@ impl App {
                 return Task::none();
             }
             SyncOtherPanel => {
-                let path = self.panels[self.active].path.clone();
-                let result = self.panels[other].navigate(path, None);
+                let path = self.panel(active).path.clone();
+                let result = self.panel_mut(other).navigate(path, None);
                 self.report(result);
                 return Task::none();
             }
             Copy | Move => {
-                let sources = self.target_paths(self.active);
+                let sources = self.target_paths(active);
                 if sources.is_empty() {
                     return Task::none();
                 }
-                let target = self.panels[other].path.clone();
+                let target = self.panel(other).path.clone();
                 return self.open_transfer(cmd == Move, sources, &target);
             }
-            Rename => {
-                let Some(entry) = self.panels[self.active].current().filter(|e| !e.is_parent()) else {
-                    return Task::none();
-                };
-                let dialog = Dialog::Rename { src: entry.path.clone(), input: entry.name.clone() };
-                return self.open_dialog(dialog);
-            }
+            Rename => return self.start_rename(),
             MakeDir => return self.open_dialog(Dialog::MakeDir { input: String::new() }),
             Delete | DeletePermanent => {
-                let paths = self.target_paths(self.active);
+                let paths = self.target_paths(active);
                 if paths.is_empty() {
                     return Task::none();
                 }
                 self.dialog = Some(Dialog::Delete { paths, to_trash: cmd == Delete });
+                return Task::none();
+            }
+            NewTab => {
+                let path = self.panel(active).path.clone();
+                self.open_tab(active, path, true);
+                return Task::none();
+            }
+            CloseTab => {
+                self.close_tab(active, self.sides[active].current);
+                return Task::none();
+            }
+            NextTab | PrevTab => {
+                let s = &self.sides[active];
+                let n = s.tabs.len();
+                let next = if cmd == NextTab { (s.current + 1) % n } else { (s.current + n - 1) % n };
+                self.select_tab(active, next);
+                return Task::none();
+            }
+            OpenInNewTab => {
+                let dir = self.panel(active).current().filter(|e| e.is_dir()).map(|e| e.path.clone());
+                if let Some(path) = dir {
+                    self.open_tab(active, path, true);
+                }
                 return Task::none();
             }
             Refresh => {
@@ -408,7 +637,7 @@ impl App {
             _ => {}
         }
 
-        let panel = &mut self.panels[self.active];
+        let panel = self.panel_mut(active);
         let mut info = None;
         let result: io::Result<()> = match cmd {
             CursorUp => Ok(panel.move_cursor(-1)),
@@ -449,33 +678,285 @@ impl App {
                 }
                 _ => Ok(()),
             },
-            Quit | SwitchPanel | SyncOtherPanel | Copy | Move | Rename | MakeDir | Delete
-            | DeletePermanent => unreachable!(),
+            _ => unreachable!("handled above"),
         };
         panel.ensure_visible(rows);
         self.report(result);
         if let Some(msg) = info {
-            let tone = if cmd == Open || cmd == View || cmd == Edit { Tone::Success } else { Tone::Info };
+            let tone = if matches!(cmd, Open | View | Edit) { Tone::Success } else { Tone::Info };
             self.status = Some((msg, tone));
         }
         Task::none()
     }
 
     fn target_paths(&self, side: usize) -> Vec<PathBuf> {
-        self.panels[side].targets().into_iter().map(|e| e.path.clone()).collect()
+        self.panel(side).targets().into_iter().map(|e| e.path.clone()).collect()
     }
 
+    /// Ends an in-place rename (keeping the new name), path editing and
+    /// quick search — e.g. when the user clicks elsewhere.
+    fn leave_edits(&mut self) {
+        self.path_edit = None;
+        self.quick_search = None;
+        if self.rename.is_some() {
+            self.commit_rename();
+        }
+    }
+
+    // ---- tabs -------------------------------------------------------------
+
+    fn open_tab(&mut self, side: usize, path: PathBuf, switch: bool) {
+        let mut panel = self.panel(side).clone();
+        let result = if panel.path == path { panel.reload() } else { panel.navigate(path, None) };
+        match result {
+            Ok(()) => {
+                let s = &mut self.sides[side];
+                s.tabs.insert(s.current + 1, panel);
+                if switch {
+                    s.current += 1;
+                    self.active = side;
+                }
+            }
+            Err(e) => self.status = Some((e.to_string(), Tone::Error)),
+        }
+    }
+
+    fn close_tab(&mut self, side: usize, index: usize) {
+        let s = &mut self.sides[side];
+        if s.tabs.len() <= 1 || index >= s.tabs.len() {
+            return;
+        }
+        s.tabs.remove(index);
+        if s.current > index || s.current >= s.tabs.len() {
+            s.current = s.current.saturating_sub(1);
+        }
+        let result = self.panel_mut(side).reload();
+        self.report(result);
+    }
+
+    fn select_tab(&mut self, side: usize, index: usize) {
+        if index < self.sides[side].tabs.len() {
+            self.sides[side].current = index;
+            // Tabs in the background may be stale.
+            let result = self.panel_mut(side).reload();
+            self.report(result);
+            self.after_change();
+        }
+    }
+
+    // ---- quick search -----------------------------------------------------
+
+    fn quick_search_type(&mut self, typed: &str) -> Task<Message> {
+        let side = self.active;
+        let mut text = match &self.quick_search {
+            Some(q) if q.side == side => q.text.clone(),
+            _ => String::new(),
+        };
+        text.push_str(typed);
+        let panel = self.panel(side);
+        // Stay on the current entry if it still matches.
+        let Some(index) = panel.find_prefix(&text, panel.cursor, true) else {
+            // No match: ignore the key but keep the box open.
+            return match &self.quick_search {
+                Some(q) => self.quick_search_timer(q.seq),
+                None => Task::none(),
+            };
+        };
+        let seq = self.quick_search.as_ref().map_or(0, |q| q.seq + 1);
+        self.quick_search = Some(QuickSearch { side, text, seq });
+        self.jump_to(side, index);
+        self.quick_search_timer(seq)
+    }
+
+    fn quick_search_back(&mut self) -> Task<Message> {
+        let Some(q) = &mut self.quick_search else { return Task::none() };
+        q.text.pop();
+        q.seq += 1;
+        let (side, text, seq) = (q.side, q.text.clone(), q.seq);
+        if text.is_empty() {
+            self.quick_search = None;
+            return Task::none();
+        }
+        if let Some(index) = self.panel(side).find_prefix(&text, 0, true) {
+            self.jump_to(side, index);
+        }
+        self.quick_search_timer(seq)
+    }
+
+    fn quick_search_step(&mut self, forward: bool) -> Task<Message> {
+        let Some(q) = &mut self.quick_search else { return Task::none() };
+        q.seq += 1;
+        let (side, text, seq) = (q.side, q.text.clone(), q.seq);
+        let panel = self.panel(side);
+        let len = panel.entries.len().max(1);
+        let from = if forward { (panel.cursor + 1) % len } else { (panel.cursor + len - 1) % len };
+        if let Some(index) = panel.find_prefix(&text, from, forward) {
+            self.jump_to(side, index);
+        }
+        self.quick_search_timer(seq)
+    }
+
+    fn quick_search_timer(&self, seq: u64) -> Task<Message> {
+        delayed(QUICK_SEARCH_TIMEOUT, Message::QuickSearchTimeout(seq))
+    }
+
+    fn jump_to(&mut self, side: usize, index: usize) {
+        let rows = self.page_rows();
+        let panel = self.panel_mut(side);
+        panel.set_cursor(index);
+        panel.ensure_visible(rows);
+    }
+
+    // ---- inline rename ----------------------------------------------------
+
+    fn start_rename(&mut self) -> Task<Message> {
+        let side = self.active;
+        let Some(entry) = self.panel(side).current().filter(|e| !e.is_parent()) else {
+            return Task::none();
+        };
+        let rename = InlineRename { side, src: entry.path.clone(), text: entry.name.clone() };
+        self.path_edit = None;
+        self.rename = Some(rename);
+        Task::batch([text_input::focus(rename_input_id()), text_input::select_all(rename_input_id())])
+    }
+
+    fn commit_rename(&mut self) {
+        let Some(InlineRename { side, src, text }) = self.rename.take() else { return };
+        let name = text.trim();
+        let Some(parent) = src.parent() else { return };
+        if name.is_empty() || src.file_name().is_some_and(|n| n == name) {
+            return;
+        }
+        let dst = parent.join(name);
+        // Allow case-only renames, which "exist" on Windows.
+        let result = if dst.exists() && !ops::same_path(&src, &dst) {
+            Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("'{name}' already exists")))
+        } else {
+            std::fs::rename(&src, &dst)
+        };
+        let ok = result.is_ok();
+        self.report(result);
+        self.reload_panels();
+        if ok {
+            self.panel_mut(side).focus(name);
+            self.after_change();
+        }
+    }
+
+    // ---- path bar ---------------------------------------------------------
+
+    fn path_edit_key(&mut self, named: Option<Named>) -> Task<Message> {
+        let Some(edit) = &mut self.path_edit else { return Task::none() };
+        let count = edit.suggestions.len();
+        match named {
+            Some(Named::Escape) => self.path_edit = None,
+            Some(Named::ArrowDown) if count > 0 => {
+                edit.selected = Some(edit.selected.map_or(0, |i| (i + 1) % count));
+            }
+            Some(Named::ArrowUp) if count > 0 => {
+                edit.selected = Some(edit.selected.map_or(count - 1, |i| (i + count - 1) % count));
+            }
+            Some(Named::Tab) if count > 0 => {
+                // Complete to the highlighted (or first) suggestion and keep going.
+                let pick = &edit.suggestions[edit.selected.unwrap_or(0)];
+                let mut text = pick.display().to_string();
+                if !text.ends_with(MAIN_SEPARATOR) {
+                    text.push(MAIN_SEPARATOR);
+                }
+                edit.text = text;
+                self.refresh_suggestions();
+                return text_input::move_cursor_to_end(path_input_id());
+            }
+            _ => {}
+        }
+        Task::none()
+    }
+
+    fn refresh_suggestions(&mut self) {
+        let Some(side) = self.path_edit.as_ref().map(|e| e.side) else { return };
+        let base = self.panel(side).path.clone();
+        let Some(edit) = &mut self.path_edit else { return };
+        edit.selected = None;
+        edit.suggestions.clear();
+
+        let raw = edit.text.trim().trim_matches('"');
+        if raw.is_empty() {
+            return;
+        }
+        let path = resolve_typed_path(raw, &base);
+        let ends_with_sep = raw.ends_with(['\\', '/']) || (raw.len() == 2 && raw.ends_with(':'));
+        let (dir, prefix) = if ends_with_sep {
+            (path.clone(), String::new())
+        } else {
+            match (path.parent(), path.file_name()) {
+                (Some(parent), Some(name)) => (parent.to_path_buf(), name.to_string_lossy().to_lowercase()),
+                _ => return,
+            }
+        };
+
+        if edit.cache.as_ref().is_none_or(|(cached, _)| *cached != dir) {
+            edit.cache = Some((dir.clone(), list_subfolders(&dir)));
+        }
+        let Some((_, names)) = &edit.cache else { return };
+        edit.suggestions = names
+            .iter()
+            .filter(|n| n.to_lowercase().starts_with(&prefix))
+            .take(MAX_SUGGESTIONS)
+            .map(|n| dir.join(n))
+            .collect();
+        // Don't suggest exactly what's already typed.
+        if edit.suggestions.len() == 1 && normalize_lexically(&edit.suggestions[0]) == normalize_lexically(&path) {
+            edit.suggestions.clear();
+        }
+    }
+
+    fn submit_path(&mut self) {
+        let Some(edit) = self.path_edit.as_ref() else { return };
+        let raw = edit.text.trim().trim_matches('"').to_string();
+        if raw.is_empty() {
+            self.path_edit = None;
+            return;
+        }
+        let path = resolve_typed_path(&raw, &self.panel(edit.side).path);
+        self.go_to_path(path);
+    }
+
+    /// Navigates the edited side to `path` (a folder, or a file to focus).
+    fn go_to_path(&mut self, path: PathBuf) {
+        let Some(edit) = self.path_edit.take() else { return };
+        let path = normalize_lexically(&path);
+        let panel = self.panel_mut(edit.side);
+        let result = if path.is_dir() {
+            panel.navigate(path, None)
+        } else if path.is_file() {
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+            match path.parent() {
+                Some(parent) => panel.navigate(parent.to_path_buf(), name.as_deref()),
+                None => Ok(()),
+            }
+        } else {
+            Err(io::Error::new(io::ErrorKind::NotFound, format!("Path not found: {}", path.display())))
+        };
+        self.after_change();
+        self.report(result);
+    }
+
+    // ---- dialogs ----------------------------------------------------------
+
     fn open_transfer(&mut self, is_move: bool, sources: Vec<PathBuf>, target: &Path) -> Task<Message> {
+        if sources.is_empty() {
+            return Task::none();
+        }
         let mut input = target.display().to_string();
         if !input.ends_with(MAIN_SEPARATOR) {
             input.push(MAIN_SEPARATOR);
         }
-        let base = self.panels[self.active].path.clone();
+        let base = self.panel(self.active).path.clone();
         self.open_dialog(Dialog::Transfer { is_move, sources, base, input })
     }
 
     fn open_dialog(&mut self, dialog: Dialog) -> Task<Message> {
-        self.path_edit = None;
+        self.leave_edits();
         self.dialog = Some(dialog);
         Task::batch([text_input::focus(dialog_input_id()), text_input::select_all(dialog_input_id())])
     }
@@ -505,7 +986,7 @@ impl App {
                 if name.is_empty() {
                     return Task::none();
                 }
-                let panel = &mut self.panels[self.active];
+                let panel = self.panel_mut(self.active);
                 let result = std::fs::create_dir_all(panel.path.join(name)).and_then(|_| panel.reload());
                 // Focus the first component of what was created ("a\b" → "a").
                 if let Some(first) = Path::new(name).components().next() {
@@ -513,27 +994,6 @@ impl App {
                 }
                 self.after_change();
                 self.report(result);
-            }
-            Dialog::Rename { src, input } => {
-                let name = input.trim();
-                let Some(parent) = src.parent() else { return Task::none() };
-                if name.is_empty() || src.file_name().is_some_and(|n| n == name) {
-                    return Task::none();
-                }
-                let dst = parent.join(name);
-                // Allow case-only renames, which "exist" on Windows.
-                let result = if dst.exists() && !ops::same_path(&src, &dst) {
-                    Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("'{name}' already exists")))
-                } else {
-                    std::fs::rename(&src, &dst)
-                };
-                let ok = result.is_ok();
-                self.report(result);
-                self.reload_panels();
-                if ok {
-                    self.panels[self.active].focus(name);
-                    self.after_change();
-                }
             }
             Dialog::Delete { paths, to_trash } => {
                 let verb = if to_trash { "Recycling" } else { "Deleting" };
@@ -544,66 +1004,45 @@ impl App {
         Task::none()
     }
 
-    fn submit_path(&mut self) {
-        let Some((side, input)) = self.path_edit.take() else { return };
-        let raw = input.trim().trim_matches('"');
-        if raw.is_empty() {
-            return;
-        }
-        let panel = &mut self.panels[side];
-        let mut path = match raw.strip_prefix('~') {
-            Some(rest) => rc_platform::home_dir()
-                .map(|h| h.join(rest.trim_start_matches(['/', '\\'])))
-                .unwrap_or_else(|| PathBuf::from(raw)),
-            None => PathBuf::from(raw),
-        };
-        // "D:" means the root of D:, not D:'s current directory.
-        if raw.len() == 2 && raw.ends_with(':') {
-            path.push(MAIN_SEPARATOR.to_string());
-        }
-        if path.is_relative() {
-            path = panel.path.join(path);
-        }
-        let path = normalize_lexically(&path);
-
-        let result = if path.is_dir() {
-            panel.navigate(path, None)
-        } else if path.is_file() {
-            // Jump to the folder and put the cursor on the file.
-            let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
-            match path.parent() {
-                Some(parent) => panel.navigate(parent.to_path_buf(), name.as_deref()),
-                None => Ok(()),
-            }
-        } else {
-            Err(io::Error::new(io::ErrorKind::NotFound, format!("Path not found: {}", path.display())))
-        };
-        self.after_change();
-        self.report(result);
-    }
-
     // ---- drag & drop ------------------------------------------------------
 
-    fn update_drag(&mut self) {
-        let Some(drag) = &self.drag else { return };
+    fn update_drag(&mut self) -> Task<Message> {
+        let mouse = self.mouse;
+        let (width, height) = (self.window_width, self.window_height);
+        let Some(drag) = &mut self.drag else { return Task::none() };
+
         if drag.active {
-            return;
+            // Leaving the window hands the drag over to Windows, so it can
+            // be dropped on Explorer, the desktop or another app.
+            let outside = mouse.x < 0.0 || mouse.y < 0.0 || mouse.x > width || mouse.y > height;
+            if outside {
+                if let Some(drag) = self.drag.take() {
+                    self.hover = None;
+                    return self.drag_out(drag);
+                }
+            }
+            return Task::none();
         }
-        let distance = self.mouse.distance(drag.start);
-        if distance < DRAG_THRESHOLD {
-            return;
+
+        let start = *drag.start.get_or_insert(mouse);
+        if mouse.distance(start) < DRAG_THRESHOLD {
+            return Task::none();
         }
-        let sources = self.target_paths(drag.side);
-        if sources.is_empty() {
-            self.drag = None; // e.g. dragging ".."
-        } else if let Some(drag) = &mut self.drag {
-            drag.sources = sources;
-            drag.active = true;
+        let side = drag.side;
+        let sources = self.target_paths(side);
+        match &mut self.drag {
+            Some(drag) if !sources.is_empty() => {
+                drag.sources = sources;
+                drag.active = true;
+            }
+            _ => self.drag = None, // e.g. dragging ".."
         }
+        Task::none()
     }
 
     fn finish_drag(&mut self) -> Task<Message> {
         let Some(drag) = self.drag.take() else { return Task::none() };
+        self.hover = None;
         if !drag.active {
             return Task::none();
         }
@@ -612,8 +1051,22 @@ impl App {
         self.open_transfer(self.modifiers.shift(), drag.sources, &target)
     }
 
-    /// Panel the mouse is over (0 = left, 1 = right).
-    fn panel_under_mouse(&self) -> usize {
+    fn drag_out(&self, drag: Drag) -> Task<Message> {
+        let side = drag.side;
+        let folder = self.panel(side).path.clone();
+        let items = drag.sources;
+        window::get_oldest()
+            .and_then(move |id| {
+                let (folder, items) = (folder.clone(), items.clone());
+                window::run_with_handle(id, move |handle| {
+                    rc_platform::drag_out(native_handle(&handle), &folder, &items)
+                })
+            })
+            .map(move |result| Message::DragOutDone(side, result))
+    }
+
+    /// Side the mouse is over (0 = left, 1 = right).
+    fn side_under_mouse(&self) -> usize {
         usize::from(self.mouse.x >= self.window_width / 2.0)
     }
 
@@ -621,8 +1074,8 @@ impl App {
     /// under the mouse, else the other panel's folder. `None` means "no
     /// valid target" (e.g. back onto the same panel).
     fn drop_target(&self, drag: &Drag) -> Option<PathBuf> {
-        let side = self.panel_under_mouse();
-        let panel = &self.panels[side];
+        let side = self.side_under_mouse();
+        let panel = self.panel(side);
         if let Some((hover_side, index)) = self.hover {
             if hover_side == side {
                 if let Some(entry) = panel.entries.get(index) {
@@ -638,7 +1091,7 @@ impl App {
     // ---- context menu -----------------------------------------------------
 
     fn context_menu(&self, side: usize, background: bool) -> Task<Message> {
-        let folder = self.panels[side].path.clone();
+        let folder = self.panel(side).path.clone();
         let items = if background { Vec::new() } else { self.target_paths(side) };
         let extended = self.modifiers.shift();
 
@@ -646,8 +1099,7 @@ impl App {
             .and_then(move |id| {
                 let (folder, items) = (folder.clone(), items.clone());
                 window::run_with_handle(id, move |handle| {
-                    let hwnd = native_handle(&handle);
-                    rc_platform::show_context_menu(hwnd, &folder, &items, extended)
+                    rc_platform::show_context_menu(native_handle(&handle), &folder, &items, extended)
                 })
             })
             .map(move |result| Message::ContextDone(side, result))
@@ -668,7 +1120,7 @@ impl App {
             id,
             title,
             done_verb,
-            source_panel: self.active,
+            source_side: self.active,
             handle,
             progress: Progress::default(),
             conflict: None,
@@ -693,7 +1145,7 @@ impl App {
                 let Some(pos) = self.jobs.iter().position(|j| j.id == id) else { return };
                 let job = self.jobs.remove(pos);
                 if outcome.errors.is_empty() && !outcome.cancelled && outcome.skipped == 0 {
-                    self.panels[job.source_panel].deselect_all();
+                    self.panel_mut(job.source_side).deselect_all();
                 }
                 self.disk.borrow_mut().clear();
                 self.reload_panels();
@@ -709,9 +1161,10 @@ impl App {
 
     // ---- helpers ----------------------------------------------------------
 
-    /// Re-reads both panels after something changed on disk.
+    /// Re-reads the visible tab on both sides after something changed.
     fn reload_panels(&mut self) {
-        for panel in &mut self.panels {
+        for side in &mut self.sides {
+            let panel = &mut side.tabs[side.current];
             if let Err(e) = panel.reload() {
                 // The folder itself may be gone: walk up to something that exists.
                 let existing = panel.path.ancestors().skip(1).find(|p| p.is_dir()).map(Path::to_path_buf);
@@ -727,8 +1180,8 @@ impl App {
 
     fn after_change(&mut self) {
         let rows = self.page_rows();
-        for panel in &mut self.panels {
-            panel.ensure_visible(rows);
+        for side in &mut self.sides {
+            side.tabs[side.current].ensure_visible(rows);
         }
     }
 
@@ -769,6 +1222,26 @@ impl App {
     }
 }
 
+fn is_modifier_key(key: Named) -> bool {
+    matches!(
+        key,
+        Named::Shift
+            | Named::Control
+            | Named::Alt
+            | Named::AltGraph
+            | Named::Super
+            | Named::Meta
+            | Named::Hyper
+            | Named::Fn
+            | Named::FnLock
+            | Named::CapsLock
+            | Named::NumLock
+            | Named::ScrollLock
+            | Named::Symbol
+            | Named::SymbolLock
+    )
+}
+
 /// Opens or runs a file, returning a status line describing what happened.
 fn launch(path: &Path) -> io::Result<String> {
     rc_platform::open_default(path)?;
@@ -778,6 +1251,36 @@ fn launch(path: &Path) -> io::Result<String> {
     } else {
         format!("Opened {name} with its default app")
     })
+}
+
+/// Turns what the user typed in the path bar into a path: `~` is the home
+/// folder, `D:` the root of D:, relative paths start at `base`.
+fn resolve_typed_path(raw: &str, base: &Path) -> PathBuf {
+    let mut path = match raw.strip_prefix('~') {
+        Some(rest) => rc_platform::home_dir()
+            .map(|h| h.join(rest.trim_start_matches(['/', '\\'])))
+            .unwrap_or_else(|| PathBuf::from(raw)),
+        None => PathBuf::from(raw),
+    };
+    if raw.len() == 2 && raw.ends_with(':') {
+        path.push(MAIN_SEPARATOR.to_string());
+    }
+    if path.is_relative() {
+        path = base.join(path);
+    }
+    path
+}
+
+/// Names of the sub-folders of `dir`, sorted case-insensitively.
+fn list_subfolders(dir: &Path) -> Vec<String> {
+    let Ok(read) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut names: Vec<String> = read
+        .flatten()
+        .filter(|e| std::fs::metadata(e.path()).map(|m| m.is_dir()).unwrap_or(false))
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort_by_key(|n| n.to_lowercase());
+    names
 }
 
 /// Resolves `.` and `..` without touching the disk (unlike canonicalize,

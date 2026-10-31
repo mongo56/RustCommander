@@ -37,6 +37,12 @@ pub enum Command {
     Delete,
     /// Delete permanently (Shift+F8 / Shift+Del).
     DeletePermanent,
+    NewTab,
+    CloseTab,
+    NextTab,
+    PrevTab,
+    /// Open the folder under the cursor in a new tab.
+    OpenInNewTab,
     Quit,
 }
 
@@ -74,6 +80,11 @@ impl Command {
             MakeDir => "cm_MkDir",
             Delete => "cm_Delete",
             DeletePermanent => "cm_DeletePermanent",
+            NewTab => "cm_OpenNewTab",
+            CloseTab => "cm_CloseCurrentTab",
+            NextTab => "cm_SwitchToNextTab",
+            PrevTab => "cm_SwitchToPreviousTab",
+            OpenInNewTab => "cm_OpenDirInNewTab",
             Quit => "cm_Exit",
         }
     }

@@ -32,6 +32,10 @@ bindings, the F-key bar and a future command palette share one code path.
 | Backspace / Ctrl+PgUp | Parent folder |
 | Ctrl+\\ | Root |
 | Tab | Switch panel |
+| *type letters* | Quick search: jumps to the first name starting with what you typed; ↑/↓ next/previous match, Backspace edits, Esc closes |
+| Ctrl+T / Ctrl+W | New tab / close tab |
+| Ctrl+Tab / Ctrl+Shift+Tab | Next / previous tab |
+| Ctrl+↑ | Open folder under cursor in a new tab |
 | Insert / Space | Select (Insert moves down) |
 | Ctrl+A / Ctrl+D / Esc | Select all / deselect |
 | Ctrl+F3–F6 | Sort by name / ext / date / size (again = reverse) |
@@ -40,7 +44,7 @@ bindings, the F-key bar and a future command palette share one code path.
 | Alt+O | Show this folder in the other panel |
 | F3 / F4 | View / edit (opens with system default for now) |
 | F5 / F6 | Copy / move selection (or cursor item) to the other panel; target is editable, relative paths allowed, a single item can be given a new name |
-| F2 / Shift+F6 | Rename in place |
+| F2 / Shift+F6 | Rename in place (edit the name right in the list; Enter to apply, Esc to cancel) |
 | F7 | New folder (nested paths like `a\b` work) |
 | F8 / Del | Delete to Recycle Bin |
 | Shift+F8 / Shift+Del | Delete permanently |
@@ -49,8 +53,10 @@ bindings, the F-key bar and a future command palette share one code path.
 ## Mouse
 
 - **Drive bar**: click a drive to jump to it; free space is shown on the right.
-- **Path bar**: click to edit the path (absolute, relative, `~`, or a file path to jump to that file). Enter to go, Esc to cancel.
+- **Path bar**: click to edit the path (absolute, relative, `~`, or a file path to jump to that file). Matching folders are suggested as you type: Tab completes, ↑/↓ choose, Enter goes, Esc cancels.
 - **Drag and drop**: drag files onto the other panel to copy (hold Shift to move). Drop onto a folder row to copy into that folder. A confirmation dialog with the target follows.
+- **Other apps**: drag files out of the window onto Explorer, the desktop, a mail client, etc. Files dragged in from Explorer open the Copy dialog for the panel they were dropped on.
+- **Tabs**: click to switch, middle-click (or ×) to close, + for a new tab; middle-click a folder to open it in a background tab.
 - **Right-click**: the Windows Explorer context menu for the item(s) (Open with, Send to, 7-Zip, …); on empty space, the folder's menu (New, Open in Terminal, …). Rename and Delete in the menu use RustCommander's own dialogs.
 - File and folder icons come from the system.
 
@@ -64,9 +70,9 @@ drives. Skipped files stay in the source.
 
 1. ~~File operations with background jobs, progress and conflict prompts~~ ✔
 2. Async directory loading + filesystem watching (`notify`)
-3. Tabs per panel, history, hotlist (Ctrl+D)
-4. Quick search (type to jump), quick filter
+3. ~~Tabs per panel~~ ✔, history, hotlist (Ctrl+D), restore tabs on start
+4. ~~Quick search (type to jump)~~ ✔, quick filter
 5. Built-in viewer (F3), multi-rename, compare by content
 6. `Vfs` trait: archives, SFTP/FTP, plugins
-7. Windows shell integration: ~~context menu, icons, recycle bin~~ ✔, drag out to / in from Explorer
+7. ~~Windows shell integration: context menu, icons, recycle bin, drag & drop with other apps~~ ✔
 8. Config file for keymap and theme
