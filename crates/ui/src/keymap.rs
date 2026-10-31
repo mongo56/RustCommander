@@ -36,6 +36,7 @@ pub fn command_for(key: &Key, m: Modifiers) -> Option<Command> {
             Named::F5 if ctrl => SortBy(SortKey::Modified),
             Named::F6 if ctrl => SortBy(SortKey::Size),
             Named::F4 if alt => Quit,
+            Named::F4 if shift => EditNew,
             Named::F2 if ctrl => Refresh,
             Named::F3 => View,
             Named::F4 => Edit,

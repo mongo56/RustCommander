@@ -526,6 +526,12 @@ impl App {
                 Some(input_field(input)),
                 "Create",
             ),
+            Dialog::EditNew { input } => (
+                "Edit file".into(),
+                format!("File to edit (created if missing) in {}:", self.panel(self.active).path.display()),
+                Some(input_field(input)),
+                "Edit",
+            ),
             Dialog::Delete { paths, to_trash } => (
                 if *to_trash { "Delete" } else { "Delete permanently" }.into(),
                 if *to_trash {

@@ -5,6 +5,7 @@
 use super::*;
 use crate::theme::filled;
 use iced::widget::text::{Span, Wrapping};
+use iced::widget::scrollable::{self, AbsoluteOffset, Direction, RelativeOffset, Scrollbar};
 use iced::widget::{center, column, container, mouse_area, responsive, rich_text, row, text, Column, Space};
 use iced::{Alignment, ContentFit, Element, Font, Length};
 use rc_core::viewer::{self, Document, Hit, Mode, HEX_WIDTH};
@@ -21,6 +22,18 @@ const SEARCH_H: f32 = 40.0;
 const H_STEP: usize = 4;
 /// Images are scaled down to fit this many pixels per side (GPU texture limit).
 const MAX_IMAGE_SIDE: u32 = 8192;
+/// Zoom factor per +/- press, and the zoom range.
+const ZOOM_STEP: f32 = 1.25;
+const ZOOM_MIN: f32 = 0.05;
+const ZOOM_MAX: f32 = 32.0;
+/// Pixels the arrow keys pan a zoomed image by.
+const PAN_STEP: f32 = 48.0;
+/// Longest prefix of a line measured when clamping horizontal scroll.
+const MEASURE_MAX: usize = 100_000;
+
+fn image_scroll_id() -> scrollable::Id {
+    scrollable::Id::new("viewer-image")
+}
 
 fn search_input_id() -> text_input::Id {
     text_input::Id::new("viewer-search")
@@ -61,6 +74,10 @@ pub(super) struct Viewer {
     case: bool,
     hit: Option<Hit>,
     note: Option<(String, Tone)>,
+    /// Image scale; `None` fits the window (never enlarging).
+    zoom: Option<f32>,
+    /// Scroll position of a zoomed image.
+    pan: RelativeOffset,
 }
 
 impl Viewer {
@@ -71,6 +88,13 @@ impl Viewer {
     fn doc_arc(&self) -> Option<Arc<Document>> {
         match &self.content {
             Content::Loaded(Loaded::Doc(doc)) => Some(doc.clone()),
+            _ => None,
+        }
+    }
+
+    fn image_size(&self) -> Option<(u32, u32)> {
+        match &self.content {
+            Content::Loaded(Loaded::Image { width, height, .. }) => Some((*width, *height)),
             _ => None,
         }
     }
@@ -142,6 +166,8 @@ impl App {
             case: false,
             hit: None,
             note: None,
+            zoom: None,
+            pan: RelativeOffset::START,
         });
         self.viewer_show(index)
     }
@@ -157,6 +183,8 @@ impl App {
         v.left = 0;
         v.hit = None;
         v.note = None;
+        v.zoom = None;
+        v.pan = RelativeOffset::START;
         load(v.path().to_path_buf(), seq)
     }
 
@@ -206,6 +234,68 @@ impl App {
         v.top = v.top.saturating_add_signed(delta).min(max);
     }
 
+    /// Furthest `left` that still shows the end of the longest visible line.
+    fn viewer_max_left(&self) -> usize {
+        let Some(v) = &self.viewer else { return 0 };
+        let Some(doc) = v.doc() else { return 0 };
+        if v.mode != Mode::Text || v.wrap {
+            return 0;
+        }
+        let end = (v.top + self.viewer_rows()).min(doc.rows(v.mode));
+        let longest = (v.top..end)
+            .map(|i| viewer::display_line(doc.line(i), 0, MEASURE_MAX).chars().count())
+            .max()
+            .unwrap_or(0);
+        (longest + 1).saturating_sub(self.viewer_cols())
+    }
+
+    /// Scale that fits an image of `size` into the viewer, never enlarging.
+    fn viewer_fit_scale(&self, (w, h): (u32, u32)) -> f32 {
+        let avail_w = (self.window_width - 16.0).max(1.0);
+        let avail_h = (self.window_height - VIEWER_CHROME_H - 16.0).max(1.0);
+        (avail_w / w.max(1) as f32).min(avail_h / h.max(1) as f32).min(1.0)
+    }
+
+    /// Image-only keys: zoom and pan. `None` when the key is not one of them.
+    fn viewer_image_key(&mut self, named: Option<Named>, typed: Option<&str>) -> Option<Task<Message>> {
+        let size = self.viewer.as_ref()?.image_size()?;
+        let fit = self.viewer_fit_scale(size);
+        let page = (self.window_height - VIEWER_CHROME_H - 40.0).max(PAN_STEP);
+        let v = self.viewer.as_mut()?;
+        let current = v.zoom.unwrap_or(fit);
+        let set_zoom = |v: &mut Viewer, zoom: Option<f32>| {
+            if v.zoom.is_none() {
+                // Coming from "fit", the whole image was visible: zoom on its centre.
+                v.pan = RelativeOffset { x: 0.5, y: 0.5 };
+            }
+            v.zoom = zoom.map(|z| z.clamp(ZOOM_MIN, ZOOM_MAX));
+            if v.zoom.is_some() { scrollable::snap_to(image_scroll_id(), v.pan) } else { Task::none() }
+        };
+        let pan = |x: f32, y: f32| scrollable::scroll_by(image_scroll_id(), AbsoluteOffset { x, y });
+        let zoomed = v.zoom.is_some();
+        Some(match (named, typed) {
+            (_, Some("+" | "=")) => set_zoom(v, Some(current * ZOOM_STEP)),
+            (_, Some("-")) => set_zoom(v, Some(current / ZOOM_STEP)),
+            (_, Some("0" | "*")) => set_zoom(v, None),
+            (_, Some("1")) => set_zoom(v, Some(1.0)),
+            (Some(Named::ArrowLeft), _) if zoomed => pan(-PAN_STEP, 0.0),
+            (Some(Named::ArrowRight), _) if zoomed => pan(PAN_STEP, 0.0),
+            (Some(Named::ArrowUp), _) if zoomed => pan(0.0, -PAN_STEP),
+            (Some(Named::ArrowDown), _) if zoomed => pan(0.0, PAN_STEP),
+            (Some(Named::PageUp), _) if zoomed => pan(0.0, -page),
+            (Some(Named::PageDown), _) if zoomed => pan(0.0, page),
+            (Some(Named::Home), _) if zoomed => scrollable::snap_to(image_scroll_id(), RelativeOffset::START),
+            (Some(Named::End), _) if zoomed => scrollable::snap_to(image_scroll_id(), RelativeOffset::END),
+            _ => return None,
+        })
+    }
+
+    pub(super) fn viewer_panned(&mut self, offset: RelativeOffset) {
+        if let Some(v) = &mut self.viewer {
+            v.pan = offset;
+        }
+    }
+
     pub(super) fn viewer_wheel(&mut self, lines: f32) {
         self.viewer_scroll((-lines * 3.0).round() as isize);
     }
@@ -237,6 +327,11 @@ impl App {
             return Task::batch([text_input::focus(search_input_id()), text_input::select_all(search_input_id())]);
         }
         let typed = ch.filter(|_| !ctrl && !mods.alt());
+        if let Some(task) = self.viewer_image_key(named, typed.as_deref()) {
+            return task;
+        }
+        let max_left = self.viewer_max_left();
+        let Some(v) = &mut self.viewer else { return Task::none() };
         match (named, typed.as_deref()) {
             (Some(Named::Escape), _) | (_, Some("q")) => self.close_viewer(),
             (Some(Named::ArrowDown), _) => self.viewer_scroll(1),
@@ -248,7 +343,7 @@ impl App {
                 v.left = 0;
             }
             (Some(Named::End), _) => self.viewer_scroll(isize::MAX),
-            (Some(Named::ArrowRight), _) if !v.wrap => v.left += H_STEP,
+            (Some(Named::ArrowRight), _) if !v.wrap => v.left = (v.left + H_STEP).min(max_left.max(v.left)),
             (Some(Named::ArrowLeft), _) if !v.wrap => v.left = v.left.saturating_sub(H_STEP),
             (Some(Named::Space), _) | (_, Some("n")) => {
                 if v.index + 1 < v.files.len() {
@@ -381,7 +476,12 @@ impl App {
                     info.push(format!("first {} shown", rc_core::format::size(viewer::LOAD_LIMIT)));
                 }
             }
-            Content::Loaded(Loaded::Image { width, height, .. }) => info.push(format!("{width} × {height}")),
+            Content::Loaded(Loaded::Image { width, height, .. }) => {
+                info.push(format!("{width} × {height}"));
+                let scale = v.zoom.unwrap_or_else(|| self.viewer_fit_scale((*width, *height)));
+                let pct = format!("{:.0}%", scale * 100.0);
+                info.push(if v.zoom.is_none() { format!("Fit {pct}") } else { pct });
+            }
             _ => {}
         }
         let header = container(
@@ -400,11 +500,14 @@ impl App {
         let body: Element<'a, Message> = match &v.content {
             Content::Loading => center(text("Loading…").size(13).color(theme::MUTED)).into(),
             Content::Failed(e) => center(text(format!("Can't open: {e}")).size(13).color(theme::ERROR)).into(),
-            Content::Loaded(Loaded::Image { handle, .. }) => center(
-                image(handle.clone()).content_fit(ContentFit::ScaleDown).filter_method(image::FilterMethod::Linear),
-            )
-            .padding(8)
-            .into(),
+            Content::Loaded(Loaded::Image { handle, width, height }) => match v.zoom {
+                None => center(
+                    image(handle.clone()).content_fit(ContentFit::ScaleDown).filter_method(image::FilterMethod::Linear),
+                )
+                .padding(8)
+                .into(),
+                Some(zoom) => zoomed_image(handle, *width as f32 * zoom, *height as f32 * zoom, zoom),
+            },
             Content::Loaded(Loaded::Doc(doc)) => self.text_body(v, doc),
         };
         let body = mouse_area(container(body).width(Length::Fill).height(Length::Fill).style(filled(theme::PANEL)))
@@ -438,14 +541,17 @@ impl App {
                 .style(filled(theme::HEADER)),
             );
         }
+        let help = if v.image_size().is_some() {
+            "Esc close · N/P next/prev file · +/- zoom · 0 fit · 1 actual size · arrows/PgUp/PgDn pan"
+        } else {
+            "Esc close · N/P next/prev file · 1 text · 3 hex · W wrap · F7 find · F3/Shift+F3 next/prev · C match case"
+        };
         let footer: Element<'a, Message> = match &v.note {
             Some((msg, tone)) => text(msg.as_str())
                 .size(12)
                 .color(if *tone == Tone::Error { theme::ERROR } else { theme::TEXT })
                 .into(),
-            None => text(
-                "Esc close · N/P next/prev file · 1 text · 3 hex · W wrap · F7 find · F3/Shift+F3 next/prev · C match case",
-            )
+            None => text(help)
             .size(12)
             .color(theme::MUTED)
             .wrapping(Wrapping::None)
@@ -504,6 +610,23 @@ impl App {
         })
         .into()
     }
+}
+
+/// An image drawn at `w` x `h` pixels, centred when smaller than the view
+/// and scrollable both ways when larger.
+fn zoomed_image<'a>(handle: &'a image::Handle, w: f32, h: f32, zoom: f32) -> Element<'a, Message> {
+    let filter = if zoom >= 2.0 { image::FilterMethod::Nearest } else { image::FilterMethod::Linear };
+    responsive(move |size| {
+        let picture = image(handle.clone()).width(w).height(h).content_fit(ContentFit::Fill).filter_method(filter);
+        scrollable::Scrollable::new(container(picture).center_x(w.max(size.width)).center_y(h.max(size.height)))
+            .id(image_scroll_id())
+            .direction(Direction::Both { vertical: Scrollbar::default(), horizontal: Scrollbar::default() })
+            .on_scroll(|viewport| Message::ViewerPanned(viewport.relative_offset()))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    })
+    .into()
 }
 
 /// Character ranges of hex row `row` covered by `hit`: the hex digits and

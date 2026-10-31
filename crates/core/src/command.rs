@@ -35,6 +35,8 @@ pub enum Command {
     SyncOtherPanel,
     View,
     Edit,
+    /// Ask for a file name, create it if missing and edit it (Shift+F4).
+    EditNew,
     Copy,
     Move,
     /// Rename the cursor entry in place (Shift+F6).
@@ -85,6 +87,7 @@ impl Command {
             SyncOtherPanel => "cm_TransferPath",
             View => "cm_View",
             Edit => "cm_Edit",
+            EditNew => "cm_EditNewFile",
             Copy => "cm_Copy",
             Move => "cm_RenMov",
             Rename => "cm_RenameOnly",

@@ -126,6 +126,8 @@ enum Tone {
 enum Dialog {
     Transfer { is_move: bool, sources: Vec<PathBuf>, base: PathBuf, input: String },
     MakeDir { input: String },
+    /// Shift+F4: name of the file to create (if missing) and edit.
+    EditNew { input: String },
     Delete { paths: Vec<PathBuf>, to_trash: bool },
     /// Hotlist menu; `selected` indexes the entries, then the add/remove item.
     Hotlist { selected: usize },
@@ -238,6 +240,8 @@ pub enum Message {
     Listed(PathBuf, u64, Result<Vec<Entry>, String>),
     ViewerLoaded(u64, Result<viewer::Loaded, String>),
     ViewerWheel(f32),
+    /// The zoomed image was scrolled (relative offset).
+    ViewerPanned(iced::widget::scrollable::RelativeOffset),
     ViewerSearch(String),
     ViewerFind,
     /// Background listing for a pending navigation: (side, seq, listing).
@@ -567,7 +571,7 @@ impl App {
                 }
             }
             Message::DialogInput(value) => {
-                if let Some(Dialog::Transfer { input, .. } | Dialog::MakeDir { input }) = &mut self.dialog {
+                if let Some(Dialog::Transfer { input, .. } | Dialog::MakeDir { input } | Dialog::EditNew { input }) = &mut self.dialog {
                     *input = value;
                 }
             }
@@ -597,6 +601,7 @@ impl App {
             Message::Listed(path, seq, result) => self.apply_listing(path, seq, result),
             Message::ViewerLoaded(seq, result) => return self.viewer_loaded(seq, result),
             Message::ViewerWheel(lines) => self.viewer_wheel(lines),
+            Message::ViewerPanned(offset) => self.viewer_panned(offset),
             Message::ViewerSearch(text) => self.viewer_search_input(text),
             Message::ViewerFind => return self.viewer_submit(),
             Message::Navigated(side, seq, result) => {
@@ -765,6 +770,14 @@ impl App {
                     }
                 }
                 return Task::none();
+            }
+            EditNew => {
+                let input = self
+                    .panel(active)
+                    .current()
+                    .filter(|e| e.kind == EntryKind::File)
+                    .map_or_else(String::new, |e| e.name.clone());
+                return self.open_dialog(Dialog::EditNew { input });
             }
             SwitchPanel => {
                 self.active = other;
@@ -1276,6 +1289,34 @@ impl App {
                 }
                 self.after_change();
                 self.report(result);
+            }
+            Dialog::EditNew { input } => {
+                let name = input.trim();
+                if name.is_empty() {
+                    return Task::none();
+                }
+                let path = self.panel(self.active).path.join(name);
+                let created = !path.exists();
+                if created {
+                    let made = path
+                        .parent()
+                        .map_or(Ok(()), std::fs::create_dir_all)
+                        .and_then(|_| std::fs::File::create_new(&path).map(drop));
+                    if let Err(e) = made {
+                        self.status = Some((format!("Can't create {name}: {e}"), Tone::Error));
+                        return Task::none();
+                    }
+                    let panel = self.panel_mut(self.active);
+                    let _ = panel.reload();
+                    if let Some(first) = Path::new(name).components().next() {
+                        panel.focus(&first.as_os_str().to_string_lossy());
+                    }
+                    self.after_change();
+                }
+                match crate::editor::launch(&self.editor, &path) {
+                    Ok(()) => self.status = Some((format!("Editing {name}"), Tone::Success)),
+                    Err(e) => self.status = Some((format!("Can't start the editor: {e}"), Tone::Error)),
+                }
             }
             Dialog::Delete { paths, to_trash } => {
                 let verb = if to_trash { "Recycling" } else { "Deleting" };
