@@ -30,8 +30,13 @@ pub enum Command {
     Edit,
     Copy,
     Move,
+    /// Rename the cursor entry in place (Shift+F6).
+    Rename,
     MakeDir,
+    /// Delete to the recycle bin.
     Delete,
+    /// Delete permanently (Shift+F8 / Shift+Del).
+    DeletePermanent,
     Quit,
 }
 
@@ -65,8 +70,10 @@ impl Command {
             Edit => "cm_Edit",
             Copy => "cm_Copy",
             Move => "cm_RenMov",
+            Rename => "cm_RenameOnly",
             MakeDir => "cm_MkDir",
             Delete => "cm_Delete",
+            DeletePermanent => "cm_DeletePermanent",
             Quit => "cm_Exit",
         }
     }

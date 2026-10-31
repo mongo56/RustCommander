@@ -8,6 +8,7 @@ pub fn command_for(key: &Key, m: Modifiers) -> Option<Command> {
     use Command::*;
     let ctrl = m.control();
     let alt = m.alt();
+    let shift = m.shift();
 
     let cmd = match key.as_ref() {
         Key::Named(named) => match named {
@@ -34,8 +35,10 @@ pub fn command_for(key: &Key, m: Modifiers) -> Option<Command> {
             Named::F3 => View,
             Named::F4 => Edit,
             Named::F5 => Copy,
+            Named::F6 if shift => Rename,
             Named::F6 => Move,
             Named::F7 => MakeDir,
+            Named::F8 | Named::Delete if shift => DeletePermanent,
             Named::F8 | Named::Delete => Delete,
             _ => return None,
         },

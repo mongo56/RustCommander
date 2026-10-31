@@ -14,6 +14,7 @@ rc-platform = { path = "crates/platform" }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 iced = { version = "0.13.1", features = ["lazy"] }
 open = "5"
+trash = "5"
 
 [profile.release]
 lto = "thin"

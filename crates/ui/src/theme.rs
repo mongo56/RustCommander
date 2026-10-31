@@ -1,7 +1,7 @@
 //! Colours and widget styles. Everything visual lives here so a light theme
 //! (or user themes) can be added later without touching the app logic.
 
-use iced::widget::{button, container};
+use iced::widget::{button, container, progress_bar, text_input};
 use iced::{Background, Border, Color, Theme};
 
 const fn rgb(hex: u32) -> Color {
@@ -71,5 +71,64 @@ pub fn fkey(_theme: &Theme, status: button::Status) -> button::Style {
         text_color: TEXT,
         border: Border { color: BORDER, width: 1.0, radius: 4.0.into() },
         ..button::Style::default()
+    }
+}
+
+/// Highlighted dialog button (the default action).
+pub fn primary(_theme: &Theme, status: button::Status) -> button::Style {
+    button::Style {
+        background: Some(Background::Color(match status {
+            button::Status::Hovered | button::Status::Pressed => rgb(0x6eaaff),
+            _ => ACCENT,
+        })),
+        text_color: rgb(0x0d1117),
+        border: Border { color: ACCENT, width: 1.0, radius: 4.0.into() },
+        ..button::Style::default()
+    }
+}
+
+pub fn dialog(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(HEADER)),
+        border: Border { color: BORDER, width: 1.0, radius: 8.0.into() },
+        shadow: iced::Shadow {
+            color: Color { a: 0.5, ..Color::BLACK },
+            offset: iced::Vector::new(0.0, 8.0),
+            blur_radius: 24.0,
+        },
+        ..container::Style::default()
+    }
+}
+
+pub fn backdrop(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(Color { a: 0.55, ..Color::BLACK })),
+        ..container::Style::default()
+    }
+}
+
+pub fn input(_theme: &Theme, status: text_input::Status) -> text_input::Style {
+    text_input::Style {
+        background: Background::Color(PANEL),
+        border: Border {
+            color: match status {
+                text_input::Status::Focused => ACCENT,
+                _ => BORDER,
+            },
+            width: 1.0,
+            radius: 4.0.into(),
+        },
+        icon: MUTED,
+        placeholder: MUTED,
+        value: TEXT,
+        selection: CURSOR,
+    }
+}
+
+pub fn progress(_theme: &Theme) -> progress_bar::Style {
+    progress_bar::Style {
+        background: Background::Color(PANEL),
+        bar: Background::Color(ACCENT),
+        border: Border { color: BORDER, width: 0.0, radius: 3.0.into() },
     }
 }

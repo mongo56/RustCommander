@@ -7,6 +7,7 @@ pub mod command;
 pub mod entry;
 pub mod format;
 pub mod fs;
+pub mod ops;
 pub mod panel;
 
 pub use command::Command;

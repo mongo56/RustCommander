@@ -67,11 +67,14 @@ impl Panel {
     /// Re-reads the current folder, keeping cursor and selection by name.
     pub fn reload(&mut self) -> io::Result<()> {
         let focus = self.current().map(|e| e.name.clone());
+        let old_cursor = self.cursor;
         let mut entries = list_dir(&self.path, self.show_hidden)?;
         sort_entries(&mut entries, self.sort);
         self.entries = entries;
         let names: HashSet<&str> = self.entries.iter().map(|e| e.name.as_str()).collect();
         self.selected.retain(|n| names.contains(n.as_str()));
+        // If the cursor entry vanished (deleted/moved), stay at the same row.
+        self.cursor = old_cursor;
         self.focus_name(focus.as_deref());
         Ok(())
     }
@@ -84,6 +87,7 @@ impl Panel {
         self.entries = entries;
         self.selected.clear();
         self.scroll = 0;
+        self.cursor = 0;
         self.focus_name(focus);
         Ok(())
     }
@@ -148,10 +152,16 @@ impl Panel {
         self.scroll = visible_start(self.scroll, self.cursor, rows, self.entries.len());
     }
 
+    /// Puts the cursor on the entry called `name`, if present.
+    pub fn focus(&mut self, name: &str) {
+        self.focus_name(Some(name));
+    }
+
+    /// Moves the cursor to `name`; if not found the cursor keeps its row.
     fn focus_name(&mut self, name: Option<&str>) {
-        self.cursor = name
-            .and_then(|n| self.entries.iter().position(|e| e.name == n))
-            .unwrap_or(0);
+        if let Some(i) = name.and_then(|n| self.entries.iter().position(|e| e.name == n)) {
+            self.cursor = i;
+        }
         self.set_cursor(self.cursor);
     }
 
@@ -226,6 +236,7 @@ impl Panel {
         }
         let focus = self.current().map(|e| e.name.clone());
         sort_entries(&mut self.entries, self.sort);
+        self.cursor = 0;
         self.focus_name(focus.as_deref());
     }
 

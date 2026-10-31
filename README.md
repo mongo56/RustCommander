@@ -16,7 +16,7 @@ cargo test                          # core tests
 
 | Crate | Purpose |
 |---|---|
-| `crates/core` (`rc-core`) | UI-agnostic logic: `Panel` (listing, cursor, selection, sorting), `Entry`, `Command`. No UI dependencies. |
+| `crates/core` (`rc-core`) | UI-agnostic logic: `Panel` (listing, cursor, selection, sorting), `Entry`, `Command`, `ops` (copy/move/delete jobs). No UI dependencies. |
 | `crates/platform` (`rc-platform`) | OS integration: drives, opening files. Later: shell context menu, icons, recycle bin, drag-out. |
 | `crates/ui` (`rustcommander`) | iced front end: `app.rs` (state/update/view), `keymap.rs` (keys → `Command`), `theme.rs` (colours/styles). |
 
@@ -39,11 +39,22 @@ bindings, the F-key bar and a future command palette share one code path.
 | Ctrl+H | Toggle hidden/system files |
 | Alt+O | Show this folder in the other panel |
 | F3 / F4 | View / edit (opens with system default for now) |
-| F5–F8 | Copy / Move / MkDir / Delete (not implemented yet) |
+| F5 / F6 | Copy / move selection (or cursor item) to the other panel; target is editable, relative paths allowed, a single item can be given a new name |
+| Shift+F6 | Rename in place |
+| F7 | New folder (nested paths like `a\b` work) |
+| F8 / Del | Delete to Recycle Bin |
+| Shift+F8 / Shift+Del | Delete permanently |
+| Esc | Close dialog / cancel job at an overwrite prompt |
+
+File operations run as background jobs (several at once) with progress,
+speed, pause/resume and cancel. Existing files trigger an overwrite prompt:
+overwrite, overwrite all, overwrite older, skip, skip all, or cancel. Moves
+use a plain rename when possible and fall back to copy and delete across
+drives. Skipped files stay in the source.
 
 ## Roadmap
 
-1. File operations (copy/move/delete/mkdir) on a background job queue with progress and conflict prompts
+1. ~~File operations with background jobs, progress and conflict prompts~~ ✔
 2. Async directory loading + filesystem watching (`notify`)
 3. Tabs per panel, history, hotlist (Ctrl+D)
 4. Quick search (type to jump), quick filter
