@@ -69,6 +69,9 @@ pub struct App {
     hotlist: Vec<crate::hotlist::HotItem>,
     jobs: Vec<RunningJob>,
     next_job_id: u64,
+    /// Tasks started where none can be returned (an archive rename committed
+    /// by `leave_edits`); `update` runs them.
+    deferred: Vec<Task<Message>>,
     /// Folder size counts running (Space / Alt+Shift+Enter): the folder
     /// listed and the batch's cancel flag.
     counts: Vec<(PathBuf, Arc<AtomicBool>)>,
@@ -164,6 +167,10 @@ enum Tone {
 enum Dialog {
     Transfer { is_move: bool, sources: Vec<PathBuf>, base: PathBuf, input: String },
     MakeDir { input: String },
+    /// Alt+F5: the zip to pack `sources` into (`base`: for relative input).
+    Pack { sources: Vec<PathBuf>, base: PathBuf, input: String },
+    /// Alt+F9: the folder to unpack `archives` into.
+    Unpack { archives: Vec<PathBuf>, base: PathBuf, input: String },
     /// Shift+F4: name of the file to create (if missing) and edit.
     EditNew { input: String },
     Delete { paths: Vec<PathBuf>, to_trash: bool },
@@ -246,6 +253,8 @@ struct RunningJob {
     progress: Progress,
     conflict: Option<Conflict>,
     started: Instant,
+    /// Name to put the cursor on in a side once the job is done.
+    focus: Option<(usize, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -363,6 +372,7 @@ impl App {
             hotlist: session.as_ref().map(|s| s.hotlist.clone()).unwrap_or_default(),
             jobs: Vec::new(),
             next_job_id: 1,
+            deferred: Vec::new(),
             counts: Vec::new(),
             compare_opts: session.as_ref().map(|s| s.compare.into()).unwrap_or_default(),
             comparing: None,
@@ -472,6 +482,14 @@ impl App {
     // ---- update -----------------------------------------------------------
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        let task = self.handle(message);
+        if self.deferred.is_empty() {
+            return task;
+        }
+        Task::batch(std::iter::once(task).chain(self.deferred.drain(..)))
+    }
+
+    fn handle(&mut self, message: Message) -> Task<Message> {
         if !self.counts.is_empty() {
             self.prune_counts();
         }
@@ -719,7 +737,14 @@ impl App {
                 }
             }
             Message::DialogInput(value) => {
-                if let Some(Dialog::Transfer { input, .. } | Dialog::MakeDir { input } | Dialog::EditNew { input }) = &mut self.dialog {
+                if let Some(
+                    Dialog::Transfer { input, .. }
+                    | Dialog::MakeDir { input }
+                    | Dialog::EditNew { input }
+                    | Dialog::Pack { input, .. }
+                    | Dialog::Unpack { input, .. },
+                ) = &mut self.dialog
+                {
                     *input = value;
                 }
             }
@@ -797,7 +822,7 @@ impl App {
         ("F2 / Shift+F6 (renaming)", "Select the name without extension, the extension, the whole name; Enter renames, Esc cancels"),
         ("Click, double-click", "Move the cursor, open"),
         ("Middle-click a folder", "Open it in a new tab"),
-        ("Enter / Ctrl+PgDn on a .zip, .jar, .7z", "Browse the archive like a folder (read-only: view, copy out, Enter opens a temp copy)"),
+        ("Enter / Ctrl+PgDn on a .zip, .jar, .7z", "Browse the archive like a folder: view, copy out, Enter opens a temp copy; in a zip also copy/move in, F7, F2, F8 (7z is read-only)"),
         ("Right-click", "Explorer context menu"),
         ("Drag and drop", "Copy (Shift = move) between panels and other apps; right drag = drop menu"),
         ("Mouse wheel", "Scroll the view (the cursor stays)"),
@@ -992,16 +1017,18 @@ impl App {
         let active = self.active;
         let other = 1 - active;
 
-        // Archives are read-only for now.
+        // In archives: zips can be changed (as jobs), 7z can't; nothing can
+        // be edited in place. `bool` = allowed in a zip.
         let refused = match cmd {
-            Edit | EditNew => Some("edit files"),
-            MakeDir => Some("create folders"),
-            Rename | MultiRename => Some("rename"),
-            Delete | DeletePermanent => Some("delete"),
+            Edit | EditNew => Some(("edit files", false)),
+            MultiRename => Some(("multi-rename", false)),
+            MakeDir => Some(("create folders", true)),
+            Rename => Some(("rename", true)),
+            Delete | DeletePermanent => Some(("delete", true)),
             _ => None,
         };
-        if let Some(what) = refused {
-            if self.refuse_in_archive(active, what) {
+        if let Some((what, zip_ok)) = refused {
+            if self.refuse_in_archive(active, what, zip_ok) {
                 return Task::none();
             }
         }
@@ -1055,6 +1082,8 @@ impl App {
             }
             Rename => return self.start_rename(),
             MakeDir => return self.open_dialog(Dialog::MakeDir { input: String::new() }),
+            Pack => return self.open_pack(),
+            Unpack => return self.open_unpack(),
             Hotlist => {
                 self.open_hotlist();
                 return Task::none();
@@ -1361,6 +1390,15 @@ impl App {
             return;
         }
         let dst = parent.join(name);
+        if vfs::is_virtual(&src) {
+            let title = format!("Renaming {} → {name}", src.file_name().unwrap_or_default().to_string_lossy());
+            let task = self.start_job(Job::Rename { from: src, to: dst }, title);
+            if let Some(job) = self.jobs.last_mut() {
+                job.focus = Some((side, name.to_owned()));
+            }
+            self.deferred.push(task);
+            return;
+        }
         // Allow case-only renames, which "exist" on Windows.
         let result = if dst.exists() && !ops::same_path(&src, &dst) {
             Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("'{name}' already exists")))
@@ -1539,6 +1577,15 @@ impl App {
                 if name.is_empty() {
                     return Task::none();
                 }
+                let dir = self.panel(self.active).path.clone();
+                if vfs::in_archive(&dir) {
+                    let first = Path::new(name).components().next().map(|c| c.as_os_str().to_string_lossy().into_owned());
+                    let task = self.start_job(Job::MakeDir(dir.join(name)), format!("Creating folder {name}"));
+                    if let (Some(job), Some(first)) = (self.jobs.last_mut(), first) {
+                        job.focus = Some((self.active, first));
+                    }
+                    return task;
+                }
                 let panel = self.panel_mut(self.active);
                 let result = std::fs::create_dir_all(panel.path.join(name)).and_then(|_| panel.reload());
                 // Focus the first component of what was created ("a\b" → "a").
@@ -1573,7 +1620,39 @@ impl App {
                 }
                 self.edit_file(&path, name);
             }
+            Dialog::Pack { sources, base, input } => {
+                let mut archive = resolve_typed_path(input.trim().trim_matches('"'), &base);
+                if !archive.extension().is_some_and(|e| e.eq_ignore_ascii_case("zip") || e.eq_ignore_ascii_case("jar")) {
+                    let mut name = archive.file_name().unwrap_or_default().to_os_string();
+                    name.push(".zip");
+                    archive.set_file_name(name);
+                }
+                if archive.is_dir() || vfs::in_archive(archive.parent().unwrap_or(&archive)) {
+                    self.status = Some((format!("Can't pack into {}", archive.display()), Tone::Error));
+                    return Task::none();
+                }
+                let title = format!("Packing {} → {}", describe(&sources), archive.display());
+                let other = 1 - self.active;
+                let focus = (archive.parent() == Some(self.panel(other).path.as_path()))
+                    .then(|| (other, archive.file_name().unwrap_or_default().to_string_lossy().into_owned()));
+                let task = self.start_job(Job::Pack { sources, archive }, title);
+                if let Some(job) = self.jobs.last_mut() {
+                    job.focus = focus;
+                }
+                return task;
+            }
+            Dialog::Unpack { archives, base, input } => {
+                let target = resolve_typed_path(input.trim().trim_matches('"'), &base);
+                if vfs::in_archive(&target) {
+                    self.status = Some(("Can't unpack into an archive".into(), Tone::Info));
+                    return Task::none();
+                }
+                let title = format!("Unpacking {} → {}", describe(&archives), target.display());
+                return self.start_job(Job::Unpack { archives, target }, title);
+            }
             Dialog::Delete { paths, to_trash } => {
+                // No recycle bin inside archives.
+                let to_trash = to_trash && !paths.iter().any(|p| vfs::is_virtual(p));
                 let verb = if to_trash { "Recycling" } else { "Deleting" };
                 let title = format!("{verb} {}", describe(&paths));
                 return self.start_job(Job::Delete { paths, to_trash }, title);
@@ -1764,6 +1843,7 @@ impl App {
             progress: Progress::default(),
             conflict: None,
             started: Instant::now(),
+            focus: None,
         });
         Task::run(rx, move |event| Message::Job(id, event))
     }
@@ -1788,6 +1868,9 @@ impl App {
                 }
                 self.disk.borrow_mut().clear();
                 self.reload_panels();
+                if let Some((side, name)) = job.focus.filter(|_| outcome.errors.is_empty()) {
+                    self.panel_mut(side).focus(&name);
+                }
                 self.status = Some(summarize(job.done_verb, &outcome));
                 self.after_change();
             }
@@ -1800,14 +1883,74 @@ impl App {
 
     // ---- helpers ----------------------------------------------------------
 
-    /// Archives are read-only: if `side` shows one (or a folder in one),
-    /// says that `what` can't be done there and returns true.
-    fn refuse_in_archive(&mut self, side: usize, what: &str) -> bool {
-        let refused = vfs::in_archive(&self.panel(side).path);
-        if refused {
-            self.status = Some((format!("Archives are read-only: can't {what} here"), Tone::Info));
+    /// If `side` shows an archive (or a folder in one) where `what` can't be
+    /// done, says so and returns true. `zip_ok`: it can be done in a zip
+    /// (7z archives are read-only).
+    fn refuse_in_archive(&mut self, side: usize, what: &str, zip_ok: bool) -> bool {
+        let Some(writable) = vfs::archive_writable(&self.panel(side).path) else { return false };
+        if zip_ok && writable {
+            return false;
         }
-        refused
+        let msg = match zip_ok {
+            true => format!("7z archives are read-only (only zips can be changed): can't {what} here"),
+            false => format!("Can't {what} inside archives"),
+        };
+        self.status = Some((msg, Tone::Info));
+        true
+    }
+
+    /// Alt+F5: asks for the name of a zip to pack the selection into, in
+    /// the other panel's folder.
+    fn open_pack(&mut self) -> Task<Message> {
+        let sources = self.target_paths(self.active);
+        if sources.is_empty() {
+            return Task::none();
+        }
+        if sources.iter().any(|p| vfs::is_virtual(p)) {
+            self.status = Some(("Can't pack files inside archives: copy them out first".into(), Tone::Info));
+            return Task::none();
+        }
+        let target = self.panel(1 - self.active).path.clone();
+        let folder = if vfs::in_archive(&target) { self.panel(self.active).path.clone() } else { target };
+        let stem = match &sources[..] {
+            [one] if one.is_dir() => one.file_name().map(|n| n.to_string_lossy().into_owned()),
+            [one] => one.file_stem().map(|n| n.to_string_lossy().into_owned()),
+            _ => self.panel(self.active).path.file_name().map(|n| n.to_string_lossy().into_owned()),
+        };
+        let input = folder.join(format!("{}.zip", stem.unwrap_or_else(|| "archive".into()))).display().to_string();
+        let base = self.panel(self.active).path.clone();
+        self.open_dialog(Dialog::Pack { sources, base, input })
+    }
+
+    /// Alt+F9: asks where to unpack the selected archives (the other
+    /// panel's folder).
+    fn open_unpack(&mut self) -> Task<Message> {
+        let archives: Vec<PathBuf> = self
+            .panel(self.active)
+            .targets()
+            .into_iter()
+            .filter(|e| e.kind == EntryKind::File && vfs::is_archive_name(&e.name))
+            .map(|e| e.path.clone())
+            .collect();
+        if archives.is_empty() {
+            self.status = Some(("Select zip or 7z archives to unpack".into(), Tone::Info));
+            return Task::none();
+        }
+        if archives.iter().any(|p| vfs::is_virtual(p)) {
+            self.status = Some(("Can't unpack archives inside archives yet: copy them out first".into(), Tone::Info));
+            return Task::none();
+        }
+        let target = self.panel(1 - self.active).path.clone();
+        if vfs::in_archive(&target) {
+            self.status = Some(("Can't unpack into an archive".into(), Tone::Info));
+            return Task::none();
+        }
+        let mut input = target.display().to_string();
+        if !input.ends_with(MAIN_SEPARATOR) {
+            input.push(MAIN_SEPARATOR);
+        }
+        let base = self.panel(self.active).path.clone();
+        self.open_dialog(Dialog::Unpack { archives, base, input })
     }
 
     /// Re-reads the visible tab on both sides after something changed.
@@ -2186,12 +2329,19 @@ fn is_modifier_key(key: Named) -> bool {
 
 /// Copying into archives and moving out of them isn't supported yet.
 fn archive_transfer_problem(is_move: bool, sources: &[PathBuf], target: &Path) -> Option<&'static str> {
-    if vfs::in_archive(target) {
-        Some("Archives are read-only: can't copy or move files into them")
-    } else if is_move && sources.iter().any(|p| vfs::is_virtual(p)) {
-        Some("Archives are read-only: can't move files out of them (copy with F5)")
-    } else {
-        None
+    let from = sources.iter().find_map(|p| vfs::split_archive(p).filter(|(_, inner)| !inner.as_os_str().is_empty()));
+    let into = vfs::split_archive(target);
+    match (&from, &into) {
+        (_, Some((file, _))) if vfs::archive_writable(file) == Some(false) => {
+            Some("7z archives are read-only (only zips can be changed)")
+        }
+        (Some((a, _)), Some((b, _))) if !ops::same_path(a, b) => {
+            Some("Can't copy between archives: copy out to a folder first")
+        }
+        (Some((a, _)), None) if is_move && vfs::archive_writable(a) == Some(false) => {
+            Some("7z archives are read-only: can't move files out of them (copy with F5)")
+        }
+        _ => None,
     }
 }
 

@@ -549,11 +549,29 @@ impl App {
                 Some(input_field(input)),
                 "Create",
             ),
+            Dialog::Pack { sources, input, .. } => (
+                "Pack".into(),
+                format!("Pack {} into the zip archive:", describe(sources)),
+                Some(input_field(input)),
+                "Pack",
+            ),
+            Dialog::Unpack { archives, input, .. } => (
+                "Unpack".into(),
+                format!("Unpack {} to:", describe(archives)),
+                Some(input_field(input)),
+                "Unpack",
+            ),
             Dialog::EditNew { input } => (
                 "Edit file".into(),
                 format!("File to edit (created if missing) in {}:", self.panel(self.active).path.display()),
                 Some(input_field(input)),
                 "Edit",
+            ),
+            Dialog::Delete { paths, .. } if paths.first().is_some_and(|p| rc_core::vfs::is_virtual(p)) => (
+                "Delete".into(),
+                format!("Delete {} from the archive? This cannot be undone.", describe(paths)),
+                None,
+                "Delete",
             ),
             Dialog::Delete { paths, to_trash } => (
                 if *to_trash { "Delete" } else { "Delete permanently" }.into(),

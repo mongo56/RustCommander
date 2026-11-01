@@ -14,6 +14,7 @@ pub mod panel;
 pub mod rename;
 pub mod search;
 pub mod vfs;
+mod zip_edit;
 pub mod viewer;
 
 pub use command::Command;

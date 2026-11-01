@@ -56,6 +56,10 @@ pub enum Command {
     /// Rename the selected files by mask (Ctrl+M).
     MultiRename,
     MakeDir,
+    /// Pack the selected files into a zip in the other panel (Alt+F5).
+    Pack,
+    /// Unpack the selected archives into the other panel (Alt+F9).
+    Unpack,
     /// Delete to the recycle bin.
     Delete,
     /// Delete permanently (Shift+F8 / Shift+Del).
@@ -118,6 +122,8 @@ impl Command {
             Rename => "cm_RenameOnly",
             MultiRename => "cm_MultiRenameFiles",
             MakeDir => "cm_MkDir",
+            Pack => "cm_PackFiles",
+            Unpack => "cm_UnpackFiles",
             Delete => "cm_Delete",
             DeletePermanent => "cm_DeletePermanent",
             NewTab => "cm_OpenNewTab",
@@ -176,6 +182,8 @@ impl Command {
             Rename => "Rename in place",
             MultiRename => "Multi-rename the selected files by mask",
             MakeDir => "Create a folder",
+            Pack => "Pack the selected files into a zip archive in the other panel",
+            Unpack => "Unpack the selected archives (zip, 7z) into the other panel",
             Delete => "Delete to the recycle bin",
             DeletePermanent => "Delete permanently",
             NewTab => "New tab",
@@ -237,6 +245,8 @@ impl Command {
             Rename,
             MultiRename,
             MakeDir,
+            Pack,
+            Unpack,
             Delete,
             DeletePermanent,
             NewTab,

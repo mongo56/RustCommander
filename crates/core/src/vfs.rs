@@ -2,8 +2,9 @@
 //!
 //! Paths stay plain `PathBuf`s. A path that runs through an archive file
 //! (`C:\x\a.zip\sub\f.txt`) is served by that archive's [`Vfs`]; anything
-//! else is the local file system ([`LocalFs`]). Archives are read-only:
-//! they can be listed, walked and read (copy out, view), not changed.
+//! else is the local file system ([`LocalFs`]). Archives can be listed,
+//! walked and read (copy out, view); zips can also be changed (see
+//! `zip_edit`, driven by the jobs in `ops`), 7z archives are read-only.
 //! Supported: zip (`.zip`, `.jar`) via the `zip` crate, 7z via
 //! `sevenz-rust2`. Parsed archive indexes are cached by path, size and
 //! modification time, so browsing an archive reads its directory once.
@@ -31,6 +32,8 @@ pub trait Vfs: Send + Sync {
     /// returns `Ok(false)` to stop early.
     fn read_files(&self, files: &[PathBuf], each: &mut dyn FnMut(usize, &mut dyn Read) -> io::Result<bool>)
         -> io::Result<()>;
+    /// `path` itself (not followed into a folder); `None` if it doesn't exist.
+    fn stat(&self, path: &Path) -> io::Result<Option<Entry>>;
     /// Whether files can be created, changed or deleted here.
     fn writable(&self) -> bool;
 }
@@ -38,18 +41,24 @@ pub trait Vfs: Send + Sync {
 /// The local file system.
 pub struct LocalFs;
 
+impl LocalFs {
+    fn entry_of(path: &Path) -> io::Result<Entry> {
+        let meta = fs::metadata(path)?;
+        let name = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+        let kind = if meta.is_dir() { EntryKind::Dir } else { EntryKind::File };
+        let size = if meta.is_dir() { 0 } else { meta.len() };
+        let modified = meta.modified().ok().map(DateTime::<Local>::from);
+        Ok(Entry { name, path: path.to_path_buf(), kind, size, modified, hidden: false })
+    }
+}
+
 impl Vfs for LocalFs {
     fn list(&self, dir: &Path) -> io::Result<Vec<Entry>> {
         crate::fs::list_dir(dir, true)
     }
 
     fn walk(&self, path: &Path) -> io::Result<Vec<Entry>> {
-        let meta = fs::metadata(path)?;
-        let name = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
-        let kind = if meta.is_dir() { EntryKind::Dir } else { EntryKind::File };
-        let size = if meta.is_dir() { 0 } else { meta.len() };
-        let modified = meta.modified().ok().map(DateTime::<Local>::from);
-        let mut out = vec![Entry { name, path: path.to_path_buf(), kind, size, modified, hidden: false }];
+        let mut out = vec![Self::entry_of(path)?];
         let mut i = 0;
         while i < out.len() {
             if out[i].kind == EntryKind::Dir {
@@ -69,6 +78,14 @@ impl Vfs for LocalFs {
             }
         }
         Ok(())
+    }
+
+    fn stat(&self, path: &Path) -> io::Result<Option<Entry>> {
+        match fs::symlink_metadata(path) {
+            Ok(_) => Ok(Some(Self::entry_of(path)?)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     fn writable(&self) -> bool {
@@ -125,6 +142,27 @@ pub fn is_virtual(path: &Path) -> bool {
 /// the local file system.
 pub fn in_archive(path: &Path) -> bool {
     split_archive(path).is_some()
+}
+
+/// For an archive or a path inside one: whether the archive can be changed
+/// (zip yes, 7z no). `None` for local paths.
+pub fn archive_writable(path: &Path) -> Option<bool> {
+    let (file, _) = split_archive(path)?;
+    Some(file.file_name().and_then(format_of) == Some(Format::Zip))
+}
+
+/// The path inside its archive of `path` (`/`-separated, as typed), with
+/// the archive file; `None` for local paths.
+pub fn inner_path(path: &Path) -> Option<(PathBuf, String)> {
+    let (file, inner) = split_archive(path)?;
+    let parts: Vec<String> = inner
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(n) => Some(n.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect();
+    Some((file, parts.join("/")))
 }
 
 /// The file system serving `path`.
@@ -260,13 +298,18 @@ fn archive(file: &Path) -> io::Result<Arc<Archive>> {
     Ok(archive)
 }
 
+/// Drops `file` from the index cache (after changing it).
+pub(crate) fn forget(file: &Path) {
+    CACHE.lock().unwrap_or_else(|e| e.into_inner()).retain(|(f, ..)| f != file);
+}
+
 fn io_err(e: impl std::fmt::Display) -> io::Error {
     io::Error::other(e.to_string())
 }
 
 /// The normal components of an entry name (`/` or `\` separated); `None`
 /// if it tries to leave the archive (`..`) or is empty.
-fn clean_parts(name: &str) -> Option<Vec<&str>> {
+pub(crate) fn clean_parts(name: &str) -> Option<Vec<&str>> {
     let mut parts = Vec::new();
     for part in name.split(['/', '\\']) {
         match part {
@@ -545,8 +588,20 @@ impl Vfs for Archive {
         }
     }
 
+    fn stat(&self, path: &Path) -> io::Result<Option<Entry>> {
+        match self.item(path) {
+            Ok((_, Some(i))) => Ok(Some(self.entry(i))),
+            Ok((_, None)) => {
+                let name = self.file.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                Ok(Some(Entry { name, path: self.file.clone(), kind: EntryKind::Dir, size: 0, modified: None, hidden: false }))
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     fn writable(&self) -> bool {
-        false
+        self.format == Format::Zip
     }
 }
 
@@ -645,7 +700,10 @@ pub(crate) mod tests {
         assert!(list(&zip.join("a.txt"), true).is_err());
 
         let vfs = open(&zip).unwrap();
-        assert!(!vfs.writable());
+        assert!(vfs.writable());
+        assert_eq!(vfs.stat(&zip.join("SUB").join("deep")).unwrap().map(|e| e.kind), Some(EntryKind::Dir));
+        assert_eq!(vfs.stat(&zip.join("a.txt")).unwrap().map(|e| e.size), Some(9));
+        assert!(vfs.stat(&zip.join("nope")).unwrap().is_none());
         let walked = vfs.walk(&zip.join("sub")).unwrap();
         assert_eq!(names(&walked), ["deep", "sub", "x.txt"]);
         assert_eq!(walked[0].name, "sub");

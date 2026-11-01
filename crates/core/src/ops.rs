@@ -1,8 +1,16 @@
 //! File operations (copy, move, delete) as blocking jobs meant to run on a
 //! worker thread. The UI talks to a running job through [`JobHandle`] and
 //! receives [`JobEvent`]s through a callback.
+//!
+//! Zip archives can be a destination or source too: every change to one
+//! (copy/move in, delete, new folder, rename, move out) is a single rewrite
+//! of the archive (`zip_edit`), done after all conflicts are answered, so a
+//! cancelled or failed job leaves the archive as it was.
 
+use crate::vfs::{self, LocalFs, Vfs};
+use crate::zip_edit::{Edits, ZipEdit};
 use chrono::{DateTime, Local};
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -24,7 +32,18 @@ pub struct Transfer {
 pub enum Job {
     Copy(Vec<Transfer>),
     Move(Vec<Transfer>),
+    /// Paths inside an archive are always deleted permanently.
     Delete { paths: Vec<PathBuf>, to_trash: bool },
+    /// Creates a folder (with its parents). Local folders are made by the
+    /// UI directly; this is for folders inside archives.
+    MakeDir(PathBuf),
+    /// Renames inside an archive (`to` is the full new path).
+    Rename { from: PathBuf, to: PathBuf },
+    /// Packs `sources` into the zip `archive` (created if missing, else
+    /// added to).
+    Pack { sources: Vec<PathBuf>, archive: PathBuf },
+    /// Unpacks each archive's contents into the folder `target`.
+    Unpack { archives: Vec<PathBuf>, target: PathBuf },
 }
 
 impl Job {
@@ -35,6 +54,10 @@ impl Job {
             Job::Move(_) => "Moved",
             Job::Delete { to_trash: true, .. } => "Recycled",
             Job::Delete { .. } => "Deleted",
+            Job::MakeDir(_) => "Created",
+            Job::Rename { .. } => "Renamed",
+            Job::Pack { .. } => "Packed",
+            Job::Unpack { .. } => "Unpacked",
         }
     }
 
@@ -44,6 +67,10 @@ impl Job {
             Job::Move(_) => "Moving",
             Job::Delete { to_trash: true, .. } => "Recycling",
             Job::Delete { .. } => "Deleting",
+            Job::MakeDir(_) => "Creating",
+            Job::Rename { .. } => "Renaming",
+            Job::Pack { .. } => "Packing",
+            Job::Unpack { .. } => "Unpacking",
         }
     }
 }
@@ -160,7 +187,7 @@ pub fn plan_transfer(sources: &[PathBuf], target: &Path) -> Result<Vec<Transfer>
         .as_os_str()
         .to_string_lossy()
         .ends_with(['/', '\\']);
-    let into_dir = sources.len() > 1 || ends_with_sep || target.is_dir();
+    let into_dir = sources.len() > 1 || ends_with_sep || target.is_dir() || is_archive_dir(target);
 
     let mut transfers = Vec::with_capacity(sources.len());
     for src in sources {
@@ -182,6 +209,11 @@ pub fn plan_transfer(sources: &[PathBuf], target: &Path) -> Result<Vec<Transfer>
         transfers.push(Transfer { src: src.clone(), dst });
     }
     Ok(transfers)
+}
+
+/// An archive (its root) or a folder inside one.
+fn is_archive_dir(path: &Path) -> bool {
+    vfs::in_archive(path) && vfs::open(path).and_then(|v| v.stat(path)).is_ok_and(|e| e.is_some_and(|e| e.is_dir()))
 }
 
 /// True if both paths refer to the same file (case-insensitive on Windows).
@@ -304,27 +336,102 @@ pub fn run(job: &Job, control: &Control, reporter: &mut dyn Reporter) -> Outcome
             }
             runner.report(true);
             let is_move = matches!(job, Job::Move(_));
-            for (t, size) in transfers.iter().zip(sizes) {
+            if let Some(archive) = dst_archive(transfers) {
+                if transfers.iter().any(|t| vfs::is_virtual(&t.src)) {
+                    runner.relocate(&archive, transfers, !is_move);
+                } else {
+                    runner.pack(&archive, transfers, is_move);
+                }
+            } else {
+                // Moved out of archives: deleted there once extracted.
+                let mut extracted = Vec::new();
+                for (t, size) in transfers.iter().zip(sizes) {
+                    if !runner.alive() {
+                        break;
+                    }
+                    if let Some(parent) = t.dst.parent() {
+                        if let Err(e) = fs::create_dir_all(parent) {
+                            runner.fail(parent, e);
+                            continue;
+                        }
+                    }
+                    if vfs::is_virtual(&t.src) {
+                        let before = (runner.outcome.errors.len(), runner.outcome.skipped);
+                        runner.extract(t);
+                        if is_move && before == (runner.outcome.errors.len(), runner.outcome.skipped) {
+                            extracted.push(t.src.clone());
+                        }
+                    } else if is_move {
+                        runner.move_item(t, size);
+                    } else {
+                        runner.copy(&t.src, &t.dst, false);
+                    }
+                }
+                if !extracted.is_empty() && runner.alive() {
+                    runner.delete_in_archives(&extracted);
+                }
+            }
+        }
+        Job::Delete { paths, .. } if paths.iter().any(|p| vfs::is_virtual(p)) => {
+            runner.progress.total_items = paths.iter().map(|p| measure(p).1).sum();
+            runner.report(true);
+            if runner.delete_in_archives(paths) {
+                runner.progress.done_items = runner.progress.total_items;
+            }
+        }
+        Job::MakeDir(path) => {
+            runner.progress.total_items = 1;
+            runner.report(true);
+            runner.make_dir(path);
+        }
+        Job::Rename { from, to } => {
+            runner.progress.total_items = 1;
+            runner.report(true);
+            match vfs::split_archive(from) {
+                Some((archive, _)) => {
+                    runner.relocate(&archive, &[Transfer { src: from.clone(), dst: to.clone() }], false);
+                }
+                None => match fs::rename(from, to) {
+                    Ok(()) => runner.item_done(0),
+                    Err(e) => {
+                        runner.fail(from, e);
+                    }
+                },
+            }
+        }
+        Job::Pack { sources, archive } => {
+            let mut transfers = Vec::new();
+            for src in sources {
+                match src.file_name() {
+                    Some(name) => transfers.push(Transfer { src: src.clone(), dst: archive.join(name) }),
+                    None => {
+                        runner.fail_msg(src, "Can't pack a drive root");
+                    }
+                }
+            }
+            for (bytes, items) in transfers.iter().map(|t| measure(&t.src)) {
+                runner.progress.total_bytes += bytes;
+                runner.progress.total_items += items;
+            }
+            runner.report(true);
+            runner.pack(archive, &transfers, false);
+        }
+        Job::Unpack { archives, target } => {
+            let all: Vec<_> = archives.iter().map(|a| vfs::open(a).and_then(|v| v.walk(a))).collect();
+            for items in all.iter().flatten() {
+                runner.progress.total_bytes += items.iter().map(|e| e.size).sum::<u64>();
+                runner.progress.total_items += items.len() as u64;
+            }
+            runner.report(true);
+            for archive in archives {
                 if !runner.alive() {
                     break;
                 }
-                if let Some(parent) = t.dst.parent() {
-                    if let Err(e) = fs::create_dir_all(parent) {
-                        runner.fail(parent, e);
-                        continue;
-                    }
+                if let Err(e) = fs::create_dir_all(target) {
+                    runner.fail(target, e);
+                    break;
                 }
-                if crate::vfs::is_virtual(&t.src) {
-                    if is_move {
-                        runner.fail_msg(&t.src, "Archives are read-only: can't move out of them");
-                    } else {
-                        runner.extract(t);
-                    }
-                } else if is_move {
-                    runner.move_item(t, size);
-                } else {
-                    runner.copy(&t.src, &t.dst, false);
-                }
+                runner.extract(&Transfer { src: archive.clone(), dst: target.clone() });
             }
         }
         Job::Delete { paths, to_trash: true } => {
@@ -476,7 +583,7 @@ impl Runner<'_> {
             if dst_meta.is_dir() {
                 return self.fail_msg(dst, "A folder with this name already exists");
             }
-            match self.resolve(src, (meta.len(), meta.modified().ok()), dst, &dst_meta) {
+            match self.resolve(src, (meta.len(), meta.modified().ok()), dst, stat_of(&dst_meta)) {
                 // An existing link is replaced, not written through.
                 Resolution::Overwrite if dst_meta.file_type().is_symlink() => {
                     if let Err(e) = remove_link(dst, &dst_meta) {
@@ -527,7 +634,7 @@ impl Runner<'_> {
                 self.fail_msg(dst, "A folder with this name already exists");
                 return LinkCopy::Stop;
             }
-            match self.resolve(src, (0, meta.modified().ok()), dst, &dst_meta) {
+            match self.resolve(src, (0, meta.modified().ok()), dst, stat_of(&dst_meta)) {
                 Resolution::Overwrite => {
                     let removed = match dst_meta.file_type().is_symlink() {
                         true => remove_link(dst, &dst_meta),
@@ -565,9 +672,8 @@ impl Runner<'_> {
         src: &Path,
         (src_size, src_modified): (u64, Option<SystemTime>),
         dst: &Path,
-        dst_meta: &fs::Metadata,
+        (dst_size, dst_modified): (u64, Option<SystemTime>),
     ) -> Resolution {
-        let dst_modified = dst_meta.modified().ok();
         let target_older = matches!((src_modified, dst_modified), (Some(s), Some(d)) if d < s);
 
         let answer = match self.sticky {
@@ -577,7 +683,7 @@ impl Runner<'_> {
                     src: src.to_path_buf(),
                     dst: dst.to_path_buf(),
                     src_size,
-                    dst_size: dst_meta.len(),
+                    dst_size,
                     src_modified: src_modified.map(DateTime::from),
                     dst_modified: dst_modified.map(DateTime::from),
                 };
@@ -636,7 +742,7 @@ impl Runner<'_> {
         }
     }
 
-    fn pump(&mut self, input: &mut dyn Read, output: &mut File) -> io::Result<bool> {
+    fn pump(&mut self, input: &mut dyn Read, output: &mut dyn Write) -> io::Result<bool> {
         loop {
             if !self.alive() {
                 return Ok(false);
@@ -668,6 +774,8 @@ impl Runner<'_> {
         let (items, vfs) = items;
         let mut files = Vec::new();
         let mut targets = Vec::new();
+        // Folders made here, to get their dates once their files are in.
+        let mut made = Vec::new();
         for item in items {
             if !self.alive() {
                 return;
@@ -685,7 +793,12 @@ impl Runner<'_> {
                     }
                     Ok(_) => self.item_done(0),
                     Err(_) => match fs::create_dir_all(&dst) {
-                        Ok(()) => self.item_done(0),
+                        Ok(()) => {
+                            if let Some(m) = item.modified {
+                                made.push((dst, SystemTime::from(m)));
+                            }
+                            self.item_done(0)
+                        }
                         Err(e) => {
                             self.fail(&dst, e);
                         }
@@ -698,7 +811,7 @@ impl Runner<'_> {
                     self.fail_msg(&dst, "A folder with this name already exists");
                     continue;
                 }
-                match self.resolve(&item.path, (item.size, item.modified.map(Into::into)), &dst, &dst_meta) {
+                match self.resolve(&item.path, (item.size, item.modified.map(Into::into)), &dst, stat_of(&dst_meta)) {
                     Resolution::Overwrite => {}
                     Resolution::Cancel => {
                         self.control.cancel();
@@ -736,6 +849,10 @@ impl Runner<'_> {
         if let Err(e) = result {
             self.fail(&t.src, e);
         }
+        // Deepest first: setting a folder's date doesn't touch its parent's.
+        for (dir, modified) in made.iter().rev() {
+            let _ = set_dir_modified(dir, *modified);
+        }
     }
 
     /// Writes `input` to the new file `dst` with progress. Ok(false) means
@@ -772,6 +889,313 @@ impl Runner<'_> {
             return;
         }
         self.copy(&t.src, &t.dst, true);
+    }
+
+    // ---- archives ---------------------------------------------------------
+
+    /// Opens `archive` for changing: an error is recorded (and `None`
+    /// returned) if it can't be read or isn't a zip.
+    fn open_writable(&mut self, archive: &Path) -> Option<std::sync::Arc<dyn Vfs>> {
+        match vfs::open(archive) {
+            Ok(v) if v.writable() => Some(v),
+            Ok(_) => {
+                self.fail_msg(archive, "Only zip archives can be changed (7z is read-only)");
+                None
+            }
+            Err(e) => {
+                self.fail(archive, e);
+                None
+            }
+        }
+    }
+
+    /// Copies or moves local files and folders into the zip `archive` (the
+    /// transfers' destinations are inside it; it's created if missing).
+    /// Conflicts are asked first, then the archive is rewritten once.
+    fn pack(&mut self, archive: &Path, transfers: &[Transfer], is_move: bool) {
+        let index = match archive.exists() {
+            true => match self.open_writable(archive) {
+                Some(v) => Some(v),
+                None => return,
+            },
+            false => None,
+        };
+        let saved = self.snapshot();
+        let mut edits = Edits::default();
+        let mut adds = Vec::new();
+        let mut complete = vec![true; transfers.len()];
+        for (ti, t) in transfers.iter().enumerate() {
+            let Some(base) = inner_of(archive, &t.dst).filter(|b| !b.is_empty()) else {
+                self.fail_msg(&t.dst, "Not a path inside the archive");
+                complete[ti] = false;
+                continue;
+            };
+            let items = match LocalFs.walk(&t.src) {
+                Ok(items) => items,
+                Err(e) => {
+                    complete[ti] = self.fail(&t.src, e);
+                    continue;
+                }
+            };
+            for item in items {
+                if !self.alive() {
+                    return self.restore(saved);
+                }
+                // Never the archive itself (packing its own folder).
+                if same_path(&item.path, archive) {
+                    continue;
+                }
+                let rel = inner_of(&t.src, &item.path).unwrap_or_default();
+                let (dst, inner) = match rel.is_empty() {
+                    true => (t.dst.clone(), base.clone()),
+                    false => (t.dst.join(&rel), format!("{base}/{rel}")),
+                };
+                self.progress.current = Some(item.path.clone());
+                let existing = index.as_ref().and_then(|v| v.stat(&dst).ok().flatten());
+                let modified = item.modified.map(SystemTime::from);
+                if item.is_dir() {
+                    match existing {
+                        Some(e) if !e.is_dir() => {
+                            complete[ti] = self.fail_msg(&dst, "A file with this name already exists");
+                        }
+                        Some(_) => self.item_done(0),
+                        None => adds.push(Add::Dir(inner, modified)),
+                    }
+                    continue;
+                }
+                if let Some(e) = existing {
+                    if e.is_dir() {
+                        complete[ti] = self.fail_msg(&dst, "A folder with this name already exists");
+                        continue;
+                    }
+                    match self.resolve(&item.path, (item.size, modified), &dst, (e.size, e.modified.map(Into::into))) {
+                        Resolution::Overwrite => edits.remove.push(inner.clone()),
+                        Resolution::Cancel => {
+                            self.control.cancel();
+                            return self.restore(saved);
+                        }
+                        _ => {
+                            self.outcome.skipped += 1;
+                            self.item_done(item.size);
+                            complete[ti] = false;
+                            continue;
+                        }
+                    }
+                }
+                adds.push(Add::File { src: item.path, inner, modified, size: item.size, transfer: ti });
+            }
+        }
+        let Some(failed) = self.rewrite(archive, &edits, &adds, &[], saved) else { return };
+        if is_move {
+            for (ti, t) in transfers.iter().enumerate() {
+                if complete[ti] && !failed.contains(&ti) {
+                    self.remove_source(&t.src);
+                }
+            }
+        }
+    }
+
+    /// Moves (or with `keep`, copies) items within the zip `archive`: the
+    /// transfers' sources and destinations are both inside it. An existing
+    /// destination is an error (no merging).
+    fn relocate(&mut self, archive: &Path, transfers: &[Transfer], keep: bool) {
+        let Some(index) = self.open_writable(archive) else { return };
+        let saved = self.snapshot();
+        let mut edits = Edits::default();
+        let mut parents = Vec::new();
+        let mut items = 0;
+        for t in transfers {
+            let (Some((src_file, from)), Some(to)) = (vfs::inner_path(&t.src), inner_of(archive, &t.dst)) else {
+                self.fail_msg(&t.src, "Not a path inside the archive");
+                continue;
+            };
+            if !same_path(&src_file, archive) {
+                self.fail_msg(&t.src, "Can't copy or move between archives: copy out first");
+                continue;
+            }
+            let renamed_case = crate::zip_edit::key(&from) == crate::zip_edit::key(&to);
+            match index.stat(&t.dst) {
+                Ok(Some(_)) if !renamed_case => {
+                    self.fail_msg(&t.dst, "Already exists in the archive");
+                    continue;
+                }
+                Err(e) => {
+                    self.fail(&t.dst, e);
+                    continue;
+                }
+                _ => {}
+            }
+            items += index.walk(&t.src).map_or(1, |w| w.len() as u64);
+            parents.push(inner_parent(&from).to_owned());
+            edits.relocate.push((from, to, keep));
+        }
+        if edits.relocate.is_empty() {
+            return;
+        }
+        let keep_dirs = if keep { Vec::new() } else { parents };
+        if self.rewrite(archive, &edits, &[], &keep_dirs, saved).is_some() {
+            self.progress.done_items += items;
+            self.report(false);
+        }
+    }
+
+    /// Deletes paths inside zip archives (one rewrite per archive). True if
+    /// all of them were deleted.
+    fn delete_in_archives(&mut self, paths: &[PathBuf]) -> bool {
+        let mut groups: Vec<(PathBuf, Vec<String>)> = Vec::new();
+        let mut ok = true;
+        for path in paths {
+            match vfs::inner_path(path).filter(|(_, inner)| !inner.is_empty()) {
+                Some((file, inner)) => match groups.iter_mut().find(|(f, _)| *f == file) {
+                    Some((_, inners)) => inners.push(inner),
+                    None => groups.push((file, vec![inner])),
+                },
+                None => ok = self.fail_msg(path, "Not a path inside an archive"),
+            }
+        }
+        for (archive, inners) in groups {
+            if !self.alive() {
+                return false;
+            }
+            if self.open_writable(&archive).is_none() {
+                ok = false;
+                continue;
+            }
+            let mut keep_dirs: Vec<String> = inners.iter().map(|i| inner_parent(i).to_owned()).collect();
+            keep_dirs.dedup();
+            let edits = Edits { remove: inners, ..Edits::default() };
+            let saved = self.snapshot();
+            ok &= self.rewrite(&archive, &edits, &[], &keep_dirs, saved).is_some();
+        }
+        ok
+    }
+
+    /// Creates a folder: inside a zip by rewriting it, else on disk.
+    fn make_dir(&mut self, path: &Path) {
+        let Some((archive, inner)) = vfs::inner_path(path).filter(|(_, inner)| !inner.is_empty()) else {
+            match fs::create_dir_all(path) {
+                Ok(()) => self.item_done(0),
+                Err(e) => {
+                    self.fail(path, e);
+                }
+            }
+            return;
+        };
+        let Some(index) = self.open_writable(&archive) else { return };
+        if let Ok(Some(e)) = index.stat(path) {
+            let what = if e.is_dir() { "folder" } else { "file" };
+            self.fail_msg(path, format!("A {what} with this name already exists"));
+            return;
+        }
+        let saved = self.snapshot();
+        self.rewrite(&archive, &Edits::default(), &[Add::Dir(inner, Some(SystemTime::now()))], &[], saved);
+    }
+
+    /// Progress and skip counts, to put back when an archive rewrite doesn't
+    /// happen (nothing was done after all).
+    fn snapshot(&self) -> (u64, u64, u64) {
+        (self.progress.done_items, self.progress.done_bytes, self.outcome.skipped)
+    }
+
+    fn restore(&mut self, (items, bytes, skipped): (u64, u64, u64)) {
+        self.progress.done_items = items;
+        self.progress.done_bytes = bytes;
+        self.outcome.skipped = skipped;
+        self.report(true);
+    }
+
+    /// Rewrites `archive` with `edits`, then `adds`, then folder entries for
+    /// `keep_dirs` (the folders of removed items, so a folder that only
+    /// existed implicitly doesn't vanish when emptied). Returns the
+    /// transfers with a file that couldn't be added, or `None` if the archive
+    /// wasn't changed (cancelled or failed; recorded, progress reset to
+    /// `saved`).
+    fn rewrite(&mut self, archive: &Path, edits: &Edits, adds: &[Add], keep_dirs: &[String], saved: (u64, u64, u64))
+        -> Option<HashSet<usize>> {
+        let mut failed = HashSet::new();
+        if edits.remove.is_empty() && edits.relocate.is_empty() && adds.is_empty() {
+            return Some(failed);
+        }
+        let result = self.write_zip(archive, edits, adds, keep_dirs, &mut failed);
+        match result {
+            Ok(true) => Some(failed),
+            Ok(false) => {
+                self.restore(saved);
+                None
+            }
+            Err(e) => {
+                self.fail(archive, e);
+                self.restore(saved);
+                None
+            }
+        }
+    }
+
+    fn write_zip(
+        &mut self,
+        archive: &Path,
+        edits: &Edits,
+        adds: &[Add],
+        keep_dirs: &[String],
+        failed: &mut HashSet<usize>,
+    ) -> io::Result<bool> {
+        self.progress.current = Some(archive.to_path_buf());
+        self.report(true);
+        let mut edit = ZipEdit::begin(archive)?;
+        let control = self.control;
+        if !edit.copy_existing(edits, &mut || control.checkpoint())? {
+            return Ok(false);
+        }
+        for add in adds {
+            if !self.alive() {
+                return Ok(false);
+            }
+            match add {
+                Add::Dir(inner, modified) => {
+                    edit.add_dir(inner, *modified)?;
+                    self.item_done(0);
+                }
+                Add::File { src, inner, modified, size, transfer } => {
+                    self.progress.current = Some(src.clone());
+                    let mut input = match File::open(src) {
+                        Ok(f) => f,
+                        Err(e) => {
+                            self.fail(src, e);
+                            failed.insert(*transfer);
+                            continue;
+                        }
+                    };
+                    edit.start_file(inner, *modified, *size)?;
+                    match self.pump(&mut input, edit.output()) {
+                        Ok(true) => self.item_done(0),
+                        Ok(false) => return Ok(false),
+                        Err(e) => {
+                            edit.abort_file()?;
+                            self.fail(src, e);
+                            failed.insert(*transfer);
+                        }
+                    }
+                }
+            }
+        }
+        for dir in keep_dirs.iter().filter(|d| !d.is_empty()) {
+            edit.add_dir(dir, None)?;
+        }
+        if !self.alive() {
+            return Ok(false);
+        }
+        self.progress.current = Some(archive.to_path_buf());
+        self.report(true);
+        edit.commit()?;
+        Ok(true)
+    }
+
+    /// Removes a moved source after it was copied, without counting it as
+    /// progress again.
+    fn remove_source(&mut self, path: &Path) {
+        let saved = self.snapshot();
+        self.remove(path);
+        self.restore(saved);
     }
 
     /// Permanently deletes `path` (recursively). Links are removed, never
@@ -819,6 +1243,38 @@ impl Runner<'_> {
     }
 }
 
+/// Size and modification time, as conflicts show them.
+fn stat_of(meta: &fs::Metadata) -> (u64, Option<SystemTime>) {
+    (meta.len(), meta.modified().ok())
+}
+
+/// The archive the transfers go into (they share a target folder), if any.
+/// A destination that is the archive file itself is a local copy over it.
+fn dst_archive(transfers: &[Transfer]) -> Option<PathBuf> {
+    let t = transfers.first()?;
+    vfs::split_archive(&t.dst).filter(|(_, inner)| !inner.as_os_str().is_empty()).map(|(file, _)| file)
+}
+
+/// `path` inside `archive` as a `/`-separated inner path (`""` for the
+/// archive itself). Works for archives that don't exist yet.
+fn inner_of(archive: &Path, path: &Path) -> Option<String> {
+    let rest = path.strip_prefix(archive).ok()?;
+    let parts: Vec<String> = rest.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
+    Some(parts.join("/"))
+}
+
+/// The folder holding the inner path `inner` (`""` = the archive root).
+fn inner_parent(inner: &str) -> &str {
+    inner.rfind('/').map_or("", |i| &inner[..i])
+}
+
+/// Something to add to a zip.
+enum Add {
+    Dir(String, Option<SystemTime>),
+    /// A local file; `transfer` indexes the job's transfers.
+    File { src: PathBuf, inner: String, modified: Option<SystemTime>, size: u64, transfer: usize },
+}
+
 /// (bytes, items) under `path`. Links count as one item and aren't followed.
 fn measure(path: &Path) -> (u64, u64) {
     if crate::vfs::is_virtual(path) {
@@ -841,6 +1297,21 @@ fn measure(path: &Path) -> (u64, u64) {
         }
     }
     total
+}
+
+/// Sets a folder's modification time (opening a folder needs
+/// `FILE_FLAG_BACKUP_SEMANTICS` on Windows).
+fn set_dir_modified(dir: &Path, modified: SystemTime) -> io::Result<()> {
+    #[cfg(windows)]
+    let handle = {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_WRITE_ATTRIBUTES: u32 = 0x100;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        fs::OpenOptions::new().access_mode(FILE_WRITE_ATTRIBUTES).custom_flags(FILE_FLAG_BACKUP_SEMANTICS).open(dir)?
+    };
+    #[cfg(not(windows))]
+    let handle = File::open(dir)?;
+    handle.set_modified(modified)
 }
 
 fn clear_readonly(path: &Path) -> io::Result<()> {
@@ -1067,14 +1538,217 @@ mod tests {
         assert!(o.errors.is_empty());
         assert_eq!(fs::read(out.join("Readme.md")).unwrap(), vec![b'r'; 5000]);
 
-        // Single file under a new name; moving out is refused.
+        // Single file under a new name; moving out deletes it in the zip.
         let ts = plan_transfer(&[zip.join("a.txt")], &out.join("renamed.txt")).unwrap();
         let (o, _) = run_job(Job::Copy(ts.clone()), Resolution::Skip);
         assert!(o.errors.is_empty());
         assert_eq!(fs::read(out.join("renamed.txt")).unwrap(), b"hello zip");
+        let ts = plan_transfer(&[zip.join("a.txt"), zip.join("sub")], &out.join("moved")).unwrap();
         let (o, _) = run_job(Job::Move(ts), Resolution::Skip);
+        assert!(o.errors.is_empty(), "{:?}", o.errors);
+        assert_eq!(fs::read(out.join("moved/a.txt")).unwrap(), b"hello zip");
+        assert_eq!(fs::read(out.join("moved/sub/deep/x.txt")).unwrap(), b"deep file");
+        assert_eq!(zip_names(&zip), ["Readme.md"]);
+    }
+
+    /// Every file and folder in a zip (inner paths, sorted), as listed.
+    fn zip_names(zip: &Path) -> Vec<String> {
+        let vfs = vfs::open(zip).unwrap();
+        let mut names: Vec<String> =
+            vfs.walk(zip).unwrap().iter().map(|e| inner_of(zip, &e.path).unwrap()).collect();
+        names.sort();
+        names
+    }
+
+    fn zip_read(path: &Path) -> Vec<u8> {
+        let mut out = Vec::new();
+        vfs::open(path).unwrap().read_files(&[path.to_path_buf()], &mut |_, r| r.read_to_end(&mut out).map(|_| true)).unwrap();
+        out
+    }
+
+    #[test]
+    fn copies_and_moves_into_zip() {
+        let tmp = TempDir::new("zip-in");
+        let src = tree(&tmp.0);
+        let zip = tmp.0.join("a.zip");
+        crate::vfs::tests::make_zip(&zip);
+
+        // The archive itself is a folder to copy into.
+        let ts = plan_transfer(std::slice::from_ref(&src), &zip).unwrap();
+        assert_eq!(ts[0].dst, zip.join("src"));
+        let (o, asked) = run_job(Job::Copy(ts.clone()), Resolution::Skip);
+        assert!(o.errors.is_empty(), "{:?}", o.errors);
+        assert_eq!((asked, o.done_items), (0, 6));
+        let names = zip_names(&zip);
+        let expected = ["Readme.md", "a.txt", "src", "src/a.txt", "src/sub", "src/sub/b.bin", "src/sub/deep"];
+        assert_eq!(names[..7], expected);
+        assert_eq!(zip_read(&zip.join("src/sub/b.bin")), vec![7u8; BUFFER_SIZE * 2 + 5]);
+        // Entries that were there are copied over unchanged.
+        assert_eq!(zip_read(&zip.join("Readme.md")), vec![b'r'; 5000]);
+        assert_eq!(zip_read(&zip.join("sub/deep/x.txt")), b"deep file");
+        // Dates are kept (zip: 2 s steps).
+        let local = fs::metadata(src.join("a.txt")).unwrap().modified().unwrap();
+        let stored: SystemTime = vfs::open(&zip).unwrap().stat(&zip.join("src/a.txt")).unwrap().unwrap().modified.unwrap().into();
+        assert!(local.duration_since(stored).unwrap_or_default() <= Duration::from_secs(2));
+
+        // Again: every file is a conflict.
+        let (o, asked) = run_job(Job::Copy(ts.clone()), Resolution::SkipAll);
+        assert_eq!((asked, o.skipped), (1, 3));
+        fs::write(src.join("a.txt"), b"changed").unwrap();
+        let (o, _) = run_job(Job::Copy(ts.clone()), Resolution::OverwriteAll);
+        assert!(o.errors.is_empty());
+        assert_eq!(zip_read(&zip.join("src/a.txt")), b"changed");
+        assert_eq!(zip_names(&zip).len(), names.len());
+
+        // Into a folder inside, under a new name; then a move.
+        let ts = plan_transfer(&[src.join("a.txt")], &zip.join("sub").join("new.txt")).unwrap();
+        let (o, _) = run_job(Job::Copy(ts), Resolution::Skip);
+        assert!(o.errors.is_empty());
+        assert_eq!(zip_read(&zip.join("sub/new.txt")), b"changed");
+        let ts = plan_transfer(std::slice::from_ref(&src), &zip.join("sub")).unwrap();
+        let (o, _) = run_job(Job::Move(ts), Resolution::Skip);
+        assert!(o.errors.is_empty(), "{:?}", o.errors);
+        assert!(!src.exists());
+        assert_eq!(zip_read(&zip.join("sub/src/sub/deep/c.txt")), b"c");
+    }
+
+    #[test]
+    fn edits_inside_zip() {
+        let tmp = TempDir::new("zip-edit");
+        let zip = tmp.0.join("a.zip");
+        crate::vfs::tests::make_zip(&zip);
+        let ok = |job| {
+            let (o, _) = run_job(job, Resolution::Cancel);
+            assert!(o.errors.is_empty() && !o.cancelled, "{:?}", o.errors);
+            o
+        };
+
+        // Deleting the only file of an implicit folder keeps the folder.
+        let o = ok(Job::Delete { paths: vec![zip.join("sub/deep/x.txt")], to_trash: true });
+        assert_eq!(o.done_items, 1);
+        assert_eq!(zip_names(&zip), ["Readme.md", "a.txt", "sub", "sub/deep"]);
+
+        ok(Job::MakeDir(zip.join("sub/new/inner")));
+        assert_eq!(zip_names(&zip), ["Readme.md", "a.txt", "sub", "sub/deep", "sub/new", "sub/new/inner"]);
+        let (o, _) = run_job(Job::MakeDir(zip.join("SUB")), Resolution::Cancel);
         assert_eq!(o.errors.len(), 1);
-        assert!(zip.is_file());
+
+        // Rename a file (also case only) and a folder with its contents.
+        ok(Job::Rename { from: zip.join("a.txt"), to: zip.join("b.txt") });
+        ok(Job::Rename { from: zip.join("b.txt"), to: zip.join("B.txt") });
+        ok(Job::Rename { from: zip.join("sub"), to: zip.join("folder") });
+        assert_eq!(zip_names(&zip), ["B.txt", "Readme.md", "folder", "folder/deep", "folder/new", "folder/new/inner"]);
+        assert_eq!(zip_read(&zip.join("B.txt")), b"hello zip");
+        let (o, _) = run_job(Job::Rename { from: zip.join("B.txt"), to: zip.join("readme.md") }, Resolution::Cancel);
+        assert_eq!(o.errors.len(), 1);
+
+        // Copy and move within the archive.
+        let ts = plan_transfer(&[zip.join("B.txt")], &zip.join("folder")).unwrap();
+        ok(Job::Copy(ts));
+        let ts = plan_transfer(&[zip.join("Readme.md")], &zip.join("folder").join("new")).unwrap();
+        ok(Job::Move(ts));
+        assert_eq!(zip_read(&zip.join("folder/B.txt")), b"hello zip");
+        assert_eq!(zip_read(&zip.join("folder/new/Readme.md")), vec![b'r'; 5000]);
+        assert_eq!(
+            zip_names(&zip),
+            ["B.txt", "folder", "folder/B.txt", "folder/deep", "folder/new", "folder/new/Readme.md", "folder/new/inner"]
+        );
+
+        ok(Job::Delete { paths: vec![zip.join("folder"), zip.join("B.txt")], to_trash: false });
+        assert!(zip_names(&zip).is_empty());
+    }
+
+    #[test]
+    fn failed_or_cancelled_zip_write_leaves_archive_intact() {
+        let tmp = TempDir::new("zip-fail");
+        let src = tree(&tmp.0);
+        let zip = tmp.0.join("a.zip");
+        crate::vfs::tests::make_zip(&zip);
+        let original = fs::read(&zip).unwrap();
+        let ts = plan_transfer(std::slice::from_ref(&src), &zip).unwrap();
+
+        // Cancelled while writing (when it starts rewriting the archive).
+        struct CancelOnProgress(Arc<Control>, PathBuf);
+        impl Reporter for CancelOnProgress {
+            fn progress(&mut self, p: &Progress) {
+                if p.current.as_ref() == Some(&self.1) {
+                    self.0.cancel();
+                }
+            }
+            fn conflict(&mut self, _: Conflict) -> Resolution {
+                Resolution::Cancel
+            }
+        }
+        let control = Arc::new(Control::default());
+        let o = run(&Job::Move(ts.clone()), &control, &mut CancelOnProgress(control.clone(), zip.clone()));
+        assert!(o.cancelled && o.errors.is_empty());
+        assert_eq!(o.done_items, 0);
+        assert_eq!(fs::read(&zip).unwrap(), original);
+        assert!(src.join("sub/b.bin").exists());
+
+        // Cancelled at a conflict.
+        let (o, _) = run_job(Job::Copy(plan_transfer(&[src.join("a.txt")], &zip).unwrap()), Resolution::Skip);
+        assert!(o.errors.is_empty());
+        let with_a = fs::read(&zip).unwrap();
+        let (o, asked) = run_job(Job::Copy(plan_transfer(&[src.join("a.txt")], &zip).unwrap()), Resolution::Cancel);
+        assert!(o.cancelled && asked == 1);
+        assert_eq!(fs::read(&zip).unwrap(), with_a);
+
+        // The temp file can't be made: an error, the archive is untouched.
+        let blocker = tmp.0.join(format!(".a.zip.{}.rctmp", std::process::id()));
+        fs::create_dir(&blocker).unwrap();
+        let before = fs::read(&zip).unwrap();
+        let (o, _) = run_job(Job::Delete { paths: vec![zip.join("Readme.md")], to_trash: false }, Resolution::Cancel);
+        assert_eq!(o.errors.len(), 1);
+        assert_eq!(fs::read(&zip).unwrap(), before);
+        fs::remove_dir(&blocker).unwrap();
+        // No temp files left behind.
+        let left: Vec<_> = fs::read_dir(&tmp.0).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().ends_with(".rctmp")).collect();
+        assert!(left.is_empty());
+    }
+
+    #[test]
+    fn packs_and_unpacks() {
+        let tmp = TempDir::new("pack");
+        let src = tree(&tmp.0);
+        let archive = tmp.0.join("out").join("new.zip");
+        fs::create_dir(tmp.0.join("out")).unwrap();
+        let sources = vec![src.join("sub"), src.join("a.txt")];
+        let (o, _) = run_job(Job::Pack { sources: sources.clone(), archive: archive.clone() }, Resolution::Cancel);
+        assert!(o.errors.is_empty(), "{:?}", o.errors);
+        assert_eq!(zip_names(&archive), ["a.txt", "sub", "sub/b.bin", "sub/deep", "sub/deep/c.txt"]);
+        // Packing again into it asks about each file.
+        let (o, asked) = run_job(Job::Pack { sources, archive: archive.clone() }, Resolution::SkipAll);
+        assert_eq!((asked, o.skipped), (1, 3));
+
+        // A folder's date survives the round trip.
+        let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1_500_000_000);
+        set_dir_modified(&src.join("sub").join("deep"), old).unwrap();
+        let (o, _) = run_job(Job::Pack { sources: vec![src.join("sub")], archive: tmp.0.join("d.zip") }, Resolution::OverwriteAll);
+        assert!(o.errors.is_empty());
+
+        let target = tmp.0.join("unpacked");
+        let job = Job::Unpack { archives: vec![archive], target: target.clone() };
+        let (o, _) = run_job(job, Resolution::OverwriteAll);
+        assert!(o.errors.is_empty(), "{:?}", o.errors);
+        assert_eq!(fs::read(target.join("a.txt")).unwrap(), b"aaa");
+        assert_eq!(fs::read(target.join("sub/b.bin")).unwrap(), vec![7u8; BUFFER_SIZE * 2 + 5]);
+        let dated = tmp.0.join("dated");
+        let (o, _) = run_job(Job::Unpack { archives: vec![tmp.0.join("d.zip")], target: dated.clone() }, Resolution::Cancel);
+        assert!(o.errors.is_empty(), "{:?}", o.errors);
+        let got = fs::metadata(dated.join("sub").join("deep")).unwrap().modified().unwrap();
+        assert!(got.duration_since(old).unwrap_or_default() <= Duration::from_secs(2), "{got:?}");
+
+        // 7z can't be changed.
+        let seven = tmp.0.join("b.7z");
+        let mut w = sevenz_rust2::ArchiveWriter::create(&seven).unwrap();
+        w.push_archive_entry(sevenz_rust2::ArchiveEntry::new_file("x.txt"), Some(&b"x"[..])).unwrap();
+        w.finish().unwrap();
+        let ts = plan_transfer(&[target.join("a.txt")], &seven).unwrap();
+        let (o, _) = run_job(Job::Copy(ts), Resolution::Cancel);
+        assert_eq!(o.errors.len(), 1);
+        let (o, _) = run_job(Job::Delete { paths: vec![seven.join("x.txt")], to_trash: false }, Resolution::Cancel);
+        assert_eq!(o.errors.len(), 1);
     }
 
     #[test]
