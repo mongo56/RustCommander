@@ -77,7 +77,7 @@ fn main() -> iced::Result {
     let size = session.as_ref().map_or(iced::Size::new(1280.0, 800.0), |s| {
         iced::Size::new(s.width.max(400.0), s.height.max(300.0))
     });
-    iced::application(concat!("RustCommander ", env!("CARGO_PKG_VERSION")), app::App::update, app::App::view)
+    iced::application("RustCommander", app::App::update, app::App::view)
         .theme(app::App::theme)
         .subscription(app::App::subscription)
         .window(iced::window::Settings {
