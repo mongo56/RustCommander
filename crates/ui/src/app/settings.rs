@@ -106,7 +106,36 @@ pub enum SettingsMsg {
     Theme(&'static str),
     Hex(usize, String),
     ResetColor(usize),
+    /// Open the colour picker for colour `i`.
+    PickOpen(usize),
+    PickHue(f32),
+    PickSat(f32),
+    PickVal(f32),
+    PickHex(String),
+    PickOk,
+    PickCancel,
     Close,
+}
+
+/// The colour picker: hue / saturation / value sliders with a live preview
+/// (the colour is only applied, not saved, until OK).
+#[derive(Debug)]
+struct Picker {
+    /// Colour index in `theme::NAMES`.
+    i: usize,
+    /// The colours in use when it opened, put back on cancel.
+    saved: theme::Colors,
+    /// Hue 0..360, saturation and value 0..100.
+    h: f32,
+    s: f32,
+    v: f32,
+    hex: String,
+}
+
+impl Picker {
+    fn color(&self) -> iced::Color {
+        theme::from_hsv(self.h, self.s / 100.0, self.v / 100.0)
+    }
 }
 
 /// Waiting for the key combination to bind to `cmd`.
@@ -133,6 +162,7 @@ pub(super) struct Settings {
     /// The colours being typed, by `theme::NAMES` index.
     hex: Vec<String>,
     capture: Option<Capture>,
+    picker: Option<Picker>,
     /// Ctrl+R pressed once on the keys page (twice resets every key).
     reset_all: bool,
     note: Option<(String, Tone)>,
@@ -155,6 +185,7 @@ impl App {
             terminal: self.config.terminal.clone(),
             hex: current_hex(),
             capture: None,
+            picker: None,
             reset_all: false,
             note: None,
         });
@@ -211,7 +242,25 @@ impl App {
         }
     }
 
+    /// Closes the colour picker; `keep` false puts the old colours back.
+    fn picker_close(&mut self, keep: bool) {
+        if let Some(p) = self.settings.as_mut().and_then(|s| s.picker.take()) {
+            if !keep {
+                theme::set(p.saved);
+            }
+        }
+    }
+
+    /// Applies the picker's colour to the running app (not saved).
+    fn picker_preview(&mut self) {
+        let Some(p) = self.settings.as_mut().and_then(|s| s.picker.as_mut()) else { return };
+        let color = p.color();
+        p.hex = theme::to_hex(color);
+        theme::set(p.saved.with_color(theme::NAMES[p.i], color));
+    }
+
     fn settings_close(&mut self) {
+        self.picker_close(false);
         self.settings_save_editor();
         self.settings = None;
     }
@@ -225,6 +274,7 @@ impl App {
     }
 
     fn settings_page(&mut self, page: Page) -> Task<Message> {
+        self.picker_close(false);
         self.settings_save_editor();
         let Some(s) = &mut self.settings else { return Task::none() };
         s.page = page;
@@ -323,6 +373,9 @@ impl App {
     }
 
     pub(super) fn settings_update(&mut self, msg: SettingsMsg) -> Task<Message> {
+        if matches!(msg, SettingsMsg::Click(_) | SettingsMsg::Theme(_) | SettingsMsg::ResetColor(_)) {
+            self.picker_close(false);
+        }
         let Some(s) = &mut self.settings else { return Task::none() };
         if !matches!(msg, SettingsMsg::ResetAllKeys) {
             s.reset_all = false;
@@ -488,6 +541,60 @@ impl App {
                 }
                 return blur();
             }
+            SettingsMsg::PickOpen(i) => {
+                s.row[2] = i + 1;
+                // Another picker still open: its preview is dropped first.
+                if let Some(old) = s.picker.take() {
+                    theme::set(old.saved);
+                }
+                let saved = theme::c();
+                let (h, sat, v) = theme::to_hsv(saved.get(theme::NAMES[i]).unwrap_or(saved.text));
+                let hex = s.hex[i].clone();
+                s.picker = Some(Picker { i, saved, h, s: sat * 100.0, v: v * 100.0, hex });
+                return blur();
+            }
+            SettingsMsg::PickHue(x) | SettingsMsg::PickSat(x) | SettingsMsg::PickVal(x) => {
+                if let Some(p) = &mut s.picker {
+                    match msg {
+                        SettingsMsg::PickHue(_) => p.h = x,
+                        SettingsMsg::PickSat(_) => p.s = x,
+                        _ => p.v = x,
+                    }
+                    self.picker_preview();
+                }
+            }
+            SettingsMsg::PickHex(value) => {
+                if let Some(p) = &mut s.picker {
+                    match theme::parse_hex(&value) {
+                        Some(color) => {
+                            let (h, sat, v) = theme::to_hsv(color);
+                            // Grey has no hue: keep the slider where it was.
+                            if sat > 0.0 {
+                                p.h = h;
+                            }
+                            p.s = sat * 100.0;
+                            p.v = v * 100.0;
+                            self.picker_preview();
+                            if let Some(p) = self.settings.as_mut().and_then(|s| s.picker.as_mut()) {
+                                p.hex = value;
+                            }
+                        }
+                        None => p.hex = value,
+                    }
+                }
+            }
+            SettingsMsg::PickOk => {
+                let Some(p) = &s.picker else { return Task::none() };
+                if theme::parse_hex(&p.hex).is_none() {
+                    s.note = Some(("Type the colour as #rrggbb".into(), Tone::Error));
+                    return Task::none();
+                }
+                let (i, hex) = (p.i, theme::to_hex(p.color()));
+                // The saved path decides whether the theme's own colour needs writing.
+                self.picker_close(false);
+                return self.settings_update(SettingsMsg::Hex(i, hex));
+            }
+            SettingsMsg::PickCancel => self.picker_close(false),
             SettingsMsg::Close => self.settings_close(),
         }
         Task::none()
@@ -506,6 +613,7 @@ impl App {
         ("Ctrl+R, Ctrl+R (key bindings)", "Default keys for every command"),
         ("Left, Right (theme row)", "Previous / next theme"),
         ("Enter (a colour)", "Type the colour as #rrggbb: it applies as soon as it's valid"),
+        ("Click a swatch (a colour)", "Colour picker: Enter takes the colour, Esc keeps the old one"),
         ("Del (a colour)", "Back to the theme's colour"),
         ("Esc", "Leave a text box / stop waiting for a key / close"),
     ];
@@ -518,6 +626,14 @@ impl App {
         captured: bool,
     ) -> Task<Message> {
         let Some(s) = &mut self.settings else { return Task::none() };
+        // The colour picker takes Enter (OK) and Esc (cancel) and nothing else.
+        if s.picker.is_some() {
+            return match named {
+                Some(Named::Enter) => self.settings_update(SettingsMsg::PickOk),
+                Some(Named::Escape) => self.settings_update(SettingsMsg::PickCancel),
+                _ => Task::none(),
+            };
+        }
         if s.capture.is_some() {
             self.settings_capture_key(named, key, mods);
             return Task::none();
@@ -778,11 +894,18 @@ impl App {
                 let preset = current.map_or(theme::DARK, |p| p.colors);
                 for (i, name) in theme::NAMES.iter().enumerate() {
                     let value = theme::c().get(name).unwrap_or(colors.text);
-                    let swatch = container(Space::new(36, 16)).style(move |_: &Theme| container::Style {
-                        background: Some(value.into()),
-                        border: iced::Border { color: colors.border, width: 1.0, radius: 3.0.into() },
-                        ..container::Style::default()
-                    });
+                    let swatch = button(Space::new(36, 16))
+                        .on_press(msg(SettingsMsg::PickOpen(i)))
+                        .padding(0)
+                        .style(move |_: &Theme, status| button::Style {
+                            background: Some(value.into()),
+                            border: iced::Border {
+                                color: if status == button::Status::Hovered { colors.accent } else { colors.border },
+                                width: 1.0,
+                                radius: 3.0.into(),
+                            },
+                            ..button::Style::default()
+                        });
                     let input = text_input("#rrggbb", &s.hex[i])
                         .id(hex_id(i))
                         .on_input(move |v| msg(SettingsMsg::Hex(i, v)))
@@ -871,7 +994,49 @@ impl App {
         .padding([8, 14])
         .style(filled(colors.header));
 
-        container(column![header, body, footer]).width(Length::Fill).height(Length::Fill).style(filled(colors.bg)).into()
+        let mut page = Column::new().push(header).push(body);
+        if let Some(p) = &s.picker {
+            let value = p.color();
+            let slider_row = |name: &'static str, max: f32, v: f32, make: fn(f32) -> SettingsMsg| {
+                row![
+                    text(name).size(12).width(Length::Fixed(70.0)),
+                    iced::widget::slider(0.0..=max, v, move |x| msg(make(x))).step(1.0_f32).width(Length::Fixed(260.0)),
+                    text(format!("{}", v.round() as i32)).size(12).width(Length::Fixed(36.0)),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center)
+            };
+            let preview = container(Space::new(90, 54)).style(move |_: &Theme| container::Style {
+                background: Some(value.into()),
+                border: iced::Border { color: colors.border, width: 1.0, radius: 4.0.into() },
+                ..container::Style::default()
+            });
+            let input = text_input("#rrggbb", &p.hex)
+                .on_input(move |v| msg(SettingsMsg::PickHex(v)))
+                .padding(3)
+                .size(13)
+                .width(Length::Fixed(90.0))
+                .style(theme::input);
+            let panel = row![
+                column![
+                    text(format!("Colour: {}", theme::NAMES[p.i])).size(13),
+                    slider_row("Hue", 360.0, p.h, SettingsMsg::PickHue),
+                    slider_row("Saturation", 100.0, p.s, SettingsMsg::PickSat),
+                    slider_row("Value", 100.0, p.v, SettingsMsg::PickVal),
+                ]
+                .spacing(6),
+                column![preview, input].spacing(8),
+                column![
+                    action("OK (Enter)", SettingsMsg::PickOk, true),
+                    action("Cancel (Esc)", SettingsMsg::PickCancel, false),
+                ]
+                .spacing(8),
+            ]
+            .spacing(24)
+            .align_y(Alignment::Center);
+            page = page.push(container(panel).width(Length::Fill).padding([8, 14]).style(filled(colors.header)));
+        }
+        container(page.push(footer)).width(Length::Fill).height(Length::Fill).style(filled(colors.bg)).into()
     }
 }
 

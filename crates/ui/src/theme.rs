@@ -203,6 +203,41 @@ impl Colors {
     }
 }
 
+impl Colors {
+    /// These colours with `name` set to `color` (unknown names change nothing).
+    pub fn with_color(mut self, name: &str, color: Color) -> Colors {
+        if let Some(slot) = self.get_mut(name) {
+            *slot = color;
+        }
+        self
+    }
+}
+
+/// Hue (0..360), saturation and value (0..1) of `c`.
+pub fn to_hsv(c: Color) -> (f32, f32, f32) {
+    let max = c.r.max(c.g).max(c.b);
+    let d = max - c.r.min(c.g).min(c.b);
+    let h = if d == 0.0 {
+        0.0
+    } else if max == c.r {
+        60.0 * ((c.g - c.b) / d).rem_euclid(6.0)
+    } else if max == c.g {
+        60.0 * ((c.b - c.r) / d + 2.0)
+    } else {
+        60.0 * ((c.r - c.g) / d + 4.0)
+    };
+    (h, if max == 0.0 { 0.0 } else { d / max }, max)
+}
+
+/// The colour with hue `h` (0..360), saturation `s` and value `v` (0..1).
+pub fn from_hsv(h: f32, s: f32, v: f32) -> Color {
+    let f = |n: f32| {
+        let k = (n + h / 60.0) % 6.0;
+        v - v * s * k.min(4.0 - k).clamp(0.0, 1.0)
+    };
+    Color { r: f(5.0), g: f(3.0), b: f(1.0), a: 1.0 }
+}
+
 /// `#rrggbb` (the `#` is optional).
 pub fn parse_hex(text: &str) -> Option<Color> {
     let hex = text.trim();
@@ -413,6 +448,17 @@ pub fn suggestion(selected: bool) -> impl Fn(&Theme, button::Status) -> button::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hsv_round_trips_every_preset_colour() {
+        for p in PRESETS {
+            for name in NAMES {
+                let hex = to_hex(p.colors.get(name).unwrap());
+                let (h, s, v) = to_hsv(parse_hex(&hex).unwrap());
+                assert_eq!(to_hex(from_hsv(h, s, v)), hex, "{} {name}", p.id);
+            }
+        }
+    }
 
     #[test]
     fn hex_round_trips_and_overrides_apply() {
