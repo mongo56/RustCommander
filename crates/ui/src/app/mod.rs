@@ -171,6 +171,9 @@ enum Dialog {
     Pack { sources: Vec<PathBuf>, base: PathBuf, input: String },
     /// Alt+F9: the folder to unpack `archives` into.
     Unpack { archives: Vec<PathBuf>, base: PathBuf, input: String },
+    /// The password of an encrypted archive; `retry`: a side to take there
+    /// once it's accepted (its listing needed it).
+    Password { archive: PathBuf, input: String, retry: Option<usize> },
     /// Shift+F4: name of the file to create (if missing) and edit.
     EditNew { input: String },
     Delete { paths: Vec<PathBuf>, to_trash: bool },
@@ -742,7 +745,8 @@ impl App {
                     | Dialog::MakeDir { input }
                     | Dialog::EditNew { input }
                     | Dialog::Pack { input, .. }
-                    | Dialog::Unpack { input, .. },
+                    | Dialog::Unpack { input, .. }
+                    | Dialog::Password { input, .. },
                 ) = &mut self.dialog
                 {
                     *input = value;
@@ -1650,6 +1654,20 @@ impl App {
                 let title = format!("Unpacking {} → {}", describe(&archives), target.display());
                 return self.start_job(Job::Unpack { archives, target }, title);
             }
+            Dialog::Password { archive, input, retry } => match vfs::try_password(&archive, &input) {
+                Ok(true) => {
+                    self.status = Some(("Password accepted".into(), Tone::Success));
+                    if let Some(side) = retry {
+                        return self.start_nav(side, Nav::to(archive));
+                    }
+                }
+                Ok(false) => {
+                    self.status = Some(("Wrong password".into(), Tone::Error));
+                    self.dialog = Some(Dialog::Password { archive, input: String::new(), retry });
+                    return text_input::focus(dialog_input_id());
+                }
+                Err(e) => self.status = Some((format!("Can't open the archive: {e}"), Tone::Error)),
+            },
             Dialog::Delete { paths, to_trash } => {
                 // No recycle bin inside archives.
                 let to_trash = to_trash && !paths.iter().any(|p| vfs::is_virtual(p));
@@ -1916,6 +1934,12 @@ impl App {
         true
     }
 
+    /// Asks for the password of the archive `path` is in (or is).
+    fn ask_password(&mut self, path: PathBuf, retry: Option<usize>) -> Task<Message> {
+        let archive = vfs::split_archive(&path).map_or(path, |(file, _)| file);
+        self.open_dialog(Dialog::Password { archive, input: String::new(), retry })
+    }
+
     /// Alt+F5: asks for the name of a zip to pack the selection into, in
     /// the other panel's folder.
     fn open_pack(&mut self) -> Task<Message> {
@@ -2177,7 +2201,21 @@ impl App {
             Ok(Listed { file: None, entries }) => {
                 self.panel_mut(side).arrive(&nav, entries);
                 self.after_change();
+                // Entering an encrypted archive asks for its password.
+                let path = self.panel(side).path.clone();
+                if self.dialog.is_none() && vfs::needs_password(&path) {
+                    return self.ask_password(path, None);
+                }
                 Task::none()
+            }
+            Err(e) if e.contains(vfs::PASSWORD_REQUIRED) && self.dialog.is_none() => {
+                match self.panel(side).nav_target(&nav) {
+                    Some(target) => self.ask_password(target, Some(side)),
+                    None => {
+                        self.status = Some((e, Tone::Error));
+                        Task::none()
+                    }
+                }
             }
             // A vanished history folder: try the one before it.
             Err(_) if self.panel_mut(side).forget_target(&nav) => self.start_nav(side, nav),

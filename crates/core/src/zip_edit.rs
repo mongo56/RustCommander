@@ -81,7 +81,7 @@ impl ZipEdit {
             };
             // Names that can't be shown (`../x`) are kept as they are.
             let Some(parts) = parts else {
-                self.writer().raw_copy_file(source.by_index_raw(i).map_err(io_err)?).map_err(io_err)?;
+                self.copy_raw(&mut source, i, None, is_dir)?;
                 continue;
             };
             let key = parts.join("/").to_lowercase();
@@ -111,6 +111,13 @@ impl ZipEdit {
     fn copy_raw(&mut self, source: &mut ZipArchive<BufReader<File>>, i: usize, name: Option<String>, is_dir: bool)
         -> io::Result<()> {
         let file = source.by_index_raw(i).map_err(io_err)?;
+        // The zip crate copies ZipCrypto entries without their encryption
+        // flag, which would leave them unreadable; AES ones survive.
+        if file.encrypted() && !file.extra_data_fields().any(|e| matches!(e, zip::ExtraField::AeXEncryption(_))) {
+            return Err(io::Error::other(
+                "This zip has files encrypted with ZipCrypto, which can't be kept when changing it",
+            ));
+        }
         let written = name.clone().unwrap_or_else(|| file.name().unwrap_or_default().into_owned());
         if is_dir {
             self.dirs.insert(key(&written));

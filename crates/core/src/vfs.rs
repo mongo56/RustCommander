@@ -11,6 +11,12 @@
 //! archive indexes are cached by path, size and modification time, so
 //! browsing an archive reads its directory once (a tar has no directory:
 //! listing reads it all, and so does reading files from it).
+//!
+//! Encrypted zips (ZipCrypto, AES) and 7z archives (AES, also with
+//! encrypted names) are read with a password given by [`try_password`],
+//! kept per archive for the session. Without one, reading an encrypted
+//! file (or listing a 7z with encrypted names) fails with an error whose
+//! text contains [`PASSWORD_REQUIRED`].
 
 use crate::entry::{Entry, EntryKind};
 use chrono::{DateTime, Local, TimeZone};
@@ -204,6 +210,69 @@ pub fn list(path: &Path, show_hidden: bool) -> io::Result<Vec<Entry>> {
     }
 }
 
+/// In the error text of reads that need an archive's password.
+pub const PASSWORD_REQUIRED: &str = "Password required";
+
+/// Passwords given for archives (archive file, password).
+static PASSWORDS: Mutex<Vec<(PathBuf, String)>> = Mutex::new(Vec::new());
+
+fn password_for(file: &Path) -> Option<String> {
+    let passwords = PASSWORDS.lock().unwrap_or_else(|e| e.into_inner());
+    passwords.iter().find(|(f, _)| f == file).map(|(_, p)| p.clone())
+}
+
+fn set_password(file: &Path, password: Option<&str>) {
+    let mut passwords = PASSWORDS.lock().unwrap_or_else(|e| e.into_inner());
+    passwords.retain(|(f, _)| f != file);
+    if let Some(p) = password {
+        passwords.push((file.to_path_buf(), p.to_owned()));
+    }
+}
+
+fn password_error(file: &Path) -> io::Error {
+    let text = match password_for(file) {
+        Some(_) => "Wrong password".to_owned(),
+        None => format!("{PASSWORD_REQUIRED}: the archive is encrypted (enter the password when opening it)"),
+    };
+    io::Error::new(io::ErrorKind::PermissionDenied, format!("{text}: {}", file.display()))
+}
+
+/// Whether `path` is (in) an archive with encrypted files for which no
+/// password was given yet.
+pub fn needs_password(path: &Path) -> bool {
+    let Some((file, _)) = split_archive(path) else { return false };
+    password_for(&file).is_none() && archive(&file).is_ok_and(|a| a.encrypted.is_some())
+}
+
+/// Tries `password` for the archive of `path`: kept if it opens the
+/// archive and decrypts its smallest encrypted file, else forgotten
+/// (Ok(false)).
+pub fn try_password(path: &Path, password: &str) -> io::Result<bool> {
+    let (file, _) = split_archive(path).ok_or_else(|| io::Error::other("Not an archive"))?;
+    let old = password_for(&file);
+    set_password(&file, Some(password));
+    forget(&file);
+    let works = archive(&file).and_then(|a| match a.encrypted {
+        Some(i) => {
+            let sample = a.entry(i).path;
+            a.read_files(&[sample], &mut |_, r| io::copy(r, &mut io::sink()).map(|_| true))
+        }
+        None => Ok(()),
+    });
+    match works {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied || e.to_string().contains("password") => {
+            set_password(&file, old.as_deref());
+            forget(&file);
+            Ok(false)
+        }
+        Err(e) => {
+            set_password(&file, old.as_deref());
+            Err(e)
+        }
+    }
+}
+
 /// Where [`extract_temp`] puts the copy of a file inside an archive (the
 /// path itself for local files): a folder per archive under the temp dir.
 pub fn temp_path(path: &Path) -> PathBuf {
@@ -290,6 +359,8 @@ struct Archive {
     by_path: HashMap<String, usize>,
     /// Children of each folder (lowercased inner path, `""` = root).
     children: HashMap<String, Vec<usize>>,
+    /// The smallest encrypted file (item index), if any is.
+    encrypted: Option<usize>,
 }
 
 /// A raw entry as the format reader reports it.
@@ -300,6 +371,7 @@ struct Raw {
     modified: Option<DateTime<Local>>,
     hidden: bool,
     source: usize,
+    encrypted: bool,
 }
 
 /// Cached archives: (file, size, mtime) → parsed index; most recent first.
@@ -376,13 +448,34 @@ fn read_zip_index(file: &Path) -> io::Result<Vec<Raw>> {
             modified,
             hidden: f.external_attributes() & 0x2 != 0 && f.unix_mode().is_none(),
             source: i,
+            encrypted: f.encrypted(),
         });
     }
     Ok(raw)
 }
 
+/// Opens a 7z with the archive's password, if one was given.
+fn open_7z(file: &Path) -> io::Result<(sevenz_rust2::Archive, sevenz_rust2::Password)> {
+    let password = password_for(file).map_or_else(sevenz_rust2::Password::empty, |p| p.as_str().into());
+    match sevenz_rust2::Archive::open_with_password(file, &password) {
+        Ok(archive) => Ok((archive, password)),
+        Err(e) => Err(sevenz_err(file, e)),
+    }
+}
+
+fn sevenz_err(file: &Path, e: sevenz_rust2::Error) -> io::Error {
+    match e {
+        sevenz_rust2::Error::PasswordRequired | sevenz_rust2::Error::MaybeBadPassword(_) => password_error(file),
+        e => io_err(e),
+    }
+}
+
 fn read_7z_index(file: &Path) -> io::Result<Vec<Raw>> {
-    let archive = sevenz_rust2::Archive::open(file).map_err(io_err)?;
+    let (archive, _) = open_7z(file)?;
+    // Files in blocks with an AES coder are encrypted.
+    let aes = sevenz_rust2::EncoderMethod::ID_AES256_SHA256;
+    let encrypted: Vec<bool> =
+        archive.blocks.iter().map(|b| b.coders.iter().any(|c| c.encoder_method_id() == aes)).collect();
     let mut raw = Vec::with_capacity(archive.files.len());
     for (i, f) in archive.files.iter().enumerate() {
         if f.is_anti_item {
@@ -400,6 +493,7 @@ fn read_7z_index(file: &Path) -> io::Result<Vec<Raw>> {
             modified,
             hidden: f.has_windows_attributes && f.windows_attributes & 0x6 != 0,
             source: i,
+            encrypted: archive.stream_map.file_block_index.get(i).copied().flatten().is_some_and(|b| encrypted[b]),
         });
     }
     Ok(raw)
@@ -443,6 +537,7 @@ fn read_tar_index(file: &Path, format: Format) -> io::Result<Vec<Raw>> {
             modified,
             hidden: false,
             source: i,
+            encrypted: false,
         });
     }
     Ok(raw)
@@ -461,16 +556,28 @@ fn read_gz_index(file: &Path) -> io::Result<Vec<Raw>> {
     }
     let modified = f.metadata()?.modified().ok().map(DateTime::<Local>::from);
     let name = file.file_stem().unwrap_or_default().to_string_lossy().into_owned();
-    Ok(vec![Raw { name, is_dir: false, size: u32::from_le_bytes(size).into(), modified, hidden: false, source: 0 }])
+    let size = u32::from_le_bytes(size).into();
+    Ok(vec![Raw { name, is_dir: false, size, modified, hidden: false, source: 0, encrypted: false }])
 }
 
 impl Archive {
     fn build(file: PathBuf, format: Format, raw: Vec<Raw>) -> Self {
-        let mut archive =
-            Archive { file, format, items: Vec::new(), by_path: HashMap::new(), children: HashMap::new() };
+        let mut archive = Archive {
+            file,
+            format,
+            items: Vec::new(),
+            by_path: HashMap::new(),
+            children: HashMap::new(),
+            encrypted: None,
+        };
         archive.children.insert(String::new(), Vec::new());
+        // The smallest encrypted file: (size, key).
+        let mut smallest: Option<(u64, String)> = None;
         for r in raw {
             let Some(parts) = clean_parts(&r.name) else { continue };
+            if r.encrypted && !r.is_dir && smallest.as_ref().is_none_or(|(size, _)| r.size < *size) {
+                smallest = Some((r.size, parts.join("/").to_lowercase()));
+            }
             let parts: Vec<String> = parts.into_iter().map(str::to_owned).collect();
             // Implicit parent folders.
             for depth in 1..parts.len() {
@@ -478,6 +585,7 @@ impl Archive {
             }
             archive.add(&parts, Some(r));
         }
+        archive.encrypted = smallest.and_then(|(_, key)| archive.by_path.get(&key).copied());
         archive
     }
 
@@ -575,9 +683,20 @@ impl Archive {
         -> io::Result<()> {
         let wanted = self.sources(files)?;
         let mut zip = zip::ZipArchive::new(BufReader::new(File::open(&self.file)?)).map_err(io_err)?;
+        let password = password_for(&self.file);
         for (i, source) in wanted {
             let Some(source) = source else { continue };
-            let mut f = zip.by_index(source).map_err(io_err)?;
+            let encrypted = zip.by_index_raw(source).map_err(io_err)?.encrypted();
+            let found = match (encrypted, &password) {
+                (false, _) => zip.by_index(source),
+                (true, Some(p)) => zip.by_index_decrypt(source, p.as_bytes()),
+                (true, None) => return Err(password_error(&self.file)),
+            };
+            let mut f = match found {
+                Ok(f) => f,
+                Err(zip::result::ZipError::InvalidPassword) => return Err(password_error(&self.file)),
+                Err(e) => return Err(io_err(e)),
+            };
             if !each(i, &mut f)? {
                 break;
             }
@@ -629,8 +748,7 @@ impl Archive {
     fn read_7z(&self, files: &[PathBuf], each: &mut dyn FnMut(usize, &mut dyn Read) -> io::Result<bool>)
         -> io::Result<()> {
         let wanted = self.sources(files)?;
-        let password = sevenz_rust2::Password::empty();
-        let archive = sevenz_rust2::Archive::open(&self.file).map_err(io_err)?;
+        let (archive, password) = open_7z(&self.file)?;
         let mut source = BufReader::new(File::open(&self.file)?);
         let map = &archive.stream_map;
         // Wanted files by archive index, grouped by block.
@@ -668,9 +786,11 @@ impl Archive {
             let decoder = sevenz_rust2::BlockDecoder::new(1, block, &archive, &password, &mut source);
             let result = decoder.for_each_entries(&mut on_entry);
             if let Some(e) = failure {
-                return Err(e);
+                // A wrong password shows as garbage data.
+                let garbled = e.to_string().contains("password") || e.kind() == io::ErrorKind::InvalidData;
+                return Err(if garbled && self.encrypted.is_some() { password_error(&self.file) } else { e });
             }
-            result.map_err(io_err)?;
+            result.map_err(|e| sevenz_err(&self.file, e))?;
             if stop {
                 break;
             }
@@ -975,6 +1095,52 @@ pub(crate) mod tests {
         assert_eq!(entries[1].size, 12);
         let vfs = open(&single).unwrap();
         assert_eq!(read_all(&*vfs, &[single.join("notes.txt")]), [(0, b"gzipped text".to_vec())]);
+    }
+
+    #[test]
+    fn reads_encrypted_archives_with_a_password() {
+        let dir = TempDir::new("password");
+        let zip = dir.0.join("secret.zip");
+        let mut w = zip::ZipWriter::new(File::create(&zip).unwrap());
+        let opts = zip::write::SimpleFileOptions::default();
+        w.start_file("plain.txt", opts).unwrap();
+        w.write_all(b"open").unwrap();
+        w.start_file("sub/hidden.txt", opts.with_aes_encryption(zip::AesMode::Aes256, "s3cret")).unwrap();
+        w.write_all(b"classified").unwrap();
+        w.finish().unwrap();
+
+        // Listing works; reading the encrypted file needs the password.
+        assert_eq!(names(&list(&zip, true).unwrap()), ["..", "plain.txt", "sub"]);
+        assert!(needs_password(&zip));
+        let vfs = open(&zip).unwrap();
+        assert_eq!(read_all(&*vfs, &[zip.join("plain.txt")]), [(0, b"open".to_vec())]);
+        let err = vfs.read_files(&[zip.join("sub/hidden.txt")], &mut |_, _| Ok(true)).unwrap_err();
+        assert!(err.to_string().contains(PASSWORD_REQUIRED), "{err}");
+        assert!(!try_password(&zip.join("sub"), "wrong").unwrap());
+        assert!(needs_password(&zip));
+        assert!(try_password(&zip, "s3cret").unwrap());
+        assert!(!needs_password(&zip.join("sub")));
+        let vfs = open(&zip).unwrap();
+        assert_eq!(read_all(&*vfs, &[zip.join("sub/hidden.txt")]), [(0, b"classified".to_vec())]);
+
+        // 7z with encrypted names: listing needs the password.
+        use sevenz_rust2::{encoder_options::AesEncoderOptions, ArchiveEntry, ArchiveWriter, EncoderMethod};
+        let seven = dir.0.join("secret.7z");
+        let mut w = ArchiveWriter::create(&seven).unwrap();
+        w.set_content_methods(vec![
+            AesEncoderOptions::new("pw7".into()).into(),
+            EncoderMethod::LZMA2.into(),
+        ]);
+        w.set_encrypt_header(true);
+        w.push_archive_entry(ArchiveEntry::new_file("x.txt"), Some(&b"seven secret"[..])).unwrap();
+        w.finish().unwrap();
+        let err = list(&seven, true).unwrap_err();
+        assert!(err.to_string().contains(PASSWORD_REQUIRED), "{err}");
+        assert!(!try_password(&seven, "nope").unwrap());
+        assert!(try_password(&seven, "pw7").unwrap());
+        assert_eq!(names(&list(&seven, true).unwrap()), ["..", "x.txt"]);
+        let vfs = open(&seven).unwrap();
+        assert_eq!(read_all(&*vfs, &[seven.join("x.txt")]), [(0, b"seven secret".to_vec())]);
     }
 
     #[test]

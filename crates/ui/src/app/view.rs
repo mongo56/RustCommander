@@ -561,6 +561,12 @@ impl App {
                 Some(input_field(input)),
                 "Unpack",
             ),
+            Dialog::Password { archive, input, .. } => (
+                "Password".into(),
+                format!("{} is encrypted. Password:", archive.file_name().unwrap_or_default().to_string_lossy()),
+                Some(input_field(input).secure(true)),
+                "OK",
+            ),
             Dialog::EditNew { input } => (
                 "Edit file".into(),
                 format!("File to edit (created if missing) in {}:", self.panel(self.active).path.display()),

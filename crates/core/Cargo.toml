@@ -11,8 +11,8 @@ trash.workspace = true
 memchr = "2.7"
 regex = "1"
 similar = { version = "3.2.1", default-features = false, features = ["std"] }
-zip = { version = "9.2", default-features = false, features = ["deflate-flate2-zlib-rs", "deflate64", "bzip2", "lzma", "xz", "zstd"] }
-sevenz-rust2 = { version = "0.24", default-features = false, features = ["bzip2", "ppmd", "deflate"] }
+zip = { version = "9.2", default-features = false, features = ["deflate-flate2-zlib-rs", "deflate64", "bzip2", "lzma", "xz", "zstd", "aes-crypto"] }
+sevenz-rust2 = { version = "0.24", default-features = false, features = ["bzip2", "ppmd", "deflate", "aes256"] }
 tar = "0.4"
 flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 bzip2 = "0.6"
@@ -21,4 +21,4 @@ bzip2 = "0.6"
 junction = "2.1"
 
 [dev-dependencies]
-sevenz-rust2 = { version = "0.24", default-features = false, features = ["compress"] }
+sevenz-rust2 = { version = "0.24", default-features = false, features = ["compress", "aes256"] }
