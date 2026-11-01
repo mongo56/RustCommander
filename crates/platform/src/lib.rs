@@ -65,11 +65,12 @@ pub fn open_default(path: &Path) -> io::Result<()> {
 }
 
 /// Starts `program` with `args` in `dir` without waiting for it, letting
-/// it take the foreground.
-pub fn spawn_detached(program: &str, args: &[std::ffi::OsString], dir: &Path) -> io::Result<()> {
+/// it take the foreground. The child can be polled to see when it exits
+/// (dropping it doesn't stop the program).
+pub fn spawn_detached(program: &str, args: &[std::ffi::OsString], dir: &Path) -> io::Result<std::process::Child> {
     #[cfg(windows)]
     win::allow_foreground();
-    std::process::Command::new(program).args(args).current_dir(dir).spawn().map(|_| ())
+    std::process::Command::new(program).args(args).current_dir(dir).spawn()
 }
 
 /// True for files that start a program rather than open a document.

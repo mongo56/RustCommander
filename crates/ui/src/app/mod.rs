@@ -1,6 +1,7 @@
 //! Application state and update logic. Drawing lives in [`view`].
 
 mod view;
+mod archive_edit;
 mod connect;
 mod file_diff;
 mod help;
@@ -150,6 +151,8 @@ pub struct App {
     /// Window position from the last session or the last quit, saved with
     /// the session.
     placement: Option<rc_platform::Placement>,
+    /// Files from zips open in the editor (F4), put back on save.
+    archive_edits: archive_edit::ArchiveEdits,
 }
 
 /// A navigation whose target folder is being listed in the background.
@@ -273,7 +276,7 @@ struct RunningJob {
     title: String,
     done_verb: &'static str,
     /// Side whose selection is cleared when the job succeeds.
-    source_side: usize,
+    source_side: Option<usize>,
     handle: JobHandle,
     progress: Progress,
     conflict: Option<Conflict>,
@@ -366,6 +369,8 @@ pub enum Message {
     Navigated(usize, u64, Listing),
     /// A file inside an archive was extracted to a temp copy to be opened.
     Extracted(Result<PathBuf, String>),
+    /// F4 inside an archive: extracted, or time to check the edited copies.
+    ArchiveEdit(archive_edit::EditMsg),
     /// Subfolders of a folder, for path bar suggestions.
     Subfolders(PathBuf, Vec<String>),
     /// A folder size: (folder listed, entry name, size).
@@ -447,6 +452,7 @@ impl App {
             keymap: keymap::Keymap::default(),
             config_stamp: None,
             placement: session.as_ref().and_then(|s| s.window).map(Into::into),
+            archive_edits: archive_edit::ArchiveEdits::default(),
         };
         app.refresh_config();
         // First start: hidden files as configured.
@@ -716,6 +722,7 @@ impl App {
                 if placement.is_some() {
                     self.placement = placement;
                 }
+                self.archive_edits_flush();
                 self.save_session();
                 return iced::exit();
             }
@@ -881,6 +888,7 @@ impl App {
             Message::Find(msg) => return self.find_update(msg),
             Message::Connect(msg) => return self.connect_update(msg),
             Message::Settings(msg) => return self.settings_update(msg),
+            Message::ArchiveEdit(msg) => return self.archive_edit_update(msg),
             Message::Navigated(side, seq, result) => {
                 let current = self.sides[side].current;
                 let pending = self.nav[side].take_if(|p| p.seq == seq && p.tab == current);
@@ -1117,6 +1125,8 @@ impl App {
         // In archives: zips can be changed (as jobs), others can't; nothing can
         // be edited in place. `bool` = allowed in a zip.
         let refused = match cmd {
+            // Files in archives are edited as temp copies (`archive_edit`).
+            Edit if !remote::is_remote(&self.panel(active).path) => None,
             Edit | EditNew => Some(("edit files", false)),
             MultiRename => Some(("multi-rename", false)),
             MakeDir => Some(("create folders", true)),
@@ -1145,6 +1155,9 @@ impl App {
             Edit => {
                 if let Some(e) = self.panel(active).current().filter(|e| e.kind == EntryKind::File) {
                     let (path, name) = (e.path.clone(), e.name.clone());
+                    if vfs::is_virtual(&path) {
+                        return self.edit_in_archive(path);
+                    }
                     self.edit_file(&path, &name);
                 }
                 return Task::none();
@@ -1995,7 +2008,7 @@ impl App {
             id,
             title,
             done_verb,
-            source_side: self.active,
+            source_side: Some(self.active),
             handle,
             progress: Progress::default(),
             conflict: None,
@@ -2020,8 +2033,8 @@ impl App {
             JobEvent::Finished(outcome) => {
                 let Some(pos) = self.jobs.iter().position(|j| j.id == id) else { return };
                 let job = self.jobs.remove(pos);
-                if outcome.errors.is_empty() && !outcome.cancelled && outcome.skipped == 0 {
-                    self.panel_mut(job.source_side).deselect_all();
+                if let Some(side) = job.source_side.filter(|_| outcome.errors.is_empty() && !outcome.cancelled && outcome.skipped == 0) {
+                    self.panel_mut(side).deselect_all();
                 }
                 self.disk.borrow_mut().clear();
                 self.reload_panels();
@@ -2034,6 +2047,7 @@ impl App {
                     }
                 }
                 self.status = Some(summarize(job.done_verb, &outcome));
+                self.archive_edit_job_done(id, &outcome);
                 self.after_change();
             }
         }
@@ -2481,7 +2495,7 @@ impl App {
     fn edit_file(&mut self, path: &Path, name: &str) {
         self.refresh_config();
         self.status = Some(match crate::editor::launch(&self.config.editor, path) {
-            Ok(()) => (format!("Editing {name}"), Tone::Success),
+            Ok(_) => (format!("Editing {name}"), Tone::Success),
             Err(e) => (format!("Can't start the editor: {e}"), Tone::Error),
         });
     }

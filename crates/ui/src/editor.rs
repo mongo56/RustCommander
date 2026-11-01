@@ -4,17 +4,20 @@
 use std::ffi::OsString;
 use std::io;
 use std::path::Path;
+use std::process::Child;
 
-/// Opens `path` in the editor `command` (empty = platform default).
-pub fn launch(command: &str, path: &Path) -> io::Result<()> {
+/// Opens `path` in the editor `command` (empty = platform default). Returns
+/// the editor's process when one was started directly (not through the
+/// file's default app).
+pub fn launch(command: &str, path: &Path) -> io::Result<Option<Child>> {
     let dir = path.parent().unwrap_or(Path::new("."));
     let command = if command.trim().is_empty() { default_editor() } else { Some(command.to_owned()) };
     let Some(command) = command else {
-        return rc_platform::open_default(path);
+        return rc_platform::open_default(path).map(|_| None);
     };
     let (program, args) = command_line(&command, path, true)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "editor command is empty"))?;
-    rc_platform::spawn_detached(&program, &args, dir)
+    rc_platform::spawn_detached(&program, &args, dir).map(Some)
 }
 
 fn default_editor() -> Option<String> {

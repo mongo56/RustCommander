@@ -436,6 +436,13 @@ fn mark_used(copy: &Path) -> io::Result<()> {
     stamp.set_modified(SystemTime::now())
 }
 
+/// Marks the temp copy `copy` (from [`extract_temp`]) as still in use, so
+/// [`clean_temp`] keeps it, e.g. while it's open in an editor.
+pub fn keep_temp(copy: &Path) -> io::Result<()> {
+    let _lock = TEMP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    mark_used(copy)
+}
+
 /// Deletes temp copies in [`temp_root`] (of earlier runs or other
 /// instances) whose folder wasn't used for `max_age`. Files that can't be
 /// deleted (open in another program) are left, and so is anything in

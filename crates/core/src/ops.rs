@@ -50,6 +50,24 @@ pub enum Job {
     Pack { sources: Vec<PathBuf>, archive: PathBuf },
     /// Unpacks each archive's contents into the folder `target`.
     Unpack { archives: Vec<PathBuf>, target: PathBuf },
+    /// Puts the edited temp copy `src` back into its zip as the file `dst`
+    /// (F4 inside an archive), replacing it without asking, but only if
+    /// that file is still as `expect` says (see [`entry_stamp`]); otherwise
+    /// it changed in the archive meanwhile and nothing is overwritten.
+    Update { src: PathBuf, dst: PathBuf, expect: Stamp },
+}
+
+/// Size and date of a file inside an archive (`None`: there's no such
+/// file), to tell whether it changed.
+pub type Stamp = Option<(u64, Option<DateTime<Local>>)>;
+
+/// The [`Stamp`] of `path` inside an archive, as it is now.
+pub fn entry_stamp(path: &Path) -> io::Result<Stamp> {
+    Ok(stamp_of(vfs::open(path)?.stat(path)?))
+}
+
+fn stamp_of(entry: Option<Entry>) -> Stamp {
+    entry.filter(|e| !e.is_dir()).map(|e| (e.size, e.modified))
 }
 
 impl Job {
@@ -64,6 +82,7 @@ impl Job {
             Job::Rename { .. } => "Renamed",
             Job::Pack { .. } => "Packed",
             Job::Unpack { .. } => "Unpacked",
+            Job::Update { .. } => "Updated",
         }
     }
 
@@ -77,6 +96,7 @@ impl Job {
             Job::Rename { .. } => "Renaming",
             Job::Pack { .. } => "Packing",
             Job::Unpack { .. } => "Unpacking",
+            Job::Update { .. } => "Updating",
         }
     }
 }
@@ -465,6 +485,13 @@ pub fn run(job: &Job, control: &Control, reporter: &mut dyn Reporter) -> Outcome
                 }
                 runner.extract(&Transfer { src: archive.clone(), dst: target.clone() });
             }
+        }
+        Job::Update { src, dst, expect } => {
+            let (bytes, items) = measure(src);
+            runner.progress.total_bytes = bytes;
+            runner.progress.total_items = items;
+            runner.report(true);
+            runner.update_entry(src, dst, expect);
         }
         Job::Delete { paths, to_trash: true } => {
             runner.progress.total_items = paths.len() as u64;
@@ -1051,6 +1078,37 @@ impl Runner<'_> {
             }
         }
         done
+    }
+
+    /// [`Job::Update`]: replaces the file `dst` in its zip with `src`, if
+    /// it's still as `expect` says.
+    fn update_entry(&mut self, src: &Path, dst: &Path, expect: &Stamp) {
+        let Some((archive, _)) = vfs::split_archive(dst) else {
+            self.fail_msg(dst, "Not a path inside an archive");
+            return;
+        };
+        if vfs::archive_writable(&archive) == Some(false) {
+            self.fail_msg(&archive, "Only zip archives can be changed (not ones inside other archives)");
+            return;
+        }
+        let Some(index) = self.open_writable(&archive) else { return };
+        let now = match index.stat(dst) {
+            Ok(entry) => stamp_of(entry),
+            Err(e) => {
+                self.fail(dst, e);
+                return;
+            }
+        };
+        if now != *expect {
+            let msg = match now {
+                None => "It was removed from the archive since it was opened for editing: not put back",
+                Some(_) => "It changed in the archive since it was opened for editing: not overwritten",
+            };
+            self.fail_msg(dst, msg);
+            return;
+        }
+        self.sticky = Some(Resolution::OverwriteAll);
+        self.pack(&archive, &[Transfer { src: src.to_path_buf(), dst: dst.to_path_buf() }], false);
     }
 
     /// Copies or moves files and folders from other archives (any kind that
@@ -1968,6 +2026,60 @@ mod tests {
         assert!(o.errors.is_empty(), "{:?}", o.errors);
         assert!(!src.exists());
         assert_eq!(zip_read(&zip.join("sub/src/sub/deep/c.txt")), b"c");
+    }
+
+    #[test]
+    fn updates_edited_entry() {
+        let tmp = TempDir::new("zip-update");
+        let zip = tmp.0.join("a.zip");
+        crate::vfs::tests::make_zip(&zip);
+        let entry = zip.join("sub").join("deep").join("x.txt");
+        let opened = entry_stamp(&entry).unwrap();
+        assert_eq!(opened.map(|s| s.0), Some(9));
+        let copy = tmp.0.join("x.txt");
+
+        // Saved in the editor: replaced without asking, the rest kept.
+        fs::write(&copy, b"edited").unwrap();
+        let (o, asked) = run_job(Job::Update { src: copy.clone(), dst: entry.clone(), expect: opened }, Resolution::Cancel);
+        assert!(o.errors.is_empty() && !o.cancelled, "{:?}", o.errors);
+        assert_eq!((asked, o.done_items), (0, 1));
+        assert_eq!(zip_read(&entry), b"edited");
+        assert_eq!(zip_names(&zip), ["Readme.md", "a.txt", "sub", "sub/deep", "sub/deep/x.txt"]);
+        assert_eq!(zip_read(&zip.join("Readme.md")), vec![b'r'; 5000]);
+        let saved = entry_stamp(&entry).unwrap();
+        assert_eq!(saved.map(|s| s.0), Some(6));
+
+        // Saved again, with the stamp from after the last save.
+        fs::write(&copy, b"edited twice").unwrap();
+        let (o, _) = run_job(Job::Update { src: copy.clone(), dst: entry.clone(), expect: saved }, Resolution::Cancel);
+        assert!(o.errors.is_empty(), "{:?}", o.errors);
+        assert_eq!(zip_read(&entry), b"edited twice");
+
+        // Changed in the archive by someone else meanwhile: not overwritten.
+        let other = tmp.0.join("other");
+        fs::create_dir_all(&other).unwrap();
+        fs::write(other.join("x.txt"), b"someone else's change").unwrap();
+        let theirs = entry_stamp(&entry).unwrap();
+        let ts = plan_transfer(&[other.join("x.txt")], &zip.join("sub").join("deep")).unwrap();
+        let (o, _) = run_job(Job::Copy(ts), Resolution::OverwriteAll);
+        assert!(o.errors.is_empty(), "{:?}", o.errors);
+        fs::write(&copy, b"mine").unwrap();
+        let (o, _) = run_job(Job::Update { src: copy.clone(), dst: entry.clone(), expect: theirs }, Resolution::Overwrite);
+        assert_eq!(o.errors.len(), 1);
+        assert!(o.errors[0].1.contains("changed in the archive"), "{:?}", o.errors);
+        assert_eq!(zip_read(&entry), b"someone else's change");
+
+        // Removed meanwhile: not put back.
+        let now = entry_stamp(&entry).unwrap();
+        let (o, _) = run_job(Job::Delete { paths: vec![entry.clone()], to_trash: false }, Resolution::Cancel);
+        assert!(o.errors.is_empty());
+        let (o, _) = run_job(Job::Update { src: copy.clone(), dst: entry.clone(), expect: now }, Resolution::Overwrite);
+        assert!(o.errors.len() == 1 && o.errors[0].1.contains("removed"), "{:?}", o.errors);
+        assert_eq!(entry_stamp(&entry).unwrap(), None);
+
+        // Not in a zip (a 7z, or a zip inside one): refused.
+        let (o, _) = run_job(Job::Update { src: copy.clone(), dst: tmp.0.join("a.7z").join("x.txt"), expect: None }, Resolution::Cancel);
+        assert_eq!(o.errors.len(), 1);
     }
 
     #[test]

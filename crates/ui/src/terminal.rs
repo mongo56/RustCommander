@@ -12,7 +12,7 @@ pub fn launch(command: &str, dir: &Path) -> io::Result<()> {
     let command = if command.trim().is_empty() { default_terminal() } else { command.to_owned() };
     let (program, args) = command_line(&command, dir, false)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "terminal command is empty"))?;
-    rc_platform::spawn_detached(&program, &args, dir)
+    rc_platform::spawn_detached(&program, &args, dir).map(|_| ())
 }
 
 /// Windows Terminal when installed, else PowerShell; elsewhere `$TERMINAL`
