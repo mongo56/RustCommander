@@ -144,4 +144,4 @@ shell integration and the build are Windows-specific.
 
 ## License
 
-TBD
+MIT — see [LICENSE](LICENSE).
