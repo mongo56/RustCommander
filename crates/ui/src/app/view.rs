@@ -798,26 +798,48 @@ impl App {
     }
 
     fn bottom_bar(&self) -> Element<'_, Message> {
+        const CHAR_W: f32 = 6.6; // rough width of a size-12 character
+        // Hint on the right (only without the function-key bar): full, keys only, or hidden as the window narrows.
+        let hint = if self.config.show_fkeys {
+            String::new()
+        } else {
+            let full = self.keymap.bar_hint();
+            let short = self.keymap.bar_hint_short();
+            let need = |s: &str| s.chars().count() as f32 * CHAR_W + 20.0;
+            if self.window_width >= need(&full) * 2.2 {
+                full
+            } else if self.window_width >= need(&short) * 2.5 {
+                short
+            } else {
+                String::new()
+            }
+        };
+        let hint_w = if hint.is_empty() { 0.0 } else { hint.chars().count() as f32 * CHAR_W + 16.0 };
+        let room = ((self.window_width - 20.0 - hint_w) / CHAR_W).max(0.0) as usize;
+        let ellipsize = |msg: &str| -> String {
+            if msg.chars().count() <= room {
+                msg.to_string()
+            } else {
+                let cut: String = msg.chars().take(room.saturating_sub(1)).collect();
+                format!("{}…", cut.trim_end())
+            }
+        };
         let status = match &self.status {
-            Some((msg, tone)) => text(msg.as_str()).size(12).color(match tone {
+            Some((msg, tone)) => text(ellipsize(&msg.replace('\n', " "))).size(12).color(match tone {
                 Tone::Info => theme::c().text,
                 Tone::Success => theme::c().success,
                 Tone::Error => theme::c().error,
             }),
-            None => text(
-                "F1 help · Type to find · Tab switch panel · Ctrl+T new tab · F2 rename · \
-                 Drag to copy (Shift = move, out of the window = other apps) · Click path to edit · \
-                 Right-click for menu",
-            )
-            .size(12)
-            .color(theme::c().muted),
+            None => text(""),
         };
 
         if !self.config.show_fkeys {
             // Just a status line with a quiet hint on the right.
-            let hint = text(self.keymap.bar_hint()).size(12).color(theme::c().muted).wrapping(Wrapping::None);
+            let hint = text(hint).size(12).color(theme::c().muted).wrapping(Wrapping::None);
             return container(row![container(status.wrapping(Wrapping::None)).clip(true), Space::with_width(Length::Fill), hint].spacing(16))
                 .padding([3, 10])
+                .width(Length::Fill)
+                .clip(true)
                 .into();
         }
 

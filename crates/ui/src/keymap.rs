@@ -99,8 +99,19 @@ impl Keymap {
     /// The hint shown instead of the function-key bar: the first key of
     /// help, the command palette and the settings, as they are bound now.
     pub fn bar_hint(&self) -> String {
+        self.bar_hint_with(true)
+    }
+
+    /// `bar_hint` without the descriptions ("F1 · Ctrl+Space · F10"), for narrow windows.
+    pub fn bar_hint_short(&self) -> String {
+        self.bar_hint_with(false)
+    }
+
+    fn bar_hint_with(&self, described: bool) -> String {
         let bindings = self.bindings();
-        let part = |cmd: Command, what: &str| Keymap::keys_for(&bindings, cmd).first().map(|key| format!("{key} {what}"));
+        let part = |cmd: Command, what: &str| {
+            Keymap::keys_for(&bindings, cmd).first().map(|key| if described { format!("{key} {what}") } else { key.to_string() })
+        };
         let parts: Vec<String> = [
             part(Command::Help, "help"),
             part(Command::CommandPalette, "command palette"),
