@@ -570,7 +570,24 @@ impl App {
             Message::Click(side, index) => {
                 self.leave_edits();
                 self.active = side;
-                self.panel_mut(side).set_cursor(index);
+                let (ctrl, shift) = (self.modifiers.control(), self.modifiers.shift());
+                if ctrl || shift {
+                    // Selecting: Ctrl+click toggles, Shift+click picks the
+                    // range from the anchor, Ctrl+Shift+click adds it. No
+                    // drag, no double click.
+                    let panel = self.panel_mut(side);
+                    if shift {
+                        panel.select_range_to(index, ctrl);
+                    } else {
+                        panel.toggle_at(index);
+                    }
+                    self.drag = None;
+                    self.last_click = None;
+                    return Task::none();
+                }
+                let panel = self.panel_mut(side);
+                panel.set_cursor(index);
+                panel.mark_anchor();
                 self.drag = Some(Drag { side, start: None, active: false, sources: Vec::new(), right: false, index });
                 let now = Instant::now();
                 let double = matches!(
@@ -910,7 +927,11 @@ impl App {
         ("Typing, Backspace (quick filter)", "Edit the filter; Esc drops it, other keys keep it"),
         ("Esc", "Cancel a slow folder change, drop the filter, then clear the selection"),
         ("F2 / Shift+F6 (renaming)", "Select the name without extension, the extension, the whole name; Enter renames, Esc cancels"),
-        ("Click, double-click", "Move the cursor, open"),
+        ("Click, double-click", "Move the cursor (the selection stays), open"),
+        ("Ctrl+click", "Select / unselect one item"),
+        ("Shift+click", "Select the range from the last clicked item to this one"),
+        ("Ctrl+Shift+click", "Add that range to the selection"),
+        ("Shift+Up/Down/PgUp/PgDn/Home/End", "Move and select the range from the cursor's starting point"),
         ("Middle-click a folder or drive", "Open it in a new tab"),
         ("Enter / Ctrl+PgDn on a .zip, .7z, .tar, .tar.gz, .gz, ...", "Browse the archive like a folder: view, copy out, Enter opens a temp copy; in a zip also copy/move in (also from other archives), F7, F2, F8 (others are read-only)"),
         ("Ctrl+F, then Enter", "Connect to an SFTP/FTP/FTPS server: browse, F3 view, F5/F6 download and upload, F7, F2, F8 work there; Ctrl+Shift+F disconnects"),
@@ -1255,6 +1276,7 @@ impl App {
                 // Space also counts a folder's size, like in TC.
                 let dir = panel.current().filter(|e| !advance && e.kind == EntryKind::Dir).map(|e| e.name.clone());
                 panel.toggle_select_current();
+                panel.mark_anchor();
                 if advance {
                     panel.move_cursor(1);
                 }
@@ -1305,15 +1327,29 @@ impl App {
             }
             self.cancel_counts();
         }
+        let extend = self.modifiers.shift();
         let panel = self.panel_mut(active);
         let mut info = None;
         let result: io::Result<()> = match cmd {
-            CursorUp => Ok(panel.move_cursor(-1)),
-            CursorDown => Ok(panel.move_cursor(1)),
-            PageUp => Ok(panel.move_cursor(-page)),
-            PageDown => Ok(panel.move_cursor(page)),
-            CursorHome => Ok(panel.cursor_home()),
-            CursorEnd => Ok(panel.cursor_end()),
+            CursorUp | CursorDown | PageUp | PageDown | CursorHome | CursorEnd => {
+                // Shift+cursor keys extend the selection from the anchor.
+                let last = panel.entries.len().saturating_sub(1) as isize;
+                let to = match cmd {
+                    CursorUp => -1,
+                    CursorDown => 1,
+                    PageUp => -page,
+                    PageDown => page,
+                    CursorHome => -last - 1,
+                    _ => last + 1,
+                };
+                if extend {
+                    panel.select_range_to((panel.cursor as isize + to).clamp(0, last) as usize, false);
+                } else {
+                    panel.move_cursor(to);
+                    panel.mark_anchor();
+                }
+                Ok(())
+            }
             CursorBy(n) => Ok(panel.move_cursor(n as isize)),
             Open => match panel.activate() {
                 // Inside an archive: extract to a temp copy first.

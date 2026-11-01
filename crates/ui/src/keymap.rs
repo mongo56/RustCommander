@@ -366,8 +366,8 @@ const DEFAULTS: &[(&str, Command)] = {
         ("f8", Delete),
         ("f9", Terminal),
         ("f10", Configuration),
-        // Shift+cursor keys just move (TC selects while moving; there is no
-        // range selection yet), so they aren't dead keys for TC users.
+        // Shift+cursor keys move and extend the selection from the anchor
+        // (`App::run` checks the Shift state).
         ("shift+up", CursorUp),
         ("shift+down", CursorDown),
         ("shift+pageup", PageUp),

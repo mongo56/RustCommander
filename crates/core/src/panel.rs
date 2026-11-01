@@ -69,6 +69,8 @@ pub struct Panel {
     wheel_anchor: Option<usize>,
     /// Selected entries, by name (survives re-sorting and refreshes).
     selected: HashSet<String>,
+    /// Entry where range selection (Shift+click / Shift+arrows) starts.
+    anchor: Option<String>,
     pub sort: Sort,
     pub show_hidden: bool,
     /// Quick filter (Ctrl+S): only entries matching it are in `entries`.
@@ -124,6 +126,7 @@ impl Panel {
             scroll: 0,
             wheel_anchor: None,
             selected: HashSet::new(),
+            anchor: None,
             sort: Sort::default(),
             show_hidden: false,
             filter: String::new(),
@@ -309,6 +312,7 @@ impl Panel {
         self.filter.clear();
         self.set_listing(entries);
         self.selected.clear();
+        self.anchor = None;
         self.dir_sizes.clear();
         self.scroll = 0;
         self.wheel_anchor = None;
@@ -566,6 +570,50 @@ impl Panel {
         if !self.selected.remove(&name) {
             self.selected.insert(name);
         }
+    }
+
+    /// Makes the cursor entry the start of later range selections.
+    pub fn mark_anchor(&mut self) {
+        self.anchor = self.current().map(|e| e.name.clone());
+    }
+
+    /// Row where range selections start: the anchor, else the cursor.
+    pub fn anchor_index(&self) -> usize {
+        let found = self.anchor.as_ref().and_then(|a| self.entries.iter().position(|e| &e.name == a));
+        found.unwrap_or(self.cursor).min(self.entries.len().saturating_sub(1))
+    }
+
+    /// Ctrl+click: toggles the entry at `index`, moves the cursor there and
+    /// makes it the anchor.
+    pub fn toggle_at(&mut self, index: usize) {
+        self.set_cursor(index);
+        self.toggle_select_current();
+        self.mark_anchor();
+    }
+
+    /// Shift+click / Shift+arrows: moves the cursor to `index` and selects
+    /// the rows between the anchor and it (`..` excluded). Without `keep`
+    /// the range replaces the selection; with it the range is added to it.
+    /// The anchor stays.
+    pub fn select_range_to(&mut self, index: usize, keep: bool) {
+        if self.entries.is_empty() {
+            return;
+        }
+        let anchor = self.anchor_index();
+        if self.anchor.is_none() {
+            self.mark_anchor_at(anchor);
+        }
+        self.set_cursor(index);
+        let (lo, hi) = (anchor.min(self.cursor), anchor.max(self.cursor));
+        if !keep {
+            self.selected.clear();
+        }
+        let names = self.entries[lo..=hi].iter().filter(|e| !e.is_parent()).map(|e| e.name.clone());
+        self.selected.extend(names);
+    }
+
+    fn mark_anchor_at(&mut self, index: usize) {
+        self.anchor = self.entries.get(index).map(|e| e.name.clone());
     }
 
     pub fn select_all(&mut self) {
@@ -846,6 +894,50 @@ mod tests {
         p.move_cursor(1);
         p.ensure_visible(10);
         assert_eq!(p.view_start(10), 4);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn click_and_range_selection() {
+        let root = std::env::temp_dir().join(format!("rc-core-range-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        for i in 0..8 {
+            std::fs::write(root.join(format!("f{i}.txt")), b"").unwrap();
+        }
+        let mut p = Panel::open(&root).unwrap();
+        // Entries: "..", f0..f7 (rows 0..=8).
+        let sel = |p: &Panel| -> Vec<String> {
+            p.entries.iter().filter(|e| p.is_selected(e)).map(|e| e.name.clone()).collect()
+        };
+        p.set_cursor(2);
+        p.mark_anchor();
+        // Shift+click on row 4: rows 2..=4.
+        p.select_range_to(4, false);
+        assert_eq!(sel(&p), ["f1.txt", "f2.txt", "f3.txt"]);
+        assert_eq!(p.cursor, 4);
+        // Shift+click on row 3 shrinks it (anchor stays on row 2).
+        p.select_range_to(3, false);
+        assert_eq!(sel(&p), ["f1.txt", "f2.txt"]);
+        // Ctrl+click toggles one and moves the anchor.
+        p.toggle_at(7);
+        assert_eq!(sel(&p), ["f1.txt", "f2.txt", "f6.txt"]);
+        p.toggle_at(7);
+        assert_eq!(sel(&p), ["f1.txt", "f2.txt"]);
+        // Ctrl+Shift+click adds a range from the anchor (row 7) keeping the rest.
+        p.select_range_to(5, true);
+        assert_eq!(sel(&p), ["f1.txt", "f2.txt", "f4.txt", "f5.txt", "f6.txt"]);
+        // A range over ".." never selects it.
+        p.set_cursor(1);
+        p.mark_anchor();
+        p.select_range_to(0, false);
+        assert_eq!(sel(&p), ["f0.txt"]);
+        assert_eq!(p.cursor, 0);
+        // Without an anchor the range starts at the cursor.
+        p.navigate(root.clone(), None).unwrap();
+        p.set_cursor(6);
+        p.select_range_to(8, false);
+        assert_eq!(sel(&p), ["f5.txt", "f6.txt", "f7.txt"]);
         std::fs::remove_dir_all(&root).unwrap();
     }
 
