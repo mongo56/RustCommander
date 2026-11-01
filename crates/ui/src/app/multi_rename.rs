@@ -333,6 +333,20 @@ impl App {
         Task::none()
     }
 
+    /// Keys of `multi_rename_key`, for the F1 help. Keep in sync.
+    pub(super) const RENAME_KEYS: &'static [(&'static str, &'static str)] = &[
+        ("Enter", "Rename the files"),
+        ("Esc", "Close (or stop editing a name)"),
+        ("Tab, Shift+Tab", "Next / previous field"),
+        ("Ctrl+Z", "Undo the last rename (also after closing)"),
+        ("Ctrl+R", "Regex search on / off"),
+        ("Ctrl+E", "Match case on / off"),
+        ("Ctrl+U", "Next upper / lower case mode"),
+        ("F2", "Edit a new name by hand (click a row too)"),
+        ("Up, Down", "Edit the previous / next name"),
+        ("[N] [E] [C] [P] [YMD] ...", "Mask placeholders: name, extension, counter, folder, date (see the form)"),
+    ];
+
     pub(super) fn multi_rename_key(
         &mut self,
         named: Option<Named>,

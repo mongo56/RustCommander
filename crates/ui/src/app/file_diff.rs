@@ -180,6 +180,15 @@ impl App {
         }
     }
 
+    /// Keys of `file_diff_key`, for the F1 help. Keep in sync.
+    pub(super) const DIFF_KEYS: &'static [(&'static str, &'static str)] = &[
+        ("Esc, Q", "Close the comparison"),
+        ("N, Space", "Next difference"),
+        ("P, Shift+Space, Backspace", "Previous difference"),
+        ("Up, Down, PgUp, PgDn, Home, End", "Scroll"),
+        ("Left, Right", "Scroll sideways"),
+    ];
+
     pub(super) fn file_diff_key(&mut self, named: Option<Named>, key: &keyboard::Key, mods: keyboard::Modifiers) {
         let rows = self.diff_rows() as isize;
         let ch = match key {

@@ -2,6 +2,7 @@
 
 mod view;
 mod file_diff;
+mod help;
 mod find_files;
 mod multi_rename;
 mod viewer;
@@ -109,6 +110,7 @@ pub struct App {
     /// closed tool is kept (fields and results) for the next Alt+F7.
     find: Option<find_files::FindFiles>,
     find_last: Option<find_files::FindFiles>,
+    help: Option<help::Help>,
     /// Multi-rename settings, kept between uses.
     rename_opts: rc_core::rename::Options,
     /// `(new, old)` paths of the last multi-rename batch, kept after the
@@ -358,6 +360,7 @@ impl App {
             file_diff: None,
             find: None,
             find_last: None,
+            help: None,
             rename_opts: rc_core::rename::Options::default(),
             rename_undo: Vec::new(),
             config: crate::config::Config::default(),
@@ -748,6 +751,26 @@ impl App {
         Task::none()
     }
 
+    /// Panel keys and mouse actions outside the keymap (`on_key`, mouse
+    /// handling), for the F1 help. Keep in sync.
+    const PANEL_KEYS: &'static [(&'static str, &'static str)] = &[
+        ("Letters, digits", "Quick search: jump to the next name starting with the typed text"),
+        ("Up, Down (quick search)", "Previous / next match"),
+        ("Backspace, Esc (quick search)", "Delete a character / end the quick search"),
+        ("Typing, Backspace (quick filter)", "Edit the filter; Esc drops it, other keys keep it"),
+        ("Esc", "Cancel a slow folder change, drop the filter, then clear the selection"),
+        ("Click, double-click", "Move the cursor, open"),
+        ("Middle-click a folder", "Open it in a new tab"),
+        ("Right-click", "Explorer context menu"),
+        ("Drag and drop", "Copy (Shift = move) between panels and other apps; right drag = drop menu"),
+        ("Mouse wheel", "Scroll the view (the cursor stays)"),
+        ("Double-click the empty tab bar", "New tab"),
+        ("Mouse back / forward", "Previous / next folder"),
+        ("Click the path bar", "Edit the path: Tab completes, Up/Down pick a suggestion, Enter goes, Esc cancels"),
+        ("Click a drive", "Change drive"),
+        ("Tab bar: click, middle-click", "Switch tab, close tab"),
+    ];
+
     fn on_key(
         &mut self,
         key: keyboard::Key,
@@ -768,6 +791,12 @@ impl App {
                 return self.update(Message::Answer(id, Resolution::Cancel));
             }
             return Task::none();
+        }
+        if self.help.is_some() {
+            if named.is_some_and(is_modifier_key) {
+                return Task::none();
+            }
+            return self.help_key(named, &key, mods, text.as_deref());
         }
         if self.multi_rename.is_some() {
             if named.is_some_and(is_modifier_key) {
@@ -927,6 +956,7 @@ impl App {
             MultiRename => return self.open_multi_rename(),
             CompareFiles => return self.open_file_diff(),
             FindFiles => return self.open_find(),
+            Help => return self.open_help(),
             Edit => {
                 if let Some(e) = self.panel(active).current().filter(|e| e.kind == EntryKind::File) {
                     let (path, name) = (e.path.clone(), e.name.clone());
@@ -1388,6 +1418,15 @@ impl App {
     }
 
     // ---- hotlist ----------------------------------------------------------
+
+    /// Keys of `hotlist_key`, for the F1 help. Keep in sync.
+    const HOTLIST_KEYS: &'static [(&'static str, &'static str)] = &[
+        ("Up, Down, Home, End", "Pick an entry"),
+        ("Enter, 1-9", "Open the folder"),
+        ("A, +", "Add / remove the current folder"),
+        ("Del", "Remove the entry"),
+        ("Esc", "Close"),
+    ];
 
     fn hotlist_key(&mut self, selected: usize, named: Option<Named>, text: Option<&str>) -> Task<Message> {
         let count = self.hotlist.len() + 1;

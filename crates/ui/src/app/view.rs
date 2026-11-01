@@ -20,16 +20,20 @@ impl App {
     pub fn view(&self) -> Element<'_, Message> {
         let panels = row![self.side_view(0), vline(), self.side_view(1)].height(Length::Fill);
 
-        let base: Element<'_, Message> = match (&self.find, &self.multi_rename, &self.viewer, &self.file_diff) {
-            (Some(f), ..) => self.find_view(f),
-            (_, _, _, Some(d)) => self.file_diff_view(d),
-            (_, Some(mr), _, _) => self.multi_rename_view(mr),
-            (_, None, Some(v), None) => self.viewer_view(v),
-            (None, None, None, None) => container(column![panels, hline(), self.jobs_view(), self.bottom_bar()])
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .style(filled(theme::c().bg))
-                .into(),
+        let base: Element<'_, Message> = if let Some(h) = &self.help {
+            self.help_view(h)
+        } else {
+            match (&self.find, &self.multi_rename, &self.viewer, &self.file_diff) {
+                (Some(f), ..) => self.find_view(f),
+                (_, _, _, Some(d)) => self.file_diff_view(d),
+                (_, Some(mr), _, _) => self.multi_rename_view(mr),
+                (_, None, Some(v), None) => self.viewer_view(v),
+                (None, None, None, None) => container(column![panels, hline(), self.jobs_view(), self.bottom_bar()])
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .style(filled(theme::c().bg))
+                    .into(),
+            }
         };
 
         let modal = self
@@ -663,8 +667,9 @@ impl App {
                 Tone::Error => theme::c().error,
             }),
             None => text(
-                "Type to find · Tab switch panel · Ctrl+T new tab · F2 rename · Drag to copy (Shift = move, \
-                 out of the window = other apps) · Click path to edit · Right-click for menu",
+                "F1 help · Type to find · Tab switch panel · Ctrl+T new tab · F2 rename · \
+                 Drag to copy (Shift = move, out of the window = other apps) · Click path to edit · \
+                 Right-click for menu",
             )
             .size(12)
             .color(theme::c().muted),

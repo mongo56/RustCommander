@@ -34,6 +34,104 @@ impl Keymap {
             None => default_command(key, m),
         }
     }
+
+    /// Every effective binding as (display name, command), defaults with the
+    /// overrides applied. Defaults are found by trying every bindable key
+    /// with every modifier combination; a combination is left out when the
+    /// same key with fewer modifiers does the same (Shift+Down = Down).
+    /// Each command's keys come with the fewest modifiers first.
+    pub fn bindings(&self) -> Vec<(String, Command)> {
+        let mut bases: Vec<Key> = Vec::new();
+        for (_, named) in NAMED {
+            let key = Key::Named(*named);
+            if !bases.contains(&key) {
+                bases.push(key);
+            }
+        }
+        bases.extend(BINDABLE_CHARS.chars().map(|c| Key::Character(c.to_string().into())));
+
+        // Modifier sets as bit masks: ctrl, alt, shift, logo.
+        let mods = |bits: u8| {
+            let mut m = Modifiers::empty();
+            for (bit, flag) in [(1, Modifiers::CTRL), (2, Modifiers::ALT), (4, Modifiers::SHIFT), (8, Modifiers::LOGO)] {
+                if bits & bit != 0 {
+                    m |= flag;
+                }
+            }
+            m
+        };
+        let mut out: Vec<(String, Command, u32)> = Vec::new();
+        for key in &bases {
+            for bits in 0u8..16 {
+                let m = mods(bits);
+                let Some(name) = key_name(key, m) else { continue };
+                if self.overrides.contains_key(&name) {
+                    continue; // listed below
+                }
+                let Some(cmd) = default_command(key, m) else { continue };
+                // Does the key with a proper subset of the modifiers do the same?
+                let redundant = (0..bits).any(|sub| sub & bits == sub && self.command(key, mods(sub)) == Some(cmd));
+                if !redundant {
+                    out.push((name, cmd, bits.count_ones()));
+                }
+            }
+        }
+        let mut overrides: Vec<_> = self.overrides.iter().filter_map(|(n, c)| c.map(|c| (n.clone(), c))).collect();
+        overrides.sort_by(|a, b| a.0.cmp(&b.0));
+        for (name, cmd) in overrides {
+            let count = ["ctrl+", "alt+", "shift+", "win+"].iter().filter(|p| name.contains(*p)).count() as u32;
+            out.push((name, cmd, count));
+        }
+        out.sort_by_key(|&(_, _, count)| count);
+        out.into_iter().map(|(name, cmd, _)| (display_key(&name), cmd)).collect()
+    }
+
+    /// The display names of the keys bound to `cmd`, from `bindings`.
+    pub fn keys_for(bindings: &[(String, Command)], cmd: Command) -> Vec<&str> {
+        bindings.iter().filter(|(_, c)| *c == cmd).map(|(k, _)| k.as_str()).collect()
+    }
+}
+
+/// Character keys tried when listing the default bindings.
+const BINDABLE_CHARS: &str = "abcdefghijklmnopqrstuvwxyz0123456789`-=[]\\;',./+*";
+
+/// Display form of a canonical key name: `ctrl+shift+pageup` -> `Ctrl+Shift+PgUp`.
+pub fn display_key(name: &str) -> String {
+    // A trailing "+" after a "+" separator is the plus key itself.
+    let (mods, base) = match name.strip_suffix("++") {
+        Some(rest) => (rest, "+"),
+        None if name == "+" => ("", "+"),
+        None => name.rsplit_once('+').unwrap_or(("", name)),
+    };
+    let base = match base {
+        "up" => "Up".to_owned(),
+        "down" => "Down".to_owned(),
+        "left" => "Left".to_owned(),
+        "right" => "Right".to_owned(),
+        "pageup" => "PgUp".to_owned(),
+        "pagedown" => "PgDn".to_owned(),
+        "home" => "Home".to_owned(),
+        "end" => "End".to_owned(),
+        "enter" => "Enter".to_owned(),
+        "backspace" => "Backspace".to_owned(),
+        "tab" => "Tab".to_owned(),
+        "space" => "Space".to_owned(),
+        "insert" => "Ins".to_owned(),
+        "delete" => "Del".to_owned(),
+        "escape" => "Esc".to_owned(),
+        other => other.to_uppercase(),
+    };
+    let mut out = String::new();
+    for part in mods.split('+').filter(|p| !p.is_empty()) {
+        out.push_str(match part {
+            "ctrl" => "Ctrl+",
+            "alt" => "Alt+",
+            "shift" => "Shift+",
+            _ => "Win+",
+        });
+    }
+    out.push_str(&base);
+    out
 }
 
 /// Named keys that can be bound, with their short aliases.
@@ -153,6 +251,7 @@ fn default_command(key: &Key, m: Modifiers) -> Option<Command> {
             Named::Insert => ToggleSelect { advance: true },
             Named::Space => ToggleSelect { advance: false },
             Named::Escape => DeselectAll,
+            Named::F1 => Help,
             Named::F3 if ctrl => SortBy(SortKey::Name),
             Named::F4 if ctrl => SortBy(SortKey::Ext),
             Named::F5 if ctrl => SortBy(SortKey::Modified),
@@ -228,6 +327,35 @@ mod tests {
     }
 
     #[test]
+    fn default_bindings_are_listed_without_redundant_modifiers() {
+        let bindings = Keymap::default().bindings();
+        let keys = |cmd| Keymap::keys_for(&bindings, cmd);
+        assert_eq!(keys(Command::Help), ["F1"]);
+        assert_eq!(keys(Command::Copy), ["F5"]);
+        assert_eq!(keys(Command::Open), ["Enter", "Ctrl+PgDn"]);
+        assert_eq!(keys(Command::CountDirSizes), ["Alt+Shift+Enter"]);
+        assert_eq!(keys(Command::CursorDown), ["Down"]);
+        assert_eq!(keys(Command::CursorUp), ["Up"]);
+        assert_eq!(keys(Command::OpenInNewTab), ["Ctrl+Up"]);
+        assert_eq!(keys(Command::GoRoot), ["Ctrl+\\"]);
+        assert_eq!(keys(Command::DeletePermanent), ["Shift+Del", "Shift+F8"]);
+    }
+
+    #[test]
+    fn display_names() {
+        for (name, shown) in [
+            ("ctrl+shift+pageup", "Ctrl+Shift+PgUp"),
+            ("alt+o", "Alt+O"),
+            ("ctrl++", "Ctrl++"),
+            ("+", "+"),
+            ("win+delete", "Win+Del"),
+            ("f12", "F12"),
+        ] {
+            assert_eq!(display_key(name), shown);
+        }
+    }
+
+    #[test]
     fn overrides_replace_and_unbind_defaults() {
         let keys = BTreeMap::from([
             ("F5".to_owned(), "cm_RenMov".to_owned()),
@@ -242,6 +370,17 @@ mod tests {
         // Untouched keys keep their default.
         assert_eq!(map.command(&Key::Named(Named::F6), none), Some(Command::Move));
         assert_eq!(map.command(&Key::Named(Named::Delete), none), Some(Command::Delete));
+
+        let bindings = map.bindings();
+        let keys = |cmd| Keymap::keys_for(&bindings, cmd);
+        assert_eq!(keys(Command::Move), ["F6", "F5"]);
+        assert_eq!(keys(Command::MakeDir), ["F7", "Ctrl+K"]);
+        // F5 now moves, but Shift+F5 still copies.
+        assert!(keys(Command::Copy).contains(&"Shift+F5"));
+        assert!(!keys(Command::Copy).contains(&"F5"));
+        // F8 unbound: Ctrl+F8 and Alt+F8 still delete, so they show up.
+        assert!(keys(Command::Delete).starts_with(&["Del", "Ctrl+F8", "Alt+F8"]));
+        assert!(!keys(Command::Delete).contains(&"F8"));
 
         let bad = |k: &str, v: &str| Keymap::new(&BTreeMap::from([(k.to_owned(), v.to_owned())])).unwrap_err();
         assert!(bad("F5", "cm_Nope").contains("cm_Nope"));

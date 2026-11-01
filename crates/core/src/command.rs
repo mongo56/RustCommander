@@ -66,6 +66,8 @@ pub enum Command {
     OpenInNewTab,
     /// Open `config.toml` in the editor (Ctrl+,).
     EditConfig,
+    /// Searchable list of keys and features (F1).
+    Help,
     Quit,
 }
 
@@ -121,7 +123,65 @@ impl Command {
             PrevTab => "cm_SwitchToPreviousTab",
             OpenInNewTab => "cm_OpenDirInNewTab",
             EditConfig => "cm_EditConfig",
+            Help => "cm_HelpIndex",
             Quit => "cm_Exit",
+        }
+    }
+
+    /// What the command does, for the F1 help list. A new command must add
+    /// one here (the match is exhaustive).
+    pub fn description(self) -> &'static str {
+        use Command::*;
+        match self {
+            CursorUp => "Cursor up",
+            CursorDown => "Cursor down",
+            PageUp => "Cursor one page up",
+            PageDown => "Cursor one page down",
+            CursorHome => "Cursor to the first entry",
+            CursorEnd => "Cursor to the last entry",
+            CursorBy(_) => "Scroll the cursor (mouse wheel)",
+            Open => "Open the folder or file under the cursor",
+            GoParent => "Go to the parent folder",
+            GoRoot => "Go to the root of the drive",
+            HistoryBack => "Back to the previous folder",
+            HistoryForward => "Forward to the next folder",
+            Hotlist => "Directory hotlist: favourite folders",
+            SwitchPanel => "Switch to the other panel",
+            ToggleSelect { advance: true } => "Select / deselect the entry and move down",
+            ToggleSelect { advance: false } => "Select / deselect the entry",
+            CountDirSizes => "Compute the size of every folder in the panel",
+            CompareDirs => "Compare folders: select the entries that differ from the other panel",
+            CompareDirsOptions => "Compare folders with options (by content, ignore dates, subfolders)",
+            CompareFiles => "Compare two files by content, side by side",
+            FindFiles => "Find files by name and contents",
+            SelectAll => "Select all entries",
+            DeselectAll => "Clear the selection",
+            Refresh => "Reread the folder",
+            ToggleHidden => "Show / hide hidden and system files",
+            QuickFilter => "Quick filter: show only entries matching typed text",
+            SortBy(SortKey::Name) => "Sort by name",
+            SortBy(SortKey::Ext) => "Sort by extension",
+            SortBy(SortKey::Size) => "Sort by size",
+            SortBy(SortKey::Modified) => "Sort by date",
+            SyncOtherPanel => "Show this folder in the other panel too",
+            View => "View the file (text, hex, images)",
+            Edit => "Edit the file in the configured editor",
+            EditNew => "Create a new file and edit it",
+            Copy => "Copy to the other panel",
+            Move => "Move / rename to the other panel",
+            Rename => "Rename in place",
+            MultiRename => "Multi-rename the selected files by mask",
+            MakeDir => "Create a folder",
+            Delete => "Delete to the recycle bin",
+            DeletePermanent => "Delete permanently",
+            NewTab => "New tab",
+            CloseTab => "Close the tab",
+            NextTab => "Next tab",
+            PrevTab => "Previous tab",
+            OpenInNewTab => "Open the folder under the cursor in a new tab",
+            EditConfig => "Edit config.toml (editor, [keys], [colors])",
+            Help => "This help: all keys and features",
+            Quit => "Exit",
         }
     }
 
@@ -180,6 +240,7 @@ impl Command {
             PrevTab,
             OpenInNewTab,
             EditConfig,
+            Help,
             Quit,
         ]
     };
@@ -200,5 +261,13 @@ mod tests {
         ids.sort_unstable();
         ids.dedup();
         assert_eq!(ids.len(), Command::ALL.len());
+    }
+
+    #[test]
+    fn every_command_has_a_description() {
+        for &c in Command::ALL {
+            assert!(!c.description().trim().is_empty(), "{}", c.id());
+        }
+        assert!(!Command::CursorBy(1).description().is_empty());
     }
 }

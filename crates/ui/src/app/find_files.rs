@@ -300,6 +300,22 @@ impl App {
         Task::none()
     }
 
+    /// Keys of `find_key`, for the F1 help. Keep in sync.
+    pub(super) const FIND_KEYS: &'static [(&'static str, &'static str)] = &[
+        ("Enter", "Search (in a box) / go to the hit (in the list)"),
+        ("Esc", "Stop the search, then close"),
+        ("Tab, Shift+Tab", "Next / previous field"),
+        ("Up, Down, PgUp, PgDn, Ctrl+Home, Ctrl+End", "Pick a hit"),
+        ("Ctrl+G, double-click", "Go to the file: the panel opens its folder"),
+        ("Ctrl+L", "Feed the hits to the panel"),
+        ("Ctrl+R", "Name regex on / off"),
+        ("Ctrl+T", "Text regex on / off"),
+        ("Ctrl+E", "Match case on / off"),
+        ("Ctrl+S", "Search subfolders on / off"),
+        ("Ctrl+H", "Search hidden files on / off"),
+        ("*.txt;*.md|skip*", "Name masks: ; separates, | starts exclusions"),
+    ];
+
     pub(super) fn find_key(
         &mut self,
         named: Option<Named>,

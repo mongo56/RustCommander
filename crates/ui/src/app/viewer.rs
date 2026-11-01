@@ -345,6 +345,25 @@ impl App {
         (avail_w / w.max(1) as f32).min(avail_h / h.max(1) as f32).min(1.0)
     }
 
+    /// Keys of `viewer_key` / `viewer_image_key`, for the F1 help. Keep in sync.
+    pub(super) const VIEWER_KEYS: &'static [(&'static str, &'static str)] = &[
+        ("Esc, Q", "Close the viewer (Esc first closes the find box)"),
+        ("Up, Down, PgUp, PgDn", "Scroll"),
+        ("Home, End", "Start / end of the file"),
+        ("Left, Right", "Scroll sideways (wrap off)"),
+        ("N, Space", "Next file in the panel"),
+        ("P, Backspace", "Previous file in the panel"),
+        ("1", "Text mode (images: actual size)"),
+        ("3", "Hex mode"),
+        ("W", "Wrap long lines on / off"),
+        ("F7, F, /, Ctrl+F", "Find text"),
+        ("F3, Shift+F3", "Find next / previous"),
+        ("C", "Case-sensitive find on / off"),
+        ("+, -, Ctrl+wheel", "Zoom an image in / out"),
+        ("0, *", "Fit the image to the window"),
+        ("Arrows, PgUp, PgDn, Home, End", "Pan a zoomed image"),
+    ];
+
     /// Image-only keys: zoom and pan. `None` when the key is not one of them.
     fn viewer_image_key(&mut self, named: Option<Named>, typed: Option<&str>) -> Option<Task<Message>> {
         self.viewer.as_ref()?.image_size()?;
