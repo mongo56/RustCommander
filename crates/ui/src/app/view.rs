@@ -16,6 +16,21 @@ const COL_SIZE: f32 = 80.0;
 const COL_DATE: f32 = 120.0;
 const ICON: f32 = 16.0;
 
+/// Which optional columns fit a panel of a given width (narrow panels drop
+/// the date first, then the extension (merged into the name), then the size).
+#[derive(Clone, Copy)]
+struct Columns {
+    date: bool,
+    ext: bool,
+    size: bool,
+}
+
+impl Columns {
+    fn for_width(width: f32) -> Self {
+        Self { date: width >= 480.0, ext: width >= 380.0, size: width >= 260.0 }
+    }
+}
+
 impl App {
     pub fn view(&self) -> Element<'_, Message> {
         let panels = row![self.side_view(0), vline(), self.side_view(1)].height(Length::Fill);
@@ -52,6 +67,11 @@ impl App {
             return stack![base, label].into();
         }
         base
+    }
+
+    /// Width of one panel; the two sides share the window equally.
+    fn panel_width(&self, _side: usize) -> f32 {
+        ((self.window_width - 1.0) / 2.0).max(1.0)
     }
 
     fn dragging(&self) -> bool {
@@ -178,9 +198,14 @@ impl App {
         }))
         .spacing(2);
 
+        let width = self.panel_width(side);
         let space = self
             .disk_space(&panel.path)
-            .map(|(free, total)| format!("{} free of {}", format::size(free), format::size(total)))
+            .map(|(free, total)| match width {
+                w if w >= 420.0 => format!("{} free of {}", format::size(free), format::size(total)),
+                w if w >= 300.0 => format!("{} free", format::size(free)),
+                _ => String::new(),
+            })
             .unwrap_or_default();
 
         container(
@@ -293,6 +318,7 @@ impl App {
             )
             .padding([2, 10])
             .width(Length::Fill)
+            .clip(true)
             .style(filled(theme::c().header))
             .into();
         }
@@ -315,6 +341,7 @@ impl App {
             )
             .padding([2, 10])
             .width(Length::Fill)
+            .clip(true)
             .style(filled(theme::c().header))
             .into();
         }
@@ -326,10 +353,12 @@ impl App {
                 format::size(total_bytes)
             ))
             .size(12)
+            .wrapping(Wrapping::None)
             .color(theme::c().muted),
         )
         .padding([4, 10])
         .width(Length::Fill)
+        .clip(true)
         .style(filled(theme::c().header))
         .into()
     }
@@ -350,16 +379,18 @@ impl App {
                 .width(width)
                 .style(theme::flat)
         };
-        container(
-            row![
-                Space::with_width(ICON),
-                sort_button("Name", SortKey::Name, Length::Fill, false),
-                sort_button("Ext", SortKey::Ext, Length::Fixed(COL_EXT), false),
-                sort_button("Size", SortKey::Size, Length::Fixed(COL_SIZE), true),
-                sort_button("Modified", SortKey::Modified, Length::Fixed(COL_DATE), false),
-            ]
-            .spacing(10),
-        )
+        let cols = Columns::for_width(self.panel_width(side));
+        let mut header = row![Space::with_width(ICON), sort_button("Name", SortKey::Name, Length::Fill, false)];
+        if cols.ext {
+            header = header.push(sort_button("Ext", SortKey::Ext, Length::Fixed(COL_EXT), false));
+        }
+        if cols.size {
+            header = header.push(sort_button("Size", SortKey::Size, Length::Fixed(COL_SIZE), true));
+        }
+        if cols.date {
+            header = header.push(sort_button("Modified", SortKey::Modified, Length::Fixed(COL_DATE), false));
+        }
+        container(header.spacing(10).clip(true))
         .padding([4, 10])
         .style(filled(theme::c().panel))
         .into()
@@ -401,6 +432,7 @@ impl App {
     fn entry_row(&self, side: usize, index: usize, active: bool) -> Element<'_, Message> {
         let panel = self.panel(side);
         let entry = &panel.entries[index];
+        let cols = Columns::for_width(self.panel_width(side));
 
         let color = if panel.is_selected(entry) {
             theme::c().selected
@@ -414,6 +446,14 @@ impl App {
         let cell = |s: String, width: Length| text(s).size(13).color(color).wrapping(Wrapping::None).width(width);
 
         let (stem, ext) = entry.split_name();
+        // Narrow panels ellipsize the name instead of just clipping it.
+        let fixed = [(cols.ext, COL_EXT), (cols.size, COL_SIZE), (cols.date, COL_DATE)]
+            .iter()
+            .filter(|(on, _)| *on)
+            .fold(0.0, |sum, (_, w)| sum + w + 10.0);
+        let name_chars = ((self.panel_width(side) - 20.0 - ICON - 10.0 - fixed) / 7.0).max(4.0) as usize;
+        let narrow = !cols.date;
+        let fit = |s: &str| if narrow { elide_end(s, name_chars) } else { s.to_string() };
         let size = match entry.kind {
             EntryKind::Parent => String::new(),
             EntryKind::Dir => match panel.dir_size(&entry.name) {
@@ -450,13 +490,18 @@ impl App {
                 r.select,
                 r.selection(),
             )),
-            None => content
-                .push(cell(stem.to_string(), Length::Fill))
+            None if cols.ext => content
+                .push(cell(fit(stem), Length::Fill))
                 .push(cell(ext.to_string(), Length::Fixed(COL_EXT))),
+            None => content.push(cell(fit(&entry.name), Length::Fill)),
         };
+        if cols.size {
+            content = content.push(cell(size, Length::Fixed(COL_SIZE)).align_x(Alignment::End));
+        }
+        if cols.date {
+            content = content.push(cell(format::date(&entry.modified), Length::Fixed(COL_DATE)).color(theme::c().muted));
+        }
         let content = content
-            .push(cell(size, Length::Fixed(COL_SIZE)).align_x(Alignment::End))
-            .push(cell(format::date(&entry.modified), Length::Fixed(COL_DATE)).color(theme::c().muted))
             .spacing(10)
             .padding([0, 10])
             .height(ROW_H)
@@ -886,6 +931,14 @@ fn new_submenu_row(typed: &str) -> Element<'static, Message> {
 }
 
 /// Keeps the end of a long path: `…\sandbox\B`.
+fn elide_end(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max_chars.saturating_sub(1)).collect();
+    format!("{head}…")
+}
+
 fn elide_left(s: &str, max_chars: usize) -> String {
     let count = s.chars().count();
     if count <= max_chars {
