@@ -5,7 +5,7 @@
 use super::*;
 use crate::theme::filled;
 use iced::widget::text::{Span, Wrapping};
-use iced::widget::scrollable::{self, AbsoluteOffset, Direction, RelativeOffset, Scrollbar};
+use iced::widget::scrollable::{self, AbsoluteOffset, Direction, RelativeOffset};
 use iced::{Point, Size};
 use iced::widget::{center, column, container, mouse_area, responsive, rich_text, row, text, Column, Space};
 use iced::{Alignment, ContentFit, Element, Font, Length};
@@ -457,6 +457,33 @@ impl App {
         Size::new(self.window_width.max(1.0), (self.window_height - VIEWER_CHROME_H - search).max(1.0))
     }
 
+    /// Scrollbar: `at` is a row of a whole file, else a byte of the file;
+    /// infinite = the end.
+    pub(super) fn viewer_seek(&mut self, at: f32) {
+        let Some(v) = &mut self.viewer else { return };
+        let Some(doc) = v.doc_arc() else { return };
+        if at.is_infinite() {
+            // Like End, keeping the horizontal scroll.
+            if doc.has_after() {
+                let want = doc.size.saturating_sub(WINDOW - 64 * 1024);
+                v.load_window(want, want);
+            }
+            return self.viewer_scroll(isize::MAX);
+        }
+        if doc.is_whole() {
+            v.top = at.round() as usize;
+        } else {
+            let byte = (at.max(0.0) as u64).min(doc.size);
+            if (doc.base()..doc.end()).contains(&byte) {
+                v.top = doc.row_of(v.mode, byte);
+            } else {
+                v.load_window(byte.saturating_sub(WINDOW / 2), byte);
+            }
+        }
+        // Clamps to the last page and slides the window near its edges.
+        self.viewer_scroll(0);
+    }
+
     pub(super) fn viewer_wheel(&mut self, lines: f32) {
         self.viewer_scroll((-lines * 3.0).round() as isize);
     }
@@ -822,12 +849,25 @@ impl App {
                 };
                 line
             });
-            container(Column::with_children(lines).width(Length::Fill))
+            let lines = container(Column::with_children(lines).width(Length::Fill))
                 .padding([0, 12])
                 .width(Length::Fill)
                 .height(Length::Fill)
-                .clip(true)
-                .into()
+                .clip(true);
+            // Whole files scroll by rows; in a large file's window the bar
+            // stands for bytes of the whole file (see `viewer_seek`).
+            let full = (size.height / LINE_H).floor().max(1.0);
+            let (offset, visible, total) = if doc.is_whole() {
+                (v.top as f32, full, doc.rows(v.mode) as f32)
+            } else {
+                let per_row = (doc.end() - doc.base()) as f32 / doc.rows(v.mode).max(1) as f32;
+                (doc.row_byte(v.mode, v.top) as f32, per_row * full, doc.size as f32)
+            };
+            // The bar's end is the file's end (the visible bytes are only estimated).
+            let end = total - visible;
+            scrollbar::attach(lines, offset, visible, total, move |at| {
+                Message::ViewerSeek(if at >= end { f32::INFINITY } else { at })
+            })
         })
         .into()
     }
@@ -841,7 +881,8 @@ fn zoomed_image<'a>(handle: &'a image::Handle, w: f32, h: f32, zoom: f32) -> Ele
         let picture = image(handle.clone()).width(w).height(h).content_fit(ContentFit::Fill).filter_method(filter);
         scrollable::Scrollable::new(container(picture).center_x(w.max(size.width)).center_y(h.max(size.height)))
             .id(image_scroll_id())
-            .direction(Direction::Both { vertical: Scrollbar::default(), horizontal: Scrollbar::default() })
+            .direction(Direction::Both { vertical: scrollbar::bar(), horizontal: scrollbar::bar() })
+            .style(scrollbar::style)
             .on_scroll(|viewport| Message::ViewerPanned(viewport.absolute_offset()))
             .width(Length::Fill)
             .height(Length::Fill)

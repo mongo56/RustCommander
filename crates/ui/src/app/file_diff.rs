@@ -30,6 +30,8 @@ const H_STEP: usize = 4;
 pub enum DiffMsg {
     Done(u64, Result<Arc<fdiff::Outcome>, String>),
     Wheel(f32),
+    /// Scrollbar: first row to show.
+    ScrollTo(usize),
 }
 
 #[derive(Debug)]
@@ -141,6 +143,10 @@ impl App {
                 self.diff_jump(true);
             }
             DiffMsg::Wheel(lines) => self.diff_scroll((-lines * 3.0).round() as isize),
+            DiffMsg::ScrollTo(row) => {
+                let top = self.file_diff.as_ref().map_or(0, |d| d.top);
+                self.diff_scroll(row as isize - top as isize);
+            }
         }
         Task::none()
     }
@@ -305,6 +311,8 @@ impl App {
         });
         responsive(move |size| {
             let rows = (size.height / LINE_H).ceil() as usize;
+            // The last row may be cut off: the bar counts whole rows.
+            let full = (size.height / LINE_H).floor().max(1.0);
             let end = (d.top + rows).min(o.rows());
             let lines = (d.top..end).map(|i| {
                 // Rows of the block jumped to get a marked gutter.
@@ -315,11 +323,13 @@ impl App {
                 };
                 row![cell(a, in_block), cell(b, in_block)].into()
             });
-            container(Column::with_children(lines).width(Length::Fill))
+            let lines = container(Column::with_children(lines).width(Length::Fill))
                 .width(Length::Fill)
                 .height(Length::Fill)
-                .clip(true)
-                .into()
+                .clip(true);
+            scrollbar::attach(lines, d.top as f32, full, o.rows() as f32, |at| {
+                Message::FileDiff(DiffMsg::ScrollTo(at.round() as usize))
+            })
         })
         .into()
     }

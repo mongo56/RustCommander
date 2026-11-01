@@ -229,7 +229,7 @@ impl App {
                 );
             }
         }
-        let body = container(scrollable(list).id(list_id()).height(Length::Fill))
+        let body = container(scrollbar::thin(list).id(list_id()).height(Length::Fill))
             .width(Length::Fill)
             .height(Length::Fill)
             .style(filled(colors.panel));

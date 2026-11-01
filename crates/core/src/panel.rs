@@ -482,6 +482,13 @@ impl Panel {
         self.wheel_anchor = Some(self.cursor);
     }
 
+    /// Scrolls the view to start at row `start` (scrollbar drag) without
+    /// moving the cursor, like [`Panel::scroll_by`].
+    pub fn scroll_to(&mut self, start: usize, rows: usize) {
+        self.scroll = start.min(self.entries.len().saturating_sub(rows.max(1)));
+        self.wheel_anchor = Some(self.cursor);
+    }
+
     /// First row to draw when `rows` rows fit on screen.
     pub fn view_start(&self, rows: usize) -> usize {
         let len = self.entries.len();
@@ -817,6 +824,29 @@ mod tests {
         assert_eq!(visible_start(20, 15, 10, 100), 15);
         assert_eq!(visible_start(95, 99, 10, 100), 90);
         assert_eq!(visible_start(3, 2, 10, 5), 0);
+    }
+
+    #[test]
+    fn scroll_to_moves_the_view_not_the_cursor() {
+        let root = std::env::temp_dir().join(format!("rc-core-scroll-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        for i in 0..50 {
+            std::fs::write(root.join(format!("f{i:02}.txt")), b"").unwrap();
+        }
+        let mut p = Panel::open(&root).unwrap();
+        let len = p.entries.len();
+        p.set_cursor(3);
+        p.scroll_to(20, 10);
+        assert_eq!((p.view_start(10), p.cursor), (20, 3));
+        // Past the end: the last full page.
+        p.scroll_to(1000, 10);
+        assert_eq!(p.view_start(10), len - 10);
+        // Moving the cursor brings it back into view.
+        p.move_cursor(1);
+        p.ensure_visible(10);
+        assert_eq!(p.view_start(10), 4);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

@@ -526,7 +526,7 @@ impl App {
                             .padding([4, 14]),
                     );
                 }
-                scrollable(rows).id(list_id()).height(Length::Fill).into()
+                scrollbar::thin(rows).id(list_id()).height(Length::Fill).into()
             }
         };
 

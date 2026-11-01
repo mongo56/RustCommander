@@ -11,6 +11,7 @@ mod viewer;
 
 use crate::keymap;
 use crate::select_range::{self, Part, SelectRange};
+use crate::scrollbar;
 use crate::session::{self, Session, SideState, TabState};
 use crate::theme;
 use crate::watch;
@@ -288,6 +289,8 @@ pub enum Message {
     FileDropped(PathBuf),
     DropPosition(Option<(f32, f32)>),
     Wheel(usize, f32),
+    /// Scrollbar dragged/clicked: first row to show, rows on screen.
+    ScrollTo(usize, usize, usize),
     Drive(usize, String),
     Sort(usize, SortKey),
     Resized(Size),
@@ -324,6 +327,8 @@ pub enum Message {
     /// match, and whether the search wrapped around.
     ViewerFound(u64, Result<Option<viewer::Found>, String>, std::sync::Arc<std::sync::atomic::AtomicBool>),
     ViewerWheel(f32),
+    /// Viewer scrollbar: the row (whole file) or byte (large file) to show at the top.
+    ViewerSeek(f32),
     /// The zoomed image was scrolled (offset in pixels).
     ViewerPanned(iced::widget::scrollable::AbsoluteOffset),
     /// Pointer moved over (or left) the viewer body.
@@ -637,6 +642,7 @@ impl App {
                 let rows = self.page_rows();
                 self.panel_mut(side).scroll_by((-lines * 3.0).round() as isize, rows);
             }
+            Message::ScrollTo(side, start, rows) => self.panel_mut(side).scroll_to(start, rows),
             Message::Drive(side, drive) => {
                 self.leave_edits();
                 self.active = side;
@@ -804,6 +810,7 @@ impl App {
             Message::ViewerLoaded(seq, result) => return self.viewer_loaded(seq, result),
             Message::ViewerFound(seq, result, cancel) => self.viewer_found(seq, result, &cancel),
             Message::ViewerWheel(lines) => self.viewer_wheel(lines),
+            Message::ViewerSeek(at) => self.viewer_seek(at),
             Message::ViewerPanned(offset) => self.viewer_panned(offset),
             Message::ViewerPointer(at) => self.viewer_pointer(at),
             Message::ViewerZoomWheel(lines) => return self.viewer_zoom_wheel(lines),
@@ -912,10 +919,12 @@ impl App {
             if named.is_some_and(is_modifier_key) {
                 return Task::none();
             }
-            if let Some(Dialog::History { .. }) = self.dialog {
-                return self.history_key(named, text.as_deref());
-            }
-            return self.hotlist_key(named, text.as_deref(), mods);
+            let task = if let Some(Dialog::History { .. }) = self.dialog {
+                self.history_key(named, text.as_deref())
+            } else {
+                self.hotlist_key(named, text.as_deref(), mods)
+            };
+            return Task::batch([task, self.popup_snap()]);
         }
         if let Some(Dialog::Compare { opts }) = &mut self.dialog {
             let option = match text.as_deref().map(str::to_ascii_lowercase).as_deref() {
@@ -1109,11 +1118,11 @@ impl App {
             Unpack => return self.open_unpack(),
             Hotlist => {
                 self.open_hotlist();
-                return Task::none();
+                return self.popup_snap();
             }
             DirHistory => {
                 self.open_history();
-                return Task::none();
+                return self.popup_snap();
             }
             Delete | DeletePermanent => {
                 let paths = self.target_paths(active);

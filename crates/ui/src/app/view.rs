@@ -243,6 +243,14 @@ impl App {
     }
 
     /// Folder suggestions under the path bar while it's being edited.
+    /// The rows of a folder popup, scrolling when they don't fit the window
+    /// (kept on the selection by [`App::popup_snap`]).
+    fn popup_list<'a>(&self, items: Column<'a, Message>) -> Element<'a, Message> {
+        container(scrollbar::thin(items).id(super::hotlist::popup_list_id()))
+            .max_height((self.window_height - 200.0).max(120.0))
+            .into()
+    }
+
     fn suggestions_view(&self, side: usize) -> Option<Element<'_, Message>> {
         let edit = self.path_edit.as_ref().filter(|e| e.side == side && !e.suggestions.is_empty())?;
         let items = Column::with_children(edit.suggestions.iter().enumerate().map(|(i, path)| {
@@ -360,12 +368,14 @@ impl App {
             let len = panel.entries.len();
             let start = panel.view_start(rows);
             let end = (start + rows).min(len);
-            container(Column::with_children((start..end).map(|i| self.entry_row(side, i, active))))
+            let rows_view = container(Column::with_children((start..end).map(|i| self.entry_row(side, i, active))))
                 .width(Length::Fill)
                 .height(Length::Fill)
-                .clip(true)
-                .style(filled(theme::c().panel))
-                .into()
+                .clip(true);
+            let bar = scrollbar::attach(rows_view, start as f32, rows as f32, len as f32, move |at| {
+                Message::ScrollTo(side, at.round() as usize, rows)
+            });
+            container(bar).width(Length::Fill).height(Length::Fill).style(filled(theme::c().panel)).into()
         });
         let mut area = mouse_area(list)
             .on_scroll(move |delta| {
@@ -708,17 +718,14 @@ impl App {
         if !menu.at.is_empty() {
             header = header.push(small_button("Back", Message::HotlistBack));
         }
-        let content = column![header].push_maybe(empty).push(items).push(hint).spacing(10);
+        let content = column![header].push_maybe(empty).push(self.popup_list(items)).push(hint).spacing(10);
         container(content).padding(16).width(Length::Fixed(520.0)).style(theme::dialog).into()
     }
 
     fn history_view(&self, selected: usize) -> Element<'_, Message> {
         let (list, current) = self.panel(self.active).history();
-        // A window of rows around the selection (the history holds up to 201).
-        const ROWS: usize = 20;
-        let start = selected.saturating_sub(ROWS / 2).min(list.len().saturating_sub(ROWS));
         let mut items = Column::new();
-        for (i, path) in list.iter().enumerate().skip(start).take(ROWS) {
+        for (i, path) in list.iter().enumerate() {
             let name = path
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
@@ -739,7 +746,7 @@ impl App {
         }
         let hint = text("Most recent first \u{b7} Enter go \u{b7} 1-9 jump \u{b7} Esc close").size(11).color(theme::c().muted);
         let title = format!("Folder history ({} of {})", selected + 1, list.len());
-        let content = column![text(title).size(16), items, hint].spacing(10);
+        let content = column![text(title).size(16), self.popup_list(items), hint].spacing(10);
         container(content).padding(16).width(Length::Fixed(520.0)).style(theme::dialog).into()
     }
 

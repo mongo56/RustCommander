@@ -17,7 +17,27 @@ pub(super) struct HotlistMenu {
     pub renaming: bool,
 }
 
+pub(super) fn popup_list_id() -> iced::widget::scrollable::Id {
+    iced::widget::scrollable::Id::new("popup-list")
+}
+
 impl App {
+    /// Scrolls the hotlist / history popup so the selected row shows: rows
+    /// are evenly tall, so the relative offset of the row's index does.
+    pub(super) fn popup_snap(&self) -> Task<Message> {
+        let (selected, rows) = match &self.dialog {
+            Some(Dialog::Hotlist(menu)) => {
+                // The entries, a row being named and the add/remove row.
+                let n = hotlist::menu(&self.hotlist, &menu.at).len();
+                (menu.selected, n + 1 + usize::from(menu.naming.is_some() && !menu.renaming))
+            }
+            Some(Dialog::History { selected }) => (*selected, self.panel(self.active).history().0.len()),
+            _ => return Task::none(),
+        };
+        let y = if rows > 1 { (selected as f32 / (rows - 1) as f32).min(1.0) } else { 0.0 };
+        iced::widget::scrollable::snap_to(popup_list_id(), iced::widget::scrollable::RelativeOffset { x: 0.0, y })
+    }
+
     /// Keys of `hotlist_key`, for the F1 help. Keep in sync.
     pub(super) const HOTLIST_KEYS: &'static [(&'static str, &'static str)] = &[
         ("Up, Down, Home, End", "Pick an entry"),

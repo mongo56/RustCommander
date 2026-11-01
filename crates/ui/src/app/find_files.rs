@@ -61,6 +61,8 @@ pub enum FindMsg {
     Feed,
     Close,
     Wheel(f32),
+    /// Scrollbar: first row to show, rows on screen.
+    ScrollTo(usize, usize),
 }
 
 pub(super) struct FindFiles {
@@ -299,6 +301,12 @@ impl App {
             FindMsg::Feed => return self.find_feed(),
             FindMsg::Close => self.close_find(),
             FindMsg::Wheel(lines) => self.find_move((-lines * 3.0).round() as isize),
+            // The list keeps its cursor on screen: it moves along with the view.
+            FindMsg::ScrollTo(start, rows) => {
+                let start = start.min(f.results.len().saturating_sub(rows));
+                f.cursor = f.cursor.clamp(start, (start + rows).saturating_sub(1).min(f.results.len().saturating_sub(1)));
+                f.top = start;
+            }
         }
         Task::none()
     }
@@ -484,11 +492,14 @@ impl App {
                 .on_press(Message::Find(FindMsg::Click(i)))
                 .into()
             });
-            container(Column::with_children(lines).width(Length::Fill))
+            let lines = container(Column::with_children(lines).width(Length::Fill))
                 .width(Length::Fill)
                 .height(Length::Fill)
-                .clip(true)
-                .into()
+                .clip(true);
+            let len = f.results.len();
+            scrollbar::attach(lines, start as f32, rows as f32, len as f32, move |at| {
+                Message::Find(FindMsg::ScrollTo(at.round() as usize, rows))
+            })
         });
         let list = mouse_area(container(list).width(Length::Fill).height(Length::Fill).style(filled(colors.panel)))
             .on_scroll(|delta| {

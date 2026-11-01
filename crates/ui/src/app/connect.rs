@@ -676,7 +676,7 @@ impl App {
                 } else {
                     Column::with_children(rows).into()
                 };
-                iced::widget::scrollable(list).height(Length::Fill).into()
+                scrollbar::thin(list).height(Length::Fill).into()
             }
         };
         let body = container(body).width(Length::Fill).height(Length::Fill).style(filled(colors.panel));
