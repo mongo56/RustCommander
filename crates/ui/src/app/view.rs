@@ -542,14 +542,14 @@ impl App {
             Dialog::Hotlist(menu) => return self.hotlist_view(menu),
             Dialog::History { selected } => return self.history_view(*selected),
             Dialog::Palette(palette) => return self.palette_view(palette),
-            Dialog::Compare { opts } => return compare_view(opts),
+            Dialog::Compare { opts } => return compare_view(opts, self.dialog_focus.unwrap_or(1)),
             _ => {}
         }
         let input_field = |value: &'a str| {
             text_input("", value)
                 .id(dialog_input_id())
                 .on_input(Message::DialogInput)
-                .on_submit(Message::DialogSubmit)
+                .on_submit(Message::DialogEnter)
                 .padding(8)
                 .size(13)
                 .style(theme::input)
@@ -615,6 +615,7 @@ impl App {
             }
         };
 
+        let focus = self.dialog_focus.unwrap_or(1);
         let mut content = column![text(title).size(16), text(body).size(13).color(theme::c().muted)].spacing(12);
         if let Some(field) = field {
             content = content.push(field);
@@ -622,8 +623,8 @@ impl App {
         content = content.push(
             row![
                 Space::with_width(Length::Fill),
-                dialog_button("Cancel", Message::DialogCancel, false),
-                dialog_button(ok, Message::DialogSubmit, true),
+                dialog_button("Cancel", Message::DialogCancel, false, focus == 0),
+                dialog_button(ok, Message::DialogSubmit, true, focus == 1),
             ]
             .spacing(8),
         );
@@ -767,7 +768,11 @@ impl App {
                 text(format::date(date)).size(13),
             ]
         };
-        let answer = |label, r, primary| dialog_button(label, Message::Answer(id, r), primary);
+        let focus = self.conflict_focus;
+        let answer = |i: usize, primary| {
+            let (label, r) = button_focus::CONFLICT_ANSWERS[i];
+            dialog_button(label, Message::Answer(id, r), primary, focus == Some(i))
+        };
 
         let content = column![
             text("File already exists").size(16),
@@ -779,16 +784,16 @@ impl App {
             ]
             .spacing(4),
             row![
-                answer("Overwrite", Resolution::Overwrite, true),
-                answer("Overwrite all", Resolution::OverwriteAll, false),
-                answer("Overwrite older", Resolution::OverwriteOlder, false),
+                answer(0, true),
+                answer(1, false),
+                answer(2, false),
             ]
             .spacing(8),
             row![
-                answer("Skip", Resolution::Skip, false),
-                answer("Skip all", Resolution::SkipAll, false),
+                answer(3, false),
+                answer(4, false),
                 Space::with_width(Length::Fill),
-                answer("Cancel job", Resolution::Cancel, false),
+                answer(5, false),
             ]
             .spacing(8),
         ]
@@ -889,12 +894,13 @@ fn elide_left(s: &str, max_chars: usize) -> String {
     format!("…{tail}")
 }
 
-fn dialog_button(label: &str, message: Message, primary: bool) -> Element<'_, Message> {
-    button(text(label).size(13))
-        .on_press(message)
-        .padding([6, 14])
-        .style(if primary { theme::primary } else { theme::fkey })
-        .into()
+fn dialog_button(label: &str, message: Message, primary: bool, focused: bool) -> Element<'_, Message> {
+    let b = button(text(label).size(13)).on_press(message).padding([6, 14]);
+    if focused {
+        b.style(theme::focused(primary)).into()
+    } else {
+        b.style(if primary { theme::primary } else { theme::fkey }).into()
+    }
 }
 
 fn small_button(label: &str, message: Message) -> Element<'_, Message> {
@@ -910,7 +916,7 @@ fn hline<'a>() -> Element<'a, Message> {
 }
 
 /// Ctrl+Shift+F2: compare options, toggled by click or their letter.
-fn compare_view(opts: &CompareOptions) -> Element<'static, Message> {
+fn compare_view(opts: &CompareOptions, focus: usize) -> Element<'static, Message> {
     let option = |i: u8, key: &'static str, label: &'static str, hint: &'static str, on: bool| {
         let content = row![
             text(key).size(12).color(theme::c().muted).width(Length::Fixed(12.0)),
@@ -928,8 +934,8 @@ fn compare_view(opts: &CompareOptions) -> Element<'static, Message> {
         option(2, "S", "Include subfolders", "Folders on both sides are marked if anything inside differs", opts.subfolders),
         row![
             Space::with_width(Length::Fill),
-            dialog_button("Cancel", Message::DialogCancel, false),
-            dialog_button("Compare", Message::DialogSubmit, true),
+            dialog_button("Cancel", Message::DialogCancel, false, focus == 0),
+            dialog_button("Compare", Message::DialogSubmit, true, focus == 1),
         ]
         .spacing(8),
     ]

@@ -294,6 +294,20 @@ pub fn primary(_theme: &Theme, status: button::Status) -> button::Style {
     }
 }
 
+/// A dialog button with the keyboard focus: a thick ring (the accent, or the
+/// text colour on the accent-filled default button so it stays visible).
+pub fn focused(primary_button: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |theme, status| {
+        let mut style = if primary_button { primary(theme, status) } else { fkey(theme, status) };
+        style.border = Border {
+            color: if primary_button { c().text } else { c().accent },
+            width: 3.0,
+            radius: 4.0.into(),
+        };
+        style
+    }
+}
+
 pub fn dialog(_theme: &Theme) -> container::Style {
     container::Style {
         background: Some(Background::Color(c().header)),

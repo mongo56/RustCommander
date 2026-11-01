@@ -1,6 +1,7 @@
 //! Application state and update logic. Drawing lives in [`view`].
 
 mod view;
+mod button_focus;
 mod archive_edit;
 mod connect;
 mod file_diff;
@@ -72,6 +73,10 @@ pub struct App {
     /// Last click on the empty part of a tab bar (double-click opens a tab).
     last_tab_bar_click: Option<(usize, Instant)>,
     dialog: Option<Dialog>,
+    /// Focused button of the open dialog (`None` = the default, the last one).
+    dialog_focus: Option<usize>,
+    /// Focused button of the overwrite question (`None` = none yet).
+    conflict_focus: Option<usize>,
     /// Favourite folders (Ctrl+D), saved with the session.
     hotlist: Vec<crate::hotlist::HotItem>,
     /// Commands last run from the command palette, most recent first
@@ -329,6 +334,8 @@ pub enum Message {
     QuickSearchTimeout(u64),
     DialogInput(String),
     DialogSubmit,
+    /// Enter in a dialog's text box: activates the focused button.
+    DialogEnter,
     DialogCancel,
     HotlistPick(usize),
     HotlistBack,
@@ -410,6 +417,8 @@ impl App {
             last_click: None,
             last_tab_bar_click: None,
             dialog: None,
+            dialog_focus: None,
+            conflict_focus: None,
             hotlist: session.as_ref().map(|s| s.hotlist.clone()).unwrap_or_default(),
             recent_commands: session
                 .as_ref()
@@ -850,7 +859,11 @@ impl App {
                 }
             }
             Message::DialogSubmit => return self.submit_dialog(),
-            Message::DialogCancel => self.dialog = None,
+            Message::DialogEnter => return self.dialog_enter(),
+            Message::DialogCancel => {
+                self.dialog = None;
+                self.dialog_focus = None;
+            }
             Message::HotlistPick(i) => return self.hotlist_pick(i),
             Message::HotlistBack => self.hotlist_back(),
             Message::HistoryPick(i) => return self.history_pick(i),
@@ -869,6 +882,7 @@ impl App {
                 }
             }
             Message::Answer(id, resolution) => {
+                self.conflict_focus = None;
                 if let Some(job) = self.job(id) {
                     job.conflict = None;
                     job.handle.answer(resolution);
@@ -926,6 +940,7 @@ impl App {
         ("Backspace, Esc (quick search)", "Delete a character / end the quick search"),
         ("Typing, Backspace (quick filter)", "Edit the filter; Esc drops it, other keys keep it"),
         ("Esc", "Cancel a slow folder change, drop the filter, then clear the selection"),
+        ("Dialogs: Left/Right, Tab", "Move the focus between the buttons (Left/Right only without a text box); Enter presses the focused one, Esc cancels"),
         ("F2 / Shift+F6 (renaming)", "Select the name without extension, the extension, the whole name; Enter renames, Esc cancels"),
         ("Click, double-click", "Move the cursor (the selection stays), open"),
         ("Ctrl+click", "Select / unselect one item"),
@@ -963,6 +978,22 @@ impl App {
         if let Some(id) = self.jobs.iter().find(|j| j.conflict.is_some()).map(|j| j.id) {
             if escape {
                 return self.update(Message::Answer(id, Resolution::Cancel));
+            }
+            let count = button_focus::CONFLICT_ANSWERS.len();
+            match named {
+                Some(Named::ArrowLeft) => self.conflict_focus = Some(button_focus::step(self.conflict_focus, count, true)),
+                Some(Named::ArrowRight) => {
+                    self.conflict_focus = Some(button_focus::step(self.conflict_focus, count, false));
+                }
+                Some(Named::Tab) => {
+                    self.conflict_focus = Some(button_focus::step(self.conflict_focus, count, mods.shift()));
+                }
+                Some(Named::Enter) => {
+                    if let Some(i) = self.conflict_focus {
+                        return self.update(Message::Answer(id, button_focus::CONFLICT_ANSWERS[i].1));
+                    }
+                }
+                _ => {}
             }
             return Task::none();
         }
@@ -1035,10 +1066,21 @@ impl App {
             }
         }
         if self.dialog.is_some() {
+            // Dialogs with a text box keep Left/Right for its cursor.
+            let has_input = !matches!(self.dialog, Some(Dialog::Delete { .. } | Dialog::Compare { .. }));
+            let back = match named {
+                Some(Named::Tab) => Some(mods.shift()),
+                Some(Named::ArrowLeft) if !has_input => Some(true),
+                Some(Named::ArrowRight) if !has_input => Some(false),
+                _ => None,
+            };
             if escape {
                 self.dialog = None;
+                self.dialog_focus = None;
+            } else if let Some(back) = back {
+                self.dialog_focus = Some(button_focus::step(Some(self.dialog_focus.unwrap_or(1)), 2, back));
             } else if named == Some(Named::Enter) && !captured {
-                return self.submit_dialog();
+                return self.dialog_enter();
             }
             return Task::none();
         }
@@ -1239,6 +1281,7 @@ impl App {
                     return Task::none();
                 }
                 self.dialog = Some(Dialog::Delete { paths, to_trash: cmd == Delete });
+                self.dialog_focus = None;
                 return Task::none();
             }
             NewTab => {
@@ -1286,6 +1329,7 @@ impl App {
             CompareDirs => return self.compare_dirs(),
             CompareDirsOptions => {
                 self.dialog = Some(Dialog::Compare { opts: self.compare_opts });
+                self.dialog_focus = None;
                 return Task::none();
             }
             CountDirSizes => {
@@ -1704,10 +1748,22 @@ impl App {
     fn open_dialog(&mut self, dialog: Dialog) -> Task<Message> {
         self.leave_edits();
         self.dialog = Some(dialog);
+        self.dialog_focus = None;
         Task::batch([text_input::focus(dialog_input_id()), text_input::select_all(dialog_input_id())])
     }
 
+    /// Enter: the focused button (Cancel or the default one).
+    fn dialog_enter(&mut self) -> Task<Message> {
+        if self.dialog_focus == Some(0) {
+            self.dialog = None;
+            self.dialog_focus = None;
+            return Task::none();
+        }
+        self.submit_dialog()
+    }
+
     fn submit_dialog(&mut self) -> Task<Message> {
+        self.dialog_focus = None;
         let Some(dialog) = self.dialog.take() else { return Task::none() };
         match dialog {
             Dialog::Transfer { is_move, sources, base, input } => {
@@ -2067,6 +2123,7 @@ impl App {
                 }
             }
             JobEvent::Conflict(conflict) => {
+                self.conflict_focus = None;
                 if let Some(job) = self.job(id) {
                     job.conflict = Some(conflict);
                 }
