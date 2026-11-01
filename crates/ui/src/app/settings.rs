@@ -5,7 +5,7 @@
 //! it), Ins adds one, Del unbinds, R resets. Colours: the theme presets
 //! and every colour as an editable `#rrggbb` with a swatch. Each change is
 //! written to `config.toml` at once (`config::write`, comments kept) and
-//! applied live; the compare options live in `session.toml`.
+//! applied live, the compare options (`[compare]`) included.
 
 use super::*;
 use crate::config::Edit;
@@ -375,9 +375,12 @@ impl App {
             SettingsMsg::Compare(i) => {
                 s.row[0] = ROW_COMPARE + i as usize;
                 toggle_compare_option(&mut self.compare_opts, i);
-                self.save_session();
+                let note = match self.save_compare() {
+                    Ok(()) => ("Compare options saved".into(), Tone::Success),
+                    Err(e) => (format!("Not saved: {e}"), Tone::Error),
+                };
                 if let Some(s) = &mut self.settings {
-                    s.note = Some(("Compare options saved".into(), Tone::Success));
+                    s.note = Some(note);
                 }
             }
             SettingsMsg::Browse => {
@@ -400,7 +403,7 @@ impl App {
             SettingsMsg::EditConfig => {
                 s.row[0] = ROW_CONFIG;
                 self.settings_save_editor();
-                let result = crate::config::create_if_missing("").map_err(|e| e.to_string());
+                let result = crate::config::create_if_missing("", Some(self.compare_opts.into())).map_err(|e| e.to_string());
                 if let (Ok(()), Some(path)) = (&result, crate::config::file()) {
                     self.edit_file(&path, "config.toml");
                 }

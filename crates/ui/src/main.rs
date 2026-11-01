@@ -54,13 +54,23 @@ fn main() -> iced::Result {
         print_version();
         return Ok(());
     }
-    let session = session::load();
+    let mut session = session::load();
     if let Some(dir) = config::dir() {
         // SFTP host keys are trusted in known_hosts there.
         rc_core::remote::set_settings_dir(dir);
     }
-    if let Err(e) = config::create_if_missing(session.as_ref().map_or("", |s| &s.editor)) {
+    let old_compare = session.as_ref().and_then(|s| s.compare);
+    if let Err(e) = config::create_if_missing(session.as_ref().map_or("", |s| &s.editor), old_compare) {
         eprintln!("could not create config.toml: {e}");
+    }
+    // Compare options moved from session.toml to config.toml: add them
+    // there unless it has a [compare] already; the session then saves
+    // without them (kept there if this failed, to try again next start).
+    if let (Some(s), Some(compare)) = (&mut session, old_compare) {
+        match config::write(&[config::Edit::CompareIfMissing(compare)]) {
+            Ok(()) => s.compare = None,
+            Err(e) => eprintln!("could not move the compare options to config.toml: {e}"),
+        }
     }
     let size = session.as_ref().map_or(iced::Size::new(1280.0, 800.0), |s| {
         iced::Size::new(s.width.max(400.0), s.height.max(300.0))

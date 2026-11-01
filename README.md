@@ -116,6 +116,9 @@ The open tabs are kept in `session.toml` and saved connections in
 ```toml
 theme = "nord"            # dark, light, nord or gruvbox
 
+[compare]                 # compare folders (Shift+F2), also Ctrl+Shift+F2 / F10
+by_content = true
+
 [keys]                    # "Key" = "command"; an empty command unbinds the key
 "Ctrl+K" = "cm_MkDir"
 "F8" = ""

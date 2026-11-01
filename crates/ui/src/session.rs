@@ -1,6 +1,7 @@
 //! Session persistence: tabs, paths, sorting and window size are saved on
 //! exit to `session.toml` in the config folder and restored on start.
 
+use crate::config::CompareState;
 use crate::hotlist::HotItem;
 use rc_core::{Panel, SortKey};
 use serde::{Deserialize, Serialize};
@@ -21,9 +22,11 @@ pub struct Session {
     /// Window position and maximised state (Windows).
     #[serde(default)]
     pub window: Option<WindowState>,
-    /// Compare-folders options (Ctrl+Shift+F2).
-    #[serde(default)]
-    pub compare: CompareState,
+    /// Compare-folders options from older versions, moved to `config.toml`
+    /// on start (`main`). Written back only while that move failed, so
+    /// they aren't lost.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compare: Option<CompareState>,
     /// Ids of the commands last run from the command palette (Ctrl+Space),
     /// most recent first.
     #[serde(default)]
@@ -31,28 +34,6 @@ pub struct Session {
     /// Editor setting from older versions; read once to seed `config.toml`.
     #[serde(default, skip_serializing)]
     pub editor: String,
-}
-
-/// [`rc_core::compare::CompareOptions`] in the session file (hidden files
-/// follow the panels).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct CompareState {
-    pub by_content: bool,
-    pub ignore_date: bool,
-    pub subfolders: bool,
-}
-
-impl From<CompareState> for rc_core::compare::CompareOptions {
-    fn from(c: CompareState) -> Self {
-        Self { by_content: c.by_content, ignore_date: c.ignore_date, subfolders: c.subfolders, show_hidden: false }
-    }
-}
-
-impl From<rc_core::compare::CompareOptions> for CompareState {
-    fn from(o: rc_core::compare::CompareOptions) -> Self {
-        Self { by_content: o.by_content, ignore_date: o.ignore_date, subfolders: o.subfolders }
-    }
 }
 
 /// [`rc_platform::Placement`] in the session file.
@@ -180,7 +161,7 @@ mod tests {
                 HotItem::Menu { name: "Empty".into(), items: vec![] },
             ],
             window: Some(WindowState { left: -8, top: 0, right: 1200, bottom: 800, maximized: true }),
-            compare: CompareState { by_content: true, ignore_date: false, subfolders: true },
+            compare: Some(CompareState { by_content: true, ignore_date: false, subfolders: true }),
             recent_commands: vec!["cm_MkDir".into(), "cm_Copy".into()],
             editor: r#""my editor.exe" -n %1"#.into(),
         };
@@ -189,6 +170,12 @@ mod tests {
         assert_eq!(back.active, 1);
         assert_eq!(back.hotlist, session.hotlist);
         assert_eq!(back.recent_commands, session.recent_commands);
+        // Compare options not yet moved to config.toml are kept...
+        assert_eq!(back.compare, session.compare);
+        // ...and dropped once they were.
+        let moved = toml::to_string_pretty(&Session { compare: None, ..back.clone() }).unwrap();
+        assert!(!moved.contains("compare"), "{moved}");
+        assert_eq!(toml::from_str::<Session>(&moved).unwrap().compare, None);
         let panel = back.left.tabs[0].open().unwrap();
         assert_eq!(panel.sort.key, SortKey::Size);
         assert!(panel.sort.descending && panel.show_hidden);
@@ -207,8 +194,12 @@ mod tests {
             [right]
             current = 0
             tabs = []
+            [compare]
+            by_content = true
+            subfolders = true
         "#;
         let session: Session = toml::from_str(text).unwrap();
+        assert_eq!(session.compare, Some(CompareState { by_content: true, ignore_date: false, subfolders: true }));
         let folders = [r"C:\Users", r"D:\Work"].map(|p| HotItem::Folder(PathBuf::from(p)));
         assert_eq!(session.hotlist, folders);
         // Saved again, plain folders keep the old form.

@@ -84,8 +84,12 @@ pub struct App {
     /// Folder size counts running (Space / Alt+Shift+Enter): the folder
     /// listed and the batch's cancel flag.
     counts: Vec<(PathBuf, Arc<AtomicBool>)>,
-    /// Compare-folders options (Ctrl+Shift+F2), saved with the session.
+    /// Compare-folders options (Ctrl+Shift+F2), saved in `config.toml`
+    /// `[compare]`.
     compare_opts: CompareOptions,
+    /// Compare options that couldn't be written to `config.toml` (or moved
+    /// there from an old session); saved with the session meanwhile.
+    compare_unsaved: Option<crate::config::CompareState>,
     /// A compare running on a worker: its cancel flag and the folders
     /// compared (results for other folders are dropped).
     comparing: Option<(Arc<AtomicBool>, PathBuf, PathBuf)>,
@@ -410,7 +414,9 @@ impl App {
             next_job_id: 1,
             deferred: Vec::new(),
             counts: Vec::new(),
-            compare_opts: session.as_ref().map(|s| s.compare.into()).unwrap_or_default(),
+            // `config.toml` `[compare]` replaces these in `refresh_config`.
+            compare_opts: session.as_ref().and_then(|s| s.compare).map(Into::into).unwrap_or_default(),
+            compare_unsaved: session.as_ref().and_then(|s| s.compare),
             comparing: None,
             path_edit: None,
             rename: None,
@@ -1144,7 +1150,7 @@ impl App {
                 return Task::none();
             }
             EditConfig => {
-                if let Err(e) = crate::config::create_if_missing("") {
+                if let Err(e) = crate::config::create_if_missing("", Some(self.compare_opts.into())) {
                     self.status = Some((format!("Can't create config.toml: {e}"), Tone::Error));
                 } else if let Some(path) = crate::config::file() {
                     self.edit_file(&path, "config.toml");
@@ -1784,8 +1790,13 @@ impl App {
                 return self.palette_pick(selected);
             }
             Dialog::Compare { opts } => {
+                let changed = self.compare_opts != opts;
                 self.compare_opts = opts;
-                self.save_session();
+                if changed {
+                    if let Err(e) = self.save_compare() {
+                        self.status = Some((format!("Compare options not saved: {e}"), Tone::Error));
+                    }
+                }
                 return self.compare_dirs();
             }
         }
@@ -2419,7 +2430,7 @@ impl App {
             left: side(&self.sides[0]),
             right: side(&self.sides[1]),
             hotlist: self.hotlist.clone(),
-            compare: self.compare_opts.into(),
+            compare: self.compare_unsaved,
             recent_commands: self.recent_commands.iter().map(|c| c.id().to_owned()).collect(),
             window: self.placement.map(Into::into),
             editor: String::new(),
@@ -2457,6 +2468,9 @@ impl App {
         let config = crate::config::load()?;
         let keymap = keymap::Keymap::new(&config.keys).map_err(|e| format!("config.toml [keys]: {e}"))?;
         let colors = config.colors().map_err(|e| format!("config.toml: {e}"))?;
+        if let Some(compare) = config.compare {
+            self.compare_opts = compare.into();
+        }
         self.config = config;
         self.keymap = keymap;
         theme::set(colors);
@@ -2484,6 +2498,21 @@ impl App {
                 Err(e) => (format!("Can't start the terminal: {e}"), Tone::Error),
             },
         });
+    }
+
+    /// Writes `compare_opts` to `config.toml` `[compare]`; when that fails
+    /// they're kept in the session instead.
+    fn save_compare(&mut self) -> Result<(), String> {
+        let state = crate::config::CompareState::from(self.compare_opts);
+        if let Err(e) = crate::config::write(&[crate::config::Edit::Compare(state)]) {
+            self.compare_unsaved = Some(state);
+            self.save_session();
+            return Err(e);
+        }
+        if self.compare_unsaved.take().is_some() {
+            self.save_session();
+        }
+        self.reload_config()
     }
 
     fn save_session(&self) {

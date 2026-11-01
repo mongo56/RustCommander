@@ -31,6 +31,31 @@ pub struct Config {
     pub keys: BTreeMap<String, String>,
     /// Colour overrides: name (see `theme::NAMES`) -> `#rrggbb`.
     pub colors: BTreeMap<String, String>,
+    /// Compare-folders options (Ctrl+Shift+F2); `None` = no `[compare]`
+    /// table (older files kept them in `session.toml`).
+    pub compare: Option<CompareState>,
+}
+
+/// [`rc_core::compare::CompareOptions`] in `[compare]` (hidden files
+/// follow the panels). Older versions kept it in `session.toml`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, Deserialize)]
+#[serde(default)]
+pub struct CompareState {
+    pub by_content: bool,
+    pub ignore_date: bool,
+    pub subfolders: bool,
+}
+
+impl From<CompareState> for rc_core::compare::CompareOptions {
+    fn from(c: CompareState) -> Self {
+        Self { by_content: c.by_content, ignore_date: c.ignore_date, subfolders: c.subfolders, show_hidden: false }
+    }
+}
+
+impl From<rc_core::compare::CompareOptions> for CompareState {
+    fn from(o: rc_core::compare::CompareOptions) -> Self {
+        Self { by_content: o.by_content, ignore_date: o.ignore_date, subfolders: o.subfolders }
+    }
 }
 
 impl Config {
@@ -55,6 +80,11 @@ pub enum Edit {
     Color(String, Option<String>),
     /// Drops every `[colors]` entry (a theme was picked).
     ClearColors,
+    /// Sets the three `[compare]` switches.
+    Compare(CompareState),
+    /// Adds `[compare]` with these values unless the file has one already
+    /// (moving the options over from an old `session.toml`).
+    CompareIfMissing(CompareState),
 }
 
 /// Applies `edits` to the text of `config.toml`; comments, layout and
@@ -92,6 +122,46 @@ pub fn apply(text: &str, edits: &[Edit]) -> Result<String, String> {
         }
     }
 
+    /// Adds an empty table `name` above the first table (as in the
+    /// template), not at the end where it would take the comments that
+    /// close the file (the template's commented-out colours).
+    fn add_table_first(doc: &mut DocumentMut, name: &str) {
+        fn shift(item: &mut Item, from: usize) {
+            match item {
+                Item::Table(t) => {
+                    if let Some(p) = t.position().filter(|p| *p >= from) {
+                        t.set_position(p + 1);
+                    }
+                    t.iter_mut().for_each(|(_, item)| shift(item, from));
+                }
+                Item::ArrayOfTables(a) => {
+                    for t in a.iter_mut() {
+                        if let Some(p) = t.position().filter(|p| *p >= from) {
+                            t.set_position(p + 1);
+                        }
+                        t.iter_mut().for_each(|(_, item)| shift(item, from));
+                    }
+                }
+                _ => {}
+            }
+        }
+        fn first(item: &Item) -> Option<usize> {
+            match item {
+                Item::Table(t) => t.position(),
+                Item::ArrayOfTables(a) => a.iter().filter_map(|t| t.position()).min(),
+                _ => None,
+            }
+        }
+        let mut table = toml_edit::Table::new();
+        table.decor_mut().set_prefix("
+");
+        if let Some(from) = doc.iter().filter_map(|(_, item)| first(item)).min() {
+            doc.iter_mut().for_each(|(_, item)| shift(item, from));
+            table.set_position(from);
+        }
+        doc.insert(name, Item::Table(table));
+    }
+
     let mut doc: DocumentMut = text.parse().map_err(|e: toml_edit::TomlError| e.message().to_owned())?;
     for edit in edits {
         match edit {
@@ -110,6 +180,16 @@ pub fn apply(text: &str, edits: &[Edit]) -> Result<String, String> {
                     change(colors, |_| true, String::new(), None);
                 }
             }
+            Edit::CompareIfMissing(_) if doc.contains_key("compare") => {}
+            Edit::Compare(c) | Edit::CompareIfMissing(c) => {
+                if !doc.contains_key("compare") {
+                    add_table_first(&mut doc, "compare");
+                }
+                let compare = table(&mut doc, "compare")?;
+                put(compare, "by_content", Value::from(c.by_content));
+                put(compare, "ignore_date", Value::from(c.ignore_date));
+                put(compare, "subfolders", Value::from(c.subfolders));
+            }
         }
     }
     let out = doc.to_string();
@@ -118,16 +198,27 @@ pub fn apply(text: &str, edits: &[Edit]) -> Result<String, String> {
 }
 
 /// Applies `edits` to `config.toml` (created from the template first if
-/// it's missing).
+/// it's missing). The new text goes to a temporary file that then replaces
+/// the old one, so a failed write never leaves it cut short; nothing is
+/// written when the edits change nothing or the file doesn't parse.
 pub fn write(edits: &[Edit]) -> Result<(), String> {
-    create_if_missing("").map_err(|e| e.to_string())?;
+    create_if_missing("", None).map_err(|e| e.to_string())?;
     let path = file().ok_or("no config folder")?;
     let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     let out = apply(&text, edits).map_err(|e| format!("{}: {e}", path.display()))?;
     if out != text {
-        std::fs::write(&path, out).map_err(|e| format!("{}: {e}", path.display()))?;
+        replace(&path, &out).map_err(|e| format!("{}: {e}", path.display()))?;
     }
     Ok(())
+}
+
+/// Writes `text` to `path` through a temporary file next to it.
+fn replace(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, text)?;
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
 }
 
 /// The folder holding `config.toml` and `session.toml`.
@@ -162,8 +253,9 @@ fn parse(text: &str) -> Result<Config, String> {
 }
 
 /// Writes the commented template unless `config.toml` exists. `editor`
-/// seeds the setting (carried over from older `session.toml` files).
-pub fn create_if_missing(editor: &str) -> std::io::Result<()> {
+/// and `compare` seed those settings (carried over from older
+/// `session.toml` files).
+pub fn create_if_missing(editor: &str, compare: Option<CompareState>) -> std::io::Result<()> {
     let path = file().ok_or_else(|| std::io::Error::other("no config folder"))?;
     if path.exists() {
         return Ok(());
@@ -171,11 +263,12 @@ pub fn create_if_missing(editor: &str) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::write(path, template(editor))
+    replace(&path, &template(editor, compare.unwrap_or_default()))
 }
 
-fn template(editor: &str) -> String {
+fn template(editor: &str, compare: CompareState) -> String {
     let editor = toml::Value::String(editor.to_owned());
+    let CompareState { by_content, ignore_date, subfolders } = compare;
     let themes: Vec<&str> = crate::theme::PRESETS.iter().map(|p| p.id).collect();
     let themes = themes.join(", ");
     let commands: Vec<&str> = rc_core::Command::ALL.iter().map(|c| c.id()).collect();
@@ -215,6 +308,14 @@ fn template(editor: &str) -> String {
          # Colour theme: {themes}. [colors] below overrides single colours.\n\
          theme = \"dark\"\n\
          \n\
+         # Compare folders (Shift+F2; Ctrl+Shift+F2 or F10 change these): read the\n\
+         # contents of same-size files, ignore dates (mark differing files on both\n\
+         # sides), and look into subfolders found on both sides.\n\
+         [compare]\n\
+         by_content = {by_content}\n\
+         ignore_date = {ignore_date}\n\
+         subfolders = {subfolders}\n\
+         \n\
          # Key bindings for the panels, on top of the Total Commander-like defaults.\n\
          # \"Key\" = \"command\"; an empty command unbinds the key. Modifiers: Ctrl, Alt,\n\
          # Shift, Win. Keys: a letter or symbol, F1-F12, Up, Down, Left, Right, PgUp,\n\
@@ -239,12 +340,12 @@ mod tests {
     #[test]
     fn template_parses_back() {
         let editor = r#""C:\Program Files\Ed\ed.exe" -n %1"#;
-        assert_eq!(parse(&template(editor)).unwrap().editor, editor);
-        let config = parse(&template("")).unwrap();
+        assert_eq!(parse(&template(editor, CompareState::default())).unwrap().editor, editor);
+        let config = parse(&template("", CompareState::default())).unwrap();
         assert_eq!(config.editor, "");
         assert!(config.keys.is_empty() && config.colors.is_empty());
         // The commented-out colour lines are valid settings once uncommented.
-        let uncommented = template("").replace("\n# bg = ", "\nbg = ");
+        let uncommented = template("", CompareState::default()).replace("\n# bg = ", "\nbg = ");
         assert_eq!(parse(&uncommented).unwrap().colors["bg"], "#14161a");
     }
 
@@ -274,7 +375,7 @@ mod tests {
         assert_eq!(config.editor, "vim %1");
         assert_eq!(config.theme, "light");
         assert!(config.show_hidden && config.show_fkeys);
-        assert!(!parse(&template("")).unwrap().show_fkeys);
+        assert!(!parse(&template("", CompareState::default())).unwrap().show_fkeys);
         assert_eq!(config.keys["Ctrl+Shift+F5"], "cm_RenMov");
         assert_eq!(config.colors["Accent"], "#00ff00");
         assert_eq!(config.colors["bg"], "#000000");
@@ -290,7 +391,7 @@ mod tests {
 
     #[test]
     fn template_edits_round_trip() {
-        let text = template("notepad");
+        let text = template("notepad", CompareState::default());
         assert_eq!(apply(&text, &[]).unwrap(), text);
         let edits = [Edit::Text("theme", "nord".into()), Edit::Key(("ctrl+k".into(), Some("cm_MkDir".into())))];
         let out = apply(&text, &edits).unwrap();
@@ -307,5 +408,122 @@ mod tests {
     fn missing_keys_default_and_typos_fail() {
         assert_eq!(parse("").unwrap().editor, "");
         assert!(parse("editor = ").is_err());
+    }
+
+    const OLD: CompareState = CompareState { by_content: true, ignore_date: false, subfolders: true };
+
+    #[test]
+    fn compare_migrates_once_and_keeps_comments() {
+        // A user's file without [compare]: comments, unknown keys and the
+        // other tables stay; [compare] is added with the old values.
+        let text = "# mine
+editor = 'ed' # trailing
+future = 1
+
+[keys]
+# a key
+F8 = \"\"
+
+[colors]
+# red
+accent = \"#ff0000\"
+";
+        let out = apply(text, &[Edit::CompareIfMissing(OLD)]).unwrap();
+        let added = "future = 1
+
+[compare]
+by_content = true
+ignore_date = false
+subfolders = true
+
+[keys]
+# a key
+";
+        assert_eq!(out.replace(added, "future = 1
+
+[keys]
+# a key
+"), text, "{out}");
+        assert_eq!(parse(&out).unwrap().compare, Some(OLD));
+        // Again (a crash before the session was saved): nothing changes.
+        assert_eq!(apply(&out, &[Edit::CompareIfMissing(CompareState::default())]).unwrap(), out);
+        // A file that has [compare] already keeps its own values, even
+        // partial or empty ones.
+        for own in ["[compare]
+ignore_date = true # me
+", "[compare]
+", "compare = { subfolders = true }
+"] {
+            let text = format!("# c
+editor = ''
+{own}");
+            assert_eq!(apply(&text, &[Edit::CompareIfMissing(OLD)]).unwrap(), text);
+        }
+        assert_eq!(parse("[compare]
+ignore_date = true
+").unwrap().compare, Some(CompareState { ignore_date: true, ..Default::default() }));
+        assert_eq!(parse("editor = ''").unwrap().compare, None);
+        // A file made from an older template: [compare] lands where the
+        // template has it now, the closing commented colours stay under
+        // [colors].
+        let now = template("", OLD);
+        let start = now.find("# Compare folders").unwrap();
+        let block = &now[start..now.find("[keys]").unwrap()];
+        let block = &block[..block.find("
+
+").unwrap() + 2];
+        let older = now.replace(block, "");
+        assert_eq!(parse(&older).unwrap().compare, None);
+        let comments = &block[..block.find("[compare]").unwrap()];
+        assert_eq!(apply(&older, &[Edit::CompareIfMissing(OLD)]).unwrap(), now.replace(comments, ""));
+        // No tables: appended. Nested tables and arrays keep their order.
+        let added = "
+[compare]
+by_content = true
+ignore_date = false
+subfolders = true
+";
+        assert_eq!(apply("x = 1
+", &[Edit::Compare(OLD)]).unwrap(), format!("x = 1
+{added}"));
+        let nested = "x = 1
+[a]
+y = 1
+[[b]]
+z = 1
+[a.c]
+w = 1
+[[b]]
+z = 2
+";
+        let out = apply(nested, &[Edit::Compare(OLD)]).unwrap();
+        assert!(out.starts_with("x = 1
+
+[compare]
+"), "{out}");
+        assert!(out.ends_with(&nested[6..]), "{out}");
+        // A broken file is reported, not overwritten.
+        assert!(apply("editor = ", &[Edit::CompareIfMissing(OLD)]).is_err());
+        assert!(apply("compare = 1", &[Edit::Compare(OLD)]).is_err());
+    }
+
+    #[test]
+    fn compare_round_trips() {
+        // The template carries the seed; changing it touches only those lines.
+        let text = template("", OLD);
+        assert_eq!(parse(&text).unwrap().compare, Some(OLD));
+        assert_eq!(apply(&text, &[Edit::CompareIfMissing(CompareState::default())]).unwrap(), text);
+        let new = CompareState { by_content: false, ignore_date: true, subfolders: true };
+        let out = apply(&text, &[Edit::Compare(new)]).unwrap();
+        assert_eq!(parse(&out).unwrap().compare, Some(new));
+        let changed: Vec<_> = out.lines().filter(|l| !text.lines().any(|t| t == *l)).collect();
+        assert_eq!(changed, ["by_content = false", "ignore_date = true"]);
+        // A trailing comment on a value survives a change.
+        let out = apply("[compare]
+subfolders = false # deep
+", &[Edit::Compare(new)]).unwrap();
+        assert!(out.contains("subfolders = true # deep"), "{out}");
+        let back: rc_core::compare::CompareOptions = parse(&out).unwrap().compare.unwrap().into();
+        assert_eq!(CompareState::from(back), new);
     }
 }
