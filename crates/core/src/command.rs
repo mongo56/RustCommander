@@ -43,6 +43,8 @@ pub enum Command {
     Move,
     /// Rename the cursor entry in place (Shift+F6).
     Rename,
+    /// Rename the selected files by mask (Ctrl+M).
+    MultiRename,
     MakeDir,
     /// Delete to the recycle bin.
     Delete,
@@ -97,6 +99,7 @@ impl Command {
             Copy => "cm_Copy",
             Move => "cm_RenMov",
             Rename => "cm_RenameOnly",
+            MultiRename => "cm_MultiRenameFiles",
             MakeDir => "cm_MkDir",
             Delete => "cm_Delete",
             DeletePermanent => "cm_DeletePermanent",
@@ -151,6 +154,7 @@ impl Command {
             Copy,
             Move,
             Rename,
+            MultiRename,
             MakeDir,
             Delete,
             DeletePermanent,

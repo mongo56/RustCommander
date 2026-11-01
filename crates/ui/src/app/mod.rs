@@ -1,6 +1,7 @@
 //! Application state and update logic. Drawing lives in [`view`].
 
 mod view;
+mod multi_rename;
 mod viewer;
 
 use crate::keymap;
@@ -92,6 +93,10 @@ pub struct App {
     nav: [Option<PendingNav>; 2],
     /// Built-in viewer (F3), covering the whole window while open.
     viewer: Option<viewer::Viewer>,
+    /// Multi-rename tool (Ctrl+M), covering the whole window while open.
+    multi_rename: Option<multi_rename::MultiRename>,
+    /// Its settings, kept between uses.
+    rename_opts: rc_core::rename::Options,
     /// Last good `config.toml` and the key bindings built from it.
     config: crate::config::Config,
     keymap: keymap::Keymap,
@@ -260,6 +265,7 @@ pub enum Message {
     ViewerZoomWheel(f32),
     ViewerSearch(String),
     ViewerFind,
+    MultiRename(multi_rename::MrMsg),
     /// Background listing for a pending navigation: (side, seq, listing).
     Navigated(usize, u64, Listing),
     /// Subfolders of a folder, for path bar suggestions.
@@ -316,6 +322,8 @@ impl App {
             next_listing: 0,
             nav: [None, None],
             viewer: None,
+            multi_rename: None,
+            rename_opts: rc_core::rename::Options::default(),
             config: crate::config::Config::default(),
             keymap: keymap::Keymap::default(),
             config_stamp: None,
@@ -661,6 +669,7 @@ impl App {
             Message::ViewerZoomWheel(lines) => return self.viewer_zoom_wheel(lines),
             Message::ViewerSearch(text) => self.viewer_search_input(text),
             Message::ViewerFind => return self.viewer_submit(),
+            Message::MultiRename(msg) => return self.multi_rename_update(msg),
             Message::Navigated(side, seq, result) => {
                 let current = self.sides[side].current;
                 let pending = self.nav[side].take_if(|p| p.seq == seq && p.tab == current);
@@ -693,6 +702,12 @@ impl App {
                 return self.update(Message::Answer(id, Resolution::Cancel));
             }
             return Task::none();
+        }
+        if self.multi_rename.is_some() {
+            if named.is_some_and(is_modifier_key) {
+                return Task::none();
+            }
+            return self.multi_rename_key(named, &key, mods, captured);
         }
         if self.viewer.is_some() {
             // Keys the search box used must not act again: in a fast burst
@@ -819,6 +834,7 @@ impl App {
         match cmd {
             Quit => return self.quit(),
             View => return self.open_viewer(),
+            MultiRename => return self.open_multi_rename(),
             Edit => {
                 if let Some(e) = self.panel(active).current().filter(|e| e.kind == EntryKind::File) {
                     let (path, name) = (e.path.clone(), e.name.clone());

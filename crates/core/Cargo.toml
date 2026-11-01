@@ -9,3 +9,4 @@ license.workspace = true
 chrono.workspace = true
 trash.workspace = true
 memchr = "2.7"
+regex = "1"

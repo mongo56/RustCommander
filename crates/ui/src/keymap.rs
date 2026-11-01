@@ -179,6 +179,7 @@ fn default_command(key: &Key, m: Modifiers) -> Option<Command> {
             "r" => Refresh,
             "h" => ToggleHidden,
             "s" => QuickFilter,
+            "m" => MultiRename,
             "\\" => GoRoot,
             "q" => Quit,
             "," => EditConfig,

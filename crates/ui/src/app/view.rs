@@ -20,9 +20,10 @@ impl App {
     pub fn view(&self) -> Element<'_, Message> {
         let panels = row![self.side_view(0), vline(), self.side_view(1)].height(Length::Fill);
 
-        let base: Element<'_, Message> = match &self.viewer {
-            Some(v) => self.viewer_view(v),
-            None => container(column![panels, hline(), self.jobs_view(), self.bottom_bar()])
+        let base: Element<'_, Message> = match (&self.multi_rename, &self.viewer) {
+            (Some(mr), _) => self.multi_rename_view(mr),
+            (None, Some(v)) => self.viewer_view(v),
+            (None, None) => container(column![panels, hline(), self.jobs_view(), self.bottom_bar()])
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .style(filled(theme::c().bg))

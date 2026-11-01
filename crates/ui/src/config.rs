@@ -93,7 +93,7 @@ fn template(editor: &str) -> String {
          # Commands:\n\
          {command_list}\
          [keys]\n\
-         # \"Ctrl+M\" = \"cm_MkDir\"\n\
+         # \"Ctrl+K\" = \"cm_MkDir\"\n\
          # \"F8\" = \"\"\n\
          \n\
          # Colours as \"#rrggbb\"; the values below are the defaults.\n\
