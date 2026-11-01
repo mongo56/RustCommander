@@ -100,6 +100,12 @@ impl Keymap {
         }
     }
 
+    /// The function-key bar: (key label, command bound to exactly that key,
+    /// `None` = unbound). Cheap enough to call on every view.
+    pub fn fkey_bar(&self) -> Vec<(&'static str, Option<Command>)> {
+        FKEY_BAR.iter().map(|&(label, name)| (label, self.command_of(name))).collect()
+    }
+
     /// Every effective binding as (display name, command), defaults with the
     /// overrides applied. Defaults are found by trying every bindable key
     /// with every modifier combination; a combination is left out when the
@@ -167,6 +173,18 @@ impl Keymap {
 pub type KeyEdit = (String, Option<String>);
 
 /// The default command of a canonical key name.
+/// The slots of the function-key bar: display label and canonical key name.
+const FKEY_BAR: [(&str, &str); 8] = [
+    ("F3", "f3"),
+    ("F4", "f4"),
+    ("F5", "f5"),
+    ("F6", "f6"),
+    ("F7", "f7"),
+    ("F8", "f8"),
+    ("F10", "f10"),
+    ("Alt+F4", "alt+f4"),
+];
+
 fn default_of(name: &str) -> Option<Command> {
     let (key, m) = press_of(name)?;
     default_command(&key, m)
@@ -512,6 +530,23 @@ mod tests {
         let bad = |k: &str, v: &str| Keymap::new(&BTreeMap::from([(k.to_owned(), v.to_owned())])).unwrap_err();
         assert!(bad("F5", "cm_Nope").contains("cm_Nope"));
         assert!(bad("Ctrl+Nope", "cm_Copy").contains("Ctrl+Nope"));
+    }
+
+    #[test]
+    fn fkey_bar_follows_bindings() {
+        let label = |map: &Keymap, key: &str| {
+            map.fkey_bar().into_iter().find(|(k, _)| *k == key).map(|(_, c)| c.map(Command::short_label)).unwrap()
+        };
+        let map = Keymap::default();
+        assert_eq!(label(&map, "F3"), Some("View"));
+        assert_eq!(label(&map, "F7"), Some("MkDir"));
+        assert_eq!(label(&map, "Alt+F4"), Some("Exit"));
+
+        let keys = BTreeMap::from([("F7".to_owned(), "cm_Copy".to_owned()), ("F8".to_owned(), String::new())]);
+        let map = Keymap::new(&keys).unwrap();
+        assert_eq!(label(&map, "F7"), Some("Copy"));
+        assert_eq!(label(&map, "F8"), None);
+        assert_eq!(label(&map, "F5"), Some("Copy"));
     }
 
     #[test]

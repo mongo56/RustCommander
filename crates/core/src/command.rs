@@ -217,6 +217,56 @@ impl Command {
         }
     }
 
+    /// A one-word label for the function-key bar.
+    pub fn short_label(self) -> &'static str {
+        use Command::*;
+        match self {
+            Help => "Help",
+            Rename => "Rename",
+            View => "View",
+            Edit => "Edit",
+            EditNew => "NewFile",
+            Copy => "Copy",
+            Move => "Move",
+            MakeDir => "MkDir",
+            Delete => "Delete",
+            DeletePermanent => "DelPerm",
+            Terminal => "Term",
+            Configuration => "Settings",
+            Quit => "Exit",
+            Open => "Open",
+            Refresh => "Refresh",
+            Pack => "Pack",
+            Unpack => "Unpack",
+            FindFiles => "Find",
+            MultiRename => "MultiRen",
+            CommandPalette => "Palette",
+            NewTab => "NewTab",
+            CloseTab => "CloseTab",
+            Hotlist => "Hotlist",
+            Connect => "Connect",
+            Disconnect => "Disconn",
+            SelectAll => "SelAll",
+            DeselectAll => "SelNone",
+            ToggleHidden => "Hidden",
+            QuickFilter => "Filter",
+            CompareDirs | CompareDirsOptions => "CmpDirs",
+            CompareFiles => "CmpFiles",
+            SortBy(SortKey::Name) => "ByName",
+            SortBy(SortKey::Ext) => "ByExt",
+            SortBy(SortKey::Size) => "BySize",
+            SortBy(SortKey::Modified) => "ByDate",
+            SwitchPanel => "Switch",
+            GoParent => "Up",
+            GoRoot => "Root",
+            EditConfig => "Config",
+            _ => {
+                let id = self.id();
+                id.strip_prefix("cm_").unwrap_or(id)
+            }
+        }
+    }
+
     /// The command with this id (case-insensitive), for config files.
     pub fn from_id(id: &str) -> Option<Command> {
         Self::ALL.iter().copied().find(|c| c.id().eq_ignore_ascii_case(id))

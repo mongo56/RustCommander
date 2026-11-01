@@ -813,22 +813,13 @@ impl App {
             .color(theme::c().muted),
         };
 
-        let keys = [
-            ("F3", "View", Command::View),
-            ("F4", "Edit", Command::Edit),
-            ("F5", "Copy", Command::Copy),
-            ("F6", "Move", Command::Move),
-            ("F7", "MkDir", Command::MakeDir),
-            ("F8", "Delete", Command::Delete),
-            ("F10", "Settings", Command::Configuration),
-            ("Alt+F4", "Exit", Command::Quit),
-        ];
-        let fkeys = Row::with_children(keys.into_iter().map(|(key, label, cmd)| {
+        let fkeys = Row::with_children(self.keymap.fkey_bar().into_iter().map(|(key, cmd)| {
+            let label = cmd.map_or("", Command::short_label);
             button(
                 container(row![text(key).size(12).color(theme::c().accent), text(label).size(12)].spacing(6))
                     .center_x(Length::Fill),
             )
-            .on_press(Message::Run(cmd))
+            .on_press_maybe(cmd.map(Message::Run))
             .padding([4, 10])
             .width(Length::Fill)
             .style(theme::fkey)
