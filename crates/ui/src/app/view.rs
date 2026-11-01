@@ -181,7 +181,7 @@ impl App {
         let buttons = Row::with_children(self.drives.iter().map(|drive| {
             let current = panel.path.starts_with(drive.as_str());
             let letter = drive.trim_end_matches(['\\', '/', ':']).to_string();
-            let letter = if letter.is_empty() { drive.clone() } else { letter };
+            let letter = if letter.is_empty() { drive.clone() } else { letter.to_lowercase() };
             let mut content = Row::new().spacing(4).align_y(Alignment::Center);
             if let Some(icon) = self.icon(Path::new(drive), true) {
                 content = content.push(image(icon).width(ICON).height(ICON));
