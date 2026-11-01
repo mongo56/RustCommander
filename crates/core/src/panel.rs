@@ -43,8 +43,11 @@ pub enum Activated {
 pub enum Nav {
     /// Go to `path`, putting the cursor on `focus` if present.
     To { path: PathBuf, focus: Option<String> },
-    Back,
-    Forward,
+    /// Back / forward this many steps (at least 1) in the history; the
+    /// folders stepped over move to the other direction, as if stepped one
+    /// by one.
+    Back(usize),
+    Forward(usize),
 }
 
 impl Nav {
@@ -94,6 +97,23 @@ struct Visit {
 
 /// Most folders kept in each history direction.
 const HISTORY_LIMIT: usize = 100;
+
+/// The visit `n` steps into a history stack (its top is one step away).
+fn step_target(stack: &[Visit], n: usize) -> Option<&Visit> {
+    stack.len().checked_sub(n.max(1)).map(|i| &stack[i])
+}
+
+/// Drops the visit `n` steps away, so the same `n` next tries the one
+/// beyond it. False if there is none.
+fn forget_step(stack: &mut Vec<Visit>, n: usize) -> bool {
+    match stack.len().checked_sub(n.max(1)) {
+        Some(i) => {
+            stack.remove(i);
+            true
+        }
+        None => false,
+    }
+}
 
 impl Panel {
     pub fn open(path: impl Into<PathBuf>) -> io::Result<Self> {
@@ -183,8 +203,8 @@ impl Panel {
     pub fn nav_target(&self, nav: &Nav) -> Option<PathBuf> {
         match nav {
             Nav::To { path, .. } => Some(path.clone()),
-            Nav::Back => self.back.last().map(|v| v.path.clone()),
-            Nav::Forward => self.forward.last().map(|v| v.path.clone()),
+            Nav::Back(n) => step_target(&self.back, *n).map(|v| v.path.clone()),
+            Nav::Forward(n) => step_target(&self.forward, *n).map(|v| v.path.clone()),
         }
     }
 
@@ -194,8 +214,8 @@ impl Panel {
     pub fn forget_target(&mut self, nav: &Nav) -> bool {
         match nav {
             Nav::To { .. } => false,
-            Nav::Back => self.back.pop().is_some(),
-            Nav::Forward => self.forward.pop().is_some(),
+            Nav::Back(n) => forget_step(&mut self.back, *n),
+            Nav::Forward(n) => forget_step(&mut self.forward, *n),
         }
     }
 
@@ -211,15 +231,21 @@ impl Panel {
                 }
                 Visit { path: path.clone(), focus: focus.clone() }
             }
-            Nav::Back | Nav::Forward => {
-                let (from, to) = if *nav == Nav::Back {
+            Nav::Back(n) | Nav::Forward(n) => {
+                let (from, to) = if matches!(nav, Nav::Back(_)) {
                     (&mut self.back, &mut self.forward)
                 } else {
                     (&mut self.forward, &mut self.back)
                 };
-                let Some(target) = from.pop() else { return };
+                if step_target(from, *n).is_none() {
+                    return;
+                }
                 push_limited(to, leaving);
-                target
+                for _ in 1..*n {
+                    let skipped = from.pop().expect("checked by step_target");
+                    push_limited(to, skipped);
+                }
+                from.pop().expect("checked by step_target")
             }
         };
         self.load(target.path, target.focus.as_deref(), entries);
@@ -236,11 +262,35 @@ impl Panel {
     /// Goes to the previous folder in the history, skipping folders that no
     /// longer exist.
     pub fn go_back(&mut self) -> io::Result<()> {
-        self.go(Nav::Back)
+        self.go(Nav::Back(1))
     }
 
     pub fn go_forward(&mut self) -> io::Result<()> {
-        self.go(Nav::Forward)
+        self.go(Nav::Forward(1))
+    }
+
+    /// The whole history for the history list (Alt+Down), most recent first:
+    /// the forward folders, the current one (at the returned index), then
+    /// the back folders.
+    pub fn history(&self) -> (Vec<&Path>, usize) {
+        let mut list: Vec<&Path> = self.forward.iter().map(|v| v.path.as_path()).collect();
+        let current = list.len();
+        list.push(&self.path);
+        list.extend(self.back.iter().rev().map(|v| v.path.as_path()));
+        (list, current)
+    }
+
+    /// The navigation to entry `i` of `history()`; `None` for the current
+    /// folder or past the end.
+    pub fn history_nav(&self, i: usize) -> Option<Nav> {
+        let f = self.forward.len();
+        if i < f {
+            Some(Nav::Forward(f - i))
+        } else if i > f && i - f <= self.back.len() {
+            Some(Nav::Back(i - f))
+        } else {
+            None
+        }
     }
 
     fn visit(&self) -> Visit {
@@ -875,6 +925,50 @@ mod tests {
         std::fs::remove_dir_all(root.join("a")).unwrap();
         panel.go_back().unwrap();
         assert_eq!(panel.path, root);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn history_list_jumps_several_steps() {
+        let root = std::env::temp_dir().join(format!("rc-core-histlist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for d in ["a", "b", "c", "d"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        let p = |d: &str| root.join(d);
+        let mut panel = Panel::open(&root).unwrap();
+        for d in ["a", "b", "c", "d"] {
+            panel.navigate(p(d), None).unwrap();
+        }
+        panel.go_back().unwrap();
+        // Most recent first, the current folder marked.
+        let (list, current) = panel.history();
+        assert_eq!(list, [p("d"), p("c"), p("b"), p("a"), root.clone()]);
+        assert_eq!(current, 1);
+        assert_eq!(panel.history_nav(1), None);
+        assert_eq!(panel.history_nav(5), None);
+        assert_eq!(panel.history_nav(0), Some(Nav::Forward(1)));
+
+        // Three back: as if stepped one by one, so forward holds b, c, d.
+        let nav = panel.history_nav(4).unwrap();
+        assert_eq!(nav, Nav::Back(3));
+        panel.go(nav).unwrap();
+        assert_eq!(panel.path, root);
+        let (list, current) = panel.history();
+        assert_eq!(list, [p("d"), p("c"), p("b"), p("a"), root.clone()]);
+        assert_eq!(current, 4);
+        panel.go_forward().unwrap();
+        assert_eq!(panel.path, p("a"));
+        panel.go(Nav::Forward(2)).unwrap();
+        assert_eq!(panel.path, p("c"));
+
+        // A vanished target: the next one beyond it is used.
+        std::fs::remove_dir_all(p("a")).unwrap();
+        panel.go(Nav::Back(2)).unwrap();
+        assert_eq!(panel.path, root);
+        let (list, _) = panel.history();
+        assert_eq!(list, [p("d"), p("c"), p("b"), root.clone()]);
+        assert!(panel.go(Nav::Back(1)).is_ok() && panel.path == root);
         std::fs::remove_dir_all(&root).unwrap();
     }
 

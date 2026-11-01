@@ -520,7 +520,8 @@ impl App {
 
     fn dialog_view<'a>(&'a self, dialog: &'a Dialog) -> Element<'a, Message> {
         match dialog {
-            Dialog::Hotlist { selected } => return self.hotlist_view(*selected),
+            Dialog::Hotlist(menu) => return self.hotlist_view(menu),
+            Dialog::History { selected } => return self.history_view(*selected),
             Dialog::Compare { opts } => return compare_view(opts),
             _ => {}
         }
@@ -561,7 +562,7 @@ impl App {
                 None,
                 "Delete",
             ),
-            Dialog::Hotlist { .. } | Dialog::Compare { .. } => unreachable!("drawn above"),
+            Dialog::Hotlist(_) | Dialog::History { .. } | Dialog::Compare { .. } => unreachable!("drawn above"),
         };
 
         let mut content = column![text(title).size(16), text(body).size(13).color(theme::c().muted)].spacing(12);
@@ -580,8 +581,34 @@ impl App {
         container(content).padding(20).width(Length::Fixed(520.0)).style(theme::dialog).into()
     }
 
-    fn hotlist_view(&self, selected: usize) -> Element<'_, Message> {
+    /// A row of the folder popups: digit key, icon, name, dimmed detail (its
+    /// start elided so the row stays on one line).
+    fn popup_row(
+        &self,
+        i: usize,
+        icon: Option<&Path>,
+        name: String,
+        color: iced::Color,
+        detail: String,
+    ) -> Row<'static, Message> {
+        let key = if i < 9 { (i + 1).to_string() } else { String::new() };
+        let mut content = Row::new().spacing(8).align_y(Alignment::Center);
+        content = content.push(text(key).size(12).color(theme::c().muted).width(Length::Fixed(12.0)));
+        match icon.and_then(|path| self.icon(path, true)) {
+            Some(icon) => content = content.push(image(icon).width(ICON).height(ICON)),
+            None => content = content.push(Space::with_width(ICON)),
+        }
+        let detail = elide_left(&detail, 66usize.saturating_sub(name.chars().count() * 6 / 5).max(16));
+        content
+            .push(text(name).size(13).color(color).wrapping(Wrapping::None))
+            .push(text(detail).size(11).color(theme::c().muted).wrapping(Wrapping::None))
+    }
+
+    fn hotlist_view(&self, menu: &hotlist::HotlistMenu) -> Element<'_, Message> {
+        use crate::hotlist::{self as hl, HotItem};
+        let selected = menu.selected;
         let here = &self.panel(self.active).path;
+        let entries = hl::menu(&self.hotlist, &menu.at);
         let row_button = |content: Row<'static, Message>, i: usize| {
             button(content)
                 .on_press(Message::HotlistPick(i))
@@ -590,33 +617,97 @@ impl App {
                 .style(theme::suggestion(selected == i))
         };
         let mut items = Column::new();
-        for (i, path) in self.hotlist.iter().enumerate() {
-            let name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| path.display().to_string());
-            let key = if i < 9 { (i + 1).to_string() } else { String::new() };
-            let mut content = Row::new().spacing(8).align_y(Alignment::Center);
-            content = content.push(text(key).size(12).color(theme::c().muted).width(Length::Fixed(12.0)));
-            if let Some(icon) = self.icon(path, true) {
-                content = content.push(image(icon).width(ICON).height(ICON));
+        let new_name = menu.naming.as_ref().filter(|_| !menu.renaming);
+        for (i, item) in entries.iter().enumerate() {
+            if i == selected {
+                items = items.push_maybe(new_name.map(|typed| new_submenu_row(typed)));
             }
-            let color = if path == here { theme::c().selected } else { theme::c().text };
-            content = content
-                .push(text(name).size(13).color(color).wrapping(Wrapping::None))
-                .push(text(elide_left(&path.display().to_string(), 60)).size(11).color(theme::c().muted).wrapping(Wrapping::None));
+            let content = match item {
+                HotItem::Folder(path) => {
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.display().to_string());
+                    let color = if path == here { theme::c().selected } else { theme::c().text };
+                    self.popup_row(i, Some(path), name, color, path.display().to_string())
+                }
+                HotItem::Menu { name, items } => {
+                    let name = match &menu.naming {
+                        Some(typed) if menu.renaming && i == selected => format!("{typed}_"),
+                        _ => format!("{name}  \u{203a}"),
+                    };
+                    let count = match items.len() {
+                        1 => "1 entry".to_owned(),
+                        n => format!("{n} entries"),
+                    };
+                    self.popup_row(i, None, name, theme::c().text, count)
+                }
+            };
             items = items.push(row_button(content, i));
         }
-        let n = self.hotlist.len();
-        let toggle = if self.hotlist.contains(here) { "Remove current folder" } else { "Add current folder" };
+        let n = entries.len();
+        if selected >= n {
+            items = items.push_maybe(new_name.map(|typed| new_submenu_row(typed)));
+        }
+        let in_menu = entries.iter().any(|it| it.folder() == Some(here.as_path()));
+        let toggle = if in_menu { "Remove current folder" } else { "Add current folder" };
         let toggle_row = Row::new()
             .spacing(8)
             .push(text("A").size(12).color(theme::c().muted).width(Length::Fixed(12.0)))
             .push(text(toggle).size(13));
         items = items.push(row_button(toggle_row, n));
         let empty = (n == 0).then(|| text("No folders yet.").size(13).color(theme::c().muted));
-        let hint = text("Enter go \u{b7} 1-9 jump \u{b7} Del remove \u{b7} Esc close").size(11).color(theme::c().muted);
-        let content = column![text("Hotlist").size(16)].push_maybe(empty).push(items).push(hint).spacing(10);
+        let hint = if menu.naming.is_some() {
+            "Type the name \u{b7} Enter OK \u{b7} Esc cancel"
+        } else {
+            "Enter go \u{b7} 1-9 jump \u{b7} N submenu \u{b7} Ctrl+arrows move \u{b7} Del remove \u{b7} F1 all keys"
+        };
+        let hint = text(hint).size(11).color(theme::c().muted);
+        // Title: the submenu path, with a way back for the mouse.
+        let mut title = String::from("Hotlist");
+        let mut level = self.hotlist.as_slice();
+        for &i in &menu.at {
+            if let Some(HotItem::Menu { name, items }) = level.get(i) {
+                title.push_str(&format!(" \u{203a} {name}"));
+                level = items;
+            }
+        }
+        let mut header = Row::new().spacing(8).align_y(Alignment::Center).push(text(title).size(16).width(Length::Fill));
+        if !menu.at.is_empty() {
+            header = header.push(small_button("Back", Message::HotlistBack));
+        }
+        let content = column![header].push_maybe(empty).push(items).push(hint).spacing(10);
+        container(content).padding(16).width(Length::Fixed(520.0)).style(theme::dialog).into()
+    }
+
+    fn history_view(&self, selected: usize) -> Element<'_, Message> {
+        let (list, current) = self.panel(self.active).history();
+        // A window of rows around the selection (the history holds up to 201).
+        const ROWS: usize = 20;
+        let start = selected.saturating_sub(ROWS / 2).min(list.len().saturating_sub(ROWS));
+        let mut items = Column::new();
+        for (i, path) in list.iter().enumerate().skip(start).take(ROWS) {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string());
+            let (name, color) = if i == current {
+                (format!("{name}  (current)"), theme::c().selected)
+            } else {
+                (name, theme::c().text)
+            };
+            let content = self.popup_row(i, Some(path), name, color, path.display().to_string());
+            items = items.push(
+                button(content)
+                    .on_press(Message::HistoryPick(i))
+                    .width(Length::Fill)
+                    .padding([4, 8])
+                    .style(theme::suggestion(selected == i)),
+            );
+        }
+        let hint = text("Most recent first \u{b7} Enter go \u{b7} 1-9 jump \u{b7} Esc close").size(11).color(theme::c().muted);
+        let title = format!("Folder history ({} of {})", selected + 1, list.len());
+        let content = column![text(title).size(16), items, hint].spacing(10);
         container(content).padding(16).width(Length::Fixed(520.0)).style(theme::dialog).into()
     }
 
@@ -708,6 +799,15 @@ impl App {
     fn path_chars(&self) -> usize {
         ((self.window_width / 2.0 - 40.0) / 7.0).max(10.0) as usize
     }
+}
+
+/// The name of a hotlist submenu being created, where it will be inserted.
+fn new_submenu_row(typed: &str) -> Element<'static, Message> {
+    let field = Row::new()
+        .spacing(8)
+        .push(text("N").size(12).color(theme::c().muted).width(Length::Fixed(12.0)))
+        .push(text(format!("New submenu: {typed}_")).size(13).color(theme::c().selected));
+    container(field).padding([4, 8]).into()
 }
 
 /// Keeps the end of a long path: `…\sandbox\B`.

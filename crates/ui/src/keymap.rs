@@ -232,6 +232,7 @@ fn default_command(key: &Key, m: Modifiers) -> Option<Command> {
     let cmd = match key.as_ref() {
         Key::Named(named) => match named {
             Named::ArrowUp if !ctrl => CursorUp,
+            Named::ArrowDown if alt => DirHistory,
             Named::ArrowDown => CursorDown,
             Named::PageUp if ctrl => GoParent,
             Named::PageUp => PageUp,

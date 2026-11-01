@@ -1,6 +1,7 @@
 //! Session persistence: tabs, paths, sorting and window size are saved on
 //! exit to `session.toml` in the config folder and restored on start.
 
+use crate::hotlist::HotItem;
 use rc_core::{Panel, SortKey};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -13,9 +14,10 @@ pub struct Session {
     pub active: usize,
     pub left: SideState,
     pub right: SideState,
-    /// Directory hotlist (Ctrl+D), in menu order.
+    /// Directory hotlist (Ctrl+D), in menu order. Older versions wrote a
+    /// list of paths, which still loads (a folder is a plain path).
     #[serde(default)]
-    pub hotlist: Vec<PathBuf>,
+    pub hotlist: Vec<HotItem>,
     /// Window position and maximised state (Windows).
     #[serde(default)]
     pub window: Option<WindowState>,
@@ -168,7 +170,11 @@ mod tests {
                 tabs: vec![TabState { path: dir.clone(), sort: "size".into(), descending: true, show_hidden: true }],
             },
             right: SideState::default(),
-            hotlist: vec![dir.clone()],
+            hotlist: vec![
+                HotItem::Folder(dir.clone()),
+                HotItem::Menu { name: "Work".into(), items: vec![HotItem::Folder(dir.join("x"))] },
+                HotItem::Menu { name: "Empty".into(), items: vec![] },
+            ],
             window: Some(WindowState { left: -8, top: 0, right: 1200, bottom: 800, maximized: true }),
             compare: CompareState { by_content: true, ignore_date: false, subfolders: true },
             editor: r#""my editor.exe" -n %1"#.into(),
@@ -176,10 +182,34 @@ mod tests {
         let text = toml::to_string_pretty(&session).unwrap();
         let back: Session = toml::from_str(&text).unwrap();
         assert_eq!(back.active, 1);
-        assert_eq!(back.hotlist, std::slice::from_ref(&dir));
+        assert_eq!(back.hotlist, session.hotlist);
         let panel = back.left.tabs[0].open().unwrap();
         assert_eq!(panel.sort.key, SortKey::Size);
         assert!(panel.sort.descending && panel.show_hidden);
+    }
+
+    #[test]
+    fn loads_old_plain_hotlist() {
+        let text = r#"
+            width = 800.0
+            height = 600.0
+            active = 0
+            hotlist = ['C:\Users', 'D:\Work']
+            [left]
+            current = 0
+            tabs = []
+            [right]
+            current = 0
+            tabs = []
+        "#;
+        let session: Session = toml::from_str(text).unwrap();
+        let folders = [r"C:\Users", r"D:\Work"].map(|p| HotItem::Folder(PathBuf::from(p)));
+        assert_eq!(session.hotlist, folders);
+        // Saved again, plain folders keep the old form.
+        let saved = toml::to_string_pretty(&session).unwrap();
+        assert!(saved.contains("Users"), "{saved}");
+        let back: Session = toml::from_str(&saved).unwrap();
+        assert_eq!(back.hotlist, folders);
     }
 
     #[test]

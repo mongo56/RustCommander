@@ -3,6 +3,7 @@
 mod view;
 mod file_diff;
 mod help;
+mod hotlist;
 mod find_files;
 mod multi_rename;
 mod viewer;
@@ -64,7 +65,7 @@ pub struct App {
     last_tab_bar_click: Option<(usize, Instant)>,
     dialog: Option<Dialog>,
     /// Favourite folders (Ctrl+D), saved with the session.
-    hotlist: Vec<PathBuf>,
+    hotlist: Vec<crate::hotlist::HotItem>,
     jobs: Vec<RunningJob>,
     next_job_id: u64,
     /// Folder size counts running (Space / Alt+Shift+Enter): the folder
@@ -165,8 +166,10 @@ enum Dialog {
     /// Shift+F4: name of the file to create (if missing) and edit.
     EditNew { input: String },
     Delete { paths: Vec<PathBuf>, to_trash: bool },
-    /// Hotlist menu; `selected` indexes the entries, then the add/remove item.
-    Hotlist { selected: usize },
+    /// Hotlist menu (Ctrl+D).
+    Hotlist(hotlist::HotlistMenu),
+    /// Folder history list (Alt+Down); `selected` indexes `Panel::history`.
+    History { selected: usize },
     /// Compare-folders options; Enter compares with them.
     Compare { opts: CompareOptions },
 }
@@ -270,6 +273,8 @@ pub enum Message {
     DialogSubmit,
     DialogCancel,
     HotlistPick(usize),
+    HotlistBack,
+    HistoryPick(usize),
     Job(u64, JobEvent),
     JobPause(u64),
     JobCancel(u64),
@@ -703,6 +708,8 @@ impl App {
             Message::DialogSubmit => return self.submit_dialog(),
             Message::DialogCancel => self.dialog = None,
             Message::HotlistPick(i) => return self.hotlist_pick(i),
+            Message::HotlistBack => self.hotlist_back(),
+            Message::HistoryPick(i) => return self.history_pick(i),
             Message::Job(id, event) => self.on_job_event(id, event),
             Message::JobPause(id) => {
                 if let Some(job) = self.job(id) {
@@ -836,11 +843,14 @@ impl App {
             }
             return self.viewer_key(&key, mods);
         }
-        if let Some(Dialog::Hotlist { selected }) = self.dialog {
-            if !named.is_some_and(is_modifier_key) {
-                return self.hotlist_key(selected, named, text.as_deref());
+        if let Some(Dialog::Hotlist(_) | Dialog::History { .. }) = self.dialog {
+            if named.is_some_and(is_modifier_key) {
+                return Task::none();
             }
-            return Task::none();
+            if let Some(Dialog::History { .. }) = self.dialog {
+                return self.history_key(named, text.as_deref());
+            }
+            return self.hotlist_key(named, text.as_deref(), mods);
         }
         if let Some(Dialog::Compare { opts }) = &mut self.dialog {
             let option = match text.as_deref().map(str::to_ascii_lowercase).as_deref() {
@@ -1024,11 +1034,11 @@ impl App {
             Rename => return self.start_rename(),
             MakeDir => return self.open_dialog(Dialog::MakeDir { input: String::new() }),
             Hotlist => {
-                self.leave_edits();
-                // Start on the current folder if it is in the list.
-                let here = &self.panel(active).path;
-                let selected = self.hotlist.iter().position(|p| p == here).unwrap_or(0);
-                self.dialog = Some(Dialog::Hotlist { selected });
+                self.open_hotlist();
+                return Task::none();
+            }
+            DirHistory => {
+                self.open_history();
                 return Task::none();
             }
             Delete | DeletePermanent => {
@@ -1109,8 +1119,8 @@ impl App {
             },
             GoParent => self.panel(active).parent_nav(),
             GoRoot => self.panel(active).root_nav(),
-            HistoryBack => Some(Nav::Back),
-            HistoryForward => Some(Nav::Forward),
+            HistoryBack => Some(Nav::Back(1)),
+            HistoryForward => Some(Nav::Forward(1)),
             _ => None,
         };
         if let Some(nav) = nav {
@@ -1444,68 +1454,6 @@ impl App {
         self.start_nav_to(edit.side, Nav::to(normalize_lexically(&path)), true)
     }
 
-    // ---- hotlist ----------------------------------------------------------
-
-    /// Keys of `hotlist_key`, for the F1 help. Keep in sync.
-    const HOTLIST_KEYS: &'static [(&'static str, &'static str)] = &[
-        ("Up, Down, Home, End", "Pick an entry"),
-        ("Enter, 1-9", "Open the folder"),
-        ("A, +", "Add / remove the current folder"),
-        ("Del", "Remove the entry"),
-        ("Esc", "Close"),
-    ];
-
-    fn hotlist_key(&mut self, selected: usize, named: Option<Named>, text: Option<&str>) -> Task<Message> {
-        let count = self.hotlist.len() + 1;
-        let mut select = |i: usize| self.dialog = Some(Dialog::Hotlist { selected: i });
-        match named {
-            Some(Named::Escape) => self.dialog = None,
-            Some(Named::ArrowUp) => select((selected + count - 1) % count),
-            Some(Named::ArrowDown) => select((selected + 1) % count),
-            Some(Named::Home | Named::PageUp) => select(0),
-            Some(Named::End | Named::PageDown) => select(count - 1),
-            Some(Named::Enter) => return self.hotlist_pick(selected),
-            Some(Named::Delete) if selected < self.hotlist.len() => {
-                self.hotlist.remove(selected);
-                self.dialog = Some(Dialog::Hotlist { selected: selected.min(self.hotlist.len()) });
-                self.save_session();
-            }
-            _ => match text.map(|t| t.to_ascii_lowercase()).as_deref() {
-                // 1-9 open the matching entry directly.
-                Some(d @ ("1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")) => {
-                    let i = d.parse::<usize>().unwrap_or(1) - 1;
-                    if i < self.hotlist.len() {
-                        return self.hotlist_pick(i);
-                    }
-                }
-                Some("a" | "+") => return self.hotlist_pick(self.hotlist.len()),
-                _ => {}
-            },
-        }
-        Task::none()
-    }
-
-    /// Opens hotlist entry `i`; the index past the entries adds or removes
-    /// the active panel's folder.
-    fn hotlist_pick(&mut self, i: usize) -> Task<Message> {
-        self.dialog = None;
-        let active = self.active;
-        if let Some(path) = self.hotlist.get(i).cloned() {
-            return self.start_nav(active, Nav::to(path));
-        }
-        let here = self.panel(active).path.clone();
-        let msg = if let Some(pos) = self.hotlist.iter().position(|p| *p == here) {
-            self.hotlist.remove(pos);
-            format!("Removed {} from the hotlist", here.display())
-        } else {
-            self.hotlist.push(here.clone());
-            format!("Added {} to the hotlist", here.display())
-        };
-        self.status = Some((msg, Tone::Info));
-        self.save_session();
-        Task::none()
-    }
-
     // ---- dialogs ----------------------------------------------------------
 
     fn open_transfer(&mut self, is_move: bool, sources: Vec<PathBuf>, target: &Path) -> Task<Message> {
@@ -1598,7 +1546,12 @@ impl App {
                 let title = format!("{verb} {}", describe(&paths));
                 return self.start_job(Job::Delete { paths, to_trash }, title);
             }
-            Dialog::Hotlist { selected } => return self.hotlist_pick(selected),
+            Dialog::Hotlist(menu) => {
+                let selected = menu.selected;
+                self.dialog = Some(Dialog::Hotlist(menu));
+                return self.hotlist_pick(selected);
+            }
+            Dialog::History { selected } => return self.history_pick(selected),
             Dialog::Compare { opts } => {
                 self.compare_opts = opts;
                 self.save_session();

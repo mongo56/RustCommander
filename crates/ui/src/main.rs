@@ -7,6 +7,7 @@ mod editor;
 mod icon;
 mod icon_art;
 mod keymap;
+mod hotlist;
 mod session;
 mod theme;
 mod watch;

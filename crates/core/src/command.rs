@@ -19,6 +19,8 @@ pub enum Command {
     /// Previous / next folder in the panel's history (Alt+Left/Right).
     HistoryBack,
     HistoryForward,
+    /// The panel's folder history as a popup list (Alt+Down).
+    DirHistory,
     /// Directory hotlist popup (Ctrl+D).
     Hotlist,
     SwitchPanel,
@@ -88,6 +90,7 @@ impl Command {
             GoRoot => "cm_GoToRoot",
             HistoryBack => "cm_PrevDir",
             HistoryForward => "cm_NextDir",
+            DirHistory => "cm_DirectoryHistory",
             Hotlist => "cm_DirectoryHotlist",
             SwitchPanel => "cm_FocusSwap",
             ToggleSelect { advance: true } => "cm_Select",
@@ -145,7 +148,8 @@ impl Command {
             GoRoot => "Go to the root of the drive",
             HistoryBack => "Back to the previous folder",
             HistoryForward => "Forward to the next folder",
-            Hotlist => "Directory hotlist: favourite folders",
+            DirHistory => "Folder history list: jump back or forward to any folder visited in this tab",
+            Hotlist => "Directory hotlist: favourite folders, with submenus",
             SwitchPanel => "Switch to the other panel",
             ToggleSelect { advance: true } => "Select / deselect the entry and move down",
             ToggleSelect { advance: false } => "Select / deselect the entry",
@@ -205,6 +209,7 @@ impl Command {
             GoRoot,
             HistoryBack,
             HistoryForward,
+            DirHistory,
             Hotlist,
             SwitchPanel,
             ToggleSelect { advance: true },
