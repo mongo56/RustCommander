@@ -4,6 +4,7 @@
 mod app;
 mod config;
 mod editor;
+mod follow;
 mod terminal;
 mod icon;
 mod icon_art;

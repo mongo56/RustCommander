@@ -8,7 +8,7 @@ use iced::widget::{
     button, center, checkbox, column, container, image, mouse_area, opaque, progress_bar, responsive, row,
     stack, text, text_input, Column, Row, Space,
 };
-use iced::{Alignment, Element, Length, Padding};
+use iced::{Alignment, Element, Length, Padding, Vector};
 use rc_core::format;
 
 const COL_EXT: f32 = 60.0;
@@ -91,13 +91,9 @@ impl App {
             None => format!("{verb} {what}"),
         };
         let tag = container(text(label).size(12)).padding([4, 8]).style(theme::drag_label);
-        Some(
-            container(tag)
-                .padding(Padding { top: self.mouse.y + 16.0, left: self.mouse.x + 14.0, ..Padding::ZERO })
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into(),
-        )
+        // Drawn at the cursor iced hands to `draw`, so it keeps up with the
+        // mouse without a round trip through `update` and `view`.
+        Some(crate::follow::Follow::new(tag, self.mouse, Vector::new(14.0, 16.0)).into())
     }
 
     fn side_view(&self, side: usize) -> Element<'_, Message> {
