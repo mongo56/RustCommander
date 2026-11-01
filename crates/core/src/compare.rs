@@ -144,7 +144,15 @@ fn files_differ(l: &Entry, r: &Entry, opts: &CompareOptions, cancel: &AtomicBool
 
 /// Whether two folders' contents differ, recursively; unreadable folders
 /// count as different.
+/// Links/junctions aren't followed (they may loop): two links are equal when
+/// they point to the same place, a link and a real folder differ.
 fn dirs_differ(a: &Path, b: &Path, opts: &CompareOptions, cancel: &AtomicBool) -> Option<bool> {
+    let link = |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink());
+    match (link(a), link(b)) {
+        (false, false) => {}
+        (true, true) => return Some(std::fs::read_link(a).ok() != std::fs::read_link(b).ok()),
+        _ => return Some(true),
+    }
     let (Ok(left), Ok(right)) = (crate::fs::list_dir(a, opts.show_hidden), crate::fs::list_dir(b, opts.show_hidden)) else {
         return Some(true);
     };
@@ -300,5 +308,28 @@ mod tests {
 
         let cancelled = AtomicBool::new(true);
         assert!(compare_with(&list(&a), &list(&b), opts, &cancelled).is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn subfolders_do_not_follow_links() {
+        let root = std::env::temp_dir().join(format!("rc-compare-links-{}", std::process::id()));
+        let _guard = Scratch(root.clone());
+        let (a, b) = (root.join("a"), root.join("b"));
+        write(&a.join("twin/y.txt"), "1");
+        write(&b.join("other/y.txt"), "1");
+        // Both point at `a` itself: following them would never end.
+        junction::create(&a, a.join("up")).unwrap();
+        junction::create(&a, b.join("up")).unwrap();
+        junction::create(a.join("twin"), a.join("other")).unwrap();
+        let never = AtomicBool::new(false);
+        let list = |p: &Path| crate::fs::list_dir(p, true).unwrap();
+        let opts = CompareOptions { by_content: true, subfolders: true, show_hidden: true, ignore_date: false };
+        let d = compare_with(&list(&a), &list(&b), opts, &never).unwrap();
+        let mut left = d.left.clone();
+        left.sort();
+        assert_eq!(left, ["other", "twin"]); // "up" is the same link on both sides
+        assert_eq!(d.right, ["other"]);
+        assert_eq!(std::fs::read_to_string(a.join("twin/y.txt")).unwrap(), "1");
     }
 }

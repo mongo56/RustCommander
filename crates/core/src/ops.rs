@@ -169,11 +169,11 @@ pub fn plan_transfer(sources: &[PathBuf], target: &Path) -> Result<Vec<Transfer>
             .ok_or_else(|| format!("Invalid source: {}", src.display()))?;
         let dst = if into_dir { target.join(name) } else { target.to_path_buf() };
 
-        let (src_n, dst_n) = (normalize(src), normalize(&dst));
+        let (src_n, dst_n) = (normalize_entry(src), normalize_entry(&dst));
         if src_n == dst_n {
             return Err(format!("Cannot copy '{}' onto itself", name.to_string_lossy()));
         }
-        if src.is_dir() && dst_n.starts_with(&src_n) {
+        if !is_link(src) && src.is_dir() && dst_n.starts_with(&src_n) {
             return Err(format!(
                 "Cannot copy folder '{}' into itself",
                 name.to_string_lossy()
@@ -187,6 +187,22 @@ pub fn plan_transfer(sources: &[PathBuf], target: &Path) -> Result<Vec<Transfer>
 /// True if both paths refer to the same file (case-insensitive on Windows).
 pub fn same_path(a: &Path, b: &Path) -> bool {
     normalize(a) == normalize(b)
+}
+
+fn is_link(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
+}
+
+/// Like `normalize`, but a link names itself, not its target (links are
+/// copied as links, and an existing one is replaced, not written through).
+fn normalize_entry(path: &Path) -> PathBuf {
+    match (is_link(path), path.parent(), path.file_name()) {
+        (true, Some(parent), Some(name)) if cfg!(windows) => {
+            normalize(parent).join(name.to_string_lossy().to_lowercase())
+        }
+        (true, Some(parent), Some(name)) => normalize(parent).join(name),
+        _ => normalize(path),
+    }
 }
 
 /// Canonicalises the deepest existing ancestor and re-appends the rest, so
@@ -403,8 +419,20 @@ impl Runner<'_> {
             Err(e) => return self.fail(src, e),
         };
 
-        if meta.file_type().is_symlink() && is_dir_link(src, &meta) {
-            return self.fail_msg(src, "Copying folder links/junctions is not supported yet");
+        if meta.file_type().is_symlink() {
+            match self.copy_link(src, &meta, dst) {
+                LinkCopy::Done => {
+                    self.item_done(link_bytes(src));
+                    if is_move {
+                        if let Err(e) = remove_link(src, &meta) {
+                            return self.fail(src, e);
+                        }
+                    }
+                    return true;
+                }
+                LinkCopy::Contents => {} // a file link without privilege: copy the file
+                LinkCopy::Stop => return false,
+            }
         }
 
         if meta.is_dir() {
@@ -449,6 +477,12 @@ impl Runner<'_> {
                 return self.fail_msg(dst, "A folder with this name already exists");
             }
             match self.resolve(src, (meta.len(), meta.modified().ok()), dst, &dst_meta) {
+                // An existing link is replaced, not written through.
+                Resolution::Overwrite if dst_meta.file_type().is_symlink() => {
+                    if let Err(e) = remove_link(dst, &dst_meta) {
+                        return self.fail(dst, e);
+                    }
+                }
                 Resolution::Overwrite => {}
                 Resolution::Cancel => {
                     self.control.cancel();
@@ -474,6 +508,54 @@ impl Runner<'_> {
             }
             Ok(false) => false, // cancelled
             Err(e) => self.fail(src, e),
+        }
+    }
+
+    /// Recreates the link `src` at `dst`, pointing where `src` points. An
+    /// existing file or link at `dst` is asked about and replaced (the old
+    /// link only, never its target); a real folder there is an error.
+    fn copy_link(&mut self, src: &Path, meta: &fs::Metadata, dst: &Path) -> LinkCopy {
+        let link = match Link::read(src, meta) {
+            Ok(link) => link,
+            Err(e) => {
+                self.fail(src, e);
+                return LinkCopy::Stop;
+            }
+        };
+        if let Ok(dst_meta) = fs::symlink_metadata(dst) {
+            if dst_meta.is_dir() {
+                self.fail_msg(dst, "A folder with this name already exists");
+                return LinkCopy::Stop;
+            }
+            match self.resolve(src, (0, meta.modified().ok()), dst, &dst_meta) {
+                Resolution::Overwrite => {
+                    let removed = match dst_meta.file_type().is_symlink() {
+                        true => remove_link(dst, &dst_meta),
+                        false => remove_file_force(dst),
+                    };
+                    if let Err(e) = removed {
+                        self.fail(dst, e);
+                        return LinkCopy::Stop;
+                    }
+                }
+                Resolution::Cancel => {
+                    self.control.cancel();
+                    return LinkCopy::Stop;
+                }
+                _ => {
+                    self.outcome.skipped += 1;
+                    self.item_done(link_bytes(src));
+                    return LinkCopy::Stop;
+                }
+            }
+        }
+        match link.create(src, dst) {
+            Ok(()) => LinkCopy::Done,
+            Err(e) if link.is_file() && is_privilege_error(&e) => LinkCopy::Contents,
+            Err(e) => {
+                self.fail_msg(dst, format!("Can't create the link: {e}"));
+                LinkCopy::Stop
+            }
         }
     }
 
@@ -745,8 +827,7 @@ fn measure(path: &Path) -> (u64, u64) {
     }
     let Ok(meta) = fs::symlink_metadata(path) else { return (0, 1) };
     if meta.file_type().is_symlink() {
-        let size = fs::metadata(path).map(|m| if m.is_file() { m.len() } else { 0 }).unwrap_or(0);
-        return (size, 1);
+        return (link_bytes(path), 1);
     }
     if !meta.is_dir() {
         return (meta.len(), 1);
@@ -791,6 +872,84 @@ fn is_dir_link(_path: &Path, meta: &fs::Metadata) -> bool {
 #[cfg(not(windows))]
 fn is_dir_link(path: &Path, _meta: &fs::Metadata) -> bool {
     fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false)
+}
+
+/// The size a link counts as in progress: its target's, for a file.
+fn link_bytes(path: &Path) -> u64 {
+    fs::metadata(path).map(|m| if m.is_file() { m.len() } else { 0 }).unwrap_or(0)
+}
+
+/// What `Runner::copy_link` did.
+enum LinkCopy {
+    Done,
+    /// Copy the link's contents instead (no privilege for file symlinks).
+    Contents,
+    /// Failed, skipped or cancelled (already recorded).
+    Stop,
+}
+
+/// A symlink or junction, as read from disk, so it can be recreated.
+enum Link {
+    #[cfg(windows)]
+    Junction(PathBuf),
+    /// The target as stored (may be relative to the link's folder).
+    Symlink { target: PathBuf, dir: bool },
+}
+
+impl Link {
+    fn read(path: &Path, meta: &fs::Metadata) -> io::Result<Link> {
+        let dir = is_dir_link(path, meta);
+        #[cfg(windows)]
+        if dir && junction::exists(path)? {
+            return junction::get_target(path).map(Link::Junction);
+        }
+        Ok(Link::Symlink { target: fs::read_link(path)?, dir })
+    }
+
+    fn is_file(&self) -> bool {
+        matches!(self, Link::Symlink { dir: false, .. })
+    }
+
+    /// Creates the same link at `dst` (`src` is the original, for resolving
+    /// relative targets). On Windows a folder symlink falls back to a
+    /// junction to the same folder when symlinks need a privilege we lack.
+    fn create(&self, src: &Path, dst: &Path) -> io::Result<()> {
+        match self {
+            #[cfg(windows)]
+            Link::Junction(target) => make_junction(target, dst),
+            #[cfg(windows)]
+            Link::Symlink { target, dir: true } => match std::os::windows::fs::symlink_dir(target, dst) {
+                Err(e) if is_privilege_error(&e) => {
+                    let absolute = src.parent().map_or_else(|| target.clone(), |p| p.join(target));
+                    make_junction(&absolute, dst)
+                }
+                other => other,
+            },
+            #[cfg(windows)]
+            Link::Symlink { target, dir: false } => std::os::windows::fs::symlink_file(target, dst),
+            #[cfg(not(windows))]
+            Link::Symlink { target, .. } => {
+                let _ = src;
+                std::os::unix::fs::symlink(target, dst)
+            }
+        }
+    }
+}
+
+/// `junction::create` makes the folder first; it's removed again on failure.
+#[cfg(windows)]
+fn make_junction(target: &Path, dst: &Path) -> io::Result<()> {
+    let existed = fs::symlink_metadata(dst).is_ok();
+    let made = junction::create(target, dst);
+    if made.is_err() && !existed {
+        let _ = fs::remove_dir(dst);
+    }
+    made
+}
+
+/// ERROR_PRIVILEGE_NOT_HELD: symlinks need admin rights or developer mode.
+fn is_privilege_error(e: &io::Error) -> bool {
+    cfg!(windows) && e.raw_os_error() == Some(1314)
 }
 
 fn remove_link(path: &Path, meta: &fs::Metadata) -> io::Result<()> {
@@ -968,5 +1127,155 @@ mod tests {
         assert!(plan_transfer(std::slice::from_ref(&src), &src.join("sub")).is_err());
         assert!(plan_transfer(&[src.join("a.txt")], &src).is_err());
         assert!(plan_transfer(&[src.join("a.txt")], &src.join("A.TXT")).is_err() == cfg!(windows));
+    }
+
+    /// A sandbox with `target/inside.txt` and `src/` holding a junction `j`
+    /// to `target`.
+    #[cfg(windows)]
+    fn junction_tree(root: &Path) -> (PathBuf, PathBuf) {
+        let target = root.join("target");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("inside.txt"), b"keep me").unwrap();
+        let src = root.join("src");
+        fs::create_dir_all(&src).unwrap();
+        junction::create(&target, src.join("j")).unwrap();
+        (src, target)
+    }
+
+    #[cfg(windows)]
+    fn assert_target_intact(target: &Path) {
+        assert_eq!(fs::read(target.join("inside.txt")).unwrap(), b"keep me");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn copies_junction_as_junction() {
+        let tmp = TempDir::new("junction-copy");
+        let (src, target) = junction_tree(&tmp.0);
+        let dest = tmp.0.join("dest");
+        fs::create_dir(&dest).unwrap();
+
+        let ts = plan_transfer(std::slice::from_ref(&src), &dest).unwrap();
+        let (o, _) = run_job(Job::Copy(ts), Resolution::Cancel);
+        assert!(o.errors.is_empty(), "{:?}", o.errors);
+        let copy = dest.join("src/j");
+        assert!(junction::exists(&copy).unwrap());
+        assert_eq!(normalize(&junction::get_target(&copy).unwrap()), normalize(&target));
+        assert_eq!(fs::read(copy.join("inside.txt")).unwrap(), b"keep me");
+        assert_eq!(fs::read_dir(&target).unwrap().count(), 1);
+
+        // The link alone, too; copying it into its own target is fine.
+        let ts = plan_transfer(&[src.join("j")], &target).unwrap();
+        let (o, _) = run_job(Job::Copy(ts), Resolution::Cancel);
+        assert!(o.errors.is_empty(), "{:?}", o.errors);
+        assert!(junction::exists(target.join("j")).unwrap());
+        fs::remove_dir(target.join("j")).unwrap();
+        assert_target_intact(&target);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn overwrites_link_not_its_target() {
+        let tmp = TempDir::new("junction-over");
+        let (src, target) = junction_tree(&tmp.0);
+        let other = tmp.0.join("other");
+        fs::create_dir(&other).unwrap();
+        fs::write(other.join("o.txt"), b"o").unwrap();
+        let dest = tmp.0.join("dest");
+        fs::create_dir(&dest).unwrap();
+        junction::create(&other, dest.join("j")).unwrap();
+
+        let ts = plan_transfer(&[src.join("j")], &dest).unwrap();
+        let (o, asked) = run_job(Job::Copy(ts.clone()), Resolution::Skip);
+        assert_eq!((asked, o.skipped), (1, 1));
+        let (o, _) = run_job(Job::Copy(ts), Resolution::Overwrite);
+        assert!(o.errors.is_empty(), "{:?}", o.errors);
+        assert_eq!(normalize(&junction::get_target(dest.join("j")).unwrap()), normalize(&target));
+        assert_eq!(fs::read(other.join("o.txt")).unwrap(), b"o");
+        assert_target_intact(&target);
+
+        // A real folder in the way is an error, and left alone.
+        fs::create_dir(dest.join("k")).unwrap();
+        let ts = plan_transfer(&[src.join("j")], &dest.join("k")).unwrap();
+        assert_eq!(ts[0].dst, dest.join("k/j"));
+        fs::create_dir(dest.join("k/j")).unwrap();
+        let (o, _) = run_job(Job::Copy(ts), Resolution::Overwrite);
+        assert_eq!(o.errors.len(), 1);
+        assert!(dest.join("k/j").is_dir() && !is_link(&dest.join("k/j")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn moves_junction_without_touching_target() {
+        let tmp = TempDir::new("junction-move");
+        let (src, target) = junction_tree(&tmp.0);
+        let dest = tmp.0.join("dest");
+
+        // Rename path.
+        let ts = plan_transfer(&[src.join("j")], &tmp.0.join("renamed")).unwrap();
+        let (o, _) = run_job(Job::Move(ts), Resolution::Cancel);
+        assert!(o.errors.is_empty(), "{:?}", o.errors);
+        assert!(junction::exists(tmp.0.join("renamed")).unwrap());
+        assert!(fs::symlink_metadata(src.join("j")).is_err());
+        assert_target_intact(&target);
+
+        // Copy + delete path (merging into an existing folder, as across drives).
+        fs::rename(tmp.0.join("renamed"), src.join("j")).unwrap();
+        fs::create_dir_all(dest.join("src")).unwrap();
+        let ts = plan_transfer(std::slice::from_ref(&src), &dest).unwrap();
+        let (o, _) = run_job(Job::Move(ts), Resolution::Cancel);
+        assert!(o.errors.is_empty(), "{:?}", o.errors);
+        assert!(!src.exists());
+        assert!(junction::exists(dest.join("src/j")).unwrap());
+        assert_target_intact(&target);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn deletes_junction_only() {
+        let tmp = TempDir::new("junction-delete");
+        let (src, target) = junction_tree(&tmp.0);
+        let (o, _) = run_job(Job::Delete { paths: vec![src.clone()], to_trash: false }, Resolution::Cancel);
+        assert!(o.errors.is_empty(), "{:?}", o.errors);
+        assert!(!src.exists());
+        assert_target_intact(&target);
+        assert_eq!(fs::read_dir(&target).unwrap().count(), 1);
+    }
+
+    /// Symlinks need developer mode or admin rights on Windows; skipped
+    /// (with a note) without them.
+    #[test]
+    fn copies_symlinks_as_links() {
+        let tmp = TempDir::new("symlink");
+        let target = tmp.0.join("target");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("inside.txt"), b"keep me").unwrap();
+        let src = tmp.0.join("src");
+        fs::create_dir(&src).unwrap();
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_dir(r"..\target", src.join("d"))
+            .and_then(|_| std::os::windows::fs::symlink_file(r"..\target\inside.txt", src.join("f")));
+        #[cfg(not(windows))]
+        let made = std::os::unix::fs::symlink("../target", src.join("d"))
+            .and_then(|_| std::os::unix::fs::symlink("../target/inside.txt", src.join("f")));
+        if let Err(e) = made {
+            eprintln!("skipping symlink test: {e}");
+            return;
+        }
+        let dest = tmp.0.join("dest");
+        fs::create_dir(&dest).unwrap();
+        let ts = plan_transfer(std::slice::from_ref(&src), &dest).unwrap();
+        let (o, _) = run_job(Job::Copy(ts), Resolution::Cancel);
+        assert!(o.errors.is_empty(), "{:?}", o.errors);
+        for name in ["d", "f"] {
+            let copy = dest.join("src").join(name);
+            assert!(is_link(&copy), "{name}");
+            assert_eq!(fs::read_link(&copy).unwrap(), fs::read_link(src.join(name)).unwrap());
+        }
+
+        let (o, _) = run_job(Job::Delete { paths: vec![dest.clone(), src.clone()], to_trash: false }, Resolution::Cancel);
+        assert!(o.errors.is_empty(), "{:?}", o.errors);
+        assert!(!dest.exists() && !src.exists());
+        assert_eq!(fs::read(target.join("inside.txt")).unwrap(), b"keep me");
     }
 }

@@ -14,5 +14,8 @@ similar = { version = "3.2.1", default-features = false, features = ["std"] }
 zip = { version = "9.2", default-features = false, features = ["deflate-flate2-zlib-rs", "deflate64", "bzip2", "lzma", "xz", "zstd"] }
 sevenz-rust2 = { version = "0.24", default-features = false, features = ["bzip2", "ppmd", "deflate"] }
 
+[target.'cfg(windows)'.dependencies]
+junction = "2.1"
+
 [dev-dependencies]
 sevenz-rust2 = { version = "0.24", default-features = false, features = ["compress"] }
