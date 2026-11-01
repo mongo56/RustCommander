@@ -13,6 +13,7 @@ use std::path::PathBuf;
 const SIZES: [u32; 7] = [16, 20, 24, 32, 48, 64, 256];
 const RT_ICON: u16 = 3;
 const RT_GROUP_ICON: u16 = 14;
+const RT_VERSION: u16 = 16;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
@@ -75,5 +76,75 @@ fn icon_res() -> Vec<u8> {
         group.extend(id.to_le_bytes());
     }
     resource(&mut out, RT_GROUP_ICON, 1, 0x1030, &group);
+    resource(&mut out, RT_VERSION, 1, 0x0030, &version_info());
     out
+}
+
+fn utf16z(s: &str) -> Vec<u8> {
+    s.encode_utf16().chain([0]).flat_map(|c| c.to_le_bytes()).collect()
+}
+
+/// One node of a VERSIONINFO tree: header, key, padded value, children.
+fn node(key: &str, kind: u16, value_len: u16, value: &[u8], children: &[u8]) -> Vec<u8> {
+    let mut b = vec![0u8; 6];
+    b.extend(utf16z(key));
+    b.resize(b.len().next_multiple_of(4), 0);
+    b.extend(value);
+    b.resize(b.len().next_multiple_of(4), 0);
+    b.extend(children);
+    let len = (b.len() as u16).to_le_bytes();
+    b[0..2].copy_from_slice(&len);
+    b[2..4].copy_from_slice(&value_len.to_le_bytes());
+    b[4..6].copy_from_slice(&kind.to_le_bytes());
+    b
+}
+
+/// The Details tab of the exe's properties: version, description, name.
+fn version_info() -> Vec<u8> {
+    let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_default();
+    let desc = std::env::var("CARGO_PKG_DESCRIPTION").unwrap_or_default();
+    let mut n = [0u16; 4];
+    for (i, part) in version.split(['.', '-']).take(3).enumerate() {
+        n[i] = part.parse().unwrap_or(0);
+    }
+    let fixed: Vec<u8> = [
+        0xFEEF04BDu32,
+        0x0001_0000,
+        (n[0] as u32) << 16 | n[1] as u32,
+        (n[2] as u32) << 16 | n[3] as u32,
+        (n[0] as u32) << 16 | n[1] as u32,
+        (n[2] as u32) << 16 | n[3] as u32,
+        0x3F, // file flags mask
+        0,    // flags
+        0x0004_0004, // VOS_NT_WINDOWS32
+        1,    // VFT_APP
+        0,
+        0,
+        0,
+    ]
+    .iter()
+    .flat_map(|v| v.to_le_bytes())
+    .collect();
+    let full = format!("{}.0", version);
+    let strings = [
+        ("CompanyName", "RustCommander"),
+        ("FileDescription", desc.as_str()),
+        ("FileVersion", full.as_str()),
+        ("InternalName", "rustcommander"),
+        ("OriginalFilename", "rustcommander.exe"),
+        ("ProductName", "RustCommander"),
+        ("ProductVersion", version.as_str()),
+    ];
+    let mut table = Vec::new();
+    for (k, v) in strings {
+        let value = utf16z(v);
+        table.extend(node(k, 1, (value.len() / 2) as u16, &value, &[]));
+    }
+    let table = node("040904B0", 1, 0, &[], &table);
+    let string_info = node("StringFileInfo", 1, 0, &[], &table);
+    let translation = node("Translation", 0, 4, &[0x09, 0x04, 0xB0, 0x04], &[]);
+    let var_info = node("VarFileInfo", 1, 0, &[], &translation);
+    let mut children = string_info;
+    children.extend(var_info);
+    node("VS_VERSION_INFO", 0, fixed.len() as u16, &fixed, &children)
 }
