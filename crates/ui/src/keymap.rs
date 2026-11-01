@@ -162,6 +162,7 @@ fn default_command(key: &Key, m: Modifiers) -> Option<Command> {
             Named::F2 if ctrl && shift && !alt => CompareDirsOptions,
             Named::F2 if ctrl => Refresh,
             Named::F2 if shift && !alt => CompareDirs,
+            Named::F2 if alt && !ctrl && !shift => CompareFiles,
             Named::F3 => View,
             Named::F4 => Edit,
             Named::F5 => Copy,

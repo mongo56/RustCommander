@@ -1,6 +1,7 @@
 //! Application state and update logic. Drawing lives in [`view`].
 
 mod view;
+mod file_diff;
 mod multi_rename;
 mod viewer;
 
@@ -101,6 +102,8 @@ pub struct App {
     viewer: Option<viewer::Viewer>,
     /// Multi-rename tool (Ctrl+M), covering the whole window while open.
     multi_rename: Option<multi_rename::MultiRename>,
+    /// Compare files by content (Alt+F2), covering the whole window.
+    file_diff: Option<file_diff::FileDiff>,
     /// Its settings, kept between uses.
     rename_opts: rc_core::rename::Options,
     /// `(new, old)` paths of the last multi-rename batch, kept after the
@@ -282,6 +285,7 @@ pub enum Message {
     ViewerSearch(String),
     ViewerFind,
     MultiRename(multi_rename::MrMsg),
+    FileDiff(file_diff::DiffMsg),
     /// Background listing for a pending navigation: (side, seq, listing).
     Navigated(usize, u64, Listing),
     /// Subfolders of a folder, for path bar suggestions.
@@ -345,6 +349,7 @@ impl App {
             nav: [None, None],
             viewer: None,
             multi_rename: None,
+            file_diff: None,
             rename_opts: rc_core::rename::Options::default(),
             rename_undo: Vec::new(),
             config: crate::config::Config::default(),
@@ -721,6 +726,7 @@ impl App {
             Message::ViewerSearch(text) => self.viewer_search_input(text),
             Message::ViewerFind => return self.viewer_submit(),
             Message::MultiRename(msg) => return self.multi_rename_update(msg),
+            Message::FileDiff(msg) => return self.file_diff_update(msg),
             Message::Navigated(side, seq, result) => {
                 let current = self.sides[side].current;
                 let pending = self.nav[side].take_if(|p| p.seq == seq && p.tab == current);
@@ -759,6 +765,12 @@ impl App {
                 return Task::none();
             }
             return self.multi_rename_key(named, &key, mods, captured);
+        }
+        if self.file_diff.is_some() {
+            if !named.is_some_and(is_modifier_key) {
+                self.file_diff_key(named, &key, mods);
+            }
+            return Task::none();
         }
         if self.viewer.is_some() {
             // Keys the search box used must not act again: in a fast burst
@@ -898,6 +910,7 @@ impl App {
             Quit => return self.quit(),
             View => return self.open_viewer(),
             MultiRename => return self.open_multi_rename(),
+            CompareFiles => return self.open_file_diff(),
             Edit => {
                 if let Some(e) = self.panel(active).current().filter(|e| e.kind == EntryKind::File) {
                     let (path, name) = (e.path.clone(), e.name.clone());

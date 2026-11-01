@@ -30,6 +30,8 @@ pub enum Command {
     CompareDirs,
     /// Compare-folders options, then compare (Ctrl+Shift+F2).
     CompareDirsOptions,
+    /// Side-by-side diff of two files (Alt+F2).
+    CompareFiles,
     SelectAll,
     DeselectAll,
     Refresh,
@@ -89,6 +91,7 @@ impl Command {
             CountDirSizes => "cm_CountDirContent",
             CompareDirs => "cm_CompareDirs",
             CompareDirsOptions => "cm_CompareDirsOptions",
+            CompareFiles => "cm_CompareFilesByContent",
             SelectAll => "cm_SelectAll",
             DeselectAll => "cm_ClearAll",
             Refresh => "cm_RereadSource",
@@ -146,6 +149,7 @@ impl Command {
             CountDirSizes,
             CompareDirs,
             CompareDirsOptions,
+            CompareFiles,
             SelectAll,
             DeselectAll,
             Refresh,

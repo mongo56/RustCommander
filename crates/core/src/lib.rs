@@ -5,6 +5,7 @@
 
 pub mod command;
 pub mod compare;
+pub mod diff;
 pub mod entry;
 pub mod format;
 pub mod fs;

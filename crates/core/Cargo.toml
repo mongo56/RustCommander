@@ -10,3 +10,4 @@ chrono.workspace = true
 trash.workspace = true
 memchr = "2.7"
 regex = "1"
+similar = { version = "3.2.1", default-features = false, features = ["std"] }

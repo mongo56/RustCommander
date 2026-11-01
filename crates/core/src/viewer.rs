@@ -296,20 +296,12 @@ impl Document {
     pub fn hex_row(&self, i: usize) -> String {
         let start = i * HEX_WIDTH;
         let chunk = self.bytes.get(start..(start + HEX_WIDTH).min(self.bytes.len())).unwrap_or(&[]);
-        let offset = self.base + start as u64;
-        let mut s = if offset >> 32 == 0 { format!("{offset:08X}  ") } else { format!("{offset:010X}  ") };
-        for k in 0..HEX_WIDTH {
-            match chunk.get(k) {
-                Some(b) => s.push_str(&format!("{b:02X} ")),
-                None => s.push_str("   "),
-            }
-            if k == HEX_WIDTH / 2 - 1 {
-                s.push(' ');
-            }
-        }
-        s.push(' ');
-        s.extend(chunk.iter().map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' }));
-        s
+        hex_line(self.base + start as u64, chunk)
+    }
+
+    /// The raw bytes of this document (the whole file or this window).
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
     }
 
     /// Next (or previous) match of `needle` in `mode`. Forward searches
@@ -410,6 +402,24 @@ fn decode_as(bytes: &[u8], encoding: Encoding) -> String {
             char::decode_utf16(units).map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER)).collect()
         }
     }
+}
+
+/// Hex dump row of `chunk` (at most [`HEX_WIDTH`] bytes) at file offset
+/// `offset`: `offset  hex bytes  ascii`.
+pub fn hex_line(offset: u64, chunk: &[u8]) -> String {
+    let mut s = if offset >> 32 == 0 { format!("{offset:08X}  ") } else { format!("{offset:010X}  ") };
+    for k in 0..HEX_WIDTH {
+        match chunk.get(k) {
+            Some(b) => s.push_str(&format!("{b:02X} ")),
+            None => s.push_str("   "),
+        }
+        if k == HEX_WIDTH / 2 - 1 {
+            s.push(' ');
+        }
+    }
+    s.push(' ');
+    s.extend(chunk.iter().map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' }));
+    s
 }
 
 /// `line` ready for display from column `skip`: tabs expanded, control
