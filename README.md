@@ -1,78 +1,147 @@
 # RustCommander
 
-A fast, keyboard-driven, dual-panel file manager in the spirit of Total
-Commander, with a modern minimalist dark look. Built with Rust and
-[iced](https://iced.rs).
+An open-source Total Commander alternative that keeps TC's keyboard workflow
+with a modern, minimalist look. Written in Rust with [iced](https://iced.rs).
 
-## Build & run
+![Dual panels](docs/screenshots/dual-panels.png)
 
-```sh
-cargo run -p rustcommander          # debug
-cargo run -p rustcommander --release
-cargo test                          # core tests
-```
+## Features
 
-## Layout
+**Panels**
+- Dual panels with tabs per side, virtualised lists, sorting, hidden-file toggle
+- Quick search (just type), quick filter (Ctrl+S)
+- Folder history (Alt+Left/Right, Alt+Down list) and a hotlist of favourite folders (Ctrl+D)
+- Folder sizes (Space on a folder), compare folders (Shift+F2)
+- Folders are watched and refresh by themselves; tabs and folders are restored on start
+- Drive bar with free space (middle-click opens a new tab), path bar with autocomplete
 
-| Crate | Purpose |
-|---|---|
-| `crates/core` (`rc-core`) | UI-agnostic logic: `Panel` (listing, cursor, selection, sorting), `Entry`, `Command`, `ops` (copy/move/delete jobs). No UI dependencies. |
-| `crates/platform` (`rc-platform`) | OS integration via `windows-rs`: drives, disk space, system icons, Explorer context menu, launching files. |
-| `crates/ui` (`rustcommander`) | iced front end: `app/mod.rs` (state/update), `app/view.rs` (drawing), `keymap.rs` (keys → `Command`), `theme.rs` (colours/styles). |
+**File operations**
+- Copy, move, delete, recycle bin and new folder run as background jobs, several at once, with progress, speed, pause and cancel
+- Overwrite prompts (overwrite, all, older, skip, skip all); symlinks and junctions are copied as links
+- Inline rename (F2) and multi-rename with masks and live preview (Ctrl+M)
+- Find files (Alt+F7) by name, mask or regex and by content, also inside archives
+- Compare files side by side (Alt+F2)
 
-Every action is a `rc_core::Command` (`cm_*` ids like Total Commander), so key
-bindings, the F-key bar and a future command palette share one code path.
+**Viewer (F3)**
+- Text, hex and image modes, find, word wrap, zoom and pan
+- Streams huge files; mouse selection and copy
 
-## Keys
+**Archives**
+- Browse zip, 7z, tar, tar.gz, tar.bz2 and gz like folders; pack (Alt+F5) and unpack (Alt+F9)
+- Add, change and delete files inside zip archives
+
+**Remote (SFTP, FTP, FTPS)**
+- Servers appear as folders (Ctrl+F connect, Ctrl+Shift+F disconnect)
+- Saved connections; passwords are kept in the Windows Credential Manager; SSH host keys are checked and remembered
+
+**Shell integration (Windows)**
+- System icons and the Explorer context menu (right-click)
+- Drag and drop between the panels and with other apps (both mouse buttons)
+- F4 opens your editor, F9 a terminal in the current folder
+
+**Configuration and keymap**
+- `config.toml` with editor, terminal, theme, key bindings and colours; changes apply on save
+- F10 settings view (general, key bindings, colours) that keeps your comments in the file
+- F1 help, Ctrl+Space command palette, built-in themes (Dark, Light, Nord, Gruvbox)
+- Every action is a `cm_*` command, so any key can be bound to any command
+
+## Key bindings
 
 | Key | Action |
 |---|---|
-| ↑ ↓ PgUp PgDn Home End | Move cursor |
-| Enter / Ctrl+PgDn | Open folder / file |
-| Backspace / Ctrl+PgUp | Parent folder |
-| Ctrl+\\ | Root |
 | Tab | Switch panel |
-| *type letters* | Quick search: jumps to the first name starting with what you typed; ↑/↓ next/previous match, Backspace edits, Esc closes |
-| Ctrl+T / Ctrl+W | New tab / close tab |
+| Enter / Backspace | Open / parent folder |
+| Ctrl+\ | Go to root |
+| Ctrl+T / Ctrl+W | New / close tab |
 | Ctrl+Tab / Ctrl+Shift+Tab | Next / previous tab |
-| Ctrl+↑ | Open folder under cursor in a new tab |
-| Insert / Space | Select (Insert moves down) |
-| Ctrl+A / Ctrl+D / Esc | Select all / deselect |
-| Ctrl+F3–F6 | Sort by name / ext / date / size (again = reverse) |
-| Ctrl+R / Ctrl+F2 | Refresh |
-| Ctrl+H | Toggle hidden/system files |
+| Ctrl+Up | Open folder in a new tab |
+| Space / Insert | Select (Insert moves down) |
+| Ctrl+A / Esc | Select all / deselect |
+| Ctrl+F3, F4, F5, F6 | Sort by name, extension, date, size |
+| Ctrl+H | Show / hide hidden files |
+| Ctrl+S | Quick filter |
+| Ctrl+D | Hotlist |
+| Alt+Left / Alt+Right / Alt+Down | History back / forward / list |
 | Alt+O | Show this folder in the other panel |
-| F3 / F4 | View / edit (opens with system default for now) |
-| F5 / F6 | Copy / move selection (or cursor item) to the other panel; target is editable, relative paths allowed, a single item can be given a new name |
-| F2 / Shift+F6 | Rename in place (edit the name right in the list; Enter to apply, Esc to cancel) |
-| F7 | New folder (nested paths like `a\b` work) |
-| F8 / Del | Delete to Recycle Bin |
+| F1 | Help |
+| F2 / Shift+F6 | Rename |
+| F3 / F4 / Shift+F4 | View / edit / edit new file |
+| F5 / F6 | Copy / move to the other panel |
+| F7 | New folder |
+| F8 / Del | Delete to recycle bin |
 | Shift+F8 / Shift+Del | Delete permanently |
-| Esc | Close dialog / cancel job at an overwrite prompt |
+| F9 | Terminal |
+| F10 | Settings |
+| Shift+F2 | Compare folders |
+| Alt+F2 | Compare files |
+| Alt+F5 / Alt+F9 | Pack / unpack |
+| Alt+F7 | Find files |
+| Ctrl+M | Multi-rename |
+| Ctrl+F / Ctrl+Shift+F | Connect to / disconnect from a server |
+| Ctrl+Space | Command palette |
+| Ctrl+, | Edit config.toml |
+| Alt+F4 / Ctrl+Q | Quit |
 
-## Mouse
+## Screenshots
 
-- **Drive bar**: click a drive to jump to it; free space is shown on the right.
-- **Path bar**: click to edit the path (absolute, relative, `~`, or a file path to jump to that file). Matching folders are suggested as you type: Tab completes, ↑/↓ choose, Enter goes, Esc cancels.
-- **Drag and drop**: drag files onto the other panel to copy (hold Shift to move). Drop onto a folder row to copy into that folder. A confirmation dialog with the target follows.
-- **Other apps**: drag files out of the window onto Explorer, the desktop, a mail client, etc. Files dragged in from Explorer open the Copy dialog for the panel they were dropped on.
-- **Tabs**: click to switch, middle-click (or ×) to close, + for a new tab; middle-click a folder to open it in a background tab.
-- **Right-click**: the Windows Explorer context menu for the item(s) (Open with, Send to, 7-Zip, …); on empty space, the folder's menu (New, Open in Terminal, …). Rename and Delete in the menu use RustCommander's own dialogs.
-- File and folder icons come from the system.
+| | |
+|---|---|
+| ![Viewer](docs/screenshots/viewer-text.png) | ![Image viewer](docs/screenshots/viewer-image.png) |
+| ![Command palette](docs/screenshots/command-palette.png) | ![Archive browsing](docs/screenshots/archive-browsing.png) |
+| ![File operation progress](docs/screenshots/file-operation-progress.png) | ![Light theme](docs/screenshots/theme-light.png) |
+| ![Settings: general](docs/screenshots/settings-general.png) | ![Settings: key bindings](docs/screenshots/settings-keys.png) |
 
-File operations run as background jobs (several at once) with progress,
-speed, pause/resume and cancel. Existing files trigger an overwrite prompt:
-overwrite, overwrite all, overwrite older, skip, skip all, or cancel. Moves
-use a plain rename when possible and fall back to copy and delete across
-drives. Skipped files stay in the source.
+## Install and run
 
-## Roadmap
+**Portable zip**: download `RustCommander-<version>-win64.zip` from the
+[Releases](../../releases) page, unzip it anywhere and run `rustcommander.exe`.
+No installer and no extra runtime are needed.
 
-1. ~~File operations with background jobs, progress and conflict prompts~~ ✔
-2. Async directory loading + filesystem watching (`notify`)
-3. ~~Tabs per panel~~ ✔, history, hotlist (Ctrl+D), restore tabs on start
-4. ~~Quick search (type to jump)~~ ✔, quick filter
-5. Built-in viewer (F3), multi-rename, compare by content
-6. `Vfs` trait: archives, SFTP/FTP, plugins
-7. ~~Windows shell integration: context menu, icons, recycle bin, drag & drop with other apps~~ ✔
-8. Config file for keymap and theme
+**From source** (needs a Rust toolchain with the MSVC target):
+
+```sh
+cargo run -p rustcommander --release    # run
+cargo build --release                   # build only
+cargo test                              # tests
+powershell -File scripts\package.ps1    # portable zip in dist/
+```
+
+## Configuration
+
+Settings live in `%APPDATA%\RustCommander\config.toml` (created with a
+commented template on first run; Ctrl+, opens it, F10 edits it from the UI).
+The open tabs are kept in `session.toml` and saved connections in
+`connections.toml` in the same folder.
+
+```toml
+theme = "nord"            # dark, light, nord or gruvbox
+
+[keys]                    # "Key" = "command"; an empty command unbinds the key
+"Ctrl+K" = "cm_MkDir"
+"F8" = ""
+
+[colors]                  # "#rrggbb", on top of the theme
+accent = "#ff8800"
+dir = "#8cb8ff"
+```
+
+Colour names: `bg`, `panel`, `zebra`, `header`, `border`, `text`, `muted`,
+`dir`, `accent`, `selected`, `error`, `cursor`, `cursor_inactive`, `success`,
+`drop`. The template lists every command id.
+
+## Platform
+
+Windows only for now (Windows 10/11, 64-bit). The core is UI-agnostic, but
+shell integration and the build are Windows-specific.
+
+## Project layout
+
+| Crate | Purpose |
+|---|---|
+| `crates/core` | Panels, commands, file operation jobs, archives and servers as a virtual file system |
+| `crates/platform` | OS integration: drives, icons, context menu, drag and drop |
+| `crates/ui` | The iced front end, keymap and themes |
+
+## License
+
+TBD
