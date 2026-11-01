@@ -304,6 +304,28 @@ impl Document {
         &self.bytes
     }
 
+    /// Bytes at file offsets `start..end`, if this window holds them all.
+    pub fn slice(&self, start: u64, end: u64) -> Option<&[u8]> {
+        if start < self.base || end > self.end() || start > end {
+            return None;
+        }
+        Some(&self.bytes[(start - self.base) as usize..(end - self.base) as usize])
+    }
+
+    /// Display columns of line `i` covered by text offsets `start..end`;
+    /// one column past the text when the line break is covered too.
+    pub fn selected_cols(&self, i: usize, start: usize, end: usize) -> Option<(usize, usize)> {
+        let (ls, line) = (self.line_start(i), self.line(i));
+        let le = ls + line.len();
+        let next = self.line_start(i + 1).max(le);
+        if start >= end || end <= ls || start >= next {
+            return None;
+        }
+        let a = column_of(line, start.saturating_sub(ls));
+        let b = column_of(line, end - ls) + usize::from(end > le);
+        Some((a, b))
+    }
+
     /// Next (or previous) match of `needle` in `mode`. Forward searches
     /// start at `from`; backward ones find a match starting before it.
     pub fn find(&self, mode: Mode, needle: &str, from: usize, case: bool, forward: bool) -> Option<Hit> {
@@ -456,6 +478,163 @@ pub fn column_of(line: &str, offset: usize) -> usize {
     line[..offset.min(line.len())]
         .chars()
         .fold(0, |col, c| if c == '\t' { (col / TAB_WIDTH + 1) * TAB_WIDTH } else { col + 1 })
+}
+
+/// Byte offset in `line` of the character boundary nearest display column
+/// `col` (tabs expanded; inverse of [`column_of`]). Past the end: `line.len()`.
+pub fn offset_at_column(line: &str, col: usize) -> usize {
+    let mut c = 0;
+    for (i, ch) in line.char_indices() {
+        let next = if ch == '\t' { (c / TAB_WIDTH + 1) * TAB_WIDTH } else { c + 1 };
+        if col < next {
+            return if col - c <= next - col { i } else { i + ch.len_utf8() };
+        }
+        c = next;
+    }
+    line.len()
+}
+
+/// Character indices where the rows of display line `shown` start when
+/// word-wrapped at `cols` columns: after the last space that fits, else
+/// mid-word. The first is always 0.
+pub fn wrap_points(shown: &str, cols: usize) -> Vec<usize> {
+    let chars: Vec<char> = shown.chars().collect();
+    let cols = cols.max(1);
+    let mut points = vec![0];
+    let mut p = 0;
+    while chars.len() - p > cols {
+        let end = p + cols;
+        let next = chars[p + 1..end].iter().rposition(|&c| c == ' ').map_or(end, |q| p + q + 2);
+        points.push(next);
+        p = next;
+    }
+    points
+}
+
+/// Where a selection was made: decoded text (text mode), or the hex digits
+/// or the character column of the hex view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Part {
+    Text,
+    Hex,
+    Ascii,
+}
+
+/// A selection by file offsets (so it survives scrolling and window moves):
+/// `anchor` where it started, `head` where the mouse is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Selection {
+    pub part: Part,
+    pub anchor: u64,
+    pub head: u64,
+}
+
+impl Selection {
+    pub fn new(part: Part, at: u64) -> Self {
+        Selection { part, anchor: at, head: at }
+    }
+
+    /// Selected file offsets `start..end`.
+    pub fn range(&self) -> (u64, u64) {
+        (self.anchor.min(self.head), self.anchor.max(self.head))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.anchor == self.head
+    }
+}
+
+/// Most bytes of a selection put on the clipboard.
+pub const COPY_LIMIT: u64 = 16 << 20;
+
+/// Clipboard text for `bytes` (at file offset `start`) selected in `part`:
+/// text decoded as the file's `encoding` (a character cut at the end
+/// dropped, the BOM skipped); hex digits as `41 42 …`, or the character
+/// column as shown (`.` for unprintable bytes), a line per 16-byte row.
+pub fn selection_text(part: Part, start: u64, bytes: &[u8], encoding: Encoding) -> String {
+    match part {
+        Part::Text => {
+            let bytes = match (encoding, std::str::from_utf8(bytes)) {
+                (Encoding::Utf8, Err(e)) if e.error_len().is_none() => &bytes[..e.valid_up_to()],
+                _ => bytes,
+            };
+            let text = decode_as(bytes, encoding);
+            match text.strip_prefix('\u{FEFF}') {
+                Some(rest) if start == 0 => rest.to_string(),
+                _ => text,
+            }
+        }
+        Part::Hex | Part::Ascii => {
+            let mut s = String::with_capacity(bytes.len() * if part == Part::Hex { 3 } else { 1 });
+            for (i, &b) in bytes.iter().enumerate() {
+                let row_start = (start + i as u64).is_multiple_of(HEX_WIDTH as u64);
+                if i > 0 && row_start {
+                    s.push('\n');
+                }
+                if part == Part::Hex {
+                    if i > 0 && !row_start {
+                        s.push(' ');
+                    }
+                    s.push_str(&format!("{b:02X}"));
+                } else {
+                    s.push(if (0x20..0x7f).contains(&b) { b as char } else { '.' });
+                }
+            }
+            s
+        }
+    }
+}
+
+/// Reads file offsets `start..end` of `path`.
+pub fn read_range(path: &Path, start: u64, end: u64) -> io::Result<Vec<u8>> {
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::with_capacity(end.saturating_sub(start) as usize);
+    file.take(end.saturating_sub(start)).read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// Column where the hex digits of a hex row at file offset `offset` start
+/// (after the offset, which has 8 digits below 4 GB, else 10).
+pub fn hex_prefix(offset: u64) -> usize {
+    if offset >> 32 == 0 { 10 } else { 12 }
+}
+
+/// Column of the first hex digit of byte `k` of a row.
+fn hex_byte_col(prefix: usize, k: usize) -> usize {
+    prefix + 3 * k + usize::from(k >= HEX_WIDTH / 2)
+}
+
+/// Column where the character column of a hex row starts.
+fn hex_ascii_col(prefix: usize) -> usize {
+    prefix + 3 * HEX_WIDTH + 2
+}
+
+/// The part of a hex row at `offset` under (fractional) column `x`.
+pub fn hex_part(offset: u64, x: f32) -> Part {
+    if x < hex_ascii_col(hex_prefix(offset)) as f32 - 1.0 { Part::Hex } else { Part::Ascii }
+}
+
+/// Byte boundary (`0..=len`) of a hex row at `offset` holding `len` bytes
+/// nearest (fractional) column `x` in `part` of the row.
+pub fn hex_boundary(part: Part, offset: u64, len: usize, x: f32) -> usize {
+    let prefix = hex_prefix(offset);
+    if part == Part::Ascii {
+        return (x - hex_ascii_col(prefix) as f32).round().clamp(0.0, len as f32) as usize;
+    }
+    // Past a byte once beyond the middle of its two digits.
+    (0..len).take_while(|&k| (hex_byte_col(prefix, k) + 1) as f32 <= x).count()
+}
+
+/// Column ranges of a hex row at `offset` covering its bytes `a..b`: the
+/// hex digits and the character column. Empty when `a >= b`.
+pub fn hex_spans(offset: u64, a: usize, b: usize) -> Vec<(usize, usize)> {
+    if a >= b {
+        return Vec::new();
+    }
+    let prefix = hex_prefix(offset);
+    let ascii = hex_ascii_col(prefix);
+    vec![(hex_byte_col(prefix, a), hex_byte_col(prefix, b - 1) + 2), (ascii + a, ascii + b)]
 }
 
 fn fold(c: char) -> char {
@@ -647,5 +826,83 @@ mod tests {
         assert_eq!(d.base() + hit.start as u64, 26);
         assert!(find_in_file(&path, w.encoding, Mode::Text, "nope", 0, false, true, &cancel).unwrap().is_none());
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn maps_columns_back_to_offsets() {
+        assert_eq!(offset_at_column("abc", 0), 0);
+        assert_eq!(offset_at_column("abc", 2), 2);
+        assert_eq!(offset_at_column("abc", 9), 3);
+        // A tab spans columns 0..4: the nearer edge.
+        assert_eq!(offset_at_column("\tx", 1), 0);
+        assert_eq!(offset_at_column("\tx", 3), 1);
+        assert_eq!(offset_at_column("\tx", 4), 1);
+        assert_eq!(offset_at_column("čx", 1), 2);
+        let line = "a\tčb";
+        for col in 0..8 {
+            assert!(column_of(line, offset_at_column(line, col)).abs_diff(col.min(6)) <= 2);
+        }
+    }
+
+    #[test]
+    fn wraps_at_spaces_else_mid_word() {
+        assert_eq!(wrap_points("short", 10), vec![0]);
+        assert_eq!(wrap_points("hello world again", 10), vec![0, 6, 12]);
+        assert_eq!(wrap_points("abcdefghijkl", 5), vec![0, 5, 10]);
+        assert_eq!(wrap_points("", 5), vec![0]);
+    }
+
+    #[test]
+    fn selection_range_and_columns() {
+        let s = Selection { part: Part::Text, anchor: 9, head: 3 };
+        assert_eq!((s.range(), s.is_empty()), ((3, 9), false));
+        assert!(Selection::new(Part::Hex, 4).is_empty());
+        let d = doc(b"ab\tc\r\nxyz\n");
+        // "b\tc" plus the line break.
+        assert_eq!(d.selected_cols(0, 1, 6), Some((1, 6)));
+        assert_eq!(d.selected_cols(0, 0, 2), Some((0, 2)));
+        // Only the line break.
+        assert_eq!(d.selected_cols(0, 4, 6), Some((5, 6)));
+        assert_eq!(d.selected_cols(1, 0, 6), None);
+        assert_eq!(d.selected_cols(1, 0, 8), Some((0, 2)));
+        assert_eq!(d.slice(1, 3), Some(&b"b\t"[..]));
+        assert_eq!(d.slice(5, 99), None);
+    }
+
+    #[test]
+    fn selection_text_per_part() {
+        let bytes = b"Hi\x00\nthere";
+        assert_eq!(selection_text(Part::Text, 4, b"there", Encoding::Utf8), "there");
+        assert_eq!(selection_text(Part::Hex, 0, &bytes[..3], Encoding::Utf8), "48 69 00");
+        // Rows break at 16-byte file offsets.
+        assert_eq!(selection_text(Part::Hex, 14, &[1, 2, 3], Encoding::Utf8), "01 02\n03");
+        assert_eq!(selection_text(Part::Ascii, 0, &bytes[..4], Encoding::Utf8), "Hi..");
+        assert_eq!(selection_text(Part::Ascii, 15, b"ab", Encoding::Latin1), "a\nb");
+        // A character cut by the copy limit is dropped; the BOM is skipped at the start.
+        assert_eq!(selection_text(Part::Text, 0, &"ač".as_bytes()[..2], Encoding::Utf8), "a");
+        assert_eq!(selection_text(Part::Text, 0, &[0xEF, 0xBB, 0xBF, b'x'], Encoding::Utf8), "x");
+        assert_eq!(selection_text(Part::Text, 2, &[b'h', 0, b'i', 0], Encoding::Utf16Le), "hi");
+        assert_eq!(selection_text(Part::Text, 0, &[0xE8], Encoding::Latin1), "è");
+    }
+
+    #[test]
+    fn hex_columns_map_both_ways() {
+        // "00000000  41 42 …": byte 0 digits at 10..12, byte 8 after the gap at 35.
+        assert_eq!(hex_spans(0, 0, 1), vec![(10, 12), (60, 61)]);
+        assert_eq!(hex_spans(0, 7, 9), vec![(31, 37), (67, 69)]);
+        assert!(hex_spans(0, 3, 3).is_empty());
+        assert_eq!(hex_spans(1 << 32, 0, 1)[0], (12, 14));
+        assert_eq!(hex_part(0, 20.0), Part::Hex);
+        assert_eq!(hex_part(0, 60.0), Part::Ascii);
+        assert_eq!(hex_boundary(Part::Hex, 0, 16, 10.0), 0);
+        assert_eq!(hex_boundary(Part::Hex, 0, 16, 11.5), 1);
+        assert_eq!(hex_boundary(Part::Hex, 0, 16, 36.0), 9);
+        assert_eq!(hex_boundary(Part::Hex, 0, 4, 50.0), 4);
+        assert_eq!(hex_boundary(Part::Ascii, 0, 16, 62.4), 2);
+        assert_eq!(hex_boundary(Part::Ascii, 0, 3, 99.0), 3);
+        let line = hex_line(0, b"ABCDEFGHIJKLMNOP");
+        let col_of = |s: &str| line.find(s).unwrap();
+        assert_eq!(hex_spans(0, 8, 9)[0].0, col_of("49"));
+        assert_eq!(hex_spans(0, 0, 1)[1].0, col_of("ABCD"));
     }
 }

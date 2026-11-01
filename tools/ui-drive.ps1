@@ -1,5 +1,5 @@
 param([string[]]$Steps)
-# Steps: keys:<SendKeys> | wait:<ms> | shot:<name> | click:x,y | dclick:x,y | rclick:x,y | wheel:x,y,notches[,ctrl]
+# Steps: keys:<SendKeys> | wait:<ms> | shot:<name> | click:x,y | sclick:x,y (Shift+click) | dclick:x,y | rclick:x,y | wheel:x,y,notches[,ctrl]
 #        drag:x1,y1,x2,y2[,shift] + drop | rdrag:x1,y1,x2,y2 + rdrop (right button)
 # Coordinates are relative to the window's top-left corner (as in screenshots).
 Add-Type @"
@@ -28,6 +28,7 @@ foreach ($s in $Steps) {
     'keys' { $ws.SendKeys($arg); Start-Sleep -Milliseconds 300 }
     'wait' { Start-Sleep -Milliseconds ([int]$arg) }
     'click' { $x, $y = $arg -split ','; MoveTo $x $y; [W4]::mouse_event(2,0,0,0,[UIntPtr]::Zero); [W4]::mouse_event(4,0,0,0,[UIntPtr]::Zero); Start-Sleep -Milliseconds 300 }
+    'sclick' { $x, $y = $arg -split ','; MoveTo $x $y; [W4]::keybd_event(0x10,0,0,[UIntPtr]::Zero); Start-Sleep -Milliseconds 100; [W4]::mouse_event(2,0,0,0,[UIntPtr]::Zero); [W4]::mouse_event(4,0,0,0,[UIntPtr]::Zero); Start-Sleep -Milliseconds 100; [W4]::keybd_event(0x10,0,2,[UIntPtr]::Zero); Start-Sleep -Milliseconds 300 }
     'dclick' { $x, $y = $arg -split ','; MoveTo $x $y; for ($i = 0; $i -lt 2; $i++) { [W4]::mouse_event(2,0,0,0,[UIntPtr]::Zero); [W4]::mouse_event(4,0,0,0,[UIntPtr]::Zero); Start-Sleep -Milliseconds 80 }; Start-Sleep -Milliseconds 300 }
     'wheel' {
       # wheel:x,y,notches[,ctrl]

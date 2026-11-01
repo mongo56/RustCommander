@@ -351,6 +351,8 @@ pub enum Message {
     ViewerZoomWheel(f32),
     ViewerSearch(String),
     ViewerFind,
+    /// Left button pressed while the viewer shows a document (starts a selection over the body).
+    ViewerPress,
     MultiRename(multi_rename::MrMsg),
     FileDiff(file_diff::DiffMsg),
     Find(find_files::FindMsg),
@@ -495,10 +497,20 @@ impl App {
             }));
         }
         // Mouse moves re-render the window, so only listen while a drag may
-        // be starting or in progress.
-        if self.drag.is_some() {
+        // be starting or in progress, or the viewer shows a document (mouse
+        // selection).
+        if self.drag.is_some() || self.viewer_tracks_mouse() {
             subs.push(event::listen_with(|event, _status, _window| match event {
                 Event::Mouse(mouse::Event::CursorMoved { position }) => Some(Message::MouseMoved(position)),
+                _ => None,
+            }));
+        }
+        // Viewer selections start on any left press over the body (seen
+        // through `ViewerPointer`): its `mouse_area` doesn't get presses on
+        // highlighted rows, since `rich_text` captures presses on its spans.
+        if self.viewer_tracks_mouse() {
+            subs.push(event::listen_with(|event, _status, _window| match event {
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => Some(Message::ViewerPress),
                 _ => None,
             }));
         }
@@ -612,9 +624,15 @@ impl App {
             }
             Message::MouseMoved(position) => {
                 self.mouse = position;
+                self.viewer_mouse_moved();
                 return self.update_drag();
             }
-            Message::MouseUp(right) => return self.finish_drag(right),
+            Message::MouseUp(right) => {
+                if !right {
+                    self.viewer_release();
+                }
+                return self.finish_drag(right);
+            }
             Message::DragOutDone(side, result) => {
                 self.reload_panels();
                 // Dropped back onto our own window: that drop is handled as
@@ -851,6 +869,7 @@ impl App {
             Message::ViewerZoomWheel(lines) => return self.viewer_zoom_wheel(lines),
             Message::ViewerSearch(text) => self.viewer_search_input(text),
             Message::ViewerFind => return self.viewer_submit(),
+            Message::ViewerPress => self.viewer_press(),
             Message::MultiRename(msg) => return self.multi_rename_update(msg),
             Message::FileDiff(msg) => return self.file_diff_update(msg),
             Message::Find(msg) => return self.find_update(msg),

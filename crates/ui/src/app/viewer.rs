@@ -9,14 +9,40 @@ use iced::widget::scrollable::{self, AbsoluteOffset, Direction, RelativeOffset};
 use iced::{Point, Size};
 use iced::widget::{center, column, container, mouse_area, responsive, rich_text, row, text, Column, Space};
 use iced::{Alignment, ContentFit, Element, Font, Length};
-use rc_core::viewer::{self, Document, Hit, Mode, HEX_WIDTH, WINDOW};
+use rc_core::viewer::{self, Document, Hit, Mode, Part, Selection, COPY_LIMIT, HEX_WIDTH, WINDOW};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 const LINE_H: f32 = 18.0;
 const FONT_SIZE: f32 = 13.0;
-/// Approximate width of a monospace character at `FONT_SIZE`.
-const CHAR_W: f32 = 7.8;
+/// Width of a monospace character at `FONT_SIZE`, measured once with the
+/// font the system resolves `Font::MONOSPACE` to (Cascadia Mono, Consolas,
+/// Courier New … differ), so columns and mouse positions match the text.
+fn char_w() -> f32 {
+    use iced::advanced::text::Paragraph as _;
+    static W: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *W.get_or_init(|| {
+        const N: usize = 100;
+        let sample = "0".repeat(N);
+        let paragraph = iced::advanced::graphics::text::Paragraph::with_text(iced::advanced::Text {
+            content: sample.as_str(),
+            bounds: Size::INFINITY,
+            size: iced::Pixels(FONT_SIZE),
+            line_height: iced::widget::text::LineHeight::Absolute(iced::Pixels(LINE_H)),
+            font: Font::MONOSPACE,
+            horizontal_alignment: iced::alignment::Horizontal::Left,
+            vertical_alignment: iced::alignment::Vertical::Top,
+            shaping: iced::widget::text::Shaping::Basic,
+            wrapping: Wrapping::None,
+        });
+        let w = paragraph.min_width() / N as f32;
+        if w.is_finite() && w > 1.0 { w } else { 7.8 }
+    })
+}
+/// Left padding of the text area.
+const TEXT_PAD: f32 = 12.0;
+/// Columns a wrapped line is laid out to at most.
+const WRAP_MAX: usize = 20_000;
 /// Header, footer and their padding around the text area.
 const VIEWER_CHROME_H: f32 = 64.0;
 const SEARCH_H: f32 = 40.0;
@@ -88,6 +114,12 @@ pub(super) struct Viewer {
     pointer: Option<Point>,
     /// Stops the running search of a large file.
     cancel: Arc<AtomicBool>,
+    /// Mouse selection, by file offsets; `selecting` while the left button drags it.
+    sel: Option<Selection>,
+    selecting: bool,
+    /// Window position of the body's top-left corner (from pointer moves),
+    /// to place the pointer while a selection drag leaves the body.
+    origin: Point,
 }
 
 impl Viewer {
@@ -230,6 +262,9 @@ impl App {
             offset: AbsoluteOffset { x: 0.0, y: 0.0 },
             pointer: None,
             cancel: Arc::new(AtomicBool::new(false)),
+            sel: None,
+            selecting: false,
+            origin: Point::ORIGIN,
         });
         self.viewer_show(index)
     }
@@ -245,6 +280,8 @@ impl App {
         v.top = 0;
         v.left = 0;
         v.hit = None;
+        v.sel = None;
+        v.selecting = false;
         v.note = None;
         v.zoom = None;
         v.offset = AbsoluteOffset { x: 0.0, y: 0.0 };
@@ -286,7 +323,7 @@ impl App {
     }
 
     fn viewer_cols(&self) -> usize {
-        ((self.window_width - 24.0) / CHAR_W).floor().max(10.0) as usize
+        ((self.window_width - 24.0) / char_w()).floor().max(10.0) as usize
     }
 
     fn viewer_scroll(&mut self, delta: isize) {
@@ -356,7 +393,7 @@ impl App {
 
     /// Keys of `viewer_key` / `viewer_image_key`, for the F1 help. Keep in sync.
     pub(super) const VIEWER_KEYS: &'static [(&'static str, &'static str)] = &[
-        ("Esc, Q", "Close the viewer (Esc first closes the find box)"),
+        ("Esc, Q", "Close the viewer (Esc first closes the find box, then clears a selection)"),
         ("Up, Down, PgUp, PgDn", "Scroll"),
         ("Home, End", "Start / end of the file"),
         ("Left, Right", "Scroll sideways (wrap off)"),
@@ -368,6 +405,9 @@ impl App {
         ("F7, F, /, Ctrl+F", "Find text"),
         ("F3, Shift+F3", "Find next / previous"),
         ("C", "Case-sensitive find on / off"),
+        ("Mouse drag, Shift+click", "Select text (hex mode: in the hex or the character column)"),
+        ("Ctrl+C, Ctrl+Insert", "Copy the selection (hex column as hex digits; at most 16 MB)"),
+        ("Ctrl+A", "Select the whole file"),
         ("+, -, Ctrl+wheel", "Zoom an image in / out"),
         ("0, *", "Fit the image to the window"),
         ("Arrows, PgUp, PgDn, Home, End", "Pan a zoomed image"),
@@ -408,9 +448,163 @@ impl App {
     }
 
     pub(super) fn viewer_pointer(&mut self, at: Option<Point>) {
-        if let Some(v) = &mut self.viewer {
-            v.pointer = at;
+        let Some(v) = &mut self.viewer else { return };
+        v.pointer = at;
+        if let Some(p) = at.filter(|_| v.selecting) {
+            self.viewer_drag_to(p);
         }
+    }
+
+    /// The viewer wants window-wide pointer moves: a document is shown
+    /// (to learn the body's position for selection drags past its edges).
+    pub(super) fn viewer_tracks_mouse(&self) -> bool {
+        self.viewer.as_ref().is_some_and(|v| v.doc().is_some())
+    }
+
+    /// A window-wide pointer move (`self.mouse`): over the body it fixes the
+    /// body's origin; outside it, it carries a selection drag on.
+    pub(super) fn viewer_mouse_moved(&mut self) {
+        let mouse = self.mouse;
+        let Some(v) = &mut self.viewer else { return };
+        match v.pointer {
+            Some(p) => v.origin = Point::new(mouse.x - p.x, mouse.y - p.y),
+            None if v.selecting => {
+                let p = Point::new(mouse.x - v.origin.x, mouse.y - v.origin.y);
+                self.viewer_drag_to(p);
+            }
+            None => {}
+        }
+    }
+
+    /// Left button pressed (anywhere; acts over the body): starts a selection there, or with
+    /// Shift extends the current one.
+    pub(super) fn viewer_press(&mut self) {
+        let shift = self.modifiers.shift();
+        let Some(v) = &self.viewer else { return };
+        // Not over the body, or on the scrollbar in its right padding.
+        let Some(p) = v.pointer.filter(|p| p.x < self.window_width - TEXT_PAD) else { return };
+        let keep = v.sel.filter(|_| shift);
+        let Some((part, at)) = self.viewer_pos_at(p, keep.map(|s| s.part)) else { return };
+        let Some(v) = &mut self.viewer else { return };
+        v.sel = Some(match keep {
+            Some(s) => Selection { head: at, ..s },
+            None => Selection::new(part, at),
+        });
+        v.selecting = true;
+        v.note = None;
+    }
+
+    /// Left button released anywhere: the drag ends; a plain click leaves no selection.
+    pub(super) fn viewer_release(&mut self) {
+        if let Some(v) = &mut self.viewer {
+            v.selecting = false;
+            if v.sel.is_some_and(|s| s.is_empty()) {
+                v.sel = None;
+            }
+        }
+    }
+
+    /// Moves the selection's head to body position `p`; above or below the
+    /// body it first scrolls a row that way.
+    fn viewer_drag_to(&mut self, p: Point) {
+        let height = self.viewer_body_size().height;
+        let Some(part) = self.viewer.as_ref().filter(|v| v.selecting).and_then(|v| v.sel).map(|s| s.part) else {
+            return;
+        };
+        if p.y < 0.0 {
+            self.viewer_scroll(-1);
+        } else if p.y >= height {
+            self.viewer_scroll(1);
+        }
+        let p = Point::new(p.x, p.y.clamp(0.0, (height - 1.0).max(0.0)));
+        let Some((_, at)) = self.viewer_pos_at(p, Some(part)) else { return };
+        if let Some(s) = self.viewer.as_mut().and_then(|v| v.sel.as_mut()) {
+            s.head = at;
+        }
+    }
+
+    /// File offset at body position `p` (and the part of a hex row it is
+    /// in, unless `part` fixes it): the character boundary nearest to it.
+    fn viewer_pos_at(&self, p: Point, part: Option<Part>) -> Option<(Part, u64)> {
+        let v = self.viewer.as_ref()?;
+        let doc = v.doc()?;
+        let x = (p.x - TEXT_PAD) / char_w();
+        let r = (p.y / LINE_H).floor().max(0.0) as usize;
+        match v.mode {
+            Mode::Text => {
+                let rows = text_rows(doc, v, self.viewer_cols(), r + 1);
+                // Below the last line: the end of the text.
+                let Some(row) = rows.get(r) else { return Some((Part::Text, doc.byte_of(usize::MAX))) };
+                let mut col = row.col + x.round().max(0.0) as usize;
+                if !row.last {
+                    col = col.min(row.col + row.shown.chars().count());
+                }
+                let t = doc.line_start(row.line) + viewer::offset_at_column(doc.line(row.line), col);
+                Some((Part::Text, doc.byte_of(t)))
+            }
+            Mode::Hex => {
+                let row = v.top + r;
+                if row >= doc.rows(Mode::Hex) {
+                    return Some((part.unwrap_or(Part::Hex), doc.end()));
+                }
+                let off = doc.row_byte(Mode::Hex, row);
+                let len = (doc.end() - off).min(HEX_WIDTH as u64) as usize;
+                let part = part.unwrap_or_else(|| viewer::hex_part(off, x));
+                Some((part, off + viewer::hex_boundary(part, off, len, x) as u64))
+            }
+        }
+    }
+
+    /// Ctrl+A: the whole file (copying takes at most `COPY_LIMIT` of it).
+    fn viewer_select_all(&mut self) {
+        let Some(v) = &mut self.viewer else { return };
+        let Some(size) = v.doc().map(|d| d.size) else { return };
+        let part = if v.mode == Mode::Text { Part::Text } else { Part::Hex };
+        v.sel = Some(Selection { part, anchor: 0, head: size });
+        v.note = (size > COPY_LIMIT).then(|| {
+            let limit = rc_core::format::size(COPY_LIMIT);
+            (format!("Selected all; Ctrl+C copies the first {limit} (copy limit)"), Tone::Info)
+        });
+    }
+
+    /// Ctrl+C / Ctrl+Insert: the selection to the clipboard, at most
+    /// `COPY_LIMIT` bytes of it (read from the file when outside the window).
+    fn viewer_copy(&mut self) -> Task<Message> {
+        let Some(v) = &mut self.viewer else { return Task::none() };
+        let Some(doc) = v.doc_arc() else { return Task::none() };
+        let Some(sel) = v.sel.filter(|s| !s.is_empty()) else {
+            v.note = Some(("Nothing selected: drag with the mouse or press Ctrl+A".into(), Tone::Info));
+            return Task::none();
+        };
+        let (start, end) = sel.range();
+        let end = end.min(doc.size);
+        let cut = end.min(start + COPY_LIMIT);
+        let bytes = match doc.slice(start, cut) {
+            Some(b) => std::borrow::Cow::Borrowed(b),
+            None => match viewer::read_range(&v.source(), start, cut) {
+                Ok(b) => std::borrow::Cow::Owned(b),
+                Err(e) => {
+                    v.note = Some((format!("Can't read: {e}"), Tone::Error));
+                    return Task::none();
+                }
+            },
+        };
+        let text = viewer::selection_text(sel.part, start, &bytes, doc.encoding);
+        let size = rc_core::format::size;
+        let how = match sel.part {
+            Part::Text => "",
+            Part::Hex => " as hex",
+            Part::Ascii => " as characters",
+        };
+        v.note = Some((
+            if cut < end {
+                format!("Copied the first {} of {} selected{how} (copy limit)", size(cut - start), size(end - start))
+            } else {
+                format!("Copied {}{how}", size(cut - start))
+            },
+            Tone::Info,
+        ));
+        iced::clipboard::write(text)
     }
 
     /// Ctrl+wheel over an image: one zoom step per notch, around the pointer.
@@ -510,6 +704,13 @@ impl App {
             keyboard::Key::Character(c) => Some(c.to_lowercase()),
             _ => None,
         };
+        if ctrl && (ch.as_deref() == Some("c") || named == Some(Named::Insert)) {
+            return self.viewer_copy();
+        }
+        if ctrl && ch.as_deref() == Some("a") {
+            self.viewer_select_all();
+            return Task::none();
+        }
         if ctrl && ch.as_deref() == Some("f") {
             v.search = Some(v.query.clone());
             return Task::batch([text_input::focus(search_input_id()), text_input::select_all(search_input_id())]);
@@ -521,6 +722,8 @@ impl App {
         let max_left = self.viewer_max_left();
         let Some(v) = &mut self.viewer else { return Task::none() };
         match (named, typed.as_deref()) {
+            // Esc drops a selection before it closes.
+            (Some(Named::Escape), _) if v.sel.is_some() => v.sel = None,
             (Some(Named::Escape), _) | (_, Some("q")) => self.close_viewer(),
             (Some(Named::ArrowDown), _) => self.viewer_scroll(1),
             (Some(Named::ArrowUp), _) => self.viewer_scroll(-1),
@@ -571,6 +774,10 @@ impl App {
         // Keep roughly the same place in the file.
         v.top = doc.row_of(mode, doc.row_byte(v.mode, v.top));
         v.mode = mode;
+        // The selection covers the same bytes in the other mode.
+        if let Some(s) = &mut v.sel {
+            s.part = if mode == Mode::Text { Part::Text } else { Part::Hex };
+        }
         v.left = 0;
         v.hit = None;
     }
@@ -717,6 +924,9 @@ impl App {
                 if v.wrap && v.mode == Mode::Text {
                     info.push("Wrap".into());
                 }
+                if let Some((a, b)) = v.sel.filter(|s| !s.is_empty()).map(|s| s.range()) {
+                    info.push(format!("{} selected", rc_core::format::size(b.min(doc.size) - a.min(doc.size))));
+                }
                 if !doc.is_whole() && doc.size > 0 {
                     let at = doc.row_byte(v.mode, v.top);
                     info.push(format!("{}%", at * 100 / doc.size));
@@ -792,7 +1002,7 @@ impl App {
         let help = if v.image_size().is_some() {
             "Esc close · N/P next/prev file · +/- or Ctrl+wheel zoom · 0 fit · 1 actual size · arrows/PgUp/PgDn pan"
         } else {
-            "Esc close · N/P next/prev file · 1 text · 3 hex · W wrap · F7 find · F3/Shift+F3 next/prev · C match case"
+            "Esc close · N/P next/prev file · 1 text · 3 hex · W wrap · F7 find · F3/Shift+F3 next/prev · C match case · drag select · Ctrl+C copy"
         };
         let footer: Element<'a, Message> = match &v.note {
             Some((msg, tone)) => text(msg.as_str())
@@ -813,42 +1023,60 @@ impl App {
         let cols = self.viewer_cols();
         responsive(move |size| {
             let rows = (size.height / LINE_H).ceil() as usize;
-            let end = (v.top + rows).min(doc.rows(v.mode));
-            let lines = (v.top..end).map(|i| {
-                let (shown, marks) = match v.mode {
-                    Mode::Text => {
-                        let line = doc.line(i);
-                        let skip = if v.wrap { 0 } else { v.left };
-                        // Wrapped lines are shown whole (up to a sane length).
-                        let max = if v.wrap { 20_000 } else { cols + 1 };
-                        let shown = viewer::display_line(line, skip, max);
-                        let marks = v.hit.filter(|h| h.mode == Mode::Text && doc.line_of(h.start) == i).map(|h| {
-                            let start = doc.line_start(i);
-                            let a = viewer::column_of(line, h.start - start);
-                            let b = viewer::column_of(line, h.end - start);
-                            vec![(a.saturating_sub(skip), b.saturating_sub(skip))]
-                        });
-                        (shown, marks.unwrap_or_default())
-                    }
-                    Mode::Hex => (doc.hex_row(i), hex_marks(v.hit, i)),
-                };
-                let line: Element<'a, Message> = if marks.is_empty() {
-                    text(if shown.is_empty() { " ".to_string() } else { shown })
-                        .font(Font::MONOSPACE)
-                        .size(FONT_SIZE)
-                        .line_height(iced::Pixels(LINE_H))
-                        .wrapping(if v.wrap { Wrapping::WordOrGlyph } else { Wrapping::None })
-                        .into()
-                } else {
-                    rich_text(highlight(&shown, &marks))
-                        .font(Font::MONOSPACE)
-                        .size(FONT_SIZE)
-                        .line_height(iced::Pixels(LINE_H))
-                        .wrapping(if v.wrap { Wrapping::WordOrGlyph } else { Wrapping::None })
-                        .into()
-                };
-                line
-            });
+            let sel = v.sel.filter(|s| !s.is_empty()).map(|s| s.range());
+            let lines: Vec<Element<'a, Message>> = match v.mode {
+                Mode::Text => {
+                    // The selection as text offsets of this window (clamped to it).
+                    let sel = sel.map(|(a, b)| (doc.text_of(a), doc.text_of(b)));
+                    text_rows(doc, v, cols, rows)
+                        .into_iter()
+                        .map(|r| {
+                            let len = r.shown.chars().count();
+                            // Line columns to this row's columns; a wrapped row
+                            // that isn't the line's last ends at its text.
+                            let clip = |(a, b): (usize, usize)| {
+                                let (a, b) = (a.saturating_sub(r.col), b.saturating_sub(r.col));
+                                let b = if r.last { b } else { b.min(len) };
+                                (a < b).then_some((a, b))
+                            };
+                            let line = doc.line(r.line);
+                            let hits: Vec<_> = v
+                                .hit
+                                .filter(|h| h.mode == Mode::Text && doc.line_of(h.start) == r.line)
+                                .and_then(|h| {
+                                    let start = doc.line_start(r.line);
+                                    clip((viewer::column_of(line, h.start - start), viewer::column_of(line, h.end - start)))
+                                })
+                                .into_iter()
+                                .collect();
+                            let sel: Vec<_> =
+                                sel.and_then(|(a, b)| doc.selected_cols(r.line, a, b)).and_then(clip).into_iter().collect();
+                            row_text(r.shown, &sel, &hits)
+                        })
+                        .collect()
+                }
+                Mode::Hex => {
+                    let end = (v.top + rows).min(doc.rows(v.mode));
+                    (v.top..end)
+                        .map(|i| {
+                            let off = doc.row_byte(Mode::Hex, i);
+                            let len = (doc.end() - off).min(HEX_WIDTH as u64);
+                            // File offsets `a..b` as byte indexes of this row.
+                            let spans = |(a, b): (u64, u64)| {
+                                let (a, b) = (a.clamp(off, off + len) - off, b.clamp(off, off + len) - off);
+                                viewer::hex_spans(off, a as usize, b as usize)
+                            };
+                            let hits = v
+                                .hit
+                                .filter(|h| h.mode == Mode::Hex)
+                                .map(|h| spans((doc.base() + h.start as u64, doc.base() + h.end as u64)))
+                                .unwrap_or_default();
+                            let sel = sel.map(spans).unwrap_or_default();
+                            row_text(doc.hex_row(i), &sel, &hits)
+                        })
+                        .collect()
+                }
+            };
             let lines = container(Column::with_children(lines).width(Length::Fill))
                 .padding([0, 12])
                 .width(Length::Fill)
@@ -891,43 +1119,91 @@ fn zoomed_image<'a>(handle: &'a image::Handle, w: f32, h: f32, zoom: f32) -> Ele
     .into()
 }
 
-/// Character ranges of hex row `row` covered by `hit`: the hex digits and
-/// the ASCII column.
-fn hex_marks(hit: Option<Hit>, row: usize) -> Vec<(usize, usize)> {
-    let Some(hit) = hit.filter(|h| h.mode == Mode::Hex) else { return Vec::new() };
-    let row_start = row * HEX_WIDTH;
-    let (a, b) = (hit.start.max(row_start), hit.end.min(row_start + HEX_WIDTH));
-    if a >= b {
-        return Vec::new();
-    }
-    let hex_col = |k: usize| 10 + 3 * k + usize::from(k >= HEX_WIDTH / 2);
-    let (ka, kb) = (a - row_start, b - row_start);
-    let ascii = 10 + 3 * HEX_WIDTH + 2;
-    vec![(hex_col(ka), hex_col(kb - 1) + 2), (ascii + ka, ascii + kb)]
+/// A screen row of the text view: display text of line `line` from
+/// display column `col`; `last` = it ends that line (not wrapped on).
+struct TextRow {
+    line: usize,
+    col: usize,
+    shown: String,
+    last: bool,
 }
 
-/// Splits `s` into spans, the character ranges in `marks` highlighted.
-fn highlight<'a>(s: &str, marks: &[(usize, usize)]) -> Vec<Span<'a, Message, Font>> {
-    let chars: Vec<char> = s.chars().collect();
+/// The first `max` screen rows of the text view from row `v.top`: one per
+/// line scrolled by `v.left`, or each line word-wrapped at `cols` columns.
+/// Drawing and mouse hit-testing both use it, so they agree.
+fn text_rows(doc: &Document, v: &Viewer, cols: usize, max: usize) -> Vec<TextRow> {
+    let mut out = Vec::new();
+    let mut i = v.top;
+    while out.len() < max && i < doc.rows(Mode::Text) {
+        let line = doc.line(i);
+        if v.wrap {
+            let full: Vec<char> = viewer::display_line(line, 0, WRAP_MAX).chars().collect();
+            let points = viewer::wrap_points(&full.iter().collect::<String>(), cols);
+            for (k, &p) in points.iter().enumerate() {
+                let end = points.get(k + 1).copied().unwrap_or(full.len());
+                let last = k + 1 == points.len();
+                out.push(TextRow { line: i, col: p, shown: full[p..end].iter().collect(), last });
+                if out.len() >= max {
+                    break;
+                }
+            }
+        } else {
+            out.push(TextRow { line: i, col: v.left, shown: viewer::display_line(line, v.left, cols), last: true });
+        }
+        i += 1;
+    }
+    out
+}
+
+/// A monospace viewer row: plain text, or spans when parts are selected or
+/// find hits.
+fn row_text<'a>(shown: String, sel: &[(usize, usize)], hits: &[(usize, usize)]) -> Element<'a, Message> {
+    if sel.is_empty() && hits.is_empty() {
+        text(if shown.is_empty() { " ".to_string() } else { shown })
+            .font(Font::MONOSPACE)
+            .size(FONT_SIZE)
+            .line_height(iced::Pixels(LINE_H))
+            .wrapping(Wrapping::None)
+            .into()
+    } else {
+        rich_text(highlight(&shown, sel, hits))
+            .font(Font::MONOSPACE)
+            .size(FONT_SIZE)
+            .line_height(iced::Pixels(LINE_H))
+            .wrapping(Wrapping::None)
+            .into()
+    }
+}
+
+/// Splits `s` into spans: character ranges in `sel` drawn as selected, in
+/// `hits` as find hits (on top). A selection reaching past the text (a
+/// line break) shows as one selected blank.
+fn highlight<'a>(s: &str, sel: &[(usize, usize)], hits: &[(usize, usize)]) -> Vec<Span<'a, Message, Font>> {
+    let mut chars: Vec<char> = s.chars().collect();
+    if sel.iter().any(|&(_, b)| b > chars.len()) {
+        chars.push(' ');
+    }
+    let mut class = vec![0u8; chars.len()];
+    for (marks, c) in [(sel, 1), (hits, 2)] {
+        for &(a, b) in marks {
+            class[a.min(chars.len())..b.min(chars.len())].fill(c);
+        }
+    }
+    let colors = theme::c();
     let mut spans = Vec::new();
     let mut pos = 0;
-    for &(a, b) in marks {
-        let (a, b) = (a.min(chars.len()).max(pos), b.min(chars.len()));
-        if a >= b {
-            continue;
-        }
-        if a > pos {
-            spans.push(Span::new(chars[pos..a].iter().collect::<String>()));
-        }
-        spans.push(
-            Span::new(chars[a..b].iter().collect::<String>())
-                .color(theme::c().bg)
-                .background(theme::c().selected),
-        );
-        pos = b;
+    while pos < chars.len() {
+        let end = (pos..chars.len()).find(|&k| class[k] != class[pos]).unwrap_or(chars.len());
+        let span = Span::new(chars[pos..end].iter().collect::<String>());
+        spans.push(match class[pos] {
+            1 => span.background(colors.cursor),
+            2 => span.color(colors.bg).background(colors.selected),
+            _ => span,
+        });
+        pos = end;
     }
-    if pos < chars.len() || spans.is_empty() {
-        spans.push(Span::new(chars[pos..].iter().collect::<String>()));
+    if spans.is_empty() {
+        spans.push(Span::new(" "));
     }
     spans
 }
