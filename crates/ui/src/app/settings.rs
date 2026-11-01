@@ -80,6 +80,15 @@ pub enum SettingsMsg {
     Click(usize),
     Editor(String),
     SaveEditor,
+    /// Open the file dialog for the editor program.
+    Browse,
+    /// A background job failed; nothing to do.
+    Nothing,
+    Picked(Option<std::path::PathBuf>),
+    /// Installed editors found in the background.
+    Detected(Vec<rc_platform::FoundEditor>),
+    /// Use the detected editor with this index.
+    UseEditor(usize),
     Terminal(String),
     ShowHidden(bool),
     ShowFkeys(bool),
@@ -117,6 +126,8 @@ pub(super) struct Settings {
     row: [usize; 3],
     /// The editor command being typed.
     editor: String,
+    /// Installed editors found on this machine (filled in the background).
+    editors: Vec<rc_platform::FoundEditor>,
     /// The terminal command being typed.
     terminal: String,
     /// The colours being typed, by `theme::NAMES` index.
@@ -140,13 +151,17 @@ impl App {
             page: Page::General,
             row: [0; 3],
             editor: self.config.editor.clone(),
+            editors: Vec::new(),
             terminal: self.config.terminal.clone(),
             hex: current_hex(),
             capture: None,
             reset_all: false,
             note: None,
         });
-        scrollable::snap_to(list_id(), RelativeOffset::START)
+        Task::batch([
+            scrollable::snap_to(list_id(), RelativeOffset::START),
+            off_thread(rc_platform::detect_editors, |found| Message::Settings(SettingsMsg::Detected(found))),
+        ])
     }
 
     fn rows_of(page: Page) -> usize {
@@ -168,6 +183,18 @@ impl App {
                 Err(e) => (format!("Not saved: {e}"), Tone::Error),
             });
         }
+    }
+
+    /// Makes `path` the editor program (quoted when it has spaces) and saves.
+    fn settings_use_editor(&mut self, path: &std::path::Path) -> Task<Message> {
+        let text = path.display().to_string();
+        let text = if text.contains(' ') { format!("\"{text}\"") } else { text };
+        if let Some(s) = &mut self.settings {
+            s.row[0] = ROW_EDITOR;
+            s.editor = text;
+        }
+        self.settings_save_editor();
+        Task::none()
     }
 
     /// Saves changed editor / terminal commands (on Enter, leaving the page, closing).
@@ -351,6 +378,23 @@ impl App {
                 self.save_session();
                 if let Some(s) = &mut self.settings {
                     s.note = Some(("Compare options saved".into(), Tone::Success));
+                }
+            }
+            SettingsMsg::Browse => {
+                s.row[0] = ROW_EDITOR;
+                return off_thread(rc_platform::pick_program, |p| Message::Settings(SettingsMsg::Picked(p)));
+            }
+            SettingsMsg::Picked(path) => {
+                if let Some(path) = path {
+                    return self.settings_use_editor(&path);
+                }
+            }
+            SettingsMsg::Detected(found) => s.editors = found,
+            SettingsMsg::Nothing => {}
+            SettingsMsg::UseEditor(i) => {
+                if let Some(found) = s.editors.get(i) {
+                    let path = found.path.clone();
+                    return self.settings_use_editor(&path);
                 }
             }
             SettingsMsg::EditConfig => {
@@ -591,6 +635,24 @@ impl App {
                     .padding(5)
                     .size(13)
                     .style(theme::input);
+                let browse = button(text("Browse...").size(13))
+                    .on_press(msg(SettingsMsg::Browse))
+                    .padding([3, 12])
+                    .style(theme::fkey);
+                let detected: Element<'a, Message> = if s.editors.is_empty() {
+                    hint("Looking for installed editors...".into()).into()
+                } else {
+                    let buttons = s.editors.iter().enumerate().map(|(i, e)| {
+                        let on = s.editor.trim_matches('"').starts_with(&e.path.display().to_string());
+                        Element::from(
+                            button(text(e.name.as_str()).size(13))
+                                .on_press(msg(SettingsMsg::UseEditor(i)))
+                                .padding([3, 12])
+                                .style(theme::drive(on)),
+                        )
+                    });
+                    Row::with_children(buttons).spacing(6).wrap().into()
+                };
                 let opts = self.compare_opts;
                 let compare = |i: u8, title: &'a str, on: bool, about: &'a str| {
                     line(
@@ -605,10 +667,11 @@ impl App {
                     heading("Files"),
                     line(
                         ROW_EDITOR,
-                        row![label("Editor for F4"), editor].spacing(8).align_y(Alignment::Center).into()
+                        row![label("Editor for F4"), editor, browse].spacing(8).align_y(Alignment::Center).into()
                     ),
                     container(hint("A program and arguments; %1 is the file (added when missing). Enter saves.".into()))
                         .padding([0, 14 + LABEL_W as u16 + 8]),
+                    row![label("Installed editors"), detected].spacing(8).padding([3, 14]),
                     line(
                         ROW_TERMINAL,
                         row![label("Terminal for F9"), terminal].spacing(8).align_y(Alignment::Center).into()
@@ -807,4 +870,18 @@ impl App {
 
         container(column![header, body, footer]).width(Length::Fill).height(Length::Fill).style(filled(colors.bg)).into()
     }
+}
+
+/// Runs `work` on its own thread and maps the result to a message.
+fn off_thread<T: Send + 'static>(work: fn() -> T, done: fn(T) -> Message) -> Task<Message> {
+    Task::perform(
+        async move {
+            let (tx, rx) = iced::futures::channel::oneshot::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(work());
+            });
+            rx.await.ok()
+        },
+        move |r| r.map_or(Message::Settings(SettingsMsg::Nothing), done),
+    )
 }

@@ -6,6 +6,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 pub mod credentials;
+mod editors;
+pub use editors::{detect_editors, pick_program, FoundEditor};
 #[cfg(windows)]
 mod win;
 
