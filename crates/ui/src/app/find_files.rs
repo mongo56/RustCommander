@@ -40,6 +40,7 @@ pub enum Opt {
     MatchCase,
     Subfolders,
     Hidden,
+    Archives,
 }
 
 #[derive(Debug, Clone)]
@@ -100,6 +101,7 @@ impl FindFiles {
             Opt::MatchCase => &mut q.match_case,
             Opt::Subfolders => &mut q.subfolders,
             Opt::Hidden => &mut q.hidden,
+            Opt::Archives => &mut q.archives,
         };
         *flag = !*flag;
     }
@@ -136,12 +138,8 @@ impl App {
         let side = self.active;
         self.leave_edits();
         let panel = self.panel(side);
-        // Archives aren't searched yet: search the folder holding one.
-        let root = match rc_core::vfs::split_archive(&panel.path) {
-            Some((archive, _)) => archive.parent().map_or_else(|| panel.path.clone(), Path::to_path_buf),
-            None => panel.path.clone(),
-        };
-        let (root, hidden) = (root.display().to_string(), panel.show_hidden);
+        // A folder in an archive is searched through the archive.
+        let (root, hidden) = (panel.path.display().to_string(), panel.show_hidden);
         let mut find = self.find_last.take().unwrap_or_else(|| FindFiles {
             side,
             root: String::new(),
@@ -160,7 +158,7 @@ impl App {
         });
         // Hits deleted or renamed since (e.g. after going to one) go away.
         if find.running.is_none() {
-            find.results.retain(|e| e.path.symlink_metadata().is_ok());
+            find.results.retain(|e| e.path.symlink_metadata().is_ok() || rc_core::vfs::is_virtual(&e.path));
             find.cursor = find.cursor.min(find.results.len().saturating_sub(1));
         }
         find.side = side;
@@ -196,7 +194,7 @@ impl App {
         let Some(f) = &mut self.find else { return Task::none() };
         f.stop();
         let root = resolve_typed_path(f.root.trim(), &self.sides[f.side].tabs[self.sides[f.side].current].path);
-        if !root.is_dir() {
+        if !root.is_dir() && !rc_core::vfs::in_archive(&root) {
             f.error = Some(format!("Not a folder: {}", root.display()));
             return Task::none();
         }
@@ -318,6 +316,7 @@ impl App {
         ("Ctrl+E", "Match case on / off"),
         ("Ctrl+S", "Search subfolders on / off"),
         ("Ctrl+H", "Search hidden files on / off"),
+        ("Ctrl+P", "Search inside archives (zip, 7z, tar, gz) on / off"),
         ("*.txt;*.md|skip*", "Name masks: ; separates, | starts exclusions"),
     ];
 
@@ -377,6 +376,7 @@ impl App {
                     "e" => FindMsg::Toggle(Opt::MatchCase),
                     "s" => FindMsg::Toggle(Opt::Subfolders),
                     "h" => FindMsg::Toggle(Opt::Hidden),
+                    "p" => FindMsg::Toggle(Opt::Archives),
                     _ => return Task::none(),
                 }
             }
@@ -425,6 +425,7 @@ impl App {
             label_w("Options"),
             toggle("Subfolders", q.subfolders, Opt::Subfolders),
             toggle("Hidden files", q.hidden, Opt::Hidden),
+            toggle("Archives", q.archives, Opt::Archives),
         ]
         .spacing(16)
         .align_y(Alignment::Center);
@@ -509,7 +510,8 @@ impl App {
         } else {
             (
                 "Enter search \u{b7} Esc stop/close \u{b7} \u{2191}\u{2193} pick a hit, Enter/double-click/Ctrl+G go to it \u{b7} \
-                 Ctrl+L feed to panel \u{b7} Ctrl+R/T regex \u{b7} Ctrl+E case \u{b7} Ctrl+S subfolders \u{b7} Ctrl+H hidden"
+                 Ctrl+L feed to panel \u{b7} Ctrl+R/T regex \u{b7} Ctrl+E case \u{b7} Ctrl+S subfolders \u{b7} Ctrl+H hidden \u{b7} \
+                 Ctrl+P archives"
                     .to_owned(),
                 colors.muted,
             )

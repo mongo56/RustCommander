@@ -7,6 +7,10 @@
 //! Hits are [`Entry`]s named by their path relative to the search root
 //! (`sub\file.txt`), so they can be shown in a panel as they are.
 //!
+//! With [`Query::archives`], archives met on the way (zip, 7z, tar, gz;
+//! not archives inside them) are searched like folders, through their
+//! [`crate::vfs::Vfs`]; a root inside an archive is always searched so.
+//!
 //! Contents are searched as raw bytes, like TC: the text is looked for as
 //! UTF-8, which also finds ASCII text in ANSI files and strings inside
 //! binary files. Files starting with a UTF-16 byte order mark are decoded
@@ -16,6 +20,7 @@
 
 use crate::entry::{Entry, EntryKind};
 use crate::fs::is_hidden;
+use crate::vfs;
 use chrono::{DateTime, Local};
 use memchr::memmem;
 use std::fs::{self, File};
@@ -53,6 +58,8 @@ pub struct Query {
     pub subfolders: bool,
     /// Include hidden/system entries (and look inside hidden folders).
     pub hidden: bool,
+    /// Look inside archives too.
+    pub archives: bool,
 }
 
 /// Hits found since the last report, and where the search is.
@@ -163,7 +170,11 @@ impl TextMatcher {
 
     /// Whether the file's contents match (false once `cancel` is set).
     pub fn file_matches(&self, path: &Path, cancel: &AtomicBool) -> io::Result<bool> {
-        let mut file = File::open(path)?;
+        self.reader_matches(&mut File::open(path)?, cancel)
+    }
+
+    /// [`Self::file_matches`] for any reader (e.g. a file in an archive).
+    pub fn reader_matches(&self, file: &mut dyn Read, cancel: &AtomicBool) -> io::Result<bool> {
         let overlap = self.overlap();
         let mut buf = vec![0u8; CHUNK + overlap];
         let mut keep = 0;
@@ -172,13 +183,13 @@ impl TextMatcher {
             if cancel.load(Ordering::Relaxed) {
                 return Ok(false);
             }
-            let read = read_full(&mut file, &mut buf[keep..])?;
+            let read = read_full(file, &mut buf[keep..])?;
             let len = keep + read;
             if first {
                 first = false;
                 if let Some(big_endian) = utf16_bom(&buf[..len]) {
                     let mut all = buf[..len].to_vec();
-                    file.take(UTF16_LIMIT.saturating_sub(len as u64)).read_to_end(&mut all)?;
+                    Read::take(&mut *file, UTF16_LIMIT.saturating_sub(len as u64)).read_to_end(&mut all)?;
                     return Ok(self.is_match(decode_utf16(&all[2..], big_endian).as_bytes()));
                 }
             }
@@ -196,7 +207,7 @@ impl TextMatcher {
 }
 
 /// Reads until `buf` is full or the file ends.
-fn read_full(file: &mut File, buf: &mut [u8]) -> io::Result<usize> {
+fn read_full(file: &mut dyn Read, buf: &mut [u8]) -> io::Result<usize> {
     let mut n = 0;
     while n < buf.len() {
         match file.read(&mut buf[n..]) {
@@ -237,6 +248,14 @@ pub fn search(query: &Query, cancel: &AtomicBool, mut report: impl FnMut(Batch) 
     };
     let mut summary = Summary::default();
     let mut batch = Batch::default();
+    if vfs::in_archive(&query.root) {
+        batch.folder = query.root.clone();
+        search_archive(&query.root, query, &names, text.as_ref(), cancel, &mut batch, &mut summary);
+        summary.cancelled = cancel.load(Ordering::Relaxed);
+        batch.checked = summary.files;
+        report(batch);
+        return Ok(summary);
+    }
     let mut last_report = Instant::now();
     let mut stack = vec![query.root.clone()];
     'walk: while let Some(dir) = stack.pop() {
@@ -283,6 +302,13 @@ pub fn search(query: &Query, cancel: &AtomicBool, mut report: impl FnMut(Batch) 
             if is_dir && query.subfolders && !is_link {
                 subfolders.push(path.clone());
             }
+            if query.archives && !is_dir && vfs::is_archive_name(&name) {
+                batch.folder = path.clone();
+                search_archive(&path, query, &names, text.as_ref(), cancel, &mut batch, &mut summary);
+                if summary.truncated {
+                    break 'walk;
+                }
+            }
             if !names.matches(&name) {
                 continue;
             }
@@ -320,6 +346,61 @@ pub fn search(query: &Query, cancel: &AtomicBool, mut report: impl FnMut(Batch) 
     batch.checked = summary.files;
     report(batch);
     Ok(summary)
+}
+
+/// Searches the archive (or the folder in one) `dir` through its `Vfs`:
+/// names, then the contents of the files whose names match. Hits go to
+/// `batch`.
+fn search_archive(
+    dir: &Path,
+    query: &Query,
+    names: &NameMatcher,
+    text: Option<&TextMatcher>,
+    cancel: &AtomicBool,
+    batch: &mut Batch,
+    summary: &mut Summary,
+) {
+    let Ok((items, vfs)) = vfs::open(dir).and_then(|v| Ok((v.walk(dir)?, v))) else {
+        summary.errors += 1;
+        return;
+    };
+    summary.folders += 1;
+    let mut found = Vec::new();
+    for item in items {
+        if item.path == dir || (!query.subfolders && item.path.parent() != Some(dir)) {
+            continue;
+        }
+        if item.hidden && !query.hidden {
+            continue;
+        }
+        summary.files += 1;
+        if names.matches(&item.name) && !(text.is_some() && item.is_dir()) {
+            found.push(item);
+        }
+    }
+    if let Some(text) = text {
+        let paths: Vec<PathBuf> = found.iter().map(|e| e.path.clone()).collect();
+        let mut matched = vec![false; found.len()];
+        let mut errors = 0;
+        let read = vfs.read_files(&paths, &mut |i, reader| {
+            match text.reader_matches(reader, cancel) {
+                Ok(m) => matched[i] = m,
+                Err(_) => errors += 1,
+            }
+            Ok(!cancel.load(Ordering::Relaxed))
+        });
+        summary.errors += errors + u64::from(read.is_err());
+        found = found.into_iter().zip(matched).filter_map(|(e, m)| m.then_some(e)).collect();
+    }
+    for mut hit in found {
+        if summary.hits >= MAX_HITS {
+            summary.truncated = true;
+            return;
+        }
+        hit.name = hit.path.strip_prefix(&query.root).unwrap_or(&hit.path).to_string_lossy().into_owned();
+        batch.hits.push(hit);
+        summary.hits += 1;
+    }
 }
 
 #[cfg(test)]
@@ -441,6 +522,20 @@ mod tests {
         let s = search(&base, &AtomicBool::new(true), |_| true).unwrap();
         assert!(s.cancelled);
         assert_eq!(s.hits, 0);
+
+        // Inside archives: only with the option, or from a root in one.
+        crate::vfs::tests::make_zip(&root.join("c").join("z.zip"));
+        let (_, hits) = run(Query { name: "*.txt".into(), archives: true, ..base.clone() });
+        assert_eq!(hits, ["a/b/three.txt", "a/two.txt", "c/z.zip/a.txt", "c/z.zip/sub/deep/x.txt", "one.txt"]);
+        let (_, hits) = run(Query { text: "deep FILE".into(), archives: true, ..base.clone() });
+        assert_eq!(hits, ["c/z.zip/sub/deep/x.txt"]);
+        let (s, hits) = run(Query { text: "deep file".into(), ..base.clone() });
+        assert_eq!((s.hits, hits.len()), (0, 0));
+        let zip_root = Query { root: root.join("c").join("z.zip").join("sub"), subfolders: true, ..Query::default() };
+        let (_, hits) = run(Query { name: "x*".into(), ..zip_root.clone() });
+        assert_eq!(hits, ["deep/x.txt"]);
+        let (_, hits) = run(Query { subfolders: false, ..zip_root });
+        assert_eq!(hits, ["deep"]);
         fs::remove_dir_all(&root).unwrap();
     }
 }
