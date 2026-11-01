@@ -5,7 +5,7 @@ use super::*;
 use crate::theme::filled;
 use iced::widget::text::Wrapping;
 use iced::widget::{
-    button, center, column, container, image, mouse_area, opaque, progress_bar, responsive, row,
+    button, center, checkbox, column, container, image, mouse_area, opaque, progress_bar, responsive, row,
     stack, text, text_input, Column, Row, Space,
 };
 use iced::{Alignment, Element, Length, Padding};
@@ -507,8 +507,10 @@ impl App {
     }
 
     fn dialog_view<'a>(&'a self, dialog: &'a Dialog) -> Element<'a, Message> {
-        if let Dialog::Hotlist { selected } = dialog {
-            return self.hotlist_view(*selected);
+        match dialog {
+            Dialog::Hotlist { selected } => return self.hotlist_view(*selected),
+            Dialog::Compare { opts } => return compare_view(opts),
+            _ => {}
         }
         let input_field = |value: &'a str| {
             text_input("", value)
@@ -547,7 +549,7 @@ impl App {
                 None,
                 "Delete",
             ),
-            Dialog::Hotlist { .. } => unreachable!("drawn by hotlist_view"),
+            Dialog::Hotlist { .. } | Dialog::Compare { .. } => unreachable!("drawn above"),
         };
 
         let mut content = column![text(title).size(16), text(body).size(13).color(theme::c().muted)].spacing(12);
@@ -723,4 +725,32 @@ fn vline<'a>() -> Element<'a, Message> {
 
 fn hline<'a>() -> Element<'a, Message> {
     container(Space::new(Length::Fill, Length::Fixed(1.0))).style(filled(theme::c().border)).into()
+}
+
+/// Ctrl+Shift+F2: compare options, toggled by click or their letter.
+fn compare_view(opts: &CompareOptions) -> Element<'static, Message> {
+    let option = |i: u8, key: &'static str, label: &'static str, hint: &'static str, on: bool| {
+        let content = row![
+            text(key).size(12).color(theme::c().muted).width(Length::Fixed(12.0)),
+            checkbox("", on).on_toggle(move |_| Message::CompareToggle(i)).size(14),
+            column![text(label).size(13), text(hint).size(11).color(theme::c().muted)].spacing(2),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+        button(content).on_press(Message::CompareToggle(i)).width(Length::Fill).padding([4, 8]).style(theme::suggestion(false))
+    };
+    let content = column![
+        text("Compare folders").size(16),
+        option(0, "C", "Compare contents", "Same-size files are read; equal contents are never marked", opts.by_content),
+        option(1, "D", "Ignore dates", "Differing files are marked on both sides", opts.ignore_date),
+        option(2, "S", "Include subfolders", "Folders on both sides are marked if anything inside differs", opts.subfolders),
+        row![
+            Space::with_width(Length::Fill),
+            dialog_button("Cancel", Message::DialogCancel, false),
+            dialog_button("Compare", Message::DialogSubmit, true),
+        ]
+        .spacing(8),
+    ]
+    .spacing(10);
+    container(content).padding(16).width(Length::Fixed(520.0)).style(theme::dialog).into()
 }

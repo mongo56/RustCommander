@@ -19,9 +19,34 @@ pub struct Session {
     /// Window position and maximised state (Windows).
     #[serde(default)]
     pub window: Option<WindowState>,
+    /// Compare-folders options (Ctrl+Shift+F2).
+    #[serde(default)]
+    pub compare: CompareState,
     /// Editor setting from older versions; read once to seed `config.toml`.
     #[serde(default, skip_serializing)]
     pub editor: String,
+}
+
+/// [`rc_core::compare::CompareOptions`] in the session file (hidden files
+/// follow the panels).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CompareState {
+    pub by_content: bool,
+    pub ignore_date: bool,
+    pub subfolders: bool,
+}
+
+impl From<CompareState> for rc_core::compare::CompareOptions {
+    fn from(c: CompareState) -> Self {
+        Self { by_content: c.by_content, ignore_date: c.ignore_date, subfolders: c.subfolders, show_hidden: false }
+    }
+}
+
+impl From<rc_core::compare::CompareOptions> for CompareState {
+    fn from(o: rc_core::compare::CompareOptions) -> Self {
+        Self { by_content: o.by_content, ignore_date: o.ignore_date, subfolders: o.subfolders }
+    }
 }
 
 /// [`rc_platform::Placement`] in the session file.
@@ -139,6 +164,7 @@ mod tests {
             right: SideState::default(),
             hotlist: vec![dir.clone()],
             window: Some(WindowState { left: -8, top: 0, right: 1200, bottom: 800, maximized: true }),
+            compare: CompareState { by_content: true, ignore_date: false, subfolders: true },
             editor: r#""my editor.exe" -n %1"#.into(),
         };
         let text = toml::to_string_pretty(&session).unwrap();

@@ -12,6 +12,7 @@ use iced::keyboard::key::Named;
 use iced::widget::{image, text_input};
 use iced::{event, keyboard, mouse, window, Event, Point, Size, Subscription, Task, Theme};
 use rc_core::ops::{self, Conflict, Job, JobEvent, JobHandle, Outcome, Progress, Resolution};
+use rc_core::compare::{CompareOptions, Differences};
 use rc_core::entry::Entry;
 use rc_core::{Activated, Command, EntryKind, Nav, Panel, SortKey};
 use rc_platform::{DragOutcome, MenuAction};
@@ -66,6 +67,11 @@ pub struct App {
     /// Folder size counts running (Space / Alt+Shift+Enter): the folder
     /// listed and the batch's cancel flag.
     counts: Vec<(PathBuf, Arc<AtomicBool>)>,
+    /// Compare-folders options (Ctrl+Shift+F2), saved with the session.
+    compare_opts: CompareOptions,
+    /// A compare running on a worker: its cancel flag and the folders
+    /// compared (results for other folders are dropped).
+    comparing: Option<(Arc<AtomicBool>, PathBuf, PathBuf)>,
     path_edit: Option<PathEdit>,
     rename: Option<InlineRename>,
     quick_search: Option<QuickSearch>,
@@ -148,6 +154,8 @@ enum Dialog {
     Delete { paths: Vec<PathBuf>, to_trash: bool },
     /// Hotlist menu; `selected` indexes the entries, then the add/remove item.
     Hotlist { selected: usize },
+    /// Compare-folders options; Enter compares with them.
+    Compare { opts: CompareOptions },
 }
 
 /// The path bar of one side being edited, with folder suggestions.
@@ -277,6 +285,10 @@ pub enum Message {
     Subfolders(PathBuf, Vec<String>),
     /// A folder size: (folder listed, entry name, size).
     DirSize(PathBuf, String, u64),
+    /// A background compare finished (`None` = cancelled).
+    Compared(Arc<AtomicBool>, Option<Differences>),
+    /// Compare dialog option clicked: 0 content, 1 ignore date, 2 subfolders.
+    CompareToggle(u8),
 }
 
 impl App {
@@ -312,6 +324,8 @@ impl App {
             jobs: Vec::new(),
             next_job_id: 1,
             counts: Vec::new(),
+            compare_opts: session.as_ref().map(|s| s.compare.into()).unwrap_or_default(),
+            comparing: None,
             path_edit: None,
             rename: None,
             quick_search: None,
@@ -606,6 +620,22 @@ impl App {
                 }
                 return self.refresh_suggestions();
             }
+            Message::Compared(token, diff) => {
+                if self.comparing.as_ref().is_some_and(|(c, ..)| Arc::ptr_eq(c, &token)) {
+                    let (_, left, right) = self.comparing.take().unwrap();
+                    match diff {
+                        Some(diff) if self.panel(0).path == left && self.panel(1).path == right => {
+                            self.apply_compare(diff)
+                        }
+                        _ => self.status = Some(("Compare cancelled".into(), Tone::Info)),
+                    }
+                }
+            }
+            Message::CompareToggle(i) => {
+                if let Some(Dialog::Compare { opts }) = &mut self.dialog {
+                    toggle_compare_option(opts, i);
+                }
+            }
             Message::DirSize(dir, name, size) => {
                 for panel in self.sides.iter_mut().flat_map(|s| s.tabs.iter_mut()).filter(|p| p.path == dir) {
                     panel.set_dir_size(&name, size);
@@ -740,6 +770,18 @@ impl App {
                 return self.hotlist_key(selected, named, text.as_deref());
             }
             return Task::none();
+        }
+        if let Some(Dialog::Compare { opts }) = &mut self.dialog {
+            let option = match text.as_deref().map(str::to_ascii_lowercase).as_deref() {
+                Some("c") => Some(0),
+                Some("d") => Some(1),
+                Some("s") => Some(2),
+                _ => None,
+            };
+            if let Some(i) = option {
+                toggle_compare_option(opts, i);
+                return Task::none();
+            }
         }
         if self.dialog.is_some() {
             if escape {
@@ -950,8 +992,9 @@ impl App {
                 panel.ensure_visible(rows);
                 return self.count_dirs(active, dir.into_iter().collect());
             }
-            CompareDirs => {
-                self.compare_dirs();
+            CompareDirs => return self.compare_dirs(),
+            CompareDirsOptions => {
+                self.dialog = Some(Dialog::Compare { opts: self.compare_opts });
                 return Task::none();
             }
             CountDirSizes => {
@@ -987,6 +1030,10 @@ impl App {
         }
 
         if cmd == DeselectAll {
+            if let Some((cancel, ..)) = self.comparing.take() {
+                cancel.store(true, Ordering::Relaxed);
+                self.status = Some(("Compare cancelled".into(), Tone::Info));
+            }
             self.cancel_counts();
         }
         let panel = self.panel_mut(active);
@@ -1433,6 +1480,11 @@ impl App {
                 return self.start_job(Job::Delete { paths, to_trash }, title);
             }
             Dialog::Hotlist { selected } => return self.hotlist_pick(selected),
+            Dialog::Compare { opts } => {
+                self.compare_opts = opts;
+                self.save_session();
+                return self.compare_dirs();
+            }
         }
         Task::none()
     }
@@ -1644,13 +1696,40 @@ impl App {
     }
 
     /// Shift+F2: selects, in both panels, the entries missing from the other
-    /// side or newer there (`rc_core::compare`).
-    fn compare_dirs(&mut self) {
+    /// side or newer there (`rc_core::compare`, with `compare_opts`). With
+    /// options that read the disk it runs on a worker (Esc cancels).
+    fn compare_dirs(&mut self) -> Task<Message> {
         if self.panel(0).path == self.panel(1).path {
             self.status = Some(("Both panels show the same folder".into(), Tone::Info));
-            return;
+            return Task::none();
         }
-        let diff = rc_core::compare::compare(&self.panel(0).entries, &self.panel(1).entries);
+        if let Some((cancel, ..)) = self.comparing.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        let opts = CompareOptions { show_hidden: self.panel(0).show_hidden && self.panel(1).show_hidden, ..self.compare_opts };
+        if !opts.reads_disk() {
+            let never = AtomicBool::new(false);
+            let diff = rc_core::compare::compare_with(&self.panel(0).entries, &self.panel(1).entries, opts, &never);
+            self.apply_compare(diff.unwrap_or_default());
+            return Task::none();
+        }
+        let (left, right) = (self.panel(0).entries.clone(), self.panel(1).entries.clone());
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.comparing = Some((cancel.clone(), self.panel(0).path.clone(), self.panel(1).path.clone()));
+        self.status = Some(("Comparing\u{2026} (Esc cancels)".into(), Tone::Info));
+        let (tx, rx) = iced::futures::channel::oneshot::channel();
+        std::thread::spawn(move || {
+            let diff = rc_core::compare::compare_with(&left, &right, opts, &cancel);
+            let _ = tx.send((cancel, diff));
+        });
+        Task::perform(rx, |r| match r {
+            Ok((token, diff)) => Message::Compared(token, diff),
+            Err(_) => Message::Compared(Arc::new(AtomicBool::new(true)), None),
+        })
+    }
+
+    /// Selects a compare result in both panels and reports it.
+    fn apply_compare(&mut self, diff: Differences) {
         let msg = if diff.is_empty() {
             ("Folders are identical".to_string(), Tone::Success)
         } else {
@@ -1828,6 +1907,7 @@ impl App {
             left: side(&self.sides[0]),
             right: side(&self.sides[1]),
             hotlist: self.hotlist.clone(),
+            compare: self.compare_opts.into(),
             window: self.placement.map(Into::into),
             editor: String::new(),
         }
@@ -2108,4 +2188,13 @@ fn restore_window(p: rc_platform::Placement) -> Task<Message> {
         None => Task::none(),
     })
     .discard()
+}
+
+/// Flips compare option `i`: 0 by content, 1 ignore date, 2 subfolders.
+fn toggle_compare_option(opts: &mut CompareOptions, i: u8) {
+    match i {
+        0 => opts.by_content ^= true,
+        1 => opts.ignore_date ^= true,
+        _ => opts.subfolders ^= true,
+    }
 }

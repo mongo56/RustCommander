@@ -159,6 +159,7 @@ fn default_command(key: &Key, m: Modifiers) -> Option<Command> {
             Named::F6 if ctrl => SortBy(SortKey::Size),
             Named::F4 if alt => Quit,
             Named::F4 if shift => EditNew,
+            Named::F2 if ctrl && shift && !alt => CompareDirsOptions,
             Named::F2 if ctrl => Refresh,
             Named::F2 if shift && !alt => CompareDirs,
             Named::F3 => View,
