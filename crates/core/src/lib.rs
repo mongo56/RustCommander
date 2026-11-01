@@ -15,6 +15,7 @@ pub mod remote;
 pub mod rename;
 pub mod search;
 pub mod vfs;
+mod gz_edit;
 mod tar_edit;
 mod zip_edit;
 pub mod viewer;

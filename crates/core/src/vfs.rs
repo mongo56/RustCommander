@@ -3,9 +3,9 @@
 //! Paths stay plain `PathBuf`s. A path that runs through an archive file
 //! (`C:\x\a.zip\sub\f.txt`) is served by that archive's [`Vfs`]; anything
 //! else is the local file system ([`LocalFs`]). Archives can be listed,
-//! walked and read (copy out, view); zips and tars can also be changed (see
-//! `zip_edit`, `tar_edit`, driven by the jobs in `ops`), the others are
-//! read-only.
+//! walked and read (copy out, view); zips, tars and plain gz files can also
+//! be changed (see `zip_edit`, `tar_edit`, `gz_edit`, driven by the jobs in
+//! `ops`), the others are read-only.
 //! Supported: zip (`.zip`, `.jar`) via the `zip` crate, 7z via
 //! `sevenz-rust2`, tar (`.tar`, `.tar.gz`/`.tgz`, `.tar.bz2`/`.tbz2`) via
 //! `tar` + `flate2`/`bzip2`, a single gzipped file (`.gz`), and rar (rar4,
@@ -163,8 +163,15 @@ pub(crate) enum Format {
 impl Format {
     /// Archives of this format can be changed (rewritten).
     pub(crate) fn writable(self) -> bool {
-        matches!(self, Format::Zip | Format::Tar | Format::TarGz | Format::TarBz2)
+        matches!(self, Format::Zip | Format::Tar | Format::TarGz | Format::TarBz2 | Format::Gz)
     }
+}
+
+/// The one file a plain `.gz` `archive` holds: its name without `.gz`.
+/// `None` for other archives.
+pub(crate) fn gz_member(archive: &Path) -> Option<String> {
+    let gz = archive.file_name().and_then(format_of) == Some(Format::Gz);
+    gz.then(|| archive.file_stem().unwrap_or_default().to_string_lossy().into_owned())
 }
 
 /// The archive format a file name stands for (by extension), if any.
@@ -310,7 +317,7 @@ pub fn in_archive(path: &Path) -> bool {
 }
 
 /// For an archive or a path inside one: whether the archive can be changed
-/// (zip and tar yes, 7z, gz and rar no). One inside another archive can be
+/// (zip, tar and gz yes, 7z and rar no). One inside another archive can be
 /// changed if that one can (it's rewritten and then put back). `None` for
 /// local paths.
 pub fn archive_writable(path: &Path) -> Option<bool> {

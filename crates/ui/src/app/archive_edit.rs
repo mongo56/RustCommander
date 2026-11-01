@@ -1,11 +1,11 @@
 //! F4 on a file inside an archive. The file is extracted to its temp copy
-//! (`vfs::extract_temp`) and opened in the editor. In a zip or tar the copy is
+//! (`vfs::extract_temp`) and opened in the editor. In a zip, tar or gz the copy is
 //! then watched (polled, since many editors return at once): each save is
 //! put back into the archive by a `Job::Update`, which refuses to overwrite the file
 //! if it changed in the archive meanwhile. Watching stops once the editor
 //! closes (when it ran as its own process), when no tab shows the archive
 //! any more, and on quit (after a last check). Copies from read-only
-//! archives (7z, gz, or inside one of those) open with a note that
+//! archives (7z, rar, or inside one of those) open with a note that
 //! changes aren't saved.
 //!
 //! Shift+F4 in a zip or tar adds the new file empty (also a `Job::Update`, of an
@@ -124,7 +124,7 @@ impl App {
     /// if one appears meanwhile) and opened once that's done.
     pub(super) fn new_in_archive(&mut self, entry: PathBuf, name: &str) -> Task<Message> {
         if vfs::archive_writable(&entry) != Some(true) {
-            let msg = "Read-only archive (only zips and tars can be changed): can't create files here";
+            let msg = "Read-only archive (only zip, tar and gz archives can be changed): can't create files here";
             self.status = Some((msg.into(), Tone::Info));
             return Task::none();
         }

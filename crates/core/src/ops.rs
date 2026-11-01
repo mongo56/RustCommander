@@ -26,6 +26,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 const BUFFER_SIZE: usize = 1024 * 1024;
 const REPORT_INTERVAL: Duration = Duration::from_millis(50);
+const READONLY: &str = "Only zip, tar and gz archives can be changed (not 7z or rar, nor ones inside those)";
 
 /// One top-level source and where it should end up (full path, not folder).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -976,7 +977,7 @@ impl Runner<'_> {
         match vfs::open(archive) {
             Ok(v) if v.writable() => Some(v),
             Ok(_) => {
-                self.fail_msg(archive, "Only zip and tar archives can be changed (7z and gz are read-only)");
+                self.fail_msg(archive, "Only zip, tar and gz archives can be changed (7z and rar are read-only)");
                 None
             }
             Err(e) => {
@@ -991,9 +992,9 @@ impl Runner<'_> {
     /// Conflicts are asked first, then the archive is rewritten once.
     /// Returns the transfers that were packed completely.
     fn pack(&mut self, archive: &Path, transfers: &[Transfer], is_move: bool) -> Vec<usize> {
-        // Not 7z or gz, nor archives inside those.
+        // Not 7z or rar, nor archives inside those.
         if vfs::archive_writable(archive) == Some(false) {
-            self.fail_msg(archive, "Only zip and tar archives can be changed (not 7z or gz, nor ones inside those)");
+            self.fail_msg(archive, READONLY);
             return Vec::new();
         }
         let index = match archive_exists(archive) {
@@ -1007,12 +1008,22 @@ impl Runner<'_> {
         let mut edits = Edits::default();
         let mut adds = Vec::new();
         let mut complete = vec![true; transfers.len()];
+        // A plain .gz takes only a file named like its one file (replacing it).
+        let gz = vfs::gz_member(archive);
         for (ti, t) in transfers.iter().enumerate() {
             let Some(base) = inner_of(archive, &t.dst).filter(|b| !b.is_empty()) else {
                 self.fail_msg(&t.dst, "Not a path inside the archive");
                 complete[ti] = false;
                 continue;
             };
+            if let Some(member) = &gz {
+                let what = if t.src.is_dir() { "folders" } else { "other files" };
+                if t.src.is_dir() || crate::zip_edit::key(&base) != crate::zip_edit::key(member) {
+                    let msg = format!("A .gz holds just one file, named like the archive ({member}): it can't take {what}");
+                    complete[ti] = self.fail_msg(&t.src, msg);
+                    continue;
+                }
+            }
             let items = match LocalFs.walk(&t.src) {
                 Ok(items) => items,
                 Err(e) => {
@@ -1088,7 +1099,7 @@ impl Runner<'_> {
             return;
         };
         if vfs::archive_writable(&archive) == Some(false) {
-            self.fail_msg(&archive, "Only zip and tar archives can be changed (not 7z or gz, nor ones inside those)");
+            self.fail_msg(&archive, READONLY);
             return;
         }
         let Some(index) = self.open_writable(&archive) else { return };
@@ -1119,7 +1130,7 @@ impl Runner<'_> {
     /// them in a zip too.
     fn copy_between_archives(&mut self, archive: &Path, transfers: &[Transfer], is_move: bool) {
         if vfs::archive_writable(archive) == Some(false) {
-            self.fail_msg(archive, "Only zip and tar archives can be changed (not 7z or gz, nor ones inside those)");
+            self.fail_msg(archive, READONLY);
             return;
         }
         if archive_exists(archive) && self.open_writable(archive).is_none() {
@@ -1137,7 +1148,7 @@ impl Runner<'_> {
                 break;
             }
             if is_move && vfs::archive_writable(&t.src) == Some(false) {
-                self.fail_msg(&t.src, "Can't move out of a read-only archive (only zips and tars can be changed): copy with F5 instead");
+                self.fail_msg(&t.src, "Can't move out of a read-only archive (only zip, tar and gz archives can be changed): copy with F5 instead");
                 continue;
             }
             let Some(name) = t.src.file_name() else {
@@ -1186,6 +1197,17 @@ impl Runner<'_> {
     /// destination is an error (no merging).
     fn relocate(&mut self, archive: &Path, transfers: &[Transfer], keep: bool) {
         let Some(index) = self.open_writable(archive) else { return };
+        // A plain .gz lists its one file under the archive's name.
+        if let Some(member) = vfs::gz_member(archive) {
+            let msg = match keep {
+                true => format!("A .gz holds just one file ({member}): it can't be copied inside it"),
+                false => format!("The file in a .gz is named like the archive ({member}): rename the .gz itself instead"),
+            };
+            for t in transfers {
+                self.fail_msg(&t.src, msg.clone());
+            }
+            return;
+        }
         let saved = self.snapshot();
         let mut edits = Edits::default();
         let mut parents = Vec::new();
@@ -1250,6 +1272,10 @@ impl Runner<'_> {
                 ok = false;
                 continue;
             }
+            if let Some(member) = vfs::gz_member(&archive) {
+                ok &= self.delete_gz(&archive, &member, &inners);
+                continue;
+            }
             let mut keep_dirs: Vec<String> = inners.iter().map(|i| inner_parent(i).to_owned()).collect();
             keep_dirs.dedup();
             let edits = Edits { remove: inners, ..Edits::default() };
@@ -1257,6 +1283,47 @@ impl Runner<'_> {
             ok &= self.rewrite(&archive, &edits, &[], &keep_dirs, saved).is_some();
         }
         ok
+    }
+
+    /// Deletes the one file of the plain .gz `archive`: that deletes the .gz
+    /// itself (it can't be empty), from the archive holding it if nested.
+    fn delete_gz(&mut self, archive: &Path, member: &str, inners: &[String]) -> bool {
+        let key = crate::zip_edit::key;
+        if let Some(other) = inners.iter().find(|i| key(i) != key(member)) {
+            return self.fail_msg(&archive.join(other), "Not found in the archive");
+        }
+        self.progress.current = Some(archive.to_path_buf());
+        let done = match archive.is_file() {
+            true => match fs::remove_file(archive) {
+                Ok(()) => true,
+                Err(e) => self.fail(archive, e),
+            },
+            false => self.delete_nested(archive),
+        };
+        if done {
+            vfs::forget(archive);
+            vfs::unmount(archive);
+        }
+        done
+    }
+
+    /// Deletes the nested archive `archive` (a logical path) from the archive
+    /// holding it.
+    fn delete_nested(&mut self, archive: &Path) -> bool {
+        let found = archive.parent().and_then(vfs::split_archive).map(|(outer, _)| outer);
+        let Some((outer, inner)) = found.and_then(|o| inner_of(&o, archive).filter(|i| !i.is_empty()).map(|i| (o, i))) else {
+            return self.fail_msg(archive, "Not an archive inside another archive");
+        };
+        if self.open_writable(&outer).is_none() {
+            return false;
+        }
+        if let Some(member) = vfs::gz_member(&outer) {
+            return self.delete_gz(&outer, &member, &[inner]);
+        }
+        let saved = self.snapshot();
+        let keep_dirs = [inner_parent(&inner).to_owned()];
+        let edits = Edits { remove: vec![inner], ..Edits::default() };
+        self.rewrite(&outer, &edits, &[], &keep_dirs, saved).is_some()
     }
 
     /// Creates a folder: inside a zip by rewriting it, else on disk.

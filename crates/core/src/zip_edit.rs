@@ -4,6 +4,7 @@
 //! then replaces the archive in one rename. Until [`ZipEdit::commit`] the
 //! archive is untouched; dropping an uncommitted edit removes the temp file.
 
+use crate::gz_edit::GzEdit;
 use crate::tar_edit::TarEdit;
 use crate::vfs::{self, clean_parts, Format};
 use chrono::{DateTime, Datelike, Local, Timelike};
@@ -194,20 +195,23 @@ fn options(modified: Option<SystemTime>, size: u64) -> SimpleFileOptions {
     opts
 }
 
-/// A zip or tar archive being rewritten (see [`ZipEdit`], [`TarEdit`]).
+/// A zip, tar or gz archive being rewritten (see [`ZipEdit`], [`TarEdit`],
+/// [`GzEdit`]).
 pub(crate) enum Rewrite {
     Zip(Box<ZipEdit>),
     Tar(Box<TarEdit>),
+    Gz(Box<GzEdit>),
 }
 
 impl Rewrite {
-    /// Starts rewriting `archive`, which must be a zip or a tar (plain, gz
-    /// or bz2) on disk; it may not exist yet.
+    /// Starts rewriting `archive`, which must be a zip, a tar (plain, gz or
+    /// bz2) or a plain gz on disk; it may not exist yet.
     pub fn begin(archive: &Path) -> io::Result<Rewrite> {
         match archive.file_name().and_then(vfs::format_of) {
             Some(Format::Zip) => Ok(Rewrite::Zip(Box::new(ZipEdit::begin(archive)?))),
             Some(f @ (Format::Tar | Format::TarGz | Format::TarBz2)) => Ok(Rewrite::Tar(Box::new(TarEdit::begin(archive, f)?))),
-            _ => Err(io::Error::other("Only zip and tar archives can be changed")),
+            Some(Format::Gz) => Ok(Rewrite::Gz(Box::new(GzEdit::begin(archive)?))),
+            _ => Err(io::Error::other("Only zip, tar and gz archives can be changed")),
         }
     }
 
@@ -215,6 +219,7 @@ impl Rewrite {
         match self {
             Rewrite::Zip(e) => e.copy_existing(edits, alive),
             Rewrite::Tar(e) => e.copy_existing(edits, alive),
+            Rewrite::Gz(e) => e.copy_existing(edits, alive),
         }
     }
 
@@ -222,6 +227,7 @@ impl Rewrite {
         match self {
             Rewrite::Zip(e) => e.add_dir(inner, modified),
             Rewrite::Tar(e) => e.add_dir(inner, modified),
+            Rewrite::Gz(e) => e.add_dir(inner, modified),
         }
     }
 
@@ -229,6 +235,7 @@ impl Rewrite {
         match self {
             Rewrite::Zip(e) => e.start_file(inner, modified, size),
             Rewrite::Tar(e) => e.start_file(inner, modified),
+            Rewrite::Gz(e) => e.start_file(inner, modified),
         }
     }
 
@@ -236,6 +243,7 @@ impl Rewrite {
         match self {
             Rewrite::Zip(e) => e.output(),
             Rewrite::Tar(e) => e.output(),
+            Rewrite::Gz(e) => e.output(),
         }
     }
 
@@ -243,6 +251,7 @@ impl Rewrite {
         match self {
             Rewrite::Zip(e) => e.abort_file(),
             Rewrite::Tar(e) => e.abort_file(),
+            Rewrite::Gz(e) => e.abort_file(),
         }
     }
 
@@ -250,6 +259,7 @@ impl Rewrite {
         match self {
             Rewrite::Zip(e) => (*e).commit(),
             Rewrite::Tar(e) => (*e).commit(),
+            Rewrite::Gz(e) => (*e).commit(),
         }
     }
 }
