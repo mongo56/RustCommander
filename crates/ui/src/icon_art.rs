@@ -31,9 +31,9 @@ const fn rr(x0: f32, y0: f32, x1: f32, y1: f32, r: f32) -> RoundRect {
 /// Colour of one sample point, or `None` for transparent.
 fn sample(x: f32, y: f32) -> Option<[f32; 3]> {
     const BG: RoundRect = rr(0.03, 0.03, 0.97, 0.97, 0.2);
-    const LEFT: RoundRect = rr(0.16, 0.2, 0.48, 0.82, 0.05);
-    const RIGHT: RoundRect = rr(0.52, 0.2, 0.84, 0.82, 0.05);
-    const CURSOR: RoundRect = rr(0.19, 0.42, 0.45, 0.5, 0.02);
+    const LEFT: RoundRect = rr(0.12, 0.14, 0.49, 0.86, 0.05);
+    const RIGHT: RoundRect = rr(0.51, 0.14, 0.88, 0.86, 0.05);
+    const CURSOR: RoundRect = rr(0.15, 0.44, 0.46, 0.53, 0.02);
     const PANEL: [f32; 3] = [0.10, 0.11, 0.13];
     const LINE: [f32; 3] = [0.36, 0.40, 0.47];
 
@@ -46,17 +46,17 @@ fn sample(x: f32, y: f32) -> Option<[f32; 3]> {
     for panel in [&LEFT, &RIGHT] {
         if panel.contains(x, y) {
             // Faint "file name" lines.
-            let row = (y - 0.26) / 0.08;
-            let in_line = row >= 0.0 && row.fract() < 0.35 && y < 0.78;
-            let line_end = panel.x1 - 0.05 - 0.06 * (row.floor() % 3.0);
-            let lined = in_line && x > panel.x0 + 0.04 && x < line_end;
+            let row = (y - 0.21) / 0.085;
+            let in_line = row >= 0.0 && row.fract() < 0.35 && y < 0.83;
+            let line_end = panel.x1 - 0.045 - 0.06 * (row.floor() % 3.0);
+            let lined = in_line && x > panel.x0 + 0.035 && x < line_end;
             return Some(if lined { LINE } else { PANEL });
         }
     }
     // Diagonal gradient from the accent blue to a deeper blue.
     let t = (x + y) / 2.0;
-    let from = [0.42, 0.67, 1.0];
-    let to = [0.16, 0.38, 0.82];
+    let from = [0.22, 0.38, 0.62];
+    let to = [0.12, 0.24, 0.48];
     Some([0, 1, 2].map(|i| from[i] + (to[i] - from[i]) * t))
 }
 
