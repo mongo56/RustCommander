@@ -88,6 +88,13 @@ pub struct Panel {
     /// path relative to `path` (the search root); refreshes re-check them
     /// on disk instead of listing the folder, and any navigation ends it.
     results: Option<String>,
+    /// Thumbnail view (Ctrl+Shift+F5) instead of the list. The grid's
+    /// layout comes from the UI ([`Panel::set_grid`]).
+    pub thumbnails: bool,
+    /// Thumbnail grid: (columns, fully visible rows). While `thumbnails` is
+    /// on, `scroll` counts grid rows and the `rows` arguments of the scroll
+    /// methods are ignored in favour of this.
+    grid: (usize, usize),
 }
 
 /// A history entry: the folder and the entry the cursor was on.
@@ -135,6 +142,8 @@ impl Panel {
             forward: Vec::new(),
             dir_sizes: HashMap::new(),
             results: None,
+            thumbnails: false,
+            grid: (1, 1),
         };
         panel.reload()?;
         Ok(panel)
@@ -472,16 +481,39 @@ impl Panel {
         self.cursor = self.entries.len().saturating_sub(1);
     }
 
+    /// Sets the thumbnail grid's layout: columns and fully visible rows.
+    pub fn set_grid(&mut self, cols: usize, rows: usize) {
+        self.grid = (cols.max(1), rows.max(1));
+    }
+
+    /// The thumbnail grid's (columns, visible rows).
+    pub fn grid(&self) -> (usize, usize) {
+        self.grid
+    }
+
+    /// (columns, visible rows) of the current view: the grid in thumbnail
+    /// view, one column of `rows` in the list.
+    fn layout(&self, rows: usize) -> (usize, usize) {
+        if self.thumbnails { self.grid } else { (1, rows.max(1)) }
+    }
+
+    /// Rows of the view: entries in the list, grid rows in thumbnail view.
+    fn row_count(&self, cols: usize) -> usize {
+        self.entries.len().div_ceil(cols)
+    }
+
     /// Adjusts `scroll` so the cursor lies within `rows` visible rows.
     pub fn ensure_visible(&mut self, rows: usize) {
+        let (cols, rows) = self.layout(rows);
         self.wheel_anchor = None;
-        self.scroll = visible_start(self.scroll, self.cursor, rows, self.entries.len());
+        self.scroll = visible_start(self.scroll, self.cursor / cols, rows, self.row_count(cols));
     }
 
     /// Scrolls the view by `delta` rows without moving the cursor.
     pub fn scroll_by(&mut self, delta: isize, rows: usize) {
         let start = self.view_start(rows);
-        let max = self.entries.len().saturating_sub(rows.max(1));
+        let (cols, rows) = self.layout(rows);
+        let max = self.row_count(cols).saturating_sub(rows);
         self.scroll = (start as isize + delta).clamp(0, max as isize) as usize;
         self.wheel_anchor = Some(self.cursor);
     }
@@ -489,18 +521,27 @@ impl Panel {
     /// Scrolls the view to start at row `start` (scrollbar drag) without
     /// moving the cursor, like [`Panel::scroll_by`].
     pub fn scroll_to(&mut self, start: usize, rows: usize) {
-        self.scroll = start.min(self.entries.len().saturating_sub(rows.max(1)));
+        let (cols, rows) = self.layout(rows);
+        self.scroll = start.min(self.row_count(cols).saturating_sub(rows));
         self.wheel_anchor = Some(self.cursor);
     }
 
-    /// First row to draw when `rows` rows fit on screen.
+    /// First row to draw when `rows` rows fit on screen (in thumbnail view:
+    /// the first grid row, `rows` being ignored).
     pub fn view_start(&self, rows: usize) -> usize {
-        let len = self.entries.len();
+        let (cols, rows) = self.layout(rows);
+        let len = self.row_count(cols);
         if self.wheel_anchor == Some(self.cursor) {
-            self.scroll.min(len.saturating_sub(rows.max(1)))
+            self.scroll.min(len.saturating_sub(rows))
         } else {
-            visible_start(self.scroll, self.cursor, rows, len)
+            visible_start(self.scroll, self.cursor / cols, rows, len)
         }
+    }
+
+    /// The entry `dx` columns and `dy` rows from the cursor in the
+    /// thumbnail grid (see [`grid_move`]).
+    pub fn grid_target(&self, dx: isize, dy: isize) -> usize {
+        grid_move(self.cursor, self.entries.len(), self.grid.0, dx, dy)
     }
 
     /// Puts the cursor on the entry called `name`, if present.
@@ -806,6 +847,27 @@ pub fn visible_start(scroll: usize, cursor: usize, rows: usize, len: usize) -> u
     start.min(len.saturating_sub(rows))
 }
 
+/// Moves `cursor` in a grid of `cols` columns holding `len` entries
+/// (row-major, the last row maybe partial): `dx` steps through the entries
+/// in order (wrapping across rows), `dy` moves whole rows in the same
+/// column, stopping at the first / last row; a column missing from a
+/// partial last row lands on the last entry.
+pub fn grid_move(cursor: usize, len: usize, cols: usize, dx: isize, dy: isize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let cols = cols.max(1);
+    let last = len - 1;
+    let cursor = (cursor.min(last) as isize + dx).clamp(0, last as isize) as usize;
+    if dy == 0 {
+        return cursor;
+    }
+    let last_row = (last / cols) as isize;
+    let row = (cursor / cols) as isize + dy;
+    let row = row.clamp(0, last_row) as usize;
+    (row * cols + cursor % cols).min(last)
+}
+
 /// `..` first, then folders, then files. Folders are always ordered by name
 /// unless sorting by date (same as Total Commander).
 /// Quick-filter match, case-insensitive. `filter` holds one or more
@@ -908,7 +970,43 @@ mod tests {
         p.move_cursor(1);
         p.ensure_visible(10);
         assert_eq!(p.view_start(10), 4);
+
+        // Thumbnail view: scrolling counts grid rows of the grid's layout.
+        p.thumbnails = true;
+        p.set_grid(4, 3);
+        let rows = len.div_ceil(4);
+        p.set_cursor(len - 1);
+        p.ensure_visible(10);
+        assert_eq!(p.view_start(10), rows - 3);
+        p.scroll_by(-100, 10);
+        assert_eq!((p.view_start(10), p.cursor), (0, len - 1));
+        p.scroll_to(1000, 10);
+        assert_eq!(p.view_start(10), rows - 3);
+        p.set_cursor(9); // row 2
+        p.ensure_visible(10);
+        assert_eq!(p.view_start(10), 2);
+        assert_eq!(p.grid_target(0, 1), 13);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn grid_moves_in_two_dimensions() {
+        // 10 entries in 4 columns:  0 1 2 3 / 4 5 6 7 / 8 9
+        let mv = |cursor, dx, dy| grid_move(cursor, 10, 4, dx, dy);
+        assert_eq!(mv(5, 1, 0), 6);
+        assert_eq!(mv(3, 1, 0), 4); // wraps to the next row
+        assert_eq!(mv(0, -1, 0), 0);
+        assert_eq!(mv(9, 1, 0), 9);
+        assert_eq!(mv(5, 0, -1), 1);
+        assert_eq!(mv(1, 0, -1), 1); // first row: stays
+        assert_eq!(mv(1, 0, 1), 5);
+        assert_eq!(mv(5, 0, 1), 9);
+        assert_eq!(mv(6, 0, 1), 9); // partial last row: the last entry
+        assert_eq!(mv(9, 0, 1), 9);
+        assert_eq!(mv(2, 0, 100), 9); // page down past the end
+        assert_eq!(mv(7, 0, -100), 3); // page up keeps the column
+        assert_eq!(grid_move(0, 0, 4, 1, 1), 0);
+        assert_eq!(grid_move(3, 5, 1, 0, 1), 4); // one column = a list
     }
 
     #[test]

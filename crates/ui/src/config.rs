@@ -26,6 +26,9 @@ pub struct Config {
     /// The function-key bar (F1-F10 buttons) under the panels; off = a
     /// one-line hint instead.
     pub show_fkeys: bool,
+    /// Edge of the thumbnail view's pictures in pixels (Ctrl+Shift+F5);
+    /// 0 = the default, see [`Config::thumbnail_size`].
+    pub thumbnail_size: u32,
     /// Key bindings on top of the defaults: key (`Ctrl+Shift+F5`) ->
     /// command id (`cm_Copy`), `""` unbinds the key.
     pub keys: BTreeMap<String, String>,
@@ -59,6 +62,12 @@ impl From<rc_core::compare::CompareOptions> for CompareState {
 }
 
 impl Config {
+    /// The thumbnail edge in pixels: `thumbnail_size`, 128 when unset,
+    /// kept within 32..=512.
+    pub fn thumbnail_size(&self) -> u32 {
+        if self.thumbnail_size == 0 { 128 } else { self.thumbnail_size.clamp(32, 512) }
+    }
+
     /// The theme preset with the `[colors]` overrides on top.
     pub fn colors(&self) -> Result<crate::theme::Colors, String> {
         let preset = crate::theme::preset(&self.theme).ok_or_else(|| format!("unknown theme \"{}\"", self.theme))?;
@@ -304,6 +313,10 @@ fn template(editor: &str, compare: CompareState) -> String {
          # Show the function-key bar (F1-F10 buttons) under the panels. Off = only a\n\
          # one-line hint (F1 help, command palette, F10 settings).\n\
          show_fkeys = false\n\
+         \n\
+         # Size of the pictures in the thumbnail view (Ctrl+Shift+F5), in pixels\n\
+         # (32-512).\n\
+         thumbnail_size = 128\n\
          \n\
          # Colour theme: {themes}. [colors] below overrides single colours.\n\
          theme = \"dark\"\n\

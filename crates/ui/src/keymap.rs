@@ -349,6 +349,8 @@ const DEFAULTS: &[(&str, Command)] = {
         ("pagedown", PageDown),
         ("home", CursorHome),
         ("end", CursorEnd),
+        ("left", CursorLeft),
+        ("right", CursorRight),
         ("enter", Open),
         ("backspace", GoParent),
         ("tab", SwitchPanel),
@@ -374,6 +376,8 @@ const DEFAULTS: &[(&str, Command)] = {
         ("shift+pagedown", PageDown),
         ("shift+home", CursorHome),
         ("shift+end", CursorEnd),
+        ("shift+left", CursorLeft),
+        ("shift+right", CursorRight),
         ("shift+tab", SwitchPanel),
         ("ctrl+up", OpenInNewTab),
         ("alt+down", DirHistory),
@@ -415,6 +419,7 @@ const DEFAULTS: &[(&str, Command)] = {
         ("alt+shift+enter", CountDirSizes),
         ("ctrl+shift+tab", PrevTab),
         ("ctrl+shift+f2", CompareDirsOptions),
+        ("ctrl+shift+f5", Thumbnails),
         ("ctrl+shift+f", Disconnect),
     ]
 };

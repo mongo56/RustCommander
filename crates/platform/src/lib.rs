@@ -9,6 +9,8 @@ pub mod credentials;
 mod editors;
 pub use editors::{detect_editors, pick_program, FoundEditor};
 #[cfg(windows)]
+mod thumb_win;
+#[cfg(windows)]
 mod win;
 
 /// An RGBA icon bitmap (straight alpha).
@@ -139,6 +141,42 @@ pub fn file_icon(path: &Path, is_dir: bool) -> Option<Icon> {
             has_own_icon(&ext)
         };
         win::file_icon(path, is_dir, !per_file)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (path, is_dir);
+        None
+    }
+}
+
+/// The shell's thumbnail of a file (pictures, videos, PDFs, ... whatever
+/// Explorer previews), fitting `size`×`size`. `None` when there is none:
+/// it never falls back to an icon. Slow (decodes the file unless the
+/// system's thumbnail cache has it): call it off the UI thread.
+pub fn thumbnail(path: &Path, size: u32) -> Option<Icon> {
+    #[cfg(windows)]
+    {
+        thumb_win::thumbnail(path, size)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (path, size);
+        None
+    }
+}
+
+/// The system's large (48 px) icon for a file or folder; cache it by
+/// [`icon_key`] like [`file_icon`]. Works for paths that don't exist
+/// (inside archives) unless their icon is per file.
+pub fn large_icon(path: &Path, is_dir: bool) -> Option<Icon> {
+    #[cfg(windows)]
+    {
+        let ext = path
+            .extension()
+            .map(|e| e.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        let per_file = if is_dir { path.parent().is_none() } else { has_own_icon(&ext) };
+        thumb_win::large_icon(path, is_dir, !per_file || !path.exists())
     }
     #[cfg(not(windows))]
     {

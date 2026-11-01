@@ -74,7 +74,7 @@ impl App {
         ((self.window_width - 1.0) / 2.0).max(1.0)
     }
 
-    fn dragging(&self) -> bool {
+    pub(super) fn dragging(&self) -> bool {
         self.drag.as_ref().is_some_and(|d| d.active)
     }
 
@@ -396,23 +396,9 @@ impl App {
         .into()
     }
 
-    /// Virtualised list: only the rows that fit on screen are built.
+    /// The panel's entries: the list, or the thumbnail grid.
     fn file_list(&self, side: usize, active: bool) -> Element<'_, Message> {
-        let panel = self.panel(side);
-        let list = responsive(move |size| {
-            let rows = ((size.height / ROW_H).floor() as usize).max(1);
-            let len = panel.entries.len();
-            let start = panel.view_start(rows);
-            let end = (start + rows).min(len);
-            let rows_view = container(Column::with_children((start..end).map(|i| self.entry_row(side, i, active))))
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .clip(true);
-            let bar = scrollbar::attach(rows_view, start as f32, rows as f32, len as f32, move |at| {
-                Message::ScrollTo(side, at.round() as usize, rows)
-            });
-            container(bar).width(Length::Fill).height(Length::Fill).style(filled(theme::c().panel)).into()
-        });
+        let list = if self.panel(side).thumbnails { self.thumb_grid(side, active) } else { self.list_rows(side, active) };
         let mut area = mouse_area(list)
             .on_scroll(move |delta| {
                 let lines = match delta {
@@ -427,6 +413,26 @@ impl App {
             area = area.on_exit(Message::HoverEnd(side));
         }
         area.into()
+    }
+
+    /// Virtualised list: only the rows that fit on screen are built.
+    fn list_rows(&self, side: usize, active: bool) -> Element<'_, Message> {
+        let panel = self.panel(side);
+        responsive(move |size| {
+            let rows = ((size.height / ROW_H).floor() as usize).max(1);
+            let len = panel.entries.len();
+            let start = panel.view_start(rows);
+            let end = (start + rows).min(len);
+            let rows_view = container(Column::with_children((start..end).map(|i| self.entry_row(side, i, active))))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .clip(true);
+            let bar = scrollbar::attach(rows_view, start as f32, rows as f32, len as f32, move |at| {
+                Message::ScrollTo(side, at.round() as usize, rows)
+            });
+            container(bar).width(Length::Fill).height(Length::Fill).style(filled(theme::c().panel)).into()
+        })
+        .into()
     }
 
     fn entry_row(&self, side: usize, index: usize, active: bool) -> Element<'_, Message> {
@@ -931,7 +937,7 @@ fn new_submenu_row(typed: &str) -> Element<'static, Message> {
 }
 
 /// Keeps the end of a long path: `…\sandbox\B`.
-fn elide_end(s: &str, max_chars: usize) -> String {
+pub(super) fn elide_end(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {
         return s.to_string();
     }

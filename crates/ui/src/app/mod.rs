@@ -11,6 +11,7 @@ mod palette;
 mod find_files;
 mod multi_rename;
 mod settings;
+mod thumbs;
 mod viewer;
 
 use crate::keymap;
@@ -116,6 +117,8 @@ pub struct App {
     /// Icon cache keyed by `rc_platform::icon_key`. Filled lazily from
     /// `view`, hence the RefCell.
     icons: RefCell<HashMap<String, Option<image::Handle>>>,
+    /// Thumbnail view: decoded thumbnails, decodes running, grid sizes.
+    thumbs: thumbs::Thumbs,
     /// Free/total space per volume root, refreshed every few seconds.
     disk: RefCell<HashMap<PathBuf, DiskEntry>>,
     /// Latest background listing requested per folder (`Message::Listed`).
@@ -390,6 +393,8 @@ pub enum Message {
     Compared(Arc<AtomicBool>, Option<Differences>),
     /// Compare dialog option clicked: 0 content, 1 ignore date, 2 subfolders.
     CompareToggle(u8),
+    /// A thumbnail was decoded (`None`: the file has none).
+    Thumb(thumbs::ThumbKey, Option<image::Handle>),
 }
 
 impl App {
@@ -446,6 +451,7 @@ impl App {
             hover: None,
             modifiers: keyboard::Modifiers::default(),
             icons: RefCell::new(HashMap::new()),
+            thumbs: thumbs::Thumbs::default(),
             disk: RefCell::new(HashMap::new()),
             listings: HashMap::new(),
             next_listing: 0,
@@ -566,17 +572,21 @@ impl App {
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
         let task = self.handle(message);
+        let thumbs = self.pump_thumbs();
         if self.deferred.is_empty() {
-            return task;
+            return Task::batch([task, thumbs]);
         }
-        Task::batch(std::iter::once(task).chain(self.deferred.drain(..)))
+        Task::batch([task, thumbs].into_iter().chain(self.deferred.drain(..)))
     }
 
     fn handle(&mut self, message: Message) -> Task<Message> {
         if !self.counts.is_empty() {
             self.prune_counts();
         }
+        // Grid layouts follow the last drawn size of each side.
+        self.sync_grids();
         match message {
+            Message::Thumb(key, handle) => self.thumb_done(key, handle),
             Message::Key(key, mods, text, captured) => return self.on_key(key, mods, text, captured),
             Message::Modifiers(m) => self.modifiers = m,
             Message::Run(cmd) => return self.run(cmd),
@@ -752,7 +762,10 @@ impl App {
             }
             Message::Wheel(side, lines) => {
                 let rows = self.page_rows();
-                self.panel_mut(side).scroll_by((-lines * 3.0).round() as isize, rows);
+                let panel = self.panel_mut(side);
+                // Three lines a notch in the list, one row of thumbnails.
+                let step = if panel.thumbnails { -lines } else { -lines * 3.0 };
+                panel.scroll_by(step.round() as isize, rows);
             }
             Message::ScrollTo(side, start, rows) => self.panel_mut(side).scroll_to(start, rows),
             Message::Drive(side, drive) => {
@@ -974,6 +987,7 @@ impl App {
         ("Shift+click", "Select the range from the last clicked item to this one"),
         ("Ctrl+Shift+click", "Add that range to the selection"),
         ("Shift+Up/Down/PgUp/PgDn/Home/End", "Move and select the range from the cursor's starting point"),
+        ("Thumbnail view (Ctrl+Shift+F5)", "Arrows move in the grid (Shift+arrows select), PgUp/PgDn by a screen; Enter, Space/Ins, quick search, clicks and dragging work as in the list. Picture size: thumbnail_size in config.toml"),
         ("Middle-click a folder or drive", "Open it in a new tab"),
         ("Enter / Ctrl+PgDn on a .zip, .7z, .tar, .tar.gz, .gz, ...", "Browse the archive like a folder: view, copy out, Enter opens a temp copy; in a zip also copy/move in (also from other archives), F7, F2, F8 (others are read-only)"),
         ("Ctrl+F, then Enter", "Connect to an SFTP/FTP/FTPS server: browse, F3 view, F5/F6 download and upload, F7, F2, F8 work there; Ctrl+Shift+F disconnects"),
@@ -1364,6 +1378,10 @@ impl App {
                 let names = names.map(|e| e.name.clone()).collect();
                 return self.count_dirs(active, names);
             }
+            Thumbnails => {
+                self.toggle_thumbnails();
+                return Task::none();
+            }
             ToggleHidden => {
                 let panel = self.panel_mut(active);
                 panel.show_hidden = !panel.show_hidden;
@@ -1402,21 +1420,38 @@ impl App {
         let panel = self.panel_mut(active);
         let mut info = None;
         let result: io::Result<()> = match cmd {
-            CursorUp | CursorDown | PageUp | PageDown | CursorHome | CursorEnd => {
-                // Shift+cursor keys extend the selection from the anchor.
-                let last = panel.entries.len().saturating_sub(1) as isize;
-                let to = match cmd {
-                    CursorUp => -1,
-                    CursorDown => 1,
-                    PageUp => -page,
-                    PageDown => page,
-                    CursorHome => -last - 1,
-                    _ => last + 1,
-                };
-                if extend {
-                    panel.select_range_to((panel.cursor as isize + to).clamp(0, last) as usize, false);
+            // Left / Right only move in the thumbnail grid.
+            CursorLeft | CursorRight if !panel.thumbnails => Ok(()),
+            CursorUp | CursorDown | PageUp | PageDown | CursorHome | CursorEnd | CursorLeft | CursorRight => {
+                let last = panel.entries.len().saturating_sub(1);
+                let target = if panel.thumbnails {
+                    let page = panel.grid().1.saturating_sub(1).max(1) as isize;
+                    match cmd {
+                        CursorUp => panel.grid_target(0, -1),
+                        CursorDown => panel.grid_target(0, 1),
+                        CursorLeft => panel.grid_target(-1, 0),
+                        CursorRight => panel.grid_target(1, 0),
+                        PageUp => panel.grid_target(0, -page),
+                        PageDown => panel.grid_target(0, page),
+                        CursorHome => 0,
+                        _ => last,
+                    }
                 } else {
-                    panel.move_cursor(to);
+                    let to = match cmd {
+                        CursorUp => -1,
+                        CursorDown => 1,
+                        PageUp => -page,
+                        PageDown => page,
+                        CursorHome => -(last as isize) - 1,
+                        _ => last as isize + 1,
+                    };
+                    (panel.cursor as isize + to).clamp(0, last as isize) as usize
+                };
+                // Shift+cursor keys extend the selection from the anchor.
+                if extend {
+                    panel.select_range_to(target, false);
+                } else {
+                    panel.set_cursor(target);
                     panel.mark_anchor();
                 }
                 Ok(())

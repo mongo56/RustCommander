@@ -73,6 +73,9 @@ pub struct TabState {
     pub descending: bool,
     #[serde(default)]
     pub show_hidden: bool,
+    /// Thumbnail view (Ctrl+Shift+F5) instead of the list.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub thumbnails: bool,
 }
 
 fn default_sort() -> String {
@@ -92,6 +95,7 @@ impl TabState {
             sort: sort.into(),
             descending: panel.sort.descending,
             show_hidden: panel.show_hidden,
+            thumbnails: panel.thumbnails,
         }
     }
 
@@ -113,6 +117,7 @@ impl TabState {
         };
         panel.sort.descending = self.descending;
         panel.show_hidden = self.show_hidden;
+        panel.thumbnails = self.thumbnails;
         panel.reload().ok()?;
         Some(panel)
     }
@@ -152,7 +157,7 @@ mod tests {
             active: 1,
             left: SideState {
                 current: 0,
-                tabs: vec![TabState { path: dir.clone(), sort: "size".into(), descending: true, show_hidden: true }],
+                tabs: vec![TabState { path: dir.clone(), sort: "size".into(), descending: true, show_hidden: true, thumbnails: true }],
             },
             right: SideState::default(),
             hotlist: vec![
@@ -178,7 +183,9 @@ mod tests {
         assert_eq!(toml::from_str::<Session>(&moved).unwrap().compare, None);
         let panel = back.left.tabs[0].open().unwrap();
         assert_eq!(panel.sort.key, SortKey::Size);
-        assert!(panel.sort.descending && panel.show_hidden);
+        assert!(panel.sort.descending && panel.show_hidden && panel.thumbnails);
+        // List-view tabs don't write the switch.
+        assert_eq!(text.matches("thumbnails").count(), 1, "{text}");
     }
 
     #[test]
@@ -216,6 +223,7 @@ mod tests {
             sort: default_sort(),
             descending: false,
             show_hidden: false,
+            thumbnails: false,
         };
         assert_eq!(tab.open().unwrap().path, std::env::temp_dir());
     }
