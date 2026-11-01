@@ -1,4 +1,7 @@
-param([string[]]$Steps)
+param([string[]]$Steps, [int]$ProcessId = 0)
+# Drives only a test build: pass -ProcessId, or exactly one rustcommander.exe
+# started from this repo (target\...) must be running. The user's installed
+# copy is never touched.
 # Steps: keys:<SendKeys> | wait:<ms> | shot:<name> | click:x,y | sclick:x,y (Shift+click) | dclick:x,y | rclick:x,y | wheel:x,y,notches[,ctrl]
 #        drag:x1,y1,x2,y2[,shift] + drop | rdrag:x1,y1,x2,y2 + rdrop (right button)
 # Coordinates are relative to the window's top-left corner (as in screenshots).
@@ -15,7 +18,14 @@ public class W4 {
 "@
 Add-Type -AssemblyName System.Drawing
 $scratch = Split-Path -Parent $MyInvocation.MyCommand.Path
-$p = Get-Process rustcommander | Select-Object -First 1
+$repo = (Resolve-Path (Join-Path $scratch '..')).Path.TrimEnd('\') + '\'
+if ($ProcessId) { $p = Get-Process -Id $ProcessId -ErrorAction Stop }
+else {
+  $p = @(Get-Process rustcommander -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path.StartsWith($repo, 'OrdinalIgnoreCase') })
+  if ($p.Count -ne 1) { throw "Expected exactly one rustcommander.exe under $repo, found $($p.Count). Pass -ProcessId." }
+  $p = $p[0]
+}
+if (-not $p.Path -or -not $p.Path.StartsWith($repo, 'OrdinalIgnoreCase')) { throw "PID $($p.Id) ($($p.Path)) is not a build from this repo; refusing to drive it." }
 $h = $p.MainWindowHandle
 [W4]::SetForegroundWindow($h) | Out-Null
 Start-Sleep -Milliseconds 400
