@@ -14,7 +14,7 @@
 use crate::entry::Entry;
 use crate::remote;
 use crate::vfs::{self, LocalFs, Vfs};
-use crate::zip_edit::{Edits, ZipEdit};
+use crate::zip_edit::{Edits, Rewrite};
 use chrono::{DateTime, Local};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
@@ -976,7 +976,7 @@ impl Runner<'_> {
         match vfs::open(archive) {
             Ok(v) if v.writable() => Some(v),
             Ok(_) => {
-                self.fail_msg(archive, "Only zip archives can be changed (7z, tar, gz and archives inside archives are read-only)");
+                self.fail_msg(archive, "Only zip and tar archives can be changed (7z, gz and archives inside archives are read-only)");
                 None
             }
             Err(e) => {
@@ -993,7 +993,7 @@ impl Runner<'_> {
     fn pack(&mut self, archive: &Path, transfers: &[Transfer], is_move: bool) -> Vec<usize> {
         // Not 7z, tar, ... nor archives inside archives (temp copies).
         if vfs::archive_writable(archive) == Some(false) {
-            self.fail_msg(archive, "Only zip archives can be changed (not ones inside other archives)");
+            self.fail_msg(archive, "Only zip and tar archives can be changed (not ones inside other archives)");
             return Vec::new();
         }
         let index = match archive.exists() {
@@ -1088,7 +1088,7 @@ impl Runner<'_> {
             return;
         };
         if vfs::archive_writable(&archive) == Some(false) {
-            self.fail_msg(&archive, "Only zip archives can be changed (not ones inside other archives)");
+            self.fail_msg(&archive, "Only zip and tar archives can be changed (not ones inside other archives)");
             return;
         }
         let Some(index) = self.open_writable(&archive) else { return };
@@ -1119,7 +1119,7 @@ impl Runner<'_> {
     /// them in a zip too.
     fn copy_between_archives(&mut self, archive: &Path, transfers: &[Transfer], is_move: bool) {
         if vfs::archive_writable(archive) == Some(false) {
-            self.fail_msg(archive, "Only zip archives can be changed (not 7z, tar, gz or ones inside other archives)");
+            self.fail_msg(archive, "Only zip and tar archives can be changed (not 7z, gz or ones inside other archives)");
             return;
         }
         if archive.exists() && self.open_writable(archive).is_none() {
@@ -1137,7 +1137,7 @@ impl Runner<'_> {
                 break;
             }
             if is_move && vfs::archive_writable(&t.src) == Some(false) {
-                self.fail_msg(&t.src, "Can't move out of a read-only archive (only zips can be changed): copy with F5 instead");
+                self.fail_msg(&t.src, "Can't move out of a read-only archive (only zips and tars can be changed): copy with F5 instead");
                 continue;
             }
             let Some(name) = t.src.file_name() else {
@@ -1507,7 +1507,7 @@ impl Runner<'_> {
     ) -> io::Result<bool> {
         self.progress.current = Some(archive.to_path_buf());
         self.report(true);
-        let mut edit = ZipEdit::begin(archive)?;
+        let mut edit = Rewrite::begin(archive)?;
         let control = self.control;
         if !edit.copy_existing(edits, &mut || control.checkpoint())? {
             return Ok(false);
@@ -2318,24 +2318,40 @@ mod tests {
         assert!(!zip_names(&from).contains(&"a.txt".to_string()));
         assert!(!staging_left());
 
-        // From a tar: copying works, moving is refused (read-only source).
+        // From a tar: copying and moving work (tars can be changed too).
         let tar = tmp.0.join("t.tar");
         crate::vfs::tests::make_tar(File::create(&tar).unwrap());
         let ts = plan_transfer(&[tar.join("docs")], &to).unwrap();
-        let before = fs::read(&to).unwrap();
-        let (o, _) = run_job(Job::Move(ts.clone()), Resolution::Cancel);
-        assert_eq!(o.errors.len(), 1, "{:?}", o.errors);
-        assert_eq!(fs::read(&to).unwrap(), before);
         let (o, _) = run_job(Job::Copy(ts), Resolution::Cancel);
         assert!(o.errors.is_empty(), "{:?}", o.errors);
         assert_eq!(zip_read(&to.join("docs/one.txt")), b"first");
+        let ts = plan_transfer(&[tar.join("top.txt")], &to).unwrap();
+        let (o, _) = run_job(Job::Move(ts), Resolution::Cancel);
+        assert!(o.errors.is_empty(), "{:?}", o.errors);
+        assert_eq!(zip_read(&to.join("top.txt")), vec![b't'; 3000]);
+        assert!(!zip_names(&tar).contains(&"top.txt".to_string()));
 
-        // Into a tar: refused.
+        // From a 7z: moving is refused (read-only source).
+        let seven = tmp.0.join("s.7z");
+        let mut w = sevenz_rust2::ArchiveWriter::create(&seven).unwrap();
+        w.push_archive_entry(sevenz_rust2::ArchiveEntry::new_file("x.txt"), Some(&b"x"[..])).unwrap();
+        w.finish().unwrap();
+        let ts = plan_transfer(&[seven.join("x.txt")], &to).unwrap();
+        let before = fs::read(&to).unwrap();
+        let (o, _) = run_job(Job::Move(ts), Resolution::Cancel);
+        assert_eq!(o.errors.len(), 1, "{:?}", o.errors);
+        assert_eq!(fs::read(&to).unwrap(), before);
+
+        // Into a tar: added; into a 7z: refused.
         let ts = plan_transfer(&[from.join("Readme.md")], &tar).unwrap();
-        let before = fs::read(&tar).unwrap();
+        let (o, _) = run_job(Job::Copy(ts), Resolution::Cancel);
+        assert!(o.errors.is_empty(), "{:?}", o.errors);
+        assert_eq!(zip_read(&tar.join("Readme.md")), vec![b'r'; 5000]);
+        let ts = plan_transfer(&[from.join("Readme.md")], &seven).unwrap();
+        let before = fs::read(&seven).unwrap();
         let (o, _) = run_job(Job::Copy(ts), Resolution::Cancel);
         assert_eq!(o.errors.len(), 1, "{:?}", o.errors);
-        assert_eq!(fs::read(&tar).unwrap(), before);
+        assert_eq!(fs::read(&seven).unwrap(), before);
         assert!(!staging_left());
     }
 

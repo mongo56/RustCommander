@@ -4,7 +4,8 @@
 //! then replaces the archive in one rename. Until [`ZipEdit::commit`] the
 //! archive is untouched; dropping an uncommitted edit removes the temp file.
 
-use crate::vfs::clean_parts;
+use crate::tar_edit::TarEdit;
+use crate::vfs::{self, clean_parts, Format};
 use chrono::{DateTime, Datelike, Local, Timelike};
 use std::collections::HashSet;
 use std::fs::{self, File};
@@ -33,7 +34,7 @@ pub(crate) fn key(inner: &str) -> String {
 
 /// The number of components of `prefix` that `key` starts with, if it's
 /// `prefix` itself or under it.
-fn matches(key: &str, prefix: &str) -> Option<usize> {
+pub(crate) fn matches(key: &str, prefix: &str) -> Option<usize> {
     let under = key.len() > prefix.len() && key.starts_with(prefix) && key.as_bytes()[prefix.len()] == b'/';
     (key == prefix || under).then(|| prefix.split('/').count())
 }
@@ -191,6 +192,66 @@ fn options(modified: Option<SystemTime>, size: u64) -> SimpleFileOptions {
         opts = opts.last_modified_time(time);
     }
     opts
+}
+
+/// A zip or tar archive being rewritten (see [`ZipEdit`], [`TarEdit`]).
+pub(crate) enum Rewrite {
+    Zip(Box<ZipEdit>),
+    Tar(Box<TarEdit>),
+}
+
+impl Rewrite {
+    /// Starts rewriting `archive`, which must be a zip or a tar (plain, gz
+    /// or bz2) on disk; it may not exist yet.
+    pub fn begin(archive: &Path) -> io::Result<Rewrite> {
+        match archive.file_name().and_then(vfs::format_of) {
+            Some(Format::Zip) => Ok(Rewrite::Zip(Box::new(ZipEdit::begin(archive)?))),
+            Some(f @ (Format::Tar | Format::TarGz | Format::TarBz2)) => Ok(Rewrite::Tar(Box::new(TarEdit::begin(archive, f)?))),
+            _ => Err(io::Error::other("Only zip and tar archives can be changed")),
+        }
+    }
+
+    pub fn copy_existing(&mut self, edits: &Edits, alive: &mut dyn FnMut() -> bool) -> io::Result<bool> {
+        match self {
+            Rewrite::Zip(e) => e.copy_existing(edits, alive),
+            Rewrite::Tar(e) => e.copy_existing(edits, alive),
+        }
+    }
+
+    pub fn add_dir(&mut self, inner: &str, modified: Option<SystemTime>) -> io::Result<()> {
+        match self {
+            Rewrite::Zip(e) => e.add_dir(inner, modified),
+            Rewrite::Tar(e) => e.add_dir(inner, modified),
+        }
+    }
+
+    pub fn start_file(&mut self, inner: &str, modified: Option<SystemTime>, size: u64) -> io::Result<()> {
+        match self {
+            Rewrite::Zip(e) => e.start_file(inner, modified, size),
+            Rewrite::Tar(e) => e.start_file(inner, modified),
+        }
+    }
+
+    pub fn output(&mut self) -> &mut dyn Write {
+        match self {
+            Rewrite::Zip(e) => e.output(),
+            Rewrite::Tar(e) => e.output(),
+        }
+    }
+
+    pub fn abort_file(&mut self) -> io::Result<()> {
+        match self {
+            Rewrite::Zip(e) => e.abort_file(),
+            Rewrite::Tar(e) => e.abort_file(),
+        }
+    }
+
+    pub fn commit(self) -> io::Result<()> {
+        match self {
+            Rewrite::Zip(e) => (*e).commit(),
+            Rewrite::Tar(e) => (*e).commit(),
+        }
+    }
 }
 
 fn io_err(e: impl std::fmt::Display) -> io::Error {

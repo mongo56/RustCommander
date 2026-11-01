@@ -3,8 +3,9 @@
 //! Paths stay plain `PathBuf`s. A path that runs through an archive file
 //! (`C:\x\a.zip\sub\f.txt`) is served by that archive's [`Vfs`]; anything
 //! else is the local file system ([`LocalFs`]). Archives can be listed,
-//! walked and read (copy out, view); zips can also be changed (see
-//! `zip_edit`, driven by the jobs in `ops`), the others are read-only.
+//! walked and read (copy out, view); zips and tars can also be changed (see
+//! `zip_edit`, `tar_edit`, driven by the jobs in `ops`), the others are
+//! read-only.
 //! Supported: zip (`.zip`, `.jar`) via the `zip` crate, 7z via
 //! `sevenz-rust2`, tar (`.tar`, `.tar.gz`/`.tgz`, `.tar.bz2`/`.tbz2`) via
 //! `tar` + `flate2`/`bzip2`, and a single gzipped file (`.gz`). Parsed
@@ -144,7 +145,7 @@ impl Vfs for LocalFs {
 // ---- paths -------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Format {
+pub(crate) enum Format {
     Zip,
     SevenZ,
     Tar,
@@ -154,8 +155,15 @@ enum Format {
     Gz,
 }
 
+impl Format {
+    /// Archives of this format can be changed (rewritten).
+    pub(crate) fn writable(self) -> bool {
+        matches!(self, Format::Zip | Format::Tar | Format::TarGz | Format::TarBz2)
+    }
+}
+
 /// The archive format a file name stands for (by extension), if any.
-fn format_of(name: &OsStr) -> Option<Format> {
+pub(crate) fn format_of(name: &OsStr) -> Option<Format> {
     let name = name.to_string_lossy().to_ascii_lowercase();
     let ext = Path::new(&name).extension()?.to_str()?;
     let inner_tar = name.trim_end_matches(&format!(".{ext}")).ends_with(".tar");
@@ -283,10 +291,11 @@ pub fn in_archive(path: &Path) -> bool {
 }
 
 /// For an archive or a path inside one: whether the archive can be changed
-/// (zip yes, 7z no). `None` for local paths.
+/// (zip and tar yes, 7z no, nor ones inside other archives). `None` for
+/// local paths.
 pub fn archive_writable(path: &Path) -> Option<bool> {
     let (file, _) = split_archive(path)?;
-    Some(file.file_name().and_then(format_of) == Some(Format::Zip) && file.is_file())
+    Some(file.file_name().and_then(format_of).is_some_and(Format::writable) && file.is_file())
 }
 
 /// The path inside its archive of `path` (`/`-separated, as typed), with
@@ -746,7 +755,7 @@ fn read_7z_index(file: &Path, disk: &Path) -> io::Result<Vec<Raw>> {
 }
 
 /// The decompressed contents of a tar-like or gz `file`.
-fn open_stream(file: &Path, format: Format) -> io::Result<Box<dyn Read>> {
+pub(crate) fn open_stream(file: &Path, format: Format) -> io::Result<Box<dyn Read>> {
     let input = BufReader::new(File::open(file)?);
     Ok(match format {
         Format::TarGz | Format::Gz => Box::new(flate2::read::MultiGzDecoder::new(input)),
@@ -1104,7 +1113,7 @@ impl Vfs for Archive {
     }
 
     fn writable(&self) -> bool {
-        self.format == Format::Zip && self.disk == self.file
+        self.format.writable() && self.disk == self.file
     }
 }
 
@@ -1383,7 +1392,7 @@ pub(crate) mod tests {
             assert_eq!(one.size, 5);
             assert_eq!(one.modified.unwrap().timestamp(), 1_600_000_000);
             let vfs = open(&path).unwrap();
-            assert!(!vfs.writable());
+            assert!(vfs.writable());
             let files = [path.join("top.txt"), path.join("deep/x/two.txt"), path.join("docs/one.txt")];
             let read = read_all(&*vfs, &files);
             assert_eq!(read, [(0, vec![b't'; 3000]), (1, b"second!".to_vec()), (2, b"first".to_vec())]);
