@@ -401,6 +401,15 @@ impl Panel {
             .collect();
     }
 
+    /// Replaces the selection with the named entries (unknown names and
+    /// `..` are ignored).
+    pub fn set_selection(&mut self, names: impl IntoIterator<Item = String>) {
+        let known: std::collections::HashSet<&str> =
+            self.entries.iter().filter(|e| !e.is_parent()).map(|e| e.name.as_str()).collect();
+        let names: HashSet<String> = names.into_iter().filter(|n| known.contains(n.as_str())).collect();
+        self.selected = names;
+    }
+
     pub fn deselect_all(&mut self) {
         self.selected.clear();
     }

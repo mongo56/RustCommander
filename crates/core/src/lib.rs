@@ -4,6 +4,7 @@
 //! translates input into [`Command`]s and renders [`Panel`] state.
 
 pub mod command;
+pub mod compare;
 pub mod entry;
 pub mod format;
 pub mod fs;

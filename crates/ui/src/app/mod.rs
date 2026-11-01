@@ -950,6 +950,10 @@ impl App {
                 panel.ensure_visible(rows);
                 return self.count_dirs(active, dir.into_iter().collect());
             }
+            CompareDirs => {
+                self.compare_dirs();
+                return Task::none();
+            }
             CountDirSizes => {
                 let names = self.panel(active).entries.iter().filter(|e| e.kind == EntryKind::Dir);
                 let names = names.map(|e| e.name.clone()).collect();
@@ -1639,8 +1643,24 @@ impl App {
         }
     }
 
-    /// Lists `path` on a worker thread; the result updates every visible tab
-    /// still showing it (`Message::Listed`).
+    /// Shift+F2: selects, in both panels, the entries missing from the other
+    /// side or newer there (`rc_core::compare`).
+    fn compare_dirs(&mut self) {
+        if self.panel(0).path == self.panel(1).path {
+            self.status = Some(("Both panels show the same folder".into(), Tone::Info));
+            return;
+        }
+        let diff = rc_core::compare::compare(&self.panel(0).entries, &self.panel(1).entries);
+        let msg = if diff.is_empty() {
+            ("Folders are identical".to_string(), Tone::Success)
+        } else {
+            (format!("Differences: {} left, {} right", diff.left.len(), diff.right.len()), Tone::Info)
+        };
+        self.panel_mut(0).set_selection(diff.left);
+        self.panel_mut(1).set_selection(diff.right);
+        self.status = Some(msg);
+    }
+
     /// Counts the sizes of folders `names` of `side`'s folder on a worker
     /// thread, one `Message::DirSize` each. Folders already counted (or
     /// being counted) are skipped.
@@ -1688,6 +1708,8 @@ impl App {
         }
     }
 
+    /// Lists `path` on a worker thread; the result updates every visible tab
+    /// still showing it (`Message::Listed`).
     fn list_in_background(&mut self, path: PathBuf) -> Task<Message> {
         self.next_listing += 1;
         let seq = self.next_listing;

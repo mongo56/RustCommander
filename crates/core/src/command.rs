@@ -26,6 +26,8 @@ pub enum Command {
     ToggleSelect { advance: bool },
     /// Compute the size of every folder in the panel (Alt+Shift+Enter).
     CountDirSizes,
+    /// Select the entries that differ from the other panel (Shift+F2).
+    CompareDirs,
     SelectAll,
     DeselectAll,
     Refresh,
@@ -83,6 +85,7 @@ impl Command {
             ToggleSelect { advance: true } => "cm_Select",
             ToggleSelect { advance: false } => "cm_SelectNoMove",
             CountDirSizes => "cm_CountDirContent",
+            CompareDirs => "cm_CompareDirs",
             SelectAll => "cm_SelectAll",
             DeselectAll => "cm_ClearAll",
             Refresh => "cm_RereadSource",
@@ -138,6 +141,7 @@ impl Command {
             ToggleSelect { advance: true },
             ToggleSelect { advance: false },
             CountDirSizes,
+            CompareDirs,
             SelectAll,
             DeselectAll,
             Refresh,

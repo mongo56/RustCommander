@@ -160,6 +160,7 @@ fn default_command(key: &Key, m: Modifiers) -> Option<Command> {
             Named::F4 if alt => Quit,
             Named::F4 if shift => EditNew,
             Named::F2 if ctrl => Refresh,
+            Named::F2 if shift && !alt => CompareDirs,
             Named::F3 => View,
             Named::F4 => Edit,
             Named::F5 => Copy,
