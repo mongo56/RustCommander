@@ -262,10 +262,9 @@ impl App {
         // Leave the panel cursor on the file viewed last.
         let path = v.path();
         let panel = self.panel_mut(v.side);
-        if path.parent() == Some(panel.path.as_path()) {
-            if let Some(name) = path.file_name() {
-                panel.focus(&name.to_string_lossy());
-            }
+        // (By path: search results name entries by their relative path.)
+        if let Some(name) = panel.entries.iter().find(|e| e.path == path).map(|e| e.name.clone()) {
+            panel.focus(&name);
         }
         let rows = self.page_rows();
         self.panel_mut(v.side).ensure_visible(rows);

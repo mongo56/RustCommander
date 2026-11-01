@@ -169,6 +169,7 @@ fn default_command(key: &Key, m: Modifiers) -> Option<Command> {
             Named::F6 if shift => Rename,
             Named::F2 if !ctrl && !alt => Rename,
             Named::F6 => Move,
+            Named::F7 if alt && !ctrl && !shift => FindFiles,
             Named::F7 => MakeDir,
             Named::F8 | Named::Delete if shift => DeletePermanent,
             Named::F8 | Named::Delete => Delete,

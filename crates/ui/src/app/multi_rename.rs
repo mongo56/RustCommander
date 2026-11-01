@@ -156,6 +156,10 @@ impl App {
     pub(super) fn open_multi_rename(&mut self) -> Task<Message> {
         let side = self.active;
         let panel = self.panel(side);
+        if panel.results().is_some() {
+            self.status = Some(("Multi-rename doesn't work on search results yet".into(), Tone::Info));
+            return Task::none();
+        }
         let entries: Vec<Entry> = panel.targets().into_iter().cloned().collect();
         if entries.is_empty() {
             return Task::none();

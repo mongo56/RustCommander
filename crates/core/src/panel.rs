@@ -3,7 +3,7 @@ use crate::fs::list_dir;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortKey {
@@ -78,6 +78,11 @@ pub struct Panel {
     /// Folder sizes computed on request (Space), by name; `None` while
     /// counting. Kept across refreshes, cleared on navigation.
     dir_sizes: HashMap<String, Option<u64>>,
+    /// Search results fed into the panel (Alt+F7, TC's "feed to listbox"):
+    /// what was searched for. `entries` then hold the hits, named by their
+    /// path relative to `path` (the search root); refreshes re-check them
+    /// on disk instead of listing the folder, and any navigation ends it.
+    results: Option<String>,
 }
 
 /// A history entry: the folder and the entry the cursor was on.
@@ -106,6 +111,7 @@ impl Panel {
             back: Vec::new(),
             forward: Vec::new(),
             dir_sizes: HashMap::new(),
+            results: None,
         };
         panel.reload()?;
         Ok(panel)
@@ -113,6 +119,10 @@ impl Panel {
 
     /// Re-reads the current folder, keeping cursor and selection by name.
     pub fn reload(&mut self) -> io::Result<()> {
+        if self.results.is_some() {
+            self.refresh_results();
+            return Ok(());
+        }
         let entries = list_dir(&self.path, self.show_hidden)?;
         self.apply_listing(entries);
         Ok(())
@@ -123,6 +133,10 @@ impl Panel {
     /// entries are dropped unless the panel shows them, so one listing made
     /// with `show_hidden = true` serves every panel on that folder.
     pub fn apply_listing(&mut self, mut entries: Vec<Entry>) {
+        if self.results.is_some() {
+            self.refresh_results();
+            return;
+        }
         if !self.show_hidden {
             entries.retain(|e| !e.hidden);
         }
@@ -240,6 +254,7 @@ impl Panel {
         }
         sort_entries(&mut entries, self.sort);
         self.path = path;
+        self.results = None;
         // A new folder starts unfiltered, like in TC.
         self.filter.clear();
         self.set_listing(entries);
@@ -251,8 +266,92 @@ impl Panel {
         self.focus_name(focus);
     }
 
-    /// Up one level, with the cursor on the folder we came out of.
+    /// Shows search hits (named relative to `root`) instead of a folder
+    /// listing; `label` says what was searched for. Recorded in the history
+    /// like a folder change, so Alt+Left returns to where the panel was.
+    /// `..` (and Backspace) lead to the search root's real listing.
+    pub fn show_results(&mut self, root: PathBuf, label: String, hits: Vec<Entry>) {
+        let leaving = self.visit();
+        push_limited(&mut self.back, leaving);
+        self.forward.clear();
+        let mut entries = vec![Entry::parent(root.clone())];
+        entries.extend(hits);
+        self.load(root, None, entries);
+        self.results = Some(label);
+        // On the first hit rather than `..`.
+        self.cursor = usize::from(self.entries.len() > 1);
+    }
+
+    /// What the search results shown were searched for, if the panel shows
+    /// search results.
+    pub fn results(&self) -> Option<&str> {
+        self.results.as_deref()
+    }
+
+    /// Search results: drops hits that no longer exist and updates the
+    /// size/date of the rest (one metadata read each).
+    fn refresh_results(&mut self) {
+        let show_hidden = self.show_hidden;
+        let check = |list: &mut Vec<Entry>| {
+            list.retain_mut(|e| {
+                if e.is_parent() {
+                    return true;
+                }
+                if e.hidden && !show_hidden {
+                    return false;
+                }
+                match std::fs::metadata(&e.path) {
+                    Ok(m) => {
+                        e.kind = if m.is_dir() { EntryKind::Dir } else { EntryKind::File };
+                        e.size = if m.is_dir() { 0 } else { m.len() };
+                        e.modified = m.modified().ok().map(chrono::DateTime::<chrono::Local>::from);
+                        true
+                    }
+                    Err(_) => false,
+                }
+            });
+        };
+        let focus = self.current().map(|e| e.name.clone());
+        let old_cursor = self.cursor;
+        match &mut self.unfiltered {
+            Some(all) => {
+                check(all);
+                let all = std::mem::take(all);
+                self.set_listing(all);
+            }
+            None => check(&mut self.entries),
+        }
+        let names: HashSet<&str> = self.entries.iter().map(|e| e.name.as_str()).collect();
+        self.selected.retain(|n| names.contains(n.as_str()));
+        self.dir_sizes.retain(|n, _| names.contains(n.as_str()));
+        self.cursor = old_cursor;
+        self.focus_name(focus.as_deref());
+    }
+
+    /// A search hit was renamed in place: shows it under its new path.
+    /// Returns its new name in the panel. Does nothing outside results.
+    pub fn result_renamed(&mut self, from: &Path, to: &Path) -> Option<String> {
+        self.results.as_ref()?;
+        let name = to.strip_prefix(&self.path).ok()?.to_string_lossy().into_owned();
+        let lists = self.entries.iter_mut().chain(self.unfiltered.iter_mut().flatten());
+        let mut found = false;
+        for e in lists.filter(|e| e.path == from) {
+            if self.selected.remove(&e.name) {
+                self.selected.insert(name.clone());
+            }
+            e.path = to.to_path_buf();
+            e.name = name.clone();
+            found = true;
+        }
+        found.then_some(name)
+    }
+
+    /// Up one level, with the cursor on the folder we came out of. From
+    /// search results: the search root itself.
     pub fn parent_nav(&self) -> Option<Nav> {
+        if self.results.is_some() {
+            return Some(Nav::to(self.path.clone()));
+        }
         let parent = self.path.parent()?.to_path_buf();
         let focus = self.path.file_name().map(|n| n.to_string_lossy().into_owned());
         Some(Nav::To { path: parent, focus })
@@ -363,12 +462,15 @@ impl Panel {
             })
             .find(|&i| {
                 let e = &self.entries[i];
-                !e.is_parent() && e.name.to_lowercase().starts_with(&prefix)
+                !e.is_parent() && e.file_name().to_lowercase().starts_with(&prefix)
             })
     }
 
     /// Short label for a tab: the folder name, or the whole path for roots.
     pub fn title(&self) -> String {
+        if self.results.is_some() {
+            return "Search results".into();
+        }
         self.path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -587,7 +689,7 @@ pub fn filter_matches(filter: &str, name: &str) -> bool {
 }
 
 /// `*` = any run of characters, `?` = exactly one.
-fn wildcard(p: &[char], s: &[char]) -> bool {
+pub(crate) fn wildcard(p: &[char], s: &[char]) -> bool {
     let (mut pi, mut si) = (0, 0);
     let mut star: Option<(usize, usize)> = None;
     while si < s.len() {
@@ -648,6 +750,63 @@ mod tests {
         assert_eq!(visible_start(20, 15, 10, 100), 15);
         assert_eq!(visible_start(95, 99, 10, 100), 90);
         assert_eq!(visible_start(3, 2, 10, 5), 0);
+    }
+
+    #[test]
+    fn search_results_in_the_panel() {
+        let root = std::env::temp_dir().join(format!("rc-core-results-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("sub.d")).unwrap();
+        std::fs::write(root.join("top.txt"), b"1").unwrap();
+        std::fs::write(root.join("sub.d").join("deep.rs"), b"22").unwrap();
+        std::fs::write(root.join("sub.d").join("noext"), b"").unwrap();
+        let q = crate::search::Query { root: root.clone(), subfolders: true, ..Default::default() };
+        let mut hits = Vec::new();
+        crate::search::search(&q, &std::sync::atomic::AtomicBool::new(false), |b| {
+            hits.extend(b.hits);
+            true
+        })
+        .unwrap();
+
+        let mut panel = Panel::open(&root).unwrap();
+        panel.show_results(root.clone(), "*".into(), hits);
+        assert_eq!(panel.results(), Some("*"));
+        assert_eq!(panel.title(), "Search results");
+        let deep = format!("sub.d{}deep.rs", std::path::MAIN_SEPARATOR);
+        let noext = format!("sub.d{}noext", std::path::MAIN_SEPARATOR);
+        let names: Vec<_> = panel.entries.iter().map(|e| e.name.clone()).collect();
+        assert_eq!(names, ["..", "sub.d", &deep, &noext, "top.txt"]);
+        // Not on `..`.
+        assert_eq!(panel.cursor, 1);
+        let e = &panel.entries[2];
+        assert_eq!(e.split_name().1, "rs");
+        assert_eq!(e.file_name(), "deep.rs");
+        assert_eq!(panel.entries[3].split_name().1, "");
+        // Quick search looks at the file name.
+        assert_eq!(panel.find_prefix("dee", 0, true), Some(2));
+
+        // Renamed in place: same row, new name; deleted: gone on refresh.
+        panel.set_selection([deep.clone()]);
+        let renamed = root.join("sub.d").join("deeper.rs");
+        std::fs::rename(root.join("sub.d").join("deep.rs"), &renamed).unwrap();
+        let new = panel.result_renamed(&root.join("sub.d").join("deep.rs"), &renamed).unwrap();
+        assert_eq!(panel.targets()[0].name, new);
+        std::fs::remove_file(root.join("top.txt")).unwrap();
+        panel.reload().unwrap();
+        assert_eq!(panel.entries.len(), 4);
+        assert!(panel.results().is_some());
+
+        // `..` leads to the root's real listing, ending the results.
+        let nav = panel.parent_nav().unwrap();
+        panel.go(nav).unwrap();
+        assert_eq!(panel.results(), None);
+        assert_eq!(panel.path, root);
+        assert_eq!(panel.entries.len(), 2);
+        // And history goes back to before the results.
+        panel.go_back().unwrap();
+        assert_eq!(panel.path, root);
+        assert_eq!(panel.results(), None);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

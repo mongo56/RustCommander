@@ -32,6 +32,8 @@ pub enum Command {
     CompareDirsOptions,
     /// Side-by-side diff of two files (Alt+F2).
     CompareFiles,
+    /// Find files by name and contents (Alt+F7).
+    FindFiles,
     SelectAll,
     DeselectAll,
     Refresh,
@@ -92,6 +94,7 @@ impl Command {
             CompareDirs => "cm_CompareDirs",
             CompareDirsOptions => "cm_CompareDirsOptions",
             CompareFiles => "cm_CompareFilesByContent",
+            FindFiles => "cm_SearchFor",
             SelectAll => "cm_SelectAll",
             DeselectAll => "cm_ClearAll",
             Refresh => "cm_RereadSource",
@@ -150,6 +153,7 @@ impl Command {
             CompareDirs,
             CompareDirsOptions,
             CompareFiles,
+            FindFiles,
             SelectAll,
             DeselectAll,
             Refresh,

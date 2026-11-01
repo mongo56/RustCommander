@@ -2,6 +2,7 @@
 
 mod view;
 mod file_diff;
+mod find_files;
 mod multi_rename;
 mod viewer;
 
@@ -104,7 +105,11 @@ pub struct App {
     multi_rename: Option<multi_rename::MultiRename>,
     /// Compare files by content (Alt+F2), covering the whole window.
     file_diff: Option<file_diff::FileDiff>,
-    /// Its settings, kept between uses.
+    /// Find files (Alt+F7), covering the whole window while open; the
+    /// closed tool is kept (fields and results) for the next Alt+F7.
+    find: Option<find_files::FindFiles>,
+    find_last: Option<find_files::FindFiles>,
+    /// Multi-rename settings, kept between uses.
     rename_opts: rc_core::rename::Options,
     /// `(new, old)` paths of the last multi-rename batch, kept after the
     /// tool closes so Ctrl+Z in a reopened tool still undoes it.
@@ -286,6 +291,7 @@ pub enum Message {
     ViewerFind,
     MultiRename(multi_rename::MrMsg),
     FileDiff(file_diff::DiffMsg),
+    Find(find_files::FindMsg),
     /// Background listing for a pending navigation: (side, seq, listing).
     Navigated(usize, u64, Listing),
     /// Subfolders of a folder, for path bar suggestions.
@@ -350,6 +356,8 @@ impl App {
             viewer: None,
             multi_rename: None,
             file_diff: None,
+            find: None,
+            find_last: None,
             rename_opts: rc_core::rename::Options::default(),
             rename_undo: Vec::new(),
             config: crate::config::Config::default(),
@@ -727,6 +735,7 @@ impl App {
             Message::ViewerFind => return self.viewer_submit(),
             Message::MultiRename(msg) => return self.multi_rename_update(msg),
             Message::FileDiff(msg) => return self.file_diff_update(msg),
+            Message::Find(msg) => return self.find_update(msg),
             Message::Navigated(side, seq, result) => {
                 let current = self.sides[side].current;
                 let pending = self.nav[side].take_if(|p| p.seq == seq && p.tab == current);
@@ -765,6 +774,12 @@ impl App {
                 return Task::none();
             }
             return self.multi_rename_key(named, &key, mods, captured);
+        }
+        if self.find.is_some() {
+            if named.is_some_and(is_modifier_key) {
+                return Task::none();
+            }
+            return self.find_key(named, &key, mods, captured);
         }
         if self.file_diff.is_some() {
             if !named.is_some_and(is_modifier_key) {
@@ -911,6 +926,7 @@ impl App {
             View => return self.open_viewer(),
             MultiRename => return self.open_multi_rename(),
             CompareFiles => return self.open_file_diff(),
+            FindFiles => return self.open_find(),
             Edit => {
                 if let Some(e) = self.panel(active).current().filter(|e| e.kind == EntryKind::File) {
                     let (path, name) = (e.path.clone(), e.name.clone());
@@ -1232,7 +1248,7 @@ impl App {
         let Some(entry) = self.panel(side).current().filter(|e| !e.is_parent()) else {
             return Task::none();
         };
-        let rename = InlineRename { side, src: entry.path.clone(), text: entry.name.clone() };
+        let rename = InlineRename { side, src: entry.path.clone(), text: entry.file_name().to_owned() };
         self.path_edit = None;
         self.rename = Some(rename);
         Task::batch([text_input::focus(rename_input_id()), text_input::select_all(rename_input_id())])
@@ -1254,9 +1270,21 @@ impl App {
         };
         let ok = result.is_ok();
         self.report(result);
+        // Search results show the hit under its new name (before the
+        // refresh would drop the old path).
+        let mut focus = name.to_owned();
+        if ok {
+            for s in 0..2 {
+                if let Some(n) = self.panel_mut(s).result_renamed(&src, &dst) {
+                    if s == side {
+                        focus = n;
+                    }
+                }
+            }
+        }
         self.reload_panels();
         if ok {
-            self.panel_mut(side).focus(name);
+            self.panel_mut(side).focus(&focus);
             self.after_change();
         }
     }
@@ -1567,8 +1595,7 @@ impl App {
     /// menu for the target folder.
     fn drop_menu(&self, drag: Drag, target: PathBuf) -> Task<Message> {
         let side = drag.side;
-        let folder = self.panel(side).path.clone();
-        let items = drag.sources;
+        let (folder, items) = self.shell_items(side, drag.sources);
         window::get_oldest()
             .and_then(move |id| {
                 let (folder, items, target) = (folder.clone(), items.clone(), target.clone());
@@ -1581,8 +1608,7 @@ impl App {
 
     fn drag_out(&self, drag: Drag) -> Task<Message> {
         let side = drag.side;
-        let folder = self.panel(side).path.clone();
-        let items = drag.sources;
+        let (folder, items) = self.shell_items(side, drag.sources);
         window::get_oldest()
             .and_then(move |id| {
                 let (folder, items) = (folder.clone(), items.clone());
@@ -1616,11 +1642,27 @@ impl App {
         (side != drag.side).then(|| panel.path.clone())
     }
 
+    /// The folder the shell resolves `items` in, and the items it can take:
+    /// the panel's folder and all of them, except in search results, whose
+    /// items may come from several folders: there the first item's folder
+    /// and only the items in it.
+    fn shell_items(&self, side: usize, mut items: Vec<PathBuf>) -> (PathBuf, Vec<PathBuf>) {
+        let panel = self.panel(side);
+        let parent = items.first().and_then(|p| p.parent()).map(Path::to_path_buf);
+        match parent.filter(|_| panel.results().is_some()) {
+            Some(parent) => {
+                items.retain(|p| p.parent() == Some(parent.as_path()));
+                (parent, items)
+            }
+            None => (panel.path.clone(), items),
+        }
+    }
+
     // ---- context menu -----------------------------------------------------
 
     fn context_menu(&self, side: usize, background: bool) -> Task<Message> {
-        let folder = self.panel(side).path.clone();
         let items = if background { Vec::new() } else { self.target_paths(side) };
+        let (folder, items) = self.shell_items(side, items);
         let extended = self.modifiers.shift();
 
         window::get_oldest()
@@ -1716,6 +1758,10 @@ impl App {
     /// side or newer there (`rc_core::compare`, with `compare_opts`). With
     /// options that read the disk it runs on a worker (Esc cancels).
     fn compare_dirs(&mut self) -> Task<Message> {
+        if (0..2).any(|side| self.panel(side).results().is_some()) {
+            self.status = Some(("Can't compare search results".into(), Tone::Info));
+            return Task::none();
+        }
         if self.panel(0).path == self.panel(1).path {
             self.status = Some(("Both panels show the same folder".into(), Tone::Info));
             return Task::none();

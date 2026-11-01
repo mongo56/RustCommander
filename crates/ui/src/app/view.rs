@@ -20,11 +20,12 @@ impl App {
     pub fn view(&self) -> Element<'_, Message> {
         let panels = row![self.side_view(0), vline(), self.side_view(1)].height(Length::Fill);
 
-        let base: Element<'_, Message> = match (&self.multi_rename, &self.viewer, &self.file_diff) {
-            (_, _, Some(d)) => self.file_diff_view(d),
-            (Some(mr), _, _) => self.multi_rename_view(mr),
-            (None, Some(v), None) => self.viewer_view(v),
-            (None, None, None) => container(column![panels, hline(), self.jobs_view(), self.bottom_bar()])
+        let base: Element<'_, Message> = match (&self.find, &self.multi_rename, &self.viewer, &self.file_diff) {
+            (Some(f), ..) => self.find_view(f),
+            (_, _, _, Some(d)) => self.file_diff_view(d),
+            (_, Some(mr), _, _) => self.multi_rename_view(mr),
+            (_, None, Some(v), None) => self.viewer_view(v),
+            (None, None, None, None) => container(column![panels, hline(), self.jobs_view(), self.bottom_bar()])
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .style(filled(theme::c().bg))
@@ -209,7 +210,13 @@ impl App {
                         .size(13)
                         .color(theme::c().muted)
                         .wrapping(Wrapping::None),
-                    None => text(elide_left(&panel.path.display().to_string(), self.path_chars()))
+                    None => text(elide_left(
+                        &match panel.results() {
+                            Some(what) => format!("{}  \u{2014} search results: {what}", panel.path.display()),
+                            None => panel.path.display().to_string(),
+                        },
+                        self.path_chars(),
+                    ))
                         .size(13)
                         .color(if active { theme::c().text } else { theme::c().muted })
                         .wrapping(Wrapping::None),

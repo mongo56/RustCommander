@@ -12,6 +12,7 @@ pub mod fs;
 pub mod ops;
 pub mod panel;
 pub mod rename;
+pub mod search;
 pub mod viewer;
 
 pub use command::Command;

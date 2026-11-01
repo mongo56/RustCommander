@@ -62,7 +62,7 @@ pub fn list_dir(path: &Path, show_hidden: bool) -> io::Result<Vec<Entry>> {
 }
 
 #[cfg(windows)]
-fn is_hidden(_name: &str, meta: &fs::Metadata) -> bool {
+pub(crate) fn is_hidden(_name: &str, meta: &fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
     const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
     const FILE_ATTRIBUTE_SYSTEM: u32 = 0x4;
@@ -70,7 +70,7 @@ fn is_hidden(_name: &str, meta: &fs::Metadata) -> bool {
 }
 
 #[cfg(not(windows))]
-fn is_hidden(name: &str, _meta: &fs::Metadata) -> bool {
+pub(crate) fn is_hidden(name: &str, _meta: &fs::Metadata) -> bool {
     name.starts_with('.')
 }
 
