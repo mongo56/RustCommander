@@ -12,6 +12,11 @@
 //! browsing an archive reads its directory once (a tar has no directory:
 //! listing reads it all, and so does reading files from it).
 //!
+//! An archive inside an archive (`a.zip\b.7z\x`) is browsed through a temp
+//! copy of the inner one ([`temp_path`], extracted when a path first runs
+//! through it and again when it changed): paths stay logical, only reads go
+//! to the copy. Nested archives are read-only.
+//!
 //! Encrypted zips (ZipCrypto, AES) and 7z archives (AES, also with
 //! encrypted names) are read with a password given by [`try_password`],
 //! kept per archive for the session. Without one, reading an encrypted
@@ -140,7 +145,9 @@ pub fn is_archive_name(name: &str) -> bool {
 
 /// Splits a path that runs through an archive file into the archive and the
 /// path inside it (empty for the archive's root). `None` for local paths.
-/// Only names with an archive extension are checked on disk.
+/// Only names with an archive extension are checked on disk. For nested
+/// archives the archive is the innermost one (a logical path, e.g.
+/// `a.zip\b.zip`), mounted on the way.
 pub fn split_archive(path: &Path) -> Option<(PathBuf, PathBuf)> {
     let mut archive = PathBuf::new();
     let mut parts = path.components();
@@ -148,11 +155,78 @@ pub fn split_archive(path: &Path) -> Option<(PathBuf, PathBuf)> {
         archive.push(part);
         if let Component::Normal(name) = part {
             if format_of(name).is_some() && archive.is_file() {
-                return Some((archive, parts.as_path().to_path_buf()));
+                return Some(split_nested(archive, parts.as_path()));
             }
         }
     }
     None
+}
+
+/// `inner` inside `archive`: if it runs through an archive file stored in
+/// `archive`, that one is mounted and the rest split in it.
+fn split_nested(archive: PathBuf, inner: &Path) -> (PathBuf, PathBuf) {
+    let mut logical = archive.clone();
+    let mut parts = inner.components();
+    while let Some(part) = parts.next() {
+        logical.push(part);
+        if let Component::Normal(name) = part {
+            if format_of(name).is_some() && mount(&archive, &logical).is_some() {
+                return split_nested(logical, parts.as_path());
+            }
+        }
+    }
+    (archive, inner.to_path_buf())
+}
+
+/// Mounted nested archives: (logical path, temp copy, size and date of the
+/// entry it was extracted from).
+type Mounts = Vec<(PathBuf, PathBuf, u64, Option<DateTime<Local>>)>;
+static MOUNTS: Mutex<Mounts> = Mutex::new(Vec::new());
+
+/// The temp copy of the archive file `logical` stored in the archive
+/// `parent`, extracted if missing or outdated. `None` if `logical` isn't a
+/// file there (or can't be extracted).
+fn mount(parent: &Path, logical: &Path) -> Option<PathBuf> {
+    let index = archive(parent).ok()?;
+    let entry = index.stat(logical).ok()??;
+    if entry.is_dir() {
+        return None;
+    }
+    let disk = temp_path_in(parent, logical.strip_prefix(parent).ok()?);
+    {
+        let mounts = MOUNTS.lock().unwrap_or_else(|e| e.into_inner());
+        let same = |(l, d, s, m): &&(PathBuf, PathBuf, u64, Option<DateTime<Local>>)| {
+            l == logical && *d == disk && *s == entry.size && *m == entry.modified
+        };
+        if mounts.iter().find(same).is_some() && disk.is_file() {
+            return Some(disk);
+        }
+    }
+    fs::create_dir_all(disk.parent()?).ok()?;
+    index
+        .read_files(&[logical.to_path_buf()], &mut |_, reader| {
+            io::copy(reader, &mut File::create(&disk)?)?;
+            Ok(true)
+        })
+        .ok()?;
+    let mut mounts = MOUNTS.lock().unwrap_or_else(|e| e.into_inner());
+    mounts.retain(|(l, ..)| l != logical);
+    mounts.push((logical.to_path_buf(), disk.clone(), entry.size, entry.modified));
+    forget(logical);
+    Some(disk)
+}
+
+/// Where the archive `file` (a logical path) is on disk: itself, or the
+/// temp copy of a nested one.
+fn on_disk(file: &Path) -> io::Result<PathBuf> {
+    if file.is_file() {
+        return Ok(file.to_path_buf());
+    }
+    let mounts = MOUNTS.lock().unwrap_or_else(|e| e.into_inner());
+    match mounts.iter().find(|(l, ..)| l == file) {
+        Some((_, disk, ..)) => Ok(disk.clone()),
+        None => Err(io::Error::new(io::ErrorKind::NotFound, format!("Archive not found: {}", file.display()))),
+    }
 }
 
 /// True for a path *inside* an archive (not the archive file itself).
@@ -170,7 +244,7 @@ pub fn in_archive(path: &Path) -> bool {
 /// (zip yes, 7z no). `None` for local paths.
 pub fn archive_writable(path: &Path) -> Option<bool> {
     let (file, _) = split_archive(path)?;
-    Some(file.file_name().and_then(format_of) == Some(Format::Zip))
+    Some(file.file_name().and_then(format_of) == Some(Format::Zip) && file.is_file())
 }
 
 /// The path inside its archive of `path` (`/`-separated, as typed), with
@@ -276,10 +350,15 @@ pub fn try_password(path: &Path, password: &str) -> io::Result<bool> {
 /// Where [`extract_temp`] puts the copy of a file inside an archive (the
 /// path itself for local files): a folder per archive under the temp dir.
 pub fn temp_path(path: &Path) -> PathBuf {
+    match split_archive(path).filter(|(_, inner)| !inner.as_os_str().is_empty()) {
+        Some((file, inner)) => temp_path_in(&file, &inner),
+        None => path.to_path_buf(),
+    }
+}
+
+/// [`temp_path`] of `inner` in the archive `file`.
+fn temp_path_in(file: &Path, inner: &Path) -> PathBuf {
     use std::hash::{Hash, Hasher};
-    let Some((file, inner)) = split_archive(path).filter(|(_, inner)| !inner.as_os_str().is_empty()) else {
-        return path.to_path_buf();
-    };
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     file.hash(&mut hasher);
     let mut out = std::env::temp_dir().join("RustCommander").join(format!("{:016x}", hasher.finish()));
@@ -352,7 +431,10 @@ struct Item {
 /// A parsed archive directory.
 #[derive(Debug)]
 struct Archive {
+    /// The logical path (entries' paths start with it).
     file: PathBuf,
+    /// Where it's read from: `file`, or a nested archive's temp copy.
+    disk: PathBuf,
     format: Format,
     items: Vec<Item>,
     /// Item index by lowercased inner path.
@@ -379,10 +461,12 @@ type Cache = Vec<(PathBuf, u64, Option<SystemTime>, Arc<Archive>)>;
 static CACHE: Mutex<Cache> = Mutex::new(Vec::new());
 const CACHE_SIZE: usize = 4;
 
-/// The parsed archive `file`, from the cache if it hasn't changed.
+/// The parsed archive `file` (a logical path), from the cache if it hasn't
+/// changed.
 fn archive(file: &Path) -> io::Result<Arc<Archive>> {
     let format = file.file_name().and_then(format_of).ok_or_else(|| io::Error::other("Not an archive"))?;
-    let meta = fs::metadata(file)?;
+    let disk = on_disk(file)?;
+    let meta = fs::metadata(&disk)?;
     let (len, modified) = (meta.len(), meta.modified().ok());
     {
         let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
@@ -394,12 +478,12 @@ fn archive(file: &Path) -> io::Result<Arc<Archive>> {
         }
     }
     let raw = match format {
-        Format::Zip => read_zip_index(file)?,
-        Format::SevenZ => read_7z_index(file)?,
-        Format::Tar | Format::TarGz | Format::TarBz2 => read_tar_index(file, format)?,
-        Format::Gz => read_gz_index(file)?,
+        Format::Zip => read_zip_index(&disk)?,
+        Format::SevenZ => read_7z_index(file, &disk)?,
+        Format::Tar | Format::TarGz | Format::TarBz2 => read_tar_index(&disk, format)?,
+        Format::Gz => read_gz_index(&disk)?,
     };
-    let archive = Arc::new(Archive::build(file.to_path_buf(), format, raw));
+    let archive = Arc::new(Archive::build(file.to_path_buf(), disk, format, raw));
     let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     cache.retain(|(f, ..)| f != file);
     cache.insert(0, (file.to_path_buf(), len, modified, archive.clone()));
@@ -454,10 +538,11 @@ fn read_zip_index(file: &Path) -> io::Result<Vec<Raw>> {
     Ok(raw)
 }
 
-/// Opens a 7z with the archive's password, if one was given.
-fn open_7z(file: &Path) -> io::Result<(sevenz_rust2::Archive, sevenz_rust2::Password)> {
+/// Opens the 7z `file` (stored at `disk`) with its password, if one was
+/// given.
+fn open_7z(file: &Path, disk: &Path) -> io::Result<(sevenz_rust2::Archive, sevenz_rust2::Password)> {
     let password = password_for(file).map_or_else(sevenz_rust2::Password::empty, |p| p.as_str().into());
-    match sevenz_rust2::Archive::open_with_password(file, &password) {
+    match sevenz_rust2::Archive::open_with_password(disk, &password) {
         Ok(archive) => Ok((archive, password)),
         Err(e) => Err(sevenz_err(file, e)),
     }
@@ -470,8 +555,8 @@ fn sevenz_err(file: &Path, e: sevenz_rust2::Error) -> io::Error {
     }
 }
 
-fn read_7z_index(file: &Path) -> io::Result<Vec<Raw>> {
-    let (archive, _) = open_7z(file)?;
+fn read_7z_index(file: &Path, disk: &Path) -> io::Result<Vec<Raw>> {
+    let (archive, _) = open_7z(file, disk)?;
     // Files in blocks with an AES coder are encrypted.
     let aes = sevenz_rust2::EncoderMethod::ID_AES256_SHA256;
     let encrypted: Vec<bool> =
@@ -561,9 +646,10 @@ fn read_gz_index(file: &Path) -> io::Result<Vec<Raw>> {
 }
 
 impl Archive {
-    fn build(file: PathBuf, format: Format, raw: Vec<Raw>) -> Self {
+    fn build(file: PathBuf, disk: PathBuf, format: Format, raw: Vec<Raw>) -> Self {
         let mut archive = Archive {
             file,
+            disk,
             format,
             items: Vec::new(),
             by_path: HashMap::new(),
@@ -682,7 +768,7 @@ impl Archive {
     fn read_zip(&self, files: &[PathBuf], each: &mut dyn FnMut(usize, &mut dyn Read) -> io::Result<bool>)
         -> io::Result<()> {
         let wanted = self.sources(files)?;
-        let mut zip = zip::ZipArchive::new(BufReader::new(File::open(&self.file)?)).map_err(io_err)?;
+        let mut zip = zip::ZipArchive::new(BufReader::new(File::open(&self.disk)?)).map_err(io_err)?;
         let password = password_for(&self.file);
         for (i, source) in wanted {
             let Some(source) = source else { continue };
@@ -715,7 +801,7 @@ impl Archive {
         }
         if self.format == Format::Gz {
             if let Some(indexes) = want.remove(&0) {
-                let mut stream = open_stream(&self.file, self.format)?;
+                let mut stream = open_stream(&self.disk, self.format)?;
                 for i in indexes {
                     if !each(i, &mut stream)? {
                         break;
@@ -724,7 +810,7 @@ impl Archive {
             }
             return Ok(());
         }
-        let mut tar = tar::Archive::new(open_stream(&self.file, self.format)?);
+        let mut tar = tar::Archive::new(open_stream(&self.disk, self.format)?);
         for (n, entry) in tar.entries()?.enumerate() {
             if want.is_empty() {
                 break;
@@ -748,8 +834,8 @@ impl Archive {
     fn read_7z(&self, files: &[PathBuf], each: &mut dyn FnMut(usize, &mut dyn Read) -> io::Result<bool>)
         -> io::Result<()> {
         let wanted = self.sources(files)?;
-        let (archive, password) = open_7z(&self.file)?;
-        let mut source = BufReader::new(File::open(&self.file)?);
+        let (archive, password) = open_7z(&self.file, &self.disk)?;
+        let mut source = BufReader::new(File::open(&self.disk)?);
         let map = &archive.stream_map;
         // Wanted files by archive index, grouped by block.
         let mut blocks: BTreeMap<usize, HashMap<usize, usize>> = BTreeMap::new();
@@ -857,7 +943,7 @@ impl Vfs for Archive {
     }
 
     fn writable(&self) -> bool {
-        self.format == Format::Zip
+        self.format == Format::Zip && self.disk == self.file
     }
 }
 
@@ -1141,6 +1227,33 @@ pub(crate) mod tests {
         assert_eq!(names(&list(&seven, true).unwrap()), ["..", "x.txt"]);
         let vfs = open(&seven).unwrap();
         assert_eq!(read_all(&*vfs, &[seven.join("x.txt")]), [(0, b"seven secret".to_vec())]);
+    }
+
+    #[test]
+    fn browses_nested_archives() {
+        let dir = TempDir::new("nested");
+        let outer = dir.0.join("outer.zip");
+        let mut inner = Vec::new();
+        make_tar(&mut inner);
+        let mut w = zip::ZipWriter::new(File::create(&outer).unwrap());
+        w.start_file("pack/inner.tar", zip::write::SimpleFileOptions::default()).unwrap();
+        w.write_all(&inner).unwrap();
+        w.add_directory("pack/folder.zip/", zip::write::SimpleFileOptions::default()).unwrap();
+        w.finish().unwrap();
+
+        let tar = outer.join("pack").join("inner.tar");
+        let deep = tar.join("docs").join("one.txt");
+        assert_eq!(split_archive(&deep), Some((tar.clone(), PathBuf::from("docs").join("one.txt"))));
+        assert_eq!(names(&list(&tar, true).unwrap()), ["..", "deep", "docs", "top.txt"]);
+        assert_eq!(list(&tar, true).unwrap()[0].path, outer.join("pack"));
+        let vfs = open(&deep).unwrap();
+        assert_eq!(read_all(&*vfs, std::slice::from_ref(&deep)), [(0, b"first".to_vec())]);
+        assert_eq!(fs::read(extract_temp(&deep).unwrap()).unwrap(), b"first");
+        // Read-only; a folder named like an archive stays a folder.
+        assert!(!vfs.writable() && archive_writable(&deep) == Some(false));
+        assert_eq!(split_archive(&outer.join("pack/folder.zip/x")), Some((outer.clone(), PathBuf::from("pack/folder.zip/x"))));
+        let _ = fs::remove_dir_all(temp_path(&outer.join("pack")).parent().unwrap());
+        let _ = fs::remove_dir_all(temp_path(&deep).parent().unwrap().parent().unwrap());
     }
 
     #[test]

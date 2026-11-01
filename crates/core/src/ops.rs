@@ -899,7 +899,7 @@ impl Runner<'_> {
         match vfs::open(archive) {
             Ok(v) if v.writable() => Some(v),
             Ok(_) => {
-                self.fail_msg(archive, "Only zip archives can be changed (7z, tar and gz are read-only)");
+                self.fail_msg(archive, "Only zip archives can be changed (7z, tar, gz and archives inside archives are read-only)");
                 None
             }
             Err(e) => {
@@ -913,6 +913,11 @@ impl Runner<'_> {
     /// transfers' destinations are inside it; it's created if missing).
     /// Conflicts are asked first, then the archive is rewritten once.
     fn pack(&mut self, archive: &Path, transfers: &[Transfer], is_move: bool) {
+        // Not 7z, tar, ... nor archives inside archives (temp copies).
+        if vfs::archive_writable(archive) == Some(false) {
+            self.fail_msg(archive, "Only zip archives can be changed (not ones inside other archives)");
+            return;
+        }
         let index = match archive.exists() {
             true => match self.open_writable(archive) {
                 Some(v) => Some(v),
@@ -1763,6 +1768,40 @@ mod tests {
         assert_eq!(o.errors.len(), 1);
         assert!(o.errors[0].1.contains("ZipCrypto"), "{:?}", o.errors);
         assert_eq!(fs::read(&zip).unwrap(), ZIPCRYPTO);
+    }
+
+    #[test]
+    fn nested_archives_are_read_only() {
+        let tmp = TempDir::new("nested");
+        let src = tree(&tmp.0);
+        let inner = tmp.0.join("inner.zip");
+        crate::vfs::tests::make_zip(&inner);
+        let (o, _) = run_job(Job::Pack { sources: vec![inner.clone()], archive: tmp.0.join("outer.zip") }, Resolution::Cancel);
+        assert!(o.errors.is_empty(), "{:?}", o.errors);
+        let outer = tmp.0.join("outer.zip");
+        let nested = outer.join("inner.zip");
+        let before = fs::read(&outer).unwrap();
+
+        // Copy in, delete, new folder: refused, nothing changes.
+        let ts = plan_transfer(&[src.join("a.txt")], &nested).unwrap();
+        assert_eq!(ts[0].dst, nested.join("a.txt"));
+        let (o, _) = run_job(Job::Copy(ts), Resolution::OverwriteAll);
+        assert_eq!(o.errors.len(), 1);
+        let (o, _) = run_job(Job::Delete { paths: vec![nested.join("a.txt")], to_trash: false }, Resolution::Cancel);
+        assert_eq!(o.errors.len(), 1);
+        let (o, _) = run_job(Job::MakeDir(nested.join("new")), Resolution::Cancel);
+        assert_eq!(o.errors.len(), 1);
+        assert_eq!(fs::read(&outer).unwrap(), before);
+
+        // Reading out of it works: copy out and unpack.
+        let out = tmp.0.join("out");
+        let (o, _) = run_job(Job::Copy(plan_transfer(&[nested.join("sub")], &out.join("x")).unwrap()), Resolution::Cancel);
+        assert!(o.errors.is_empty(), "{:?}", o.errors);
+        assert_eq!(fs::read(out.join("x/deep/x.txt")).unwrap(), b"deep file");
+        let (o, _) = run_job(Job::Unpack { archives: vec![nested.clone()], target: out.join("all") }, Resolution::Cancel);
+        assert!(o.errors.is_empty(), "{:?}", o.errors);
+        assert_eq!(fs::read(out.join("all/Readme.md")).unwrap(), vec![b'r'; 5000]);
+        let _ = fs::remove_dir_all(vfs::temp_path(&nested).parent().unwrap());
     }
 
     #[test]

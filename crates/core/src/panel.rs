@@ -425,8 +425,8 @@ impl Panel {
         match entry.kind {
             EntryKind::Parent => self.parent_nav().map_or(Activated::Nothing, Activated::Navigate),
             EntryKind::Dir => Activated::Navigate(Nav::to(entry.path.clone())),
-            // Archives open like folders (archives inside archives don't).
-            EntryKind::File if vfs::is_archive_name(&entry.name) && !vfs::in_archive(&self.path) => {
+            // Archives open like folders (also ones inside archives).
+            EntryKind::File if vfs::is_archive_name(&entry.name) => {
                 Activated::Navigate(Nav::to(entry.path.clone()))
             }
             EntryKind::File => Activated::File(entry.path.clone()),

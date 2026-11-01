@@ -1927,7 +1927,7 @@ impl App {
             return false;
         }
         let msg = match zip_ok {
-            true => format!("Only zip archives can be changed: can't {what} here"),
+            true => format!("Read-only archive (only zips, not inside archives, can be changed): can't {what} here"),
             false => format!("Can't {what} inside archives"),
         };
         self.status = Some((msg, Tone::Info));
@@ -1975,10 +1975,6 @@ impl App {
             .collect();
         if archives.is_empty() {
             self.status = Some(("Select archives (zip, 7z, tar, ...) to unpack".into(), Tone::Info));
-            return Task::none();
-        }
-        if archives.iter().any(|p| vfs::is_virtual(p)) {
-            self.status = Some(("Can't unpack archives inside archives yet: copy them out first".into(), Tone::Info));
             return Task::none();
         }
         let target = self.panel(1 - self.active).path.clone();
@@ -2388,7 +2384,7 @@ fn archive_transfer_problem(is_move: bool, sources: &[PathBuf], target: &Path) -
     let into = vfs::split_archive(target);
     match (&from, &into) {
         (_, Some((file, _))) if vfs::archive_writable(file) == Some(false) => {
-            Some("Only zip archives can be changed (this one is read-only)")
+            Some("Read-only archive (only zips, not inside archives, can be changed)")
         }
         (Some((a, _)), Some((b, _))) if !ops::same_path(a, b) => {
             Some("Can't copy between archives: copy out to a folder first")
