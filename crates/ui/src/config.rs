@@ -23,6 +23,9 @@ pub struct Config {
     /// Hidden files shown at the first start (no session yet); the
     /// settings view also applies a change to every open tab.
     pub show_hidden: bool,
+    /// The function-key bar (F1-F10 buttons) under the panels; off = a
+    /// one-line hint instead.
+    pub show_fkeys: bool,
     /// Key bindings on top of the defaults: key (`Ctrl+Shift+F5`) ->
     /// command id (`cm_Copy`), `""` unbinds the key.
     pub keys: BTreeMap<String, String>,
@@ -205,6 +208,10 @@ fn template(editor: &str) -> String {
          # Show hidden files at the first start (Ctrl+H toggles them per tab).\n\
          show_hidden = false\n\
          \n\
+         # Show the function-key bar (F1-F10 buttons) under the panels. Off = only a\n\
+         # one-line hint (F1 help, command palette, F10 settings).\n\
+         show_fkeys = false\n\
+         \n\
          # Colour theme: {themes}. [colors] below overrides single colours.\n\
          theme = \"dark\"\n\
          \n\
@@ -250,6 +257,7 @@ mod tests {
                 Edit::Text("editor", "vim %1".into()),
                 Edit::Text("theme", "light".into()),
                 Edit::Flag("show_hidden", true),
+                Edit::Flag("show_fkeys", true),
                 Edit::Key(("ctrl+k".into(), Some("cm_Copy".into()))),
                 Edit::Key(("f8".into(), None)),
                 Edit::Key(("ctrl+shift+f5".into(), Some("cm_RenMov".into()))),
@@ -265,7 +273,8 @@ mod tests {
         let config = parse(&out).unwrap();
         assert_eq!(config.editor, "vim %1");
         assert_eq!(config.theme, "light");
-        assert!(config.show_hidden);
+        assert!(config.show_hidden && config.show_fkeys);
+        assert!(!parse(&template("")).unwrap().show_fkeys);
         assert_eq!(config.keys["Ctrl+Shift+F5"], "cm_RenMov");
         assert_eq!(config.colors["Accent"], "#00ff00");
         assert_eq!(config.colors["bg"], "#000000");

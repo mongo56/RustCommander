@@ -813,6 +813,14 @@ impl App {
             .color(theme::c().muted),
         };
 
+        if !self.config.show_fkeys {
+            // Just a status line with a quiet hint on the right.
+            let hint = text(self.keymap.bar_hint()).size(12).color(theme::c().muted).wrapping(Wrapping::None);
+            return container(row![container(status.wrapping(Wrapping::None)).clip(true), Space::with_width(Length::Fill), hint].spacing(16))
+                .padding([3, 10])
+                .into();
+        }
+
         let fkeys = Row::with_children(self.keymap.fkey_bar().into_iter().map(|(key, cmd)| {
             let label = cmd.map_or("", Command::short_label);
             button(

@@ -37,6 +37,8 @@ const ROW_H: f32 = 22.0;
 /// Approximate height of everything that isn't file rows (tabs, headers,
 /// footers, function-key bar). Only used to size PageUp/PageDown jumps.
 const CHROME_H: f32 = 206.0;
+/// Height of the function-key buttons row, which `CHROME_H` includes.
+const FKEYS_H: f32 = 30.0;
 const JOB_ROW_H: f32 = 30.0;
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 /// How far the mouse must move with the button down before a drag starts.
@@ -2496,7 +2498,8 @@ impl App {
     }
 
     fn page_rows(&self) -> usize {
-        let chrome = CHROME_H + self.jobs.len() as f32 * JOB_ROW_H;
+        let bar = if self.config.show_fkeys { 0.0 } else { FKEYS_H };
+        let chrome = CHROME_H - bar + self.jobs.len() as f32 * JOB_ROW_H;
         ((self.window_height - chrome) / ROW_H).floor().max(1.0) as usize
     }
 

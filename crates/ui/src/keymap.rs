@@ -106,6 +106,22 @@ impl Keymap {
         FKEY_BAR.iter().map(|&(label, name)| (label, self.command_of(name))).collect()
     }
 
+    /// The hint shown instead of the function-key bar: the first key of
+    /// help, the command palette and the settings, as they are bound now.
+    pub fn bar_hint(&self) -> String {
+        let bindings = self.bindings();
+        let part = |cmd: Command, what: &str| Keymap::keys_for(&bindings, cmd).first().map(|key| format!("{key} {what}"));
+        let parts: Vec<String> = [
+            part(Command::Help, "help"),
+            part(Command::CommandPalette, "command palette"),
+            part(Command::Configuration, "settings"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        parts.join(" · ")
+    }
+
     /// Every effective binding as (display name, command), defaults with the
     /// overrides applied. Defaults are found by trying every bindable key
     /// with every modifier combination; a combination is left out when the
@@ -174,13 +190,16 @@ pub type KeyEdit = (String, Option<String>);
 
 /// The default command of a canonical key name.
 /// The slots of the function-key bar: display label and canonical key name.
-const FKEY_BAR: [(&str, &str); 8] = [
+const FKEY_BAR: [(&str, &str); 11] = [
+    ("F1", "f1"),
+    ("F2", "f2"),
     ("F3", "f3"),
     ("F4", "f4"),
     ("F5", "f5"),
     ("F6", "f6"),
     ("F7", "f7"),
     ("F8", "f8"),
+    ("F9", "f9"),
     ("F10", "f10"),
     ("Alt+F4", "alt+f4"),
 ];
@@ -538,6 +557,10 @@ mod tests {
             map.fkey_bar().into_iter().find(|(k, _)| *k == key).map(|(_, c)| c.map(Command::short_label)).unwrap()
         };
         let map = Keymap::default();
+        assert_eq!(label(&map, "F1"), Some("Help"));
+        assert_eq!(label(&map, "F2"), Some("Rename"));
+        assert_eq!(label(&map, "F9"), Some("Term"));
+        assert_eq!(map.bar_hint(), "F1 help · Ctrl+Space command palette · F10 settings");
         assert_eq!(label(&map, "F3"), Some("View"));
         assert_eq!(label(&map, "F7"), Some("MkDir"));
         assert_eq!(label(&map, "Alt+F4"), Some("Exit"));
@@ -547,6 +570,10 @@ mod tests {
         assert_eq!(label(&map, "F7"), Some("Copy"));
         assert_eq!(label(&map, "F8"), None);
         assert_eq!(label(&map, "F5"), Some("Copy"));
+
+        let keys = BTreeMap::from([("F10".to_owned(), String::new()), ("Ctrl+K".to_owned(), "cm_Configuration".to_owned())]);
+        let hint = Keymap::new(&keys).unwrap().bar_hint();
+        assert!(hint.contains("settings") && !hint.ends_with(" F10 settings"), "{hint}");
     }
 
     #[test]

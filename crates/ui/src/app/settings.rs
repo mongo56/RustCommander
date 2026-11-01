@@ -64,13 +64,14 @@ impl Page {
 }
 
 /// Rows of the General page.
-const GENERAL_ROWS: usize = 7;
+const GENERAL_ROWS: usize = 8;
 const ROW_EDITOR: usize = 0;
 const ROW_TERMINAL: usize = 1;
 const ROW_HIDDEN: usize = 2;
-/// Compare options 0..3 (`toggle_compare_option`) are rows 3..6.
-const ROW_COMPARE: usize = 3;
-const ROW_CONFIG: usize = 6;
+const ROW_FKEYS: usize = 3;
+/// Compare options 0..3 (`toggle_compare_option`) are rows 4..7.
+const ROW_COMPARE: usize = 4;
+const ROW_CONFIG: usize = 7;
 
 #[derive(Debug, Clone)]
 pub enum SettingsMsg {
@@ -81,6 +82,7 @@ pub enum SettingsMsg {
     SaveEditor,
     Terminal(String),
     ShowHidden(bool),
+    ShowFkeys(bool),
     /// Toggle compare option 0..3.
     Compare(u8),
     EditConfig,
@@ -216,6 +218,7 @@ impl App {
                     Task::batch([text_input::focus(terminal_id()), text_input::move_cursor_to_end(terminal_id())])
                 }
                 ROW_HIDDEN => self.settings_update(SettingsMsg::ShowHidden(!self.config.show_hidden)),
+                ROW_FKEYS => self.settings_update(SettingsMsg::ShowFkeys(!self.config.show_fkeys)),
                 ROW_CONFIG => self.settings_update(SettingsMsg::EditConfig),
                 _ => self.settings_update(SettingsMsg::Compare((row - ROW_COMPARE) as u8)),
             },
@@ -336,6 +339,11 @@ impl App {
                 }
                 let paths: Vec<PathBuf> = (0..2).map(|side| self.panel(side).path.clone()).collect();
                 return Task::batch(paths.into_iter().map(|p| self.list_in_background(p)).collect::<Vec<_>>());
+            }
+            SettingsMsg::ShowFkeys(on) => {
+                s.row[0] = ROW_FKEYS;
+                let state = if on { "shown" } else { "hidden" };
+                self.settings_write(&[Edit::Flag("show_fkeys", on)], format!("Function-key bar {state}"));
             }
             SettingsMsg::Compare(i) => {
                 s.row[0] = ROW_COMPARE + i as usize;
@@ -613,6 +621,17 @@ impl App {
                             label("Show hidden files"),
                             switch(self.config.show_hidden, SettingsMsg::ShowHidden(!self.config.show_hidden)),
                             hint("Every tab now and at the first start; Ctrl+H toggles one tab".into()),
+                        ]
+                        .spacing(8)
+                        .align_y(Alignment::Center)
+                        .into()
+                    ),
+                    line(
+                        ROW_FKEYS,
+                        row![
+                            label("Function-key bar"),
+                            switch(self.config.show_fkeys, SettingsMsg::ShowFkeys(!self.config.show_fkeys)),
+                            hint("Buttons F1-F10 under the panels; off = a one-line hint".into()),
                         ]
                         .spacing(8)
                         .align_y(Alignment::Center)
