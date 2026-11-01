@@ -312,6 +312,41 @@ unsafe fn command_verb(menu: &IContextMenu, offset: usize) -> String {
     String::from_utf16_lossy(&buf[..len]).to_ascii_lowercase()
 }
 
+/// Invokes the shell's "Mount" verb on a disk image (iso, vhd, ...).
+/// Must run on the UI thread (it creates a COM menu).
+pub fn mount_iso(path: &Path) -> Result<(), String> {
+    let hwnd = HWND(std::ptr::null_mut());
+    let folder = path.parent().unwrap_or_else(|| Path::new("."));
+    let items = vec![path.to_path_buf()];
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+
+        let menu = context_menu_for(hwnd, folder, &items).map_err(|e| e.message())?;
+        let hmenu = CreatePopupMenu().map_err(|e| e.message())?;
+
+        let mut flags = CMF_NORMAL;
+        flags |= CMF_EXTENDEDVERBS;
+        let hr = menu.QueryContextMenu(hmenu, 0, FIRST_ID, LAST_ID, flags);
+        if hr.is_err() {
+            let _ = DestroyMenu(hmenu);
+            return Err(hr.message());
+        }
+
+        // On success the HRESULT's code is the highest offset used + 1.
+        // Command ids aren't menu positions (separators, submenus), so
+        // check every offset rather than every item.
+        let used = (hr.0 & 0xFFFF) as usize;
+        let found = (0..used).find(|&i| command_verb(&menu, i) == "mount");
+        let result = match found {
+            Some(offset) => invoke(&menu, hwnd, offset, folder, POINT::default())
+                .map_err(|e| format!("Mount failed: {}", e.message())),
+            None => Err("Windows has no Mount option for this file".to_string()),
+        };
+        let _ = DestroyMenu(hmenu);
+        result
+    }
+}
+
 unsafe fn invoke(
     menu: &IContextMenu,
     hwnd: HWND,

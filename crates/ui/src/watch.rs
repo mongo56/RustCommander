@@ -28,6 +28,29 @@ pub fn folders(dirs: Vec<PathBuf>) -> Subscription<PathBuf> {
     )
 }
 
+/// Yields the drive list each time it changes (a USB stick plugged in, a
+/// disk image mounted or ejected, ...). Polls once a second; the check is a
+/// single cheap system call.
+pub fn drives() -> Subscription<Vec<String>> {
+    Subscription::run_with_id(
+        "drives",
+        iced::stream::channel(4, move |mut output: mpsc::Sender<Vec<String>>| async move {
+            std::thread::spawn(move || {
+                let mut last = rc_platform::roots();
+                while !output.is_closed() {
+                    std::thread::sleep(Duration::from_secs(1));
+                    let now = rc_platform::roots();
+                    if now != last {
+                        let _ = output.try_send(now.clone());
+                        last = now;
+                    }
+                }
+            });
+            std::future::pending::<()>().await
+        }),
+    )
+}
+
 /// Watches `dir` (not its subfolders); `pick` maps a change to the index of
 /// the folder to report. Errors (e.g. the folder vanished) report it too.
 fn watch(

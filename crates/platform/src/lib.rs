@@ -66,6 +66,20 @@ pub fn open_default(path: &Path) -> io::Result<()> {
     open::that_detached(path)
 }
 
+/// Mounts a disk image (iso, vhd, ...) the way Windows does when you
+/// double-click it. Must run on the UI thread (COM menu).
+pub fn mount_disk_image(path: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        win::mount_iso(path)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Err("not supported on this platform".to_string())
+    }
+}
+
 /// Starts `program` with `args` in `dir` without waiting for it, letting
 /// it take the foreground. The child can be polled to see when it exits
 /// (dropping it doesn't stop the program).

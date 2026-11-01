@@ -368,6 +368,8 @@ pub enum Message {
     Drive(usize, String),
     DriveMiddle(usize, String),
     DriveRight(usize, String),
+    /// The set of drives changed (mount, eject, USB plug-in, ...).
+    DrivesChanged(Vec<String>),
     Sort(usize, SortKey),
     Resized(Size),
     CloseRequested,
@@ -428,6 +430,8 @@ pub enum Message {
     Navigated(usize, u64, Listing),
     /// A file inside an archive was extracted to a temp copy to be opened.
     Extracted(Result<PathBuf, String>),
+    /// A disk image finished mounting on a worker thread.
+    Mounted { active: usize, result: Result<Option<String>, String> },
     /// F4 inside an archive: extracted, or time to check the edited copies.
     ArchiveEdit(archive_edit::EditMsg),
     /// Subfolders of a folder, for path bar suggestions.
@@ -565,6 +569,7 @@ impl App {
             }),
             window::resize_events().map(|(_id, size)| Message::Resized(size)),
             window::close_requests().map(|_id| Message::CloseRequested),
+            watch::drives().map(Message::DrivesChanged),
         ];
         // Ctrl+wheel zooms images; the zoomed image's scrollable captures the
         // wheel, so listen globally instead of through the body's mouse_area.
@@ -867,6 +872,7 @@ impl App {
                 self.active = side;
                 return self.drive_context_menu(side, drive);
             }
+            Message::DrivesChanged(drives) => self.drives = drives,
             Message::Sort(side, key) => {
                 self.active = side;
                 self.panel_mut(side).sort_by(key);
@@ -1032,6 +1038,18 @@ impl App {
                     Err(e) => (e, Tone::Error),
                 });
             }
+            Message::Mounted { active, result } => match result {
+                Ok(new) => {
+                    self.drives = rc_platform::roots();
+                    if let Some(drive) = new {
+                        self.status = Some((format!("Mounted as {drive}"), Tone::Success));
+                        return self.start_nav(active, Nav::to(PathBuf::from(drive)));
+                    }
+                    // No new drive letter: already mounted, or still coming.
+                    self.status = Some(("Mounted (no new drive letter appeared)".to_string(), Tone::Info));
+                }
+                Err(e) => self.status = Some((e, Tone::Error)),
+            },
             Message::ViewerLoaded(seq, result) => return self.viewer_loaded(seq, result),
             Message::ViewerFound(seq, result, cancel) => self.viewer_found(seq, result, &cancel),
             Message::ViewerWheel(lines) => self.viewer_wheel(lines),
@@ -1078,6 +1096,7 @@ impl App {
         ("Thumbnail view (Ctrl+Shift+F5)", "Arrows move in the grid (Shift+arrows select), PgUp/PgDn by a screen; Enter, Space/Ins, quick search, clicks and dragging work as in the list. Picture size: thumbnail_size in config.toml"),
         ("Middle-click a folder or drive", "Open it in a new tab"),
         ("Right-click a drive", "Windows menu for the drive"),
+        ("Enter on a .iso, .img, .vhd, .vhdx", "Mount the disk image (Windows' Mount) and open the new drive"),
         ("Enter / Ctrl+PgDn on a .zip, .7z, .rar, .tar, .tar.gz, .gz, ...", "Browse the archive like a folder: view, copy out, Enter opens a temp copy; in a zip also copy/move in (also from other archives), F7, F2, F8 (others are read-only)"),
         ("Ctrl+F, then Enter", "Connect to an SFTP/FTP/FTPS server: browse, F3 view, F5/F6 download and upload, F7, F2, F8 work there; Ctrl+Shift+F disconnects"),
         ("Right-click", "Explorer context menu"),
@@ -1507,7 +1526,30 @@ impl App {
         }
         let extend = self.modifiers.shift();
         let panel = self.panel_mut(active);
-        let mut info = None;
+
+        // Enter on a file: open it (or mount a disk image). Handled before
+        // the shared panel work below because mounting needs &mut self for
+        // the drive bar and navigation.
+        if cmd == Open {
+            if let Activated::File(path) = panel.activate() {
+                // Inside an archive: extract to a temp copy first.
+                if vfs::is_virtual(&path) {
+                    return open_extracted(path);
+                }
+                // A disk image mounts instead of opening, like Explorer.
+                if is_disk_image(&path) {
+                    return mount_disk_image(path, active);
+                }
+                // Plain file: open with the default app.
+                match launch(&path) {
+                    Ok(msg) => self.status = Some((msg, Tone::Success)),
+                    Err(e) => self.report(Err(e)),
+                }
+                return Task::none();
+            }
+            // Folder / `..` falls through to the shared navigation below.
+        }
+
         let result: io::Result<()> = match cmd {
             // Left / Right only move in the thumbnail grid.
             CursorLeft | CursorRight if !panel.thumbnails => Ok(()),
@@ -1546,14 +1588,9 @@ impl App {
                 Ok(())
             }
             CursorBy(n) => Ok(panel.move_cursor(n as isize)),
-            Open => match panel.activate() {
-                // Inside an archive: extract to a temp copy first.
-                Activated::File(path) if vfs::is_virtual(&path) => return open_extracted(path),
-                Activated::File(path) => launch(&path).map(|msg| info = Some(msg)),
-                _ => Ok(()),
-            },
             // At the root / no history: nothing to do.
-            GoParent | GoRoot | HistoryBack | HistoryForward => Ok(()),
+            // Open on a non-file (or no current entry) is handled above.
+            GoParent | GoRoot | HistoryBack | HistoryForward | Open => Ok(()),
             SelectAll => Ok(panel.select_all()),
             DeselectAll => Ok(panel.deselect_all()),
             SortBy(key) => Ok(panel.sort_by(key)),
@@ -1561,10 +1598,6 @@ impl App {
         };
         panel.ensure_visible(rows);
         self.report(result);
-        if let Some(msg) = info {
-            let tone = if matches!(cmd, Open | View | Edit) { Tone::Success } else { Tone::Info };
-            self.status = Some((msg, tone));
-        }
         Task::none()
     }
 
@@ -2916,6 +2949,41 @@ fn archive_transfer_problem(is_move: bool, sources: &[PathBuf], target: &Path) -
         }
         _ => None,
     }
+}
+
+/// True for files Windows mounts as a drive (iso, vhd, ...).
+fn is_disk_image(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(), "iso" | "img" | "vhd" | "vhdx"))
+}
+
+/// Enter on a disk image: mount it (the shell "Mount" verb) on a worker
+/// thread, then navigate to the new drive (`Message::Mounted`). The drive
+/// letter shows up a moment after the verb returns, so the worker waits
+/// (up to ~5 s) for a new root and reports it.
+fn mount_disk_image(path: PathBuf, active: usize) -> Task<Message> {
+    Task::perform(
+        async move {
+            let (tx, rx) = iced::futures::channel::oneshot::channel();
+            std::thread::spawn(move || {
+                let before = rc_platform::roots();
+                let result = rc_platform::mount_disk_image(&path).map(|()| {
+                    for _ in 0..50 {
+                        let now = rc_platform::roots();
+                        if let Some(new) = now.into_iter().find(|d| !before.contains(d)) {
+                            return Some(new);
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    None
+                });
+                let _ = tx.send(result);
+            });
+            rx.await.unwrap_or_else(|_| Err("mount thread failed".into()))
+        },
+        move |result| Message::Mounted { active, result },
+    )
 }
 
 /// Enter on a file inside an archive: extracts it to a temp copy on a
