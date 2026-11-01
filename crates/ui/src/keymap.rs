@@ -373,6 +373,7 @@ fn default_command(key: &Key, m: Modifiers) -> Option<Command> {
             Named::F4 => Edit,
             Named::F5 if alt && !ctrl && !shift => Pack,
             Named::F9 if alt && !ctrl && !shift => Unpack,
+            Named::F9 if !alt && !ctrl && !shift => Terminal,
             Named::F5 => Copy,
             Named::F6 if shift => Rename,
             Named::F2 if !ctrl && !alt => Rename,

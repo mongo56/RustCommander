@@ -12,7 +12,7 @@ pub fn launch(command: &str, path: &Path) -> io::Result<()> {
     let Some(command) = command else {
         return rc_platform::open_default(path);
     };
-    let (program, args) = command_line(&command, path)
+    let (program, args) = command_line(&command, path, true)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "editor command is empty"))?;
     rc_platform::spawn_detached(&program, &args, dir)
 }
@@ -26,8 +26,8 @@ fn default_editor() -> Option<String> {
 }
 
 /// Program and arguments of `command` with `%1` replaced by `path`, or
-/// `path` appended when there's no `%1`.
-fn command_line(command: &str, path: &Path) -> Option<(String, Vec<OsString>)> {
+/// (when `append`) `path` appended when there's no `%1`.
+pub(crate) fn command_line(command: &str, path: &Path, append: bool) -> Option<(String, Vec<OsString>)> {
     let mut words = split(command).into_iter();
     let program = words.next()?;
     let mut used = false;
@@ -41,7 +41,7 @@ fn command_line(command: &str, path: &Path) -> Option<(String, Vec<OsString>)> {
             }
         })
         .collect();
-    if !used {
+    if !used && append {
         args.push(path.as_os_str().to_owned());
     }
     Some((program, args))
@@ -90,10 +90,12 @@ mod tests {
     #[test]
     fn places_the_file() {
         let path = Path::new("dir/a b.txt");
-        let (program, args) = command_line("ed -n", path).unwrap();
+        let (program, args) = command_line("ed -n", path, true).unwrap();
         assert_eq!((program.as_str(), args), ("ed", vec![OsString::from("-n"), OsString::from("dir/a b.txt")]));
-        let (_, args) = command_line("ed --file=%1 -x", path).unwrap();
+        let (_, args) = command_line("ed --file=%1 -x", path, true).unwrap();
         assert_eq!(args, [OsString::from("--file=dir/a b.txt"), OsString::from("-x")]);
-        assert!(command_line("", path).is_none());
+        assert!(command_line("", path, true).is_none());
+        let (_, args) = command_line("ed -n", path, false).unwrap();
+        assert_eq!(args, [OsString::from("-n")]);
     }
 }

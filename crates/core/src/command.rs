@@ -64,6 +64,8 @@ pub enum Command {
     Pack,
     /// Unpack the selected archives into the other panel (Alt+F9).
     Unpack,
+    /// Open a terminal in the active panel's folder (F9).
+    Terminal,
     /// Delete to the recycle bin.
     Delete,
     /// Delete permanently (Shift+F8 / Shift+Del).
@@ -134,6 +136,7 @@ impl Command {
             MakeDir => "cm_MkDir",
             Pack => "cm_PackFiles",
             Unpack => "cm_UnpackFiles",
+            Terminal => "cm_ExecuteDOS",
             Delete => "cm_Delete",
             DeletePermanent => "cm_DeletePermanent",
             NewTab => "cm_OpenNewTab",
@@ -198,6 +201,7 @@ impl Command {
             MakeDir => "Create a folder",
             Pack => "Pack the selected files into a zip archive in the other panel",
             Unpack => "Unpack the selected archives (zip, 7z, tar, gz) into the other panel",
+            Terminal => "Open a terminal in this folder (the \"terminal\" setting)",
             Delete => "Delete to the recycle bin",
             DeletePermanent => "Delete permanently",
             NewTab => "New tab",
@@ -265,6 +269,7 @@ impl Command {
             MakeDir,
             Pack,
             Unpack,
+            Terminal,
             Delete,
             DeletePermanent,
             NewTab,

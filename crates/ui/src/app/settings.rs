@@ -23,6 +23,10 @@ fn list_id() -> scrollable::Id {
     scrollable::Id::new("settings-list")
 }
 
+fn terminal_id() -> text_input::Id {
+    text_input::Id::new("settings-terminal")
+}
+
 fn editor_id() -> text_input::Id {
     text_input::Id::new("settings-editor")
 }
@@ -60,12 +64,13 @@ impl Page {
 }
 
 /// Rows of the General page.
-const GENERAL_ROWS: usize = 6;
+const GENERAL_ROWS: usize = 7;
 const ROW_EDITOR: usize = 0;
-const ROW_HIDDEN: usize = 1;
-/// Compare options 0..3 (`toggle_compare_option`) are rows 2..5.
-const ROW_COMPARE: usize = 2;
-const ROW_CONFIG: usize = 5;
+const ROW_TERMINAL: usize = 1;
+const ROW_HIDDEN: usize = 2;
+/// Compare options 0..3 (`toggle_compare_option`) are rows 3..6.
+const ROW_COMPARE: usize = 3;
+const ROW_CONFIG: usize = 6;
 
 #[derive(Debug, Clone)]
 pub enum SettingsMsg {
@@ -74,6 +79,7 @@ pub enum SettingsMsg {
     Click(usize),
     Editor(String),
     SaveEditor,
+    Terminal(String),
     ShowHidden(bool),
     /// Toggle compare option 0..3.
     Compare(u8),
@@ -109,6 +115,8 @@ pub(super) struct Settings {
     row: [usize; 3],
     /// The editor command being typed.
     editor: String,
+    /// The terminal command being typed.
+    terminal: String,
     /// The colours being typed, by `theme::NAMES` index.
     hex: Vec<String>,
     capture: Option<Capture>,
@@ -130,6 +138,7 @@ impl App {
             page: Page::General,
             row: [0; 3],
             editor: self.config.editor.clone(),
+            terminal: self.config.terminal.clone(),
             hex: current_hex(),
             capture: None,
             reset_all: false,
@@ -159,12 +168,17 @@ impl App {
         }
     }
 
-    /// Saves a changed editor command (on Enter, leaving the page, closing).
+    /// Saves changed editor / terminal commands (on Enter, leaving the page, closing).
     fn settings_save_editor(&mut self) {
         let Some(s) = &self.settings else { return };
         if s.editor != self.config.editor {
             let editor = s.editor.trim().to_owned();
             self.settings_write(&[Edit::Text("editor", editor)], "Editor saved".into());
+        }
+        let Some(s) = &self.settings else { return };
+        if s.terminal != self.config.terminal {
+            let terminal = s.terminal.trim().to_owned();
+            self.settings_write(&[Edit::Text("terminal", terminal)], "Terminal saved".into());
         }
     }
 
@@ -198,6 +212,9 @@ impl App {
         match s.page {
             Page::General => match row {
                 ROW_EDITOR => Task::batch([text_input::focus(editor_id()), text_input::move_cursor_to_end(editor_id())]),
+                ROW_TERMINAL => {
+                    Task::batch([text_input::focus(terminal_id()), text_input::move_cursor_to_end(terminal_id())])
+                }
                 ROW_HIDDEN => self.settings_update(SettingsMsg::ShowHidden(!self.config.show_hidden)),
                 ROW_CONFIG => self.settings_update(SettingsMsg::EditConfig),
                 _ => self.settings_update(SettingsMsg::Compare((row - ROW_COMPARE) as u8)),
@@ -294,14 +311,15 @@ impl App {
                 }
                 // A second click on a row acts like Enter (toggles a switch,
                 // waits for a key, picks the next theme).
-                if again && !(s.page == Page::General && i == ROW_EDITOR) && !(s.page == Page::Colors && i > 0) {
+                if again && !(s.page == Page::General && matches!(i, ROW_EDITOR | ROW_TERMINAL)) && !(s.page == Page::Colors && i > 0) {
                     return self.settings_activate();
                 }
-                if s.page == Page::General && i != ROW_EDITOR {
+                if s.page == Page::General && !matches!(i, ROW_EDITOR | ROW_TERMINAL) {
                     self.settings_save_editor();
                 }
             }
             SettingsMsg::Editor(value) => s.editor = value,
+            SettingsMsg::Terminal(value) => s.terminal = value,
             SettingsMsg::SaveEditor => {
                 self.settings_save_editor();
                 return blur();
@@ -501,7 +519,7 @@ impl App {
             },
         }
         s.reset_all = false;
-        if page == Page::General && row == ROW_EDITOR {
+        if page == Page::General && matches!(row, ROW_EDITOR | ROW_TERMINAL) {
             self.settings_save_editor();
         }
         Task::batch([blur(), self.settings_snap()])
@@ -558,6 +576,13 @@ impl App {
                     .padding(5)
                     .size(13)
                     .style(theme::input);
+                let terminal = text_input("Empty: Windows Terminal / PowerShell", &s.terminal)
+                    .id(terminal_id())
+                    .on_input(move |v| msg(SettingsMsg::Terminal(v)))
+                    .on_submit(msg(SettingsMsg::SaveEditor))
+                    .padding(5)
+                    .size(13)
+                    .style(theme::input);
                 let opts = self.compare_opts;
                 let compare = |i: u8, title: &'a str, on: bool, about: &'a str| {
                     line(
@@ -575,6 +600,12 @@ impl App {
                         row![label("Editor for F4"), editor].spacing(8).align_y(Alignment::Center).into()
                     ),
                     container(hint("A program and arguments; %1 is the file (added when missing). Enter saves.".into()))
+                        .padding([0, 14 + LABEL_W as u16 + 8]),
+                    line(
+                        ROW_TERMINAL,
+                        row![label("Terminal for F9"), terminal].spacing(8).align_y(Alignment::Center).into()
+                    ),
+                    container(hint("Starts in the panel's folder; %1 is that folder (optional). Enter saves.".into()))
                         .padding([0, 14 + LABEL_W as u16 + 8]),
                     line(
                         ROW_HIDDEN,

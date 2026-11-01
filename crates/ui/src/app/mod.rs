@@ -1158,6 +1158,10 @@ impl App {
             MakeDir => return self.open_dialog(Dialog::MakeDir { input: String::new() }),
             Pack => return self.open_pack(),
             Unpack => return self.open_unpack(),
+            Terminal => {
+                self.open_terminal();
+                return Task::none();
+            }
             Hotlist => {
                 self.open_hotlist();
                 return self.popup_snap();
@@ -2444,6 +2448,20 @@ impl App {
         self.status = Some(match crate::editor::launch(&self.config.editor, path) {
             Ok(()) => (format!("Editing {name}"), Tone::Success),
             Err(e) => (format!("Can't start the editor: {e}"), Tone::Error),
+        });
+    }
+
+    /// F9: a terminal in the active panel's folder (the nearest real one
+    /// above an archive or server location).
+    fn open_terminal(&mut self) {
+        self.refresh_config();
+        let dir = self.panel(self.active).path.ancestors().find(|p| !vfs::is_virtual(p) && p.is_dir()).map(Path::to_owned);
+        self.status = Some(match dir {
+            None => ("No folder on disk here to open a terminal in".into(), Tone::Error),
+            Some(dir) => match crate::terminal::launch(&self.config.terminal, &dir) {
+                Ok(()) => (format!("Terminal opened in {}", dir.display()), Tone::Success),
+                Err(e) => (format!("Can't start the terminal: {e}"), Tone::Error),
+            },
         });
     }
 

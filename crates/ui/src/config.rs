@@ -14,6 +14,10 @@ pub struct Config {
     /// Editor for F4: a program, optionally with arguments; `%1` stands for
     /// the file (appended when missing). Empty = the platform default.
     pub editor: String,
+    /// Terminal for F9: a program, optionally with arguments; `%1` stands
+    /// for the folder (optional: it is the working directory anyway).
+    /// Empty = Windows Terminal / PowerShell, else $TERMINAL.
+    pub terminal: String,
     /// Colour theme: a `theme::PRESETS` id; empty = dark.
     pub theme: String,
     /// Hidden files shown at the first start (no session yet); the
@@ -37,7 +41,7 @@ impl Config {
 /// One change to `config.toml`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Edit {
-    /// A top-level text setting (`editor`, `theme`).
+    /// A top-level text setting (`editor`, `terminal`, `theme`).
     Text(&'static str, String),
     /// A top-level switch (`show_hidden`).
     Flag(&'static str, bool),
@@ -191,6 +195,12 @@ fn template(editor: &str) -> String {
          # Empty = Notepad on Windows, else $VISUAL / $EDITOR.\n\
          # Example: editor = '\"C:\\Program Files\\Notepad++\\notepad++.exe\" -multiInst %1'\n\
          editor = {editor}\n\
+         \n\
+         # Terminal for F9: a program, optionally with arguments; it starts in the\n\
+         # active panel's folder. %1 stands for that folder (optional).\n\
+         # Empty = Windows Terminal if installed, else PowerShell; elsewhere $TERMINAL\n\
+         # or x-terminal-emulator. Example: terminal = 'wt.exe -d %1'\n\
+         terminal = \"\"\n\
          \n\
          # Show hidden files at the first start (Ctrl+H toggles them per tab).\n\
          show_hidden = false\n\
