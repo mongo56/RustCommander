@@ -9,6 +9,7 @@ mod multi_rename;
 mod viewer;
 
 use crate::keymap;
+use crate::select_range::{self, Part, SelectRange};
 use crate::session::{self, Session, SideState, TabState};
 use crate::theme;
 use crate::watch;
@@ -192,6 +193,23 @@ struct InlineRename {
     side: usize,
     src: PathBuf,
     text: String,
+    is_dir: bool,
+    /// The selected part of the name and its `select_range` request id.
+    part: Part,
+    select: u64,
+}
+
+impl InlineRename {
+    /// Selects `part` of the current text (applied by `SelectRange`).
+    fn select(&mut self, part: Part) {
+        self.part = part;
+        self.select = select_range::next_generation();
+    }
+
+    /// The grapheme range to select.
+    fn selection(&self) -> (usize, usize) {
+        self.part.range(&self.text, self.is_dir).unwrap_or((0, 0))
+    }
 }
 
 /// Type-to-jump in the active panel.
@@ -776,6 +794,7 @@ impl App {
         ("Backspace, Esc (quick search)", "Delete a character / end the quick search"),
         ("Typing, Backspace (quick filter)", "Edit the filter; Esc drops it, other keys keep it"),
         ("Esc", "Cancel a slow folder change, drop the filter, then clear the selection"),
+        ("F2 / Shift+F6 (renaming)", "Select the name without extension, the extension, the whole name; Enter renames, Esc cancels"),
         ("Click, double-click", "Move the cursor, open"),
         ("Middle-click a folder", "Open it in a new tab"),
         ("Enter / Ctrl+PgDn on a .zip, .jar, .7z", "Browse the archive like a folder (read-only: view, copy out, Enter opens a temp copy)"),
@@ -872,9 +891,12 @@ impl App {
             }
             return Task::none();
         }
-        if self.rename.is_some() {
+        if let Some(rename) = &mut self.rename {
             if escape {
                 self.rename = None;
+            } else if self.keymap.command(&key, mods) == Some(Command::Rename) {
+                // F2 / Shift+F6 again: stem → extension → whole name.
+                rename.select(rename.part.next(&rename.text, rename.is_dir));
             }
             return Task::none();
         }
@@ -1315,14 +1337,24 @@ impl App {
         let Some(entry) = self.panel(side).current().filter(|e| !e.is_parent()) else {
             return Task::none();
         };
-        let rename = InlineRename { side, src: entry.path.clone(), text: entry.file_name().to_owned() };
+        let is_dir = entry.is_dir();
+        let mut rename = InlineRename {
+            side,
+            src: entry.path.clone(),
+            text: entry.file_name().to_owned(),
+            is_dir,
+            part: Part::initial(is_dir),
+            select: 0,
+        };
+        rename.select(Part::initial(is_dir));
         self.path_edit = None;
         self.rename = Some(rename);
-        Task::batch([text_input::focus(rename_input_id()), text_input::select_all(rename_input_id())])
+        // `SelectRange` selects the stem once the input has focus.
+        text_input::focus(rename_input_id())
     }
 
     fn commit_rename(&mut self) {
-        let Some(InlineRename { side, src, text }) = self.rename.take() else { return };
+        let Some(InlineRename { side, src, text, .. }) = self.rename.take() else { return };
         let name = text.trim();
         let Some(parent) = src.parent() else { return };
         if name.is_empty() || src.file_name().is_some_and(|n| n == name) {

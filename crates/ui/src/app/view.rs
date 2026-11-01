@@ -420,7 +420,7 @@ impl App {
         let renaming = self.rename.as_ref().filter(|r| r.side == side && r.src == entry.path);
         let mut content = Row::new().push(icon);
         content = match renaming {
-            Some(r) => content.push(
+            Some(r) => content.push(SelectRange::new(
                 text_input("", &r.text)
                     .id(rename_input_id())
                     .on_input(Message::RenameInput)
@@ -429,7 +429,10 @@ impl App {
                     .padding([1, 4])
                     .width(Length::Fill)
                     .style(theme::input),
-            ),
+                rename_input_id(),
+                r.select,
+                r.selection(),
+            )),
             None => content
                 .push(cell(stem.to_string(), Length::Fill))
                 .push(cell(ext.to_string(), Length::Fixed(COL_EXT))),

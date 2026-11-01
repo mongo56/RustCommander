@@ -232,7 +232,7 @@ pub fn input(_theme: &Theme, status: text_input::Status) -> text_input::Style {
         icon: c().muted,
         placeholder: c().muted,
         value: c().text,
-        selection: c().cursor,
+        selection: Color { a: 0.45, ..c().accent },
     }
 }
 

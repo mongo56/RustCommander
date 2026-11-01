@@ -8,6 +8,7 @@ mod icon;
 mod icon_art;
 mod keymap;
 mod hotlist;
+mod select_range;
 mod session;
 mod theme;
 mod watch;
