@@ -1101,6 +1101,7 @@ impl Runner<'_> {
         };
         if now != *expect {
             let msg = match now {
+                _ if expect.is_none() => "A file with this name was added to the archive meanwhile: not overwritten",
                 None => "It was removed from the archive since it was opened for editing: not put back",
                 Some(_) => "It changed in the archive since it was opened for editing: not overwritten",
             };
@@ -2080,6 +2081,33 @@ mod tests {
         // Not in a zip (a 7z, or a zip inside one): refused.
         let (o, _) = run_job(Job::Update { src: copy.clone(), dst: tmp.0.join("a.7z").join("x.txt"), expect: None }, Resolution::Cancel);
         assert_eq!(o.errors.len(), 1);
+    }
+
+    /// Shift+F4 in a zip: an empty file is added with `expect: None`, which
+    /// refuses to replace a file or folder that exists by then.
+    #[test]
+    fn adds_new_empty_entry() {
+        let tmp = TempDir::new("zip-new");
+        let zip = tmp.0.join("a.zip");
+        crate::vfs::tests::make_zip(&zip);
+        let empty = tmp.0.join("new.txt");
+        fs::write(&empty, b"").unwrap();
+        let entry = zip.join("sub").join("new.txt");
+        let (o, _) = run_job(Job::Update { src: empty.clone(), dst: entry.clone(), expect: None }, Resolution::Cancel);
+        assert!(o.errors.is_empty() && !o.cancelled, "{:?}", o.errors);
+        assert_eq!(zip_read(&entry), b"");
+        assert_eq!(entry_stamp(&entry).unwrap().map(|s| s.0), Some(0));
+        assert_eq!(zip_names(&zip).len(), 6);
+
+        // It exists by now (e.g. added by another instance): not replaced.
+        let before = fs::read(&zip).unwrap();
+        fs::write(&empty, b"x").unwrap();
+        let (o, _) = run_job(Job::Update { src: empty.clone(), dst: entry.clone(), expect: None }, Resolution::Overwrite);
+        assert!(o.errors.len() == 1 && o.errors[0].1.contains("added to the archive meanwhile"), "{:?}", o.errors);
+        // A folder of that name: refused, the zip untouched.
+        let (o, _) = run_job(Job::Update { src: empty, dst: zip.join("sub").join("deep"), expect: None }, Resolution::Overwrite);
+        assert_eq!(o.errors.len(), 1, "{:?}", o.errors);
+        assert_eq!(fs::read(&zip).unwrap(), before);
     }
 
     #[test]

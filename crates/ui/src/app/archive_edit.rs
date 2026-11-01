@@ -7,6 +7,9 @@
 //! any more, and on quit (after a last check). Copies from read-only
 //! archives (7z, tar, gz, archives inside archives) open with a note that
 //! changes aren't saved.
+//!
+//! Shift+F4 in a zip adds the new file empty (also a `Job::Update`, of an
+//! empty temp file) and then edits it like F4.
 
 use super::*;
 use rc_core::ops::Stamp;
@@ -67,6 +70,10 @@ pub(super) struct ArchiveEdits {
     edits: Vec<ArchiveEdit>,
     /// A `Tick` is pending.
     ticking: bool,
+    /// Shift+F4 in an archive: jobs adding a new empty file (job id, the
+    /// file in the archive, the temp folder of the empty source), edited
+    /// once added.
+    creating: Vec<(u64, PathBuf, PathBuf)>,
 }
 
 fn name_of(path: &Path) -> String {
@@ -110,6 +117,47 @@ impl App {
             },
             move |(entry, result)| Message::ArchiveEdit(EditMsg::Extracted(entry, writable, result)),
         )
+    }
+
+    /// Shift+F4 inside an archive: `entry` (typed as `name`) is opened if it
+    /// exists, else added as an empty file by a `Job::Update` (which refuses
+    /// if one appears meanwhile) and opened once that's done.
+    pub(super) fn new_in_archive(&mut self, entry: PathBuf, name: &str) -> Task<Message> {
+        if vfs::archive_writable(&entry) != Some(true) {
+            let msg = "Read-only archive (only zips, not inside archives, can be changed): can't create files here";
+            self.status = Some((msg.into(), Tone::Info));
+            return Task::none();
+        }
+        match vfs::open(&entry).and_then(|v| v.stat(&entry)) {
+            Ok(Some(e)) if e.is_dir() => {
+                self.status = Some((format!("Can't create {name}: a folder with this name exists"), Tone::Error));
+                return Task::none();
+            }
+            Ok(Some(_)) => return self.edit_in_archive(entry),
+            Ok(None) => {}
+            Err(e) => {
+                self.status = Some((format!("Can't create {name}: {e}"), Tone::Error));
+                return Task::none();
+            }
+        }
+        // The empty source, in a `copy-*` folder (the startup cleanup
+        // removes ones a crash left behind).
+        let stage = vfs::temp_root().join(format!("copy-{}-new{}", std::process::id(), self.next_job_id));
+        let src = stage.join(entry.file_name().unwrap_or_default());
+        let made = std::fs::create_dir_all(&stage).and_then(|_| std::fs::File::create(&src).map(drop));
+        if let Err(e) = made {
+            let _ = std::fs::remove_dir_all(&stage);
+            self.status = Some((format!("Can't create {name}: {e}"), Tone::Error));
+            return Task::none();
+        }
+        let first = Path::new(name).components().next().map(|c| c.as_os_str().to_string_lossy().into_owned());
+        let job = Job::Update { src, dst: entry.clone(), expect: None };
+        let task = self.start_job(job, format!("Creating {name}"));
+        let job = self.jobs.last_mut().expect("job just started");
+        job.source_side = None;
+        job.focus = first.map(|f| (self.active, f));
+        self.archive_edits.creating.push((job.id, entry, stage));
+        task
     }
 
     pub(super) fn archive_edit_update(&mut self, msg: EditMsg) -> Task<Message> {
@@ -239,10 +287,19 @@ impl App {
         Task::batch(tasks)
     }
 
-    /// A job finished: if it put back an edited copy, notes the new state.
-    pub(super) fn archive_edit_job_done(&mut self, id: u64, outcome: &Outcome) {
+    /// A job finished: if it put back an edited copy, notes the new state;
+    /// if it added a new file (Shift+F4), opens that.
+    pub(super) fn archive_edit_job_done(&mut self, id: u64, outcome: &Outcome) -> Task<Message> {
+        if let Some(i) = self.archive_edits.creating.iter().position(|(j, ..)| *j == id) {
+            let (_, entry, stage) = self.archive_edits.creating.remove(i);
+            let _ = std::fs::remove_dir_all(&stage);
+            if outcome.errors.is_empty() && !outcome.cancelled {
+                return self.edit_in_archive(entry);
+            }
+            return Task::none();
+        }
         let Some(edit) = self.archive_edits.edits.iter_mut().find(|e| e.job.is_some_and(|(j, _)| j == id)) else {
-            return;
+            return Task::none();
         };
         let (_, state) = edit.job.take().expect("matched a job");
         // Not retried until the copy changes again.
@@ -261,6 +318,7 @@ impl App {
             }
             self.status = Some((format!("Saved {name} into {archive}"), Tone::Success));
         }
+        Task::none()
     }
 
     /// On quit: puts back copies saved since the last check (waiting for

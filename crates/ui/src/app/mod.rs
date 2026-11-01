@@ -838,7 +838,7 @@ impl App {
             Message::HotlistBack => self.hotlist_back(),
             Message::HistoryPick(i) => return self.history_pick(i),
             Message::PalettePick(i) => return self.palette_pick(i),
-            Message::Job(id, event) => self.on_job_event(id, event),
+            Message::Job(id, event) => return self.on_job_event(id, event),
             Message::JobPause(id) => {
                 if let Some(job) = self.job(id) {
                     let control = &job.handle.control;
@@ -1126,8 +1126,10 @@ impl App {
         // be edited in place. `bool` = allowed in a zip.
         let refused = match cmd {
             // Files in archives are edited as temp copies (`archive_edit`).
-            Edit if !remote::is_remote(&self.panel(active).path) => None,
-            Edit | EditNew => Some(("edit files", false)),
+            Edit | EditNew if remote::is_remote(&self.panel(active).path) => Some(("edit files", false)),
+            Edit => None,
+            // A new file in an archive is added, then edited as a temp copy.
+            EditNew => Some(("create files", true)),
             MultiRename => Some(("multi-rename", false)),
             MakeDir => Some(("create folders", true)),
             Rename => Some(("rename", true)),
@@ -1721,6 +1723,9 @@ impl App {
                     return Task::none();
                 }
                 let path = self.panel(self.active).path.join(name);
+                if vfs::in_archive(&path) {
+                    return self.new_in_archive(path, name);
+                }
                 let created = !path.exists();
                 if created {
                     let made = path
@@ -2018,7 +2023,7 @@ impl App {
         Task::run(rx, move |event| Message::Job(id, event))
     }
 
-    fn on_job_event(&mut self, id: u64, event: JobEvent) {
+    fn on_job_event(&mut self, id: u64, event: JobEvent) -> Task<Message> {
         match event {
             JobEvent::Progress(progress) => {
                 if let Some(job) = self.job(id) {
@@ -2031,7 +2036,7 @@ impl App {
                 }
             }
             JobEvent::Finished(outcome) => {
-                let Some(pos) = self.jobs.iter().position(|j| j.id == id) else { return };
+                let Some(pos) = self.jobs.iter().position(|j| j.id == id) else { return Task::none() };
                 let job = self.jobs.remove(pos);
                 if let Some(side) = job.source_side.filter(|_| outcome.errors.is_empty() && !outcome.cancelled && outcome.skipped == 0) {
                     self.panel_mut(side).deselect_all();
@@ -2047,10 +2052,12 @@ impl App {
                     }
                 }
                 self.status = Some(summarize(job.done_verb, &outcome));
-                self.archive_edit_job_done(id, &outcome);
+                let task = self.archive_edit_job_done(id, &outcome);
                 self.after_change();
+                return task;
             }
         }
+        Task::none()
     }
 
     fn job(&mut self, id: u64) -> Option<&mut RunningJob> {
