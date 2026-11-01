@@ -2081,7 +2081,7 @@ impl App {
             return false;
         }
         let msg = match zip_ok {
-            true => format!("Read-only archive (only zips and tars, not inside archives, can be changed): can't {what} here"),
+            true => format!("Read-only archive (only zips and tars can be changed): can't {what} here"),
             false => format!("Can't {what} inside archives"),
         };
         self.status = Some((msg, Tone::Info));
@@ -2637,7 +2637,7 @@ fn archive_transfer_problem(is_move: bool, sources: &[PathBuf], target: &Path) -
     let into = vfs::split_archive(target);
     match (&from, &into) {
         (_, Some((file, _))) if vfs::archive_writable(file) == Some(false) => {
-            Some("Read-only archive (only zips and tars, not inside archives, can be changed)")
+            Some("Read-only archive (only zips and tars can be changed)")
         }
         // Into another (writable) archive is fine: extracted, then packed.
         (Some((a, _)), _) if is_move && vfs::archive_writable(a) == Some(false) => {

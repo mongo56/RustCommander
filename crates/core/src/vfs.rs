@@ -265,9 +265,22 @@ fn mount(parent: &Path, logical: &Path) -> Option<PathBuf> {
     Some(disk)
 }
 
+/// Forgets the nested archive `logical` (and any mounted inside it) after
+/// it was changed, so it's extracted again when next used.
+pub(crate) fn unmount(logical: &Path) {
+    let mut mounts = MOUNTS.lock().unwrap_or_else(|e| e.into_inner());
+    mounts.retain(|(l, ..)| {
+        let gone = l.starts_with(logical);
+        if gone {
+            forget(l);
+        }
+        !gone
+    });
+}
+
 /// Where the archive `file` (a logical path) is on disk: itself, or the
 /// temp copy of a nested one.
-fn on_disk(file: &Path) -> io::Result<PathBuf> {
+pub(crate) fn on_disk(file: &Path) -> io::Result<PathBuf> {
     if file.is_file() {
         return Ok(file.to_path_buf());
     }
@@ -291,11 +304,15 @@ pub fn in_archive(path: &Path) -> bool {
 }
 
 /// For an archive or a path inside one: whether the archive can be changed
-/// (zip and tar yes, 7z no, nor ones inside other archives). `None` for
+/// (zip and tar yes, 7z and gz no). One inside another archive can be
+/// changed if that one can (it's rewritten and then put back). `None` for
 /// local paths.
 pub fn archive_writable(path: &Path) -> Option<bool> {
     let (file, _) = split_archive(path)?;
-    Some(file.file_name().and_then(format_of).is_some_and(Format::writable) && file.is_file())
+    if !file.file_name().and_then(format_of).is_some_and(Format::writable) {
+        return Some(false);
+    }
+    Some(file.is_file() || file.parent().and_then(archive_writable) == Some(true))
 }
 
 /// The path inside its archive of `path` (`/`-separated, as typed), with
@@ -1113,7 +1130,7 @@ impl Vfs for Archive {
     }
 
     fn writable(&self) -> bool {
-        self.format.writable() && self.disk == self.file
+        self.format.writable() && (self.disk == self.file || archive_writable(&self.file) == Some(true))
     }
 }
 
@@ -1476,7 +1493,7 @@ pub(crate) mod tests {
         assert_eq!(read_all(&*vfs, std::slice::from_ref(&deep)), [(0, b"first".to_vec())]);
         assert_eq!(fs::read(extract_temp(&deep).unwrap()).unwrap(), b"first");
         // Read-only; a folder named like an archive stays a folder.
-        assert!(!vfs.writable() && archive_writable(&deep) == Some(false));
+        assert!(vfs.writable() && archive_writable(&deep) == Some(true));
         assert_eq!(split_archive(&outer.join("pack/folder.zip/x")), Some((outer.clone(), PathBuf::from("pack/folder.zip/x"))));
         let _ = fs::remove_dir_all(temp_path(&outer.join("pack")).parent().unwrap());
         let _ = fs::remove_dir_all(temp_path(&deep).parent().unwrap().parent().unwrap());

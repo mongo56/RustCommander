@@ -976,7 +976,7 @@ impl Runner<'_> {
         match vfs::open(archive) {
             Ok(v) if v.writable() => Some(v),
             Ok(_) => {
-                self.fail_msg(archive, "Only zip and tar archives can be changed (7z, gz and archives inside archives are read-only)");
+                self.fail_msg(archive, "Only zip and tar archives can be changed (7z and gz are read-only)");
                 None
             }
             Err(e) => {
@@ -991,12 +991,12 @@ impl Runner<'_> {
     /// Conflicts are asked first, then the archive is rewritten once.
     /// Returns the transfers that were packed completely.
     fn pack(&mut self, archive: &Path, transfers: &[Transfer], is_move: bool) -> Vec<usize> {
-        // Not 7z, tar, ... nor archives inside archives (temp copies).
+        // Not 7z or gz, nor archives inside those.
         if vfs::archive_writable(archive) == Some(false) {
-            self.fail_msg(archive, "Only zip and tar archives can be changed (not ones inside other archives)");
+            self.fail_msg(archive, "Only zip and tar archives can be changed (not 7z or gz, nor ones inside those)");
             return Vec::new();
         }
-        let index = match archive.exists() {
+        let index = match archive_exists(archive) {
             true => match self.open_writable(archive) {
                 Some(v) => Some(v),
                 None => return Vec::new(),
@@ -1088,7 +1088,7 @@ impl Runner<'_> {
             return;
         };
         if vfs::archive_writable(&archive) == Some(false) {
-            self.fail_msg(&archive, "Only zip and tar archives can be changed (not ones inside other archives)");
+            self.fail_msg(&archive, "Only zip and tar archives can be changed (not 7z or gz, nor ones inside those)");
             return;
         }
         let Some(index) = self.open_writable(&archive) else { return };
@@ -1119,10 +1119,10 @@ impl Runner<'_> {
     /// them in a zip too.
     fn copy_between_archives(&mut self, archive: &Path, transfers: &[Transfer], is_move: bool) {
         if vfs::archive_writable(archive) == Some(false) {
-            self.fail_msg(archive, "Only zip and tar archives can be changed (not 7z, gz or ones inside other archives)");
+            self.fail_msg(archive, "Only zip and tar archives can be changed (not 7z or gz, nor ones inside those)");
             return;
         }
-        if archive.exists() && self.open_writable(archive).is_none() {
+        if archive_exists(archive) && self.open_writable(archive).is_none() {
             return;
         }
         let stage = vfs::temp_root().join(format!("copy-{}-{}", std::process::id(), unique_id()));
@@ -1507,7 +1507,15 @@ impl Runner<'_> {
     ) -> io::Result<bool> {
         self.progress.current = Some(archive.to_path_buf());
         self.report(true);
-        let mut edit = Rewrite::begin(archive)?;
+        // An archive inside another one (mounted as a temp copy): a copy of
+        // that is changed, then put back into the outer archive.
+        let nested = !archive.exists() && archive_exists(archive);
+        let stage = match nested {
+            true => Some(Stage::copy_of(archive)?),
+            false => None,
+        };
+        let target = stage.as_ref().map_or_else(|| archive.to_path_buf(), |s| s.file.clone());
+        let mut edit = Rewrite::begin(&target)?;
         let control = self.control;
         if !edit.copy_existing(edits, &mut || control.checkpoint())? {
             return Ok(false);
@@ -1553,7 +1561,37 @@ impl Runner<'_> {
         self.progress.current = Some(archive.to_path_buf());
         self.report(true);
         edit.commit()?;
-        Ok(true)
+        match stage {
+            Some(stage) => Ok(self.put_back(archive, &stage.file)),
+            None => Ok(true),
+        }
+    }
+
+    /// Replaces the nested archive `archive` (a logical path) in the archive
+    /// holding it with the changed copy `changed`. False if that failed
+    /// (recorded; nothing changed).
+    fn put_back(&mut self, archive: &Path, changed: &Path) -> bool {
+        let found = archive.parent().and_then(vfs::split_archive).map(|(outer, _)| outer);
+        let Some((outer, inner)) = found.and_then(|o| inner_of(&o, archive).filter(|i| !i.is_empty()).map(|i| (o, i))) else {
+            return self.fail_msg(archive, "Not an archive inside another archive");
+        };
+        if self.open_writable(&outer).is_none() {
+            return false;
+        }
+        let meta = match fs::metadata(changed) {
+            Ok(m) => m,
+            Err(e) => return self.fail(changed, e),
+        };
+        // Not through `pack`: its checks would see the mounted archive, not
+        // the entry holding it.
+        let saved = self.snapshot();
+        let edits = Edits { remove: vec![inner.clone()], ..Edits::default() };
+        let add = Add::File { src: changed.to_path_buf(), inner, modified: Some(SystemTime::now()), size: meta.len(), transfer: 0 };
+        let done = self.rewrite(&outer, &edits, &[add], &[], saved).is_some_and(|failed| failed.is_empty());
+        // Counted as one change, not as one more file.
+        (self.progress.done_items, self.progress.done_bytes, self.outcome.skipped) = saved;
+        vfs::unmount(archive);
+        done
     }
 
     /// Removes a moved source after it was copied, without counting it as
@@ -1668,6 +1706,12 @@ fn dst_archive(transfers: &[Transfer]) -> Option<PathBuf> {
 
 /// `path` inside `archive` as a `/`-separated inner path (`""` for the
 /// archive itself). Works for archives that don't exist yet.
+/// Whether the archive `archive` exists: on disk, or mounted inside
+/// another archive (see [`vfs::split_archive`]).
+fn archive_exists(archive: &Path) -> bool {
+    archive.exists() || vfs::on_disk(archive).is_ok()
+}
+
 fn inner_of(archive: &Path, path: &Path) -> Option<String> {
     let rest = path.strip_prefix(archive).ok()?;
     let parts: Vec<String> = rest.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
@@ -1675,6 +1719,31 @@ fn inner_of(archive: &Path, path: &Path) -> Option<String> {
 }
 
 /// A number not returned before in this process (for temp folder names).
+/// A temp folder (`copy-*` in [`vfs::temp_root`]) holding a copy of a
+/// nested archive while it's changed; removed when dropped.
+struct Stage {
+    dir: PathBuf,
+    file: PathBuf,
+}
+
+impl Stage {
+    /// Copies the temp copy of the nested archive `archive`.
+    fn copy_of(archive: &Path) -> io::Result<Stage> {
+        let name = archive.file_name().ok_or_else(|| io::Error::other("Invalid archive path"))?;
+        let dir = vfs::temp_root().join(format!("copy-nested-{}-{}", std::process::id(), unique_id()));
+        let stage = Stage { file: dir.join(name), dir };
+        fs::create_dir_all(&stage.dir)?;
+        fs::copy(vfs::on_disk(archive)?, &stage.file)?;
+        Ok(stage)
+    }
+}
+
+impl Drop for Stage {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
 fn unique_id() -> u64 {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     NEXT.fetch_add(1, Ordering::Relaxed)
@@ -2356,7 +2425,7 @@ mod tests {
     }
 
     #[test]
-    fn nested_archives_are_read_only() {
+    fn writes_into_nested_archives() {
         let tmp = TempDir::new("nested");
         let src = tree(&tmp.0);
         let inner = tmp.0.join("inner.zip");
@@ -2365,18 +2434,64 @@ mod tests {
         assert!(o.errors.is_empty(), "{:?}", o.errors);
         let outer = tmp.0.join("outer.zip");
         let nested = outer.join("inner.zip");
-        let before = fs::read(&outer).unwrap();
+        assert_eq!(vfs::archive_writable(&nested), Some(true));
+        let ok = |job: Job| {
+            let what = format!("{job:?}");
+            let (o, _) = run_job(job, Resolution::OverwriteAll);
+            assert!(o.errors.is_empty() && !o.cancelled, "{what}: {:?}", o.errors);
+            o
+        };
 
-        // Copy in, delete, new folder: refused, nothing changes.
+        // Copy in, rename, new folder, delete: the inner zip is rewritten
+        // and put back into the outer one.
         let ts = plan_transfer(&[src.join("a.txt")], &nested).unwrap();
         assert_eq!(ts[0].dst, nested.join("a.txt"));
-        let (o, _) = run_job(Job::Copy(ts), Resolution::OverwriteAll);
-        assert_eq!(o.errors.len(), 1);
-        let (o, _) = run_job(Job::Delete { paths: vec![nested.join("a.txt")], to_trash: false }, Resolution::Cancel);
-        assert_eq!(o.errors.len(), 1);
-        let (o, _) = run_job(Job::MakeDir(nested.join("new")), Resolution::Cancel);
+        let o = ok(Job::Copy(ts));
+        assert_eq!(o.done_items, 1);
+        assert_eq!(zip_read(&nested.join("a.txt")), b"aaa");
+        ok(Job::Rename { from: nested.join("a.txt"), to: nested.join("b.txt") });
+        ok(Job::MakeDir(nested.join("new")));
+        ok(Job::Delete { paths: vec![nested.join("Readme.md")], to_trash: false });
+        assert_eq!(zip_names(&nested), ["b.txt", "new", "sub", "sub/deep", "sub/deep/x.txt"]);
+        assert_eq!(zip_names(&outer), ["inner.zip"]);
+        // The outer zip itself holds the change (read without the mount).
+        let mut z = zip::ZipArchive::new(File::open(&outer).unwrap()).unwrap();
+        let mut bytes = Vec::new();
+        z.by_name("inner.zip").unwrap().read_to_end(&mut bytes).unwrap();
+        let mut z = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let mut b = String::new();
+        z.by_name("b.txt").unwrap().read_to_string(&mut b).unwrap();
+        assert_eq!(b, "aaa");
+
+        // F4 save-back into it.
+        let entry = nested.join("b.txt");
+        let stamp = entry_stamp(&entry).unwrap();
+        let copy = tmp.0.join("edited.txt");
+        fs::write(&copy, b"edited").unwrap();
+        ok(Job::Update { src: copy, dst: entry.clone(), expect: stamp });
+        assert_eq!(zip_read(&entry), b"edited");
+
+        // Refused inside: both untouched.
+        let before = fs::read(&outer).unwrap();
+        let (o, _) = run_job(Job::MakeDir(nested.join("NEW")), Resolution::Cancel);
         assert_eq!(o.errors.len(), 1);
         assert_eq!(fs::read(&outer).unwrap(), before);
+        // The outer zip can't be replaced (read-only file): an error, both
+        // zips as they were, no temp files left.
+        let writable = fs::metadata(&outer).unwrap().permissions();
+        let mut perms = writable.clone();
+        perms.set_readonly(true);
+        fs::set_permissions(&outer, perms).unwrap();
+        let (o, _) = run_job(Job::MakeDir(nested.join("other")), Resolution::Cancel);
+        fs::set_permissions(&outer, writable).unwrap();
+        assert_eq!(o.errors.len(), 1, "{:?}", o.errors);
+        assert_eq!(fs::read(&outer).unwrap(), before);
+        assert_eq!(zip_names(&nested), ["b.txt", "new", "sub", "sub/deep", "sub/deep/x.txt"]);
+        let names = fs::read_dir(&tmp.0).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned());
+        assert!(!names.into_iter().any(|n| n.contains(".rctmp")));
+        let staged = fs::read_dir(vfs::temp_root()).into_iter().flatten().flatten();
+        let prefix = format!("copy-nested-{}-", std::process::id());
+        assert!(!staged.into_iter().any(|e| e.file_name().to_string_lossy().starts_with(&prefix)));
 
         // Reading out of it works: copy out and unpack.
         let out = tmp.0.join("out");
@@ -2385,7 +2500,7 @@ mod tests {
         assert_eq!(fs::read(out.join("x/deep/x.txt")).unwrap(), b"deep file");
         let (o, _) = run_job(Job::Unpack { archives: vec![nested.clone()], target: out.join("all") }, Resolution::Cancel);
         assert!(o.errors.is_empty(), "{:?}", o.errors);
-        assert_eq!(fs::read(out.join("all/Readme.md")).unwrap(), vec![b'r'; 5000]);
+        assert_eq!(fs::read(out.join("all/b.txt")).unwrap(), b"edited");
         let _ = fs::remove_dir_all(vfs::temp_path(&nested).parent().unwrap());
     }
 
