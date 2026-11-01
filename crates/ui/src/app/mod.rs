@@ -367,6 +367,7 @@ pub enum Message {
     ScrollTo(usize, usize, usize),
     Drive(usize, String),
     DriveMiddle(usize, String),
+    DriveRight(usize, String),
     Sort(usize, SortKey),
     Resized(Size),
     CloseRequested,
@@ -861,6 +862,11 @@ impl App {
                 self.drives = rc_platform::roots();
                 return self.open_tab(side, PathBuf::from(drive), false);
             }
+            Message::DriveRight(side, drive) => {
+                self.leave_edits();
+                self.active = side;
+                return self.drive_context_menu(side, drive);
+            }
             Message::Sort(side, key) => {
                 self.active = side;
                 self.panel_mut(side).sort_by(key);
@@ -1071,6 +1077,7 @@ impl App {
         ("Shift+Up/Down/PgUp/PgDn/Home/End", "Move and select the range from the cursor's starting point"),
         ("Thumbnail view (Ctrl+Shift+F5)", "Arrows move in the grid (Shift+arrows select), PgUp/PgDn by a screen; Enter, Space/Ins, quick search, clicks and dragging work as in the list. Picture size: thumbnail_size in config.toml"),
         ("Middle-click a folder or drive", "Open it in a new tab"),
+        ("Right-click a drive", "Windows menu for the drive"),
         ("Enter / Ctrl+PgDn on a .zip, .7z, .rar, .tar, .tar.gz, .gz, ...", "Browse the archive like a folder: view, copy out, Enter opens a temp copy; in a zip also copy/move in (also from other archives), F7, F2, F8 (others are read-only)"),
         ("Ctrl+F, then Enter", "Connect to an SFTP/FTP/FTPS server: browse, F3 view, F5/F6 download and upload, F7, F2, F8 work there; Ctrl+Shift+F disconnects"),
         ("Right-click", "Explorer context menu"),
@@ -2228,6 +2235,25 @@ impl App {
         let items = if background { Vec::new() } else { self.target_paths(side) };
         // Items in archives: the menu acts on temp copies.
         let Some((folder, items)) = self.shell_items_extracted(side, items) else { return Task::none() };
+        let extended = self.modifiers.shift();
+
+        window::get_oldest()
+            .and_then(move |id| {
+                let (folder, items) = (folder.clone(), items.clone());
+                window::run_with_handle(id, move |handle| {
+                    rc_platform::show_context_menu(native_handle(&handle), &folder, &items, extended)
+                })
+            })
+            .map(move |result| Message::ContextDone(side, result))
+    }
+
+    /// The shell menu of a drive root (right-click on a drive button): the
+    /// drive is an item of the "This PC" folder, which gives Properties,
+    /// Eject, Format, ...
+    fn drive_context_menu(&mut self, side: usize, drive: String) -> Task<Message> {
+        const THIS_PC: &str = "::{20D04FE0-3AEA-1069-A2D8-08002B30309D}";
+        let folder = PathBuf::from(THIS_PC);
+        let items = vec![PathBuf::from(drive)];
         let extended = self.modifiers.shift();
 
         window::get_oldest()

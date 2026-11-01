@@ -269,6 +269,7 @@ impl App {
                     .style(theme::drive(current)),
             )
             .on_middle_press(Message::DriveMiddle(side, drive.clone()))
+            .on_right_press(Message::DriveRight(side, drive.clone()))
             .into()
         }))
         .spacing(2);
