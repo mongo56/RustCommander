@@ -25,6 +25,9 @@ pub struct Session {
     /// Share of the width the left panel gets; older files lack it.
     #[serde(default = "default_split")]
     pub split: f32,
+    /// Widths of the Ext / Size / Modified columns; older files lack them.
+    #[serde(default = "default_columns")]
+    pub columns: [f32; 3],
     /// Compare-folders options from older versions, moved to `config.toml`
     /// on start (`main`). Written back only while that move failed, so
     /// they aren't lost.
@@ -41,6 +44,13 @@ pub struct Session {
 
 fn default_split() -> f32 {
     0.5
+}
+
+/// Default widths of the Ext / Size / Modified columns.
+pub const DEFAULT_COLUMNS: [f32; 3] = [60.0, 80.0, 120.0];
+
+fn default_columns() -> [f32; 3] {
+    DEFAULT_COLUMNS
 }
 
 /// [`rc_platform::Placement`] in the session file.
@@ -176,12 +186,14 @@ mod tests {
             compare: Some(CompareState { by_content: true, ignore_date: false, subfolders: true }),
             recent_commands: vec!["cm_MkDir".into(), "cm_Copy".into()],
             split: 0.3,
+            columns: [45.0, 95.0, 150.0],
             editor: r#""my editor.exe" -n %1"#.into(),
         };
         let text = toml::to_string_pretty(&session).unwrap();
         let back: Session = toml::from_str(&text).unwrap();
         assert_eq!(back.active, 1);
         assert_eq!(back.split, 0.3);
+        assert_eq!(back.columns, [45.0, 95.0, 150.0]);
         assert_eq!(back.hotlist, session.hotlist);
         assert_eq!(back.recent_commands, session.recent_commands);
         // Compare options not yet moved to config.toml are kept...
@@ -219,6 +231,7 @@ mod tests {
         let folders = [r"C:\Users", r"D:\Work"].map(|p| HotItem::Folder(PathBuf::from(p)));
         assert_eq!(session.hotlist, folders);
         assert_eq!(session.split, 0.5);
+        assert_eq!(session.columns, DEFAULT_COLUMNS);
         // Saved again, plain folders keep the old form.
         let saved = toml::to_string_pretty(&session).unwrap();
         assert!(saved.contains("Users"), "{saved}");

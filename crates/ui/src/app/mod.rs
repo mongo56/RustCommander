@@ -39,6 +39,11 @@ use std::time::{Duration, Instant};
 /// Width of the divider between the panels, and the narrowest a panel gets.
 const SPLIT_W: f32 = 5.0;
 const MIN_PANEL: f32 = 200.0;
+/// Narrowest the Ext / Size / Modified columns get, and the narrowest the
+/// name column is kept (columns that would squeeze it further are hidden).
+const MIN_COLUMNS: [f32; 3] = [30.0, 50.0, 70.0];
+const MAX_COLUMN: f32 = 400.0;
+const MIN_NAME: f32 = 100.0;
 const ROW_H: f32 = 22.0;
 /// Approximate height of everything that isn't file rows (tabs, headers,
 /// footers, function-key bar). Only used to size PageUp/PageDown jumps.
@@ -120,6 +125,12 @@ pub struct App {
     split_drag: bool,
     /// When the divider was last pressed (double click resets it).
     split_click: Option<Instant>,
+    /// Widths of the Ext / Size / Modified columns, shared by all panels.
+    columns: [f32; 3],
+    /// A column header edge is being dragged.
+    column_drag: Option<ColumnDrag>,
+    /// Column edge last pressed and when (double click resets the width).
+    column_click: Option<(usize, Instant)>,
     /// Row under the mouse while dragging: (side, index).
     hover: Option<(usize, usize)>,
     modifiers: keyboard::Modifiers,
@@ -274,6 +285,26 @@ struct QuickSearch {
 }
 
 #[derive(Debug)]
+/// Dragging the edge in front of a column of the panel header: `prior` is the
+/// fixed column on its left that gives or takes the width (none: the name column does).
+#[derive(Clone)]
+struct ColumnDrag {
+    side: usize,
+    col: usize,
+    prior: Option<usize>,
+    /// Mouse x at the first move; widths are changed relative to it.
+    x0: Option<f32>,
+    start: [f32; 3],
+}
+
+fn clamp_columns(widths: [f32; 3]) -> [f32; 3] {
+    let mut out = widths;
+    for (i, w) in out.iter_mut().enumerate() {
+        *w = if w.is_finite() { w.clamp(MIN_COLUMNS[i], MAX_COLUMN) } else { session::DEFAULT_COLUMNS[i] };
+    }
+    out
+}
+
 struct Drag {
     side: usize,
     /// Where the drag started; set by the first mouse move after the press.
@@ -323,6 +354,8 @@ pub enum Message {
     MouseMoved(Point),
     /// Press on the divider between the panels / double click on it.
     SplitPress,
+    /// Press on the edge in front of a column (0 = Ext, 1 = Size, 2 = Modified) in a panel's header.
+    ColumnPress(usize, usize),
     /// Mouse button released; `true` for the right button.
     MouseUp(bool),
     DragOutDone(usize, Result<DragOutcome, String>),
@@ -462,6 +495,9 @@ impl App {
             split: session.as_ref().map_or(0.5, |s| s.split).clamp(0.0, 1.0),
             split_drag: false,
             split_click: None,
+            columns: clamp_columns(session.as_ref().map_or(session::DEFAULT_COLUMNS, |s| s.columns)),
+            column_drag: None,
+            column_click: None,
             hover: None,
             modifiers: keyboard::Modifiers::default(),
             icons: RefCell::new(HashMap::new()),
@@ -544,7 +580,7 @@ impl App {
         // Mouse moves re-render the window, so only listen while a drag may
         // be starting or in progress, or the viewer shows a document (mouse
         // selection).
-        if self.drag.is_some() || self.split_drag || self.viewer_tracks_mouse() {
+        if self.drag.is_some() || self.split_drag || self.column_drag.is_some() || self.viewer_tracks_mouse() {
             subs.push(event::listen_with(|event, _status, _window| match event {
                 Event::Mouse(mouse::Event::CursorMoved { position }) => Some(Message::MouseMoved(position)),
                 _ => None,
@@ -719,6 +755,7 @@ impl App {
                     self.split = self.left_width() / room;
                     self.sync_grids();
                 }
+                self.column_dragged(position.x);
                 let pan = self.viewer_mouse_moved();
                 return Task::batch([pan, self.update_drag()]);
             }
@@ -734,8 +771,20 @@ impl App {
                     self.split_drag = true;
                 }
             }
+            Message::ColumnPress(side, col) => {
+                let now = Instant::now();
+                if matches!(self.column_click, Some((c, t)) if c == col && now - t < DOUBLE_CLICK) {
+                    self.column_click = None;
+                    self.column_drag = None;
+                    self.columns[col] = session::DEFAULT_COLUMNS[col];
+                } else {
+                    self.column_click = Some((col, now));
+                    self.column_press(side, col);
+                }
+            }
             Message::MouseUp(right) => {
                 self.split_drag = false;
+                self.column_drag = None;
                 if !right {
                     self.viewer_release();
                 }
@@ -2648,6 +2697,7 @@ impl App {
             compare: self.compare_unsaved,
             recent_commands: self.recent_commands.iter().map(|c| c.id().to_owned()).collect(),
             split: self.split,
+            columns: self.columns,
             window: self.placement.map(Into::into),
             editor: String::new(),
         }

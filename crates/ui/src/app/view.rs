@@ -11,9 +11,6 @@ use iced::widget::{
 use iced::{Alignment, Element, Length, Padding, Vector};
 use rc_core::format;
 
-const COL_EXT: f32 = 60.0;
-const COL_SIZE: f32 = 80.0;
-const COL_DATE: f32 = 120.0;
 const ICON: f32 = 16.0;
 
 /// Which optional columns fit a panel of a given width (narrow panels drop
@@ -26,8 +23,22 @@ struct Columns {
 }
 
 impl Columns {
-    fn for_width(width: f32) -> Self {
-        Self { date: width >= 480.0, ext: width >= 380.0, size: width >= 260.0 }
+    /// Room left for the name column when these columns are shown.
+    fn name_room(width: f32, widths: &[f32; 3], shown: [bool; 3]) -> f32 {
+        let fixed = (0..3).filter(|&i| shown[i]).fold(0.0, |sum, i| sum + widths[i] + 10.0);
+        width - 20.0 - ICON - 10.0 - fixed
+    }
+
+    fn for_width(width: f32, widths: &[f32; 3]) -> Self {
+        let fits = |shown| Self::name_room(width, widths, shown) >= MIN_NAME;
+        let size = width >= 260.0 && fits([false, true, false]);
+        let ext = size && width >= 380.0 && fits([true, true, false]);
+        let date = ext && width >= 480.0 && fits([true, true, true]);
+        Self { date, ext, size }
+    }
+
+    fn shown(&self) -> [bool; 3] {
+        [self.ext, self.size, self.date]
     }
 }
 
@@ -103,6 +114,43 @@ impl App {
             .on_press(Message::SplitPress)
             .interaction(mouse::Interaction::ResizingHorizontally)
             .into()
+    }
+
+    /// Press on the edge in front of column `col`: start resizing it.
+    pub(super) fn column_press(&mut self, side: usize, col: usize) {
+        let shown = Columns::for_width(self.panel_width(side), &self.columns).shown();
+        let visible: Vec<usize> = (0..3).filter(|&i| shown[i]).collect();
+        let Some(pos) = visible.iter().position(|&i| i == col) else { return };
+        let prior = if pos == 0 { None } else { Some(visible[pos - 1]) };
+        self.column_drag = Some(ColumnDrag { side, col, prior, x0: None, start: self.columns });
+    }
+
+    /// Mouse moved to window x while an edge is dragged. Dragging right
+    /// moves the edge right: the column on its left grows and the one on
+    /// its right shrinks (the name column on the left takes up the change
+    /// for the first edge).
+    pub(super) fn column_dragged(&mut self, x: f32) {
+        let Some(mut d) = self.column_drag.take() else { return };
+        let x0 = *d.x0.get_or_insert(x);
+        let dx = x - x0;
+        let (col, start) = (d.col, d.start);
+        match d.prior {
+            None => {
+                let shown = Columns::for_width(self.panel_width(d.side), &start).shown();
+                let room = Columns::name_room(self.panel_width(d.side), &start, shown) - MIN_NAME;
+                let max = (start[col] + room.max(0.0)).min(MAX_COLUMN).max(MIN_COLUMNS[col]);
+                self.columns[col] = (start[col] - dx).clamp(MIN_COLUMNS[col], max).round();
+            }
+            Some(p) => {
+                let lo = -(start[p] - MIN_COLUMNS[p]).max(0.0);
+                let lo = lo.max(-(MAX_COLUMN - start[col]).max(0.0));
+                let hi = (start[col] - MIN_COLUMNS[col]).max(0.0).min((MAX_COLUMN - start[p]).max(0.0));
+                let dx = dx.clamp(lo, hi).round();
+                self.columns[p] = start[p] + dx;
+                self.columns[col] = start[col] - dx;
+            }
+        }
+        self.column_drag = Some(d);
     }
 
     pub(super) fn dragging(&self) -> bool {
@@ -406,18 +454,32 @@ impl App {
                 .width(width)
                 .style(theme::flat)
         };
-        let cols = Columns::for_width(self.panel_width(side));
-        let mut header = row![Space::with_width(ICON), sort_button("Name", SortKey::Name, Length::Fill, false)];
+        let cols = Columns::for_width(self.panel_width(side), &self.columns);
+        // The 10 px gaps between the columns are the drag handles of the
+        // column on their right.
+        let handle = |col: usize| {
+            let line = container(Space::new(Length::Fixed(1.0), Length::Fixed(12.0))).style(filled(theme::c().border));
+            mouse_area(container(line).center_x(Length::Fixed(10.0)))
+                .on_press(Message::ColumnPress(side, col))
+                .interaction(mouse::Interaction::ResizingHorizontally)
+        };
+        let mut header = row![
+            Space::with_width(ICON + 10.0),
+            sort_button("Name", SortKey::Name, Length::Fill, false)
+        ];
         if cols.ext {
-            header = header.push(sort_button("Ext", SortKey::Ext, Length::Fixed(COL_EXT), false));
+            header = header.push(handle(0));
+            header = header.push(sort_button("Ext", SortKey::Ext, Length::Fixed(self.columns[0]), false));
         }
         if cols.size {
-            header = header.push(sort_button("Size", SortKey::Size, Length::Fixed(COL_SIZE), true));
+            header = header.push(handle(1));
+            header = header.push(sort_button("Size", SortKey::Size, Length::Fixed(self.columns[1]), true));
         }
         if cols.date {
-            header = header.push(sort_button("Modified", SortKey::Modified, Length::Fixed(COL_DATE), false));
+            header = header.push(handle(2));
+            header = header.push(sort_button("Modified", SortKey::Modified, Length::Fixed(self.columns[2]), false));
         }
-        container(header.spacing(10).clip(true))
+        container(header.align_y(Alignment::Center).clip(true))
         .padding([4, 10])
         .style(filled(theme::c().panel))
         .into()
@@ -465,7 +527,7 @@ impl App {
     fn entry_row(&self, side: usize, index: usize, active: bool) -> Element<'_, Message> {
         let panel = self.panel(side);
         let entry = &panel.entries[index];
-        let cols = Columns::for_width(self.panel_width(side));
+        let cols = Columns::for_width(self.panel_width(side), &self.columns);
 
         let color = if panel.is_selected(entry) {
             theme::c().selected
@@ -480,11 +542,7 @@ impl App {
 
         let (stem, ext) = entry.split_name();
         // Narrow panels ellipsize the name instead of just clipping it.
-        let fixed = [(cols.ext, COL_EXT), (cols.size, COL_SIZE), (cols.date, COL_DATE)]
-            .iter()
-            .filter(|(on, _)| *on)
-            .fold(0.0, |sum, (_, w)| sum + w + 10.0);
-        let name_chars = ((self.panel_width(side) - 20.0 - ICON - 10.0 - fixed) / 7.0).max(4.0) as usize;
+        let name_chars = (Columns::name_room(self.panel_width(side), &self.columns, cols.shown()) / 7.0).max(4.0) as usize;
         let narrow = !cols.date;
         let fit = |s: &str| if narrow { elide_end(s, name_chars) } else { s.to_string() };
         let size = match entry.kind {
@@ -525,14 +583,14 @@ impl App {
             )),
             None if cols.ext => content
                 .push(cell(fit(stem), Length::Fill))
-                .push(cell(ext.to_string(), Length::Fixed(COL_EXT))),
+                .push(cell(ext.to_string(), Length::Fixed(self.columns[0]))),
             None => content.push(cell(fit(&entry.name), Length::Fill)),
         };
         if cols.size {
-            content = content.push(cell(size, Length::Fixed(COL_SIZE)).align_x(Alignment::End));
+            content = content.push(cell(size, Length::Fixed(self.columns[1])).align_x(Alignment::End));
         }
         if cols.date {
-            content = content.push(cell(format::date(&entry.modified), Length::Fixed(COL_DATE)).color(theme::c().muted));
+            content = content.push(cell(format::date(&entry.modified), Length::Fixed(self.columns[2])).color(theme::c().muted));
         }
         let content = content
             .spacing(10)
