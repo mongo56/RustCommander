@@ -90,5 +90,8 @@ fn main() -> iced::Result {
             ..Default::default()
         })
         .antialiasing(true)
+        // iced's default sans-serif is Fira Sans, which Windows lacks; cosmic-text
+        // then fell back to Segoe UI word by word. Name it directly.
+        .default_font(iced::Font::with_name("Segoe UI"))
         .run_with(move || app::App::new(session))
 }

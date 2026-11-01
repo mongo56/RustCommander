@@ -12,7 +12,9 @@ repository = "https://github.com/mongo56/RustCommander"
 rc-core = { path = "crates/core" }
 rc-platform = { path = "crates/platform" }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-iced = { version = "0.13.1", features = ["lazy", "image", "advanced"] }
+# web-colors: blend in sRGB space like browsers (and iced's tiny-skia renderer).
+# The default linear-space blending makes dark-on-light text thin and washed out.
+iced = { version = "0.13.1", features = ["lazy", "image", "advanced", "web-colors"] }
 open = "5"
 trash = "5"
 
