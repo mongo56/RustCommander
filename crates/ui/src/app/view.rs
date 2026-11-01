@@ -24,6 +24,7 @@ impl App {
             self.help_view(h)
         } else {
             match (&self.find, &self.multi_rename, &self.viewer, &self.file_diff) {
+                _ if self.connect.is_some() => self.connect_view(self.connect.as_ref().unwrap()),
                 (Some(f), ..) => self.find_view(f),
                 (_, _, _, Some(d)) => self.file_diff_view(d),
                 (_, Some(mr), _, _) => self.multi_rename_view(mr),
@@ -210,14 +211,14 @@ impl App {
             _ => mouse_area(
                 container(match self.pending_nav(side) {
                     // Waiting for a slow folder: show where we're going.
-                    Some(target) => text(elide_left(&format!("{}  (reading…)", target.display()), self.path_chars()))
+                    Some(target) => text(elide_left(&format!("{}  (reading…)", rc_core::remote::display(target)), self.path_chars()))
                         .size(13)
                         .color(theme::c().muted)
                         .wrapping(Wrapping::None),
                     None => text(elide_left(
                         &match panel.results() {
-                            Some(what) => format!("{}  \u{2014} search results: {what}", panel.path.display()),
-                            None => panel.path.display().to_string(),
+                            Some(what) => format!("{}  \u{2014} search results: {what}", rc_core::remote::display(&panel.path)),
+                            None => rc_core::remote::display(&panel.path),
                         },
                         self.path_chars(),
                     ))
@@ -545,7 +546,7 @@ impl App {
             }
             Dialog::MakeDir { input } => (
                 "New folder".into(),
-                format!("Create folder in {}:", self.panel(self.active).path.display()),
+                format!("Create folder in {}:", rc_core::remote::display(&self.panel(self.active).path)),
                 Some(input_field(input)),
                 "Create",
             ),
@@ -575,7 +576,11 @@ impl App {
             ),
             Dialog::Delete { paths, .. } if paths.first().is_some_and(|p| rc_core::vfs::is_virtual(p)) => (
                 "Delete".into(),
-                format!("Delete {} from the archive? This cannot be undone.", describe(paths)),
+                format!(
+                    "Delete {} from the {}? This cannot be undone.",
+                    describe(paths),
+                    if paths.first().is_some_and(|p| rc_core::remote::is_remote(p)) { "server" } else { "archive" }
+                ),
                 None,
                 "Delete",
             ),

@@ -1,6 +1,7 @@
 //! Application state and update logic. Drawing lives in [`view`].
 
 mod view;
+mod connect;
 mod file_diff;
 mod help;
 mod hotlist;
@@ -19,7 +20,7 @@ use iced::{event, keyboard, mouse, window, Event, Point, Size, Subscription, Tas
 use rc_core::ops::{self, Conflict, Job, JobEvent, JobHandle, Outcome, Progress, Resolution};
 use rc_core::compare::{CompareOptions, Differences};
 use rc_core::entry::Entry;
-use rc_core::{vfs, Activated, Command, EntryKind, Nav, Panel, SortKey};
+use rc_core::{remote, vfs, Activated, Command, EntryKind, Nav, Panel, SortKey};
 use rc_platform::{DragOutcome, MenuAction};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -115,6 +116,11 @@ pub struct App {
     /// closed tool is kept (fields and results) for the next Alt+F7.
     find: Option<find_files::FindFiles>,
     find_last: Option<find_files::FindFiles>,
+    /// Connect to a server (Ctrl+F), covering the whole window while open.
+    connect: Option<connect::ConnectTool>,
+    /// (folder, name): put the cursor on `name` once a background listing
+    /// of `folder` arrives (after a job on a server).
+    focus_after_listing: Vec<(PathBuf, String)>,
     help: Option<help::Help>,
     /// Multi-rename settings, kept between uses.
     rename_opts: rc_core::rename::Options,
@@ -329,6 +335,7 @@ pub enum Message {
     MultiRename(multi_rename::MrMsg),
     FileDiff(file_diff::DiffMsg),
     Find(find_files::FindMsg),
+    Connect(connect::ConnectMsg),
     /// Background listing for a pending navigation: (side, seq, listing).
     Navigated(usize, u64, Listing),
     /// A file inside an archive was extracted to a temp copy to be opened.
@@ -398,6 +405,8 @@ impl App {
             file_diff: None,
             find: None,
             find_last: None,
+            connect: None,
+            focus_after_listing: Vec::new(),
             help: None,
             rename_opts: rc_core::rename::Options::default(),
             rename_undo: Vec::new(),
@@ -678,7 +687,7 @@ impl App {
             Message::EditPath(side) => {
                 self.leave_edits();
                 self.active = side;
-                let text = self.panel(side).path.display().to_string();
+                let text = remote::display(&self.panel(side).path);
                 self.path_edit = Some(PathEdit { side, text, suggestions: Vec::new(), selected: None, cache: None });
                 return Task::batch([text_input::focus(path_input_id()), text_input::select_all(path_input_id())]);
             }
@@ -803,6 +812,7 @@ impl App {
             Message::MultiRename(msg) => return self.multi_rename_update(msg),
             Message::FileDiff(msg) => return self.file_diff_update(msg),
             Message::Find(msg) => return self.find_update(msg),
+            Message::Connect(msg) => return self.connect_update(msg),
             Message::Navigated(side, seq, result) => {
                 let current = self.sides[side].current;
                 let pending = self.nav[side].take_if(|p| p.seq == seq && p.tab == current);
@@ -827,6 +837,7 @@ impl App {
         ("Click, double-click", "Move the cursor, open"),
         ("Middle-click a folder", "Open it in a new tab"),
         ("Enter / Ctrl+PgDn on a .zip, .7z, .tar, .tar.gz, .gz, ...", "Browse the archive like a folder: view, copy out, Enter opens a temp copy; in a zip also copy/move in, F7, F2, F8 (others are read-only)"),
+        ("Ctrl+F, then Enter", "Connect to an SFTP/FTP/FTPS server: browse, F3 view, F5/F6 download and upload, F7, F2, F8 work there; Ctrl+Shift+F disconnects"),
         ("Right-click", "Explorer context menu"),
         ("Drag and drop", "Copy (Shift = move) between panels and other apps; right drag = drop menu"),
         ("Mouse wheel", "Scroll the view (the cursor stays)"),
@@ -875,6 +886,12 @@ impl App {
                 return Task::none();
             }
             return self.find_key(named, &key, mods, captured);
+        }
+        if self.connect.is_some() {
+            if named.is_some_and(is_modifier_key) {
+                return Task::none();
+            }
+            return self.connect_key(named, &key, mods, captured);
         }
         if self.file_diff.is_some() {
             if !named.is_some_and(is_modifier_key) {
@@ -1044,6 +1061,8 @@ impl App {
             MultiRename => return self.open_multi_rename(),
             CompareFiles => return self.open_file_diff(),
             FindFiles => return self.open_find(),
+            Connect => return self.open_connect(),
+            Disconnect => return self.disconnect(),
             Help => return self.open_help(),
             Edit => {
                 if let Some(e) = self.panel(active).current().filter(|e| e.kind == EntryKind::File) {
@@ -1538,9 +1557,12 @@ impl App {
             self.status = Some((msg.into(), Tone::Info));
             return Task::none();
         }
-        let mut input = target.display().to_string();
-        if !input.ends_with(MAIN_SEPARATOR) {
-            input.push(MAIN_SEPARATOR);
+        let mut input = remote::display(target);
+        // A trailing separator says "into this folder" (on a server that
+        // spares asking it whether the target is a folder).
+        let sep = if remote::is_remote(target) { '/' } else { MAIN_SEPARATOR };
+        if !input.ends_with(['/', '\\']) {
+            input.push(sep);
         }
         let base = self.panel(self.active).path.clone();
         self.open_dialog(Dialog::Transfer { is_move, sources, base, input })
@@ -1556,8 +1578,7 @@ impl App {
         let Some(dialog) = self.dialog.take() else { return Task::none() };
         match dialog {
             Dialog::Transfer { is_move, sources, base, input } => {
-                let target = PathBuf::from(input.trim());
-                let target = if target.is_relative() { base.join(target) } else { target };
+                let target = resolve_typed_path(input.trim(), &base);
                 if let Some(msg) = archive_transfer_problem(is_move, &sources, &target) {
                     self.status = Some((msg.into(), Tone::Info));
                     return Task::none();
@@ -1824,6 +1845,11 @@ impl App {
         if !items.iter().any(|p| vfs::is_virtual(p)) {
             return Some(self.shell_items(side, items));
         }
+        // Downloading here would block the window.
+        if items.iter().any(|p| remote::is_remote(p)) {
+            self.status = Some(("Not for files on a server: copy them to a local folder first (F5)".into(), Tone::Info));
+            return None;
+        }
         match vfs::extract_temp_all(&items) {
             Ok(local) => {
                 let folder = local.first().and_then(|p| p.parent()).map(Path::to_path_buf)?;
@@ -1839,6 +1865,10 @@ impl App {
     // ---- context menu -----------------------------------------------------
 
     fn context_menu(&mut self, side: usize, background: bool) -> Task<Message> {
+        if background && remote::is_remote(&self.panel(side).path) {
+            self.status = Some(("No context menu on a server".into(), Tone::Info));
+            return Task::none();
+        }
         if background && vfs::in_archive(&self.panel(side).path) {
             self.status = Some(("No context menu for the archive's folders; right-click a file".into(), Tone::Info));
             return Task::none();
@@ -1904,7 +1934,12 @@ impl App {
                 self.disk.borrow_mut().clear();
                 self.reload_panels();
                 if let Some((side, name)) = job.focus.filter(|_| outcome.errors.is_empty()) {
-                    self.panel_mut(side).focus(&name);
+                    if remote::is_remote(&self.panel(side).path) {
+                        let path = self.panel(side).path.clone();
+                        self.focus_after_listing.push((path, name));
+                    } else {
+                        self.panel_mut(side).focus(&name);
+                    }
                 }
                 self.status = Some(summarize(job.done_verb, &outcome));
                 self.after_change();
@@ -1922,6 +1957,12 @@ impl App {
     /// done, says so and returns true. `zip_ok`: it can be done in a zip
     /// (other archives are read-only).
     fn refuse_in_archive(&mut self, side: usize, what: &str, zip_ok: bool) -> bool {
+        if remote::is_remote(&self.panel(side).path) {
+            if !zip_ok {
+                self.status = Some((format!("Can't {what} on a server: copy the files to a local folder first"), Tone::Info));
+            }
+            return !zip_ok;
+        }
         let Some(writable) = vfs::archive_writable(&self.panel(side).path) else { return false };
         if zip_ok && writable {
             return false;
@@ -1948,7 +1989,7 @@ impl App {
             return Task::none();
         }
         if sources.iter().any(|p| vfs::is_virtual(p)) {
-            self.status = Some(("Can't pack files inside archives: copy them out first".into(), Tone::Info));
+            self.status = Some(("Can't pack files inside archives or on servers: copy them out first".into(), Tone::Info));
             return Task::none();
         }
         let target = self.panel(1 - self.active).path.clone();
@@ -1977,9 +2018,13 @@ impl App {
             self.status = Some(("Select archives (zip, 7z, tar, ...) to unpack".into(), Tone::Info));
             return Task::none();
         }
+        if archives.iter().any(|a| remote::is_remote(a)) {
+            self.status = Some(("Can't unpack on a server: copy the archive to a local folder first".into(), Tone::Info));
+            return Task::none();
+        }
         let target = self.panel(1 - self.active).path.clone();
         if vfs::in_archive(&target) {
-            self.status = Some(("Can't unpack into an archive".into(), Tone::Info));
+            self.status = Some(("Can't unpack into an archive or onto a server".into(), Tone::Info));
             return Task::none();
         }
         let mut input = target.display().to_string();
@@ -1991,8 +2036,17 @@ impl App {
     }
 
     /// Re-reads the visible tab on both sides after something changed.
+    /// Servers are listed in the background (`deferred`).
     fn reload_panels(&mut self) {
         for side in 0..2 {
+            let path = self.panel(side).path.clone();
+            if remote::is_remote(&path) {
+                if self.panel(side).results().is_none() && (side == 0 || self.panel(0).path != path) {
+                    let task = self.list_in_background(path);
+                    self.deferred.push(task);
+                }
+                continue;
+            }
             if let Err(e) = self.panel_mut(side).reload() {
                 self.folder_unreadable(side, e.to_string());
             }
@@ -2003,6 +2057,20 @@ impl App {
     /// up to something that exists.
     fn folder_unreadable(&mut self, side: usize, error: String) {
         self.nav[side] = None;
+        // On a server: a vanished folder goes up there; a lost connection
+        // just says so.
+        let path = self.panel(side).path.clone();
+        if remote::is_remote(&path) {
+            let gone = !error.contains("Not connected") && !error.contains("timed out") && !error.contains("in time");
+            match self.panel(side).parent_nav().filter(|_| gone) {
+                Some(nav) => {
+                    let task = self.start_nav(side, nav);
+                    self.deferred.push(task);
+                }
+                None => self.status = Some((error, Tone::Error)),
+            }
+            return;
+        }
         let panel = self.panel_mut(side);
         let existing = panel.path.ancestors().skip(1).find(|p| p.is_dir()).map(Path::to_path_buf);
         match existing {
@@ -2242,6 +2310,22 @@ impl App {
                 Err(e) => self.folder_unreadable(side, e.clone()),
             }
         }
+        if result.is_ok() {
+            let wanted: Vec<String> = self
+                .focus_after_listing
+                .iter()
+                .filter(|(p, _)| *p == path)
+                .map(|(_, n)| n.clone())
+                .collect();
+            self.focus_after_listing.retain(|(p, _)| *p != path);
+            for name in wanted {
+                for side in 0..2 {
+                    if self.panel(side).path == path {
+                        self.panel_mut(side).focus(&name);
+                    }
+                }
+            }
+        }
         self.after_change();
     }
 
@@ -2380,6 +2464,18 @@ fn is_modifier_key(key: Named) -> bool {
 
 /// Copying into archives and moving out of them isn't supported yet.
 fn archive_transfer_problem(is_move: bool, sources: &[PathBuf], target: &Path) -> Option<&'static str> {
+    let server = |p: &Path| remote::split(p).map(|(key, _)| key.to_lowercase());
+    let from_server = sources.iter().find_map(|p| server(p));
+    match (from_server, server(target)) {
+        (Some(a), Some(b)) if a != b || !is_move => {
+            return Some("Can't copy between or within servers: copy to a local folder first (F6 moves on one server)");
+        }
+        (Some(_), None) if vfs::in_archive(target) => return Some("Can't copy from a server into an archive: copy to a folder first"),
+        (None, Some(_)) if sources.iter().any(|p| vfs::is_virtual(p)) => {
+            return Some("Can't copy from an archive onto a server: copy out to a folder first");
+        }
+        _ => {}
+    }
     let from = sources.iter().find_map(|p| vfs::split_archive(p).filter(|(_, inner)| !inner.as_os_str().is_empty()));
     let into = vfs::split_archive(target);
     match (&from, &into) {
@@ -2434,7 +2530,7 @@ fn resolve_typed_path(raw: &str, base: &Path) -> PathBuf {
     if raw.len() == 2 && raw.ends_with(':') {
         path.push(MAIN_SEPARATOR.to_string());
     }
-    if path.is_relative() {
+    if path.is_relative() && !remote::is_remote(&path) {
         path = base.join(path);
     }
     path

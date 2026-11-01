@@ -278,6 +278,8 @@ fn default_command(key: &Key, m: Modifiers) -> Option<Command> {
             _ => return None,
         },
         Key::Character(c) if ctrl => match c.to_ascii_lowercase().as_str() {
+            "f" if shift => Disconnect,
+            "f" => Connect,
             "a" => SelectAll,
             "t" => NewTab,
             "w" => CloseTab,

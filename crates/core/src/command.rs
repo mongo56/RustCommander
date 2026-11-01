@@ -36,6 +36,10 @@ pub enum Command {
     CompareFiles,
     /// Find files by name and contents (Alt+F7).
     FindFiles,
+    /// Saved server connections; connect one in this panel (Ctrl+F).
+    Connect,
+    /// Close the connection of the panel's server (Ctrl+Shift+F).
+    Disconnect,
     SelectAll,
     DeselectAll,
     Refresh,
@@ -104,6 +108,8 @@ impl Command {
             CompareDirsOptions => "cm_CompareDirsOptions",
             CompareFiles => "cm_CompareFilesByContent",
             FindFiles => "cm_SearchFor",
+            Connect => "cm_FtpConnect",
+            Disconnect => "cm_FtpDisconnect",
             SelectAll => "cm_SelectAll",
             DeselectAll => "cm_ClearAll",
             Refresh => "cm_RereadSource",
@@ -164,6 +170,8 @@ impl Command {
             CompareDirsOptions => "Compare folders with options (by content, ignore dates, subfolders)",
             CompareFiles => "Compare two files by content, side by side",
             FindFiles => "Find files by name and contents",
+            Connect => "Connect to a server (SFTP, FTP, FTPS): saved connections, new, edit, delete",
+            Disconnect => "Close the connection of the server shown in the panel",
             SelectAll => "Select all entries",
             DeselectAll => "Clear the selection",
             Refresh => "Reread the folder",
@@ -227,6 +235,8 @@ impl Command {
             CompareDirsOptions,
             CompareFiles,
             FindFiles,
+            Connect,
+            Disconnect,
             SelectAll,
             DeselectAll,
             Refresh,

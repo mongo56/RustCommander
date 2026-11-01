@@ -10,11 +10,16 @@ mod keymap;
 mod hotlist;
 mod select_range;
 mod session;
+mod sites;
 mod theme;
 mod watch;
 
 fn main() -> iced::Result {
     let session = session::load();
+    if let Some(dir) = config::dir() {
+        // SFTP host keys are trusted in known_hosts there.
+        rc_core::remote::set_settings_dir(dir);
+    }
     if let Err(e) = config::create_if_missing(session.as_ref().map_or("", |s| &s.editor)) {
         eprintln!("could not create config.toml: {e}");
     }

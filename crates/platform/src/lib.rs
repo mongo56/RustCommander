@@ -5,6 +5,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+pub mod credentials;
 #[cfg(windows)]
 mod win;
 
