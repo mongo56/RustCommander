@@ -212,21 +212,40 @@ pub fn extract_temp(path: &Path) -> io::Result<PathBuf> {
     if !is_virtual(path) {
         return Ok(path.to_path_buf());
     }
-    let dst = temp_path(path);
-    if let Some(parent) = dst.parent() {
-        fs::create_dir_all(parent)?;
+    Ok(extract_temp_all(std::slice::from_ref(&path.to_path_buf()))?.remove(0))
+}
+
+/// [`extract_temp`] for several files or folders (with everything in
+/// them) inside one archive, e.g. to hand them to the shell (drag out,
+/// context menu). Returns their temp paths, in order.
+pub fn extract_temp_all(paths: &[PathBuf]) -> io::Result<Vec<PathBuf>> {
+    let Some(first) = paths.iter().find(|p| is_virtual(p)) else { return Ok(paths.to_vec()) };
+    let vfs = open(first)?;
+    let (mut files, mut targets) = (Vec::new(), Vec::new());
+    for path in paths {
+        for entry in vfs.walk(path)? {
+            let dst = temp_path(&entry.path);
+            if entry.is_dir() {
+                fs::create_dir_all(&dst)?;
+                continue;
+            }
+            if let Some(parent) = dst.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            files.push(entry.path);
+            targets.push((dst, entry.modified));
+        }
     }
-    let vfs = open(path)?;
-    let modified = vfs.walk(path)?.first().and_then(|e| e.modified);
-    vfs.read_files(&[path.to_path_buf()], &mut |_, reader| {
-        let mut out = File::create(&dst)?;
+    vfs.read_files(&files, &mut |i, reader| {
+        let (dst, modified) = &targets[i];
+        let mut out = File::create(dst)?;
         io::copy(reader, &mut out)?;
         if let Some(m) = modified {
-            let _ = out.set_modified(m.into());
+            let _ = out.set_modified((*m).into());
         }
         Ok(true)
     })?;
-    Ok(dst)
+    Ok(paths.iter().map(|p| temp_path(p)).collect())
 }
 
 // ---- archives ----------------------------------------------------------------
@@ -738,6 +757,11 @@ pub(crate) mod tests {
         assert_eq!(local, temp_path(&inner));
         assert!(local.ends_with(Path::new("sub").join("deep").join("x.txt")));
         assert_eq!(fs::read(&local).unwrap(), b"deep file");
+        // A folder with its contents, and a file.
+        let all = extract_temp_all(&[zip.join("sub"), zip.join("a.txt")]).unwrap();
+        assert_eq!(all, [temp_path(&zip.join("sub")), temp_path(&zip.join("a.txt"))]);
+        assert_eq!(fs::read(all[0].join("deep").join("x.txt")).unwrap(), b"deep file");
+        assert_eq!(fs::read(&all[1]).unwrap(), b"hello zip");
         let _ = fs::remove_dir_all(local.parent().unwrap().parent().unwrap().parent().unwrap());
         assert_eq!(extract_temp(&zip).unwrap(), zip);
     }

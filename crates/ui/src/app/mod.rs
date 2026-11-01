@@ -1686,11 +1686,10 @@ impl App {
             if outside {
                 if let Some(drag) = self.drag.take() {
                     self.hover = None;
-                    if vfs::in_archive(&self.panel(drag.side).path) {
-                        self.status = Some(("Can't drag files out of archives yet; copy them with F5".into(), Tone::Info));
+                    let Some((folder, items)) = self.shell_items_extracted(drag.side, drag.sources) else {
                         return Task::none();
-                    }
-                    return self.drag_out(drag);
+                    };
+                    return self.drag_out(drag.side, folder, items);
                 }
             }
             return Task::none();
@@ -1750,9 +1749,7 @@ impl App {
             .map(move |result| Message::DropMenuDone(side, result))
     }
 
-    fn drag_out(&self, drag: Drag) -> Task<Message> {
-        let side = drag.side;
-        let (folder, items) = self.shell_items(side, drag.sources);
+    fn drag_out(&self, side: usize, folder: PathBuf, items: Vec<PathBuf>) -> Task<Message> {
         window::get_oldest()
             .and_then(move |id| {
                 let (folder, items) = (folder.clone(), items.clone());
@@ -1802,15 +1799,35 @@ impl App {
         }
     }
 
+    /// Like [`Self::shell_items`], but items inside an archive are first
+    /// extracted to their temp copies (`vfs::extract_temp_all`), which the
+    /// shell then gets. `None` (with a status) if that failed.
+    fn shell_items_extracted(&mut self, side: usize, items: Vec<PathBuf>) -> Option<(PathBuf, Vec<PathBuf>)> {
+        if !items.iter().any(|p| vfs::is_virtual(p)) {
+            return Some(self.shell_items(side, items));
+        }
+        match vfs::extract_temp_all(&items) {
+            Ok(local) => {
+                let folder = local.first().and_then(|p| p.parent()).map(Path::to_path_buf)?;
+                Some((folder, local))
+            }
+            Err(e) => {
+                self.status = Some((format!("Can't extract from the archive: {e}"), Tone::Error));
+                None
+            }
+        }
+    }
+
     // ---- context menu -----------------------------------------------------
 
     fn context_menu(&mut self, side: usize, background: bool) -> Task<Message> {
-        if vfs::in_archive(&self.panel(side).path) {
-            self.status = Some(("No context menu inside archives".into(), Tone::Info));
+        if background && vfs::in_archive(&self.panel(side).path) {
+            self.status = Some(("No context menu for the archive's folders; right-click a file".into(), Tone::Info));
             return Task::none();
         }
         let items = if background { Vec::new() } else { self.target_paths(side) };
-        let (folder, items) = self.shell_items(side, items);
+        // Items in archives: the menu acts on temp copies.
+        let Some((folder, items)) = self.shell_items_extracted(side, items) else { return Task::none() };
         let extended = self.modifiers.shift();
 
         window::get_oldest()
