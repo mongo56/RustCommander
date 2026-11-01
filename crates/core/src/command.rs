@@ -140,7 +140,7 @@ impl Command {
             CursorHome => "Cursor to the first entry",
             CursorEnd => "Cursor to the last entry",
             CursorBy(_) => "Scroll the cursor (mouse wheel)",
-            Open => "Open the folder or file under the cursor",
+            Open => "Open the folder, archive (zip, 7z: browse like a folder) or file under the cursor",
             GoParent => "Go to the parent folder",
             GoRoot => "Go to the root of the drive",
             HistoryBack => "Back to the previous folder",

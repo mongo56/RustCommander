@@ -136,7 +136,12 @@ impl App {
         let side = self.active;
         self.leave_edits();
         let panel = self.panel(side);
-        let (root, hidden) = (panel.path.display().to_string(), panel.show_hidden);
+        // Archives aren't searched yet: search the folder holding one.
+        let root = match rc_core::vfs::split_archive(&panel.path) {
+            Some((archive, _)) => archive.parent().map_or_else(|| panel.path.clone(), Path::to_path_buf),
+            None => panel.path.clone(),
+        };
+        let (root, hidden) = (root.display().to_string(), panel.show_hidden);
         let mut find = self.find_last.take().unwrap_or_else(|| FindFiles {
             side,
             root: String::new(),

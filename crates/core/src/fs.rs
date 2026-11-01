@@ -1,5 +1,5 @@
-//! Local filesystem listing. This will later sit behind a `Vfs` trait so
-//! archives, FTP/SFTP etc. can plug in as panels too.
+//! Local filesystem listing. Panels list through `crate::vfs`, which uses
+//! this for local folders (`vfs::LocalFs`) and archive readers otherwise.
 
 use crate::entry::{Entry, EntryKind};
 use chrono::{DateTime, Local};

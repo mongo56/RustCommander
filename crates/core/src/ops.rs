@@ -8,7 +8,7 @@ use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 const BUFFER_SIZE: usize = 1024 * 1024;
 const REPORT_INTERVAL: Duration = Duration::from_millis(50);
@@ -298,7 +298,13 @@ pub fn run(job: &Job, control: &Control, reporter: &mut dyn Reporter) -> Outcome
                         continue;
                     }
                 }
-                if is_move {
+                if crate::vfs::is_virtual(&t.src) {
+                    if is_move {
+                        runner.fail_msg(&t.src, "Archives are read-only: can't move out of them");
+                    } else {
+                        runner.extract(t);
+                    }
+                } else if is_move {
                     runner.move_item(t, size);
                 } else {
                     runner.copy(&t.src, &t.dst, false);
@@ -442,7 +448,7 @@ impl Runner<'_> {
             if dst_meta.is_dir() {
                 return self.fail_msg(dst, "A folder with this name already exists");
             }
-            match self.resolve(src, &meta, dst, &dst_meta) {
+            match self.resolve(src, (meta.len(), meta.modified().ok()), dst, &dst_meta) {
                 Resolution::Overwrite => {}
                 Resolution::Cancel => {
                     self.control.cancel();
@@ -475,11 +481,10 @@ impl Runner<'_> {
     fn resolve(
         &mut self,
         src: &Path,
-        src_meta: &fs::Metadata,
+        (src_size, src_modified): (u64, Option<SystemTime>),
         dst: &Path,
         dst_meta: &fs::Metadata,
     ) -> Resolution {
-        let src_modified = src_meta.modified().ok();
         let dst_modified = dst_meta.modified().ok();
         let target_older = matches!((src_modified, dst_modified), (Some(s), Some(d)) if d < s);
 
@@ -489,7 +494,7 @@ impl Runner<'_> {
                 let conflict = Conflict {
                     src: src.to_path_buf(),
                     dst: dst.to_path_buf(),
-                    src_size: src_meta.len(),
+                    src_size,
                     dst_size: dst_meta.len(),
                     src_modified: src_modified.map(DateTime::from),
                     dst_modified: dst_modified.map(DateTime::from),
@@ -549,7 +554,7 @@ impl Runner<'_> {
         }
     }
 
-    fn pump(&mut self, input: &mut File, output: &mut File) -> io::Result<bool> {
+    fn pump(&mut self, input: &mut dyn Read, output: &mut File) -> io::Result<bool> {
         loop {
             if !self.alive() {
                 return Ok(false);
@@ -564,6 +569,114 @@ impl Runner<'_> {
             self.progress.done_bytes += n as u64;
             self.report(false);
         }
+    }
+
+    /// Copies a file or folder out of an archive (`t.src` is a path inside
+    /// one) to the local `t.dst`. Folders are created and conflicts asked
+    /// first, then the files are read in the archive's order.
+    fn extract(&mut self, t: &Transfer) {
+        self.progress.current = Some(t.src.clone());
+        let items = match crate::vfs::open(&t.src).and_then(|vfs| Ok((vfs.walk(&t.src)?, vfs))) {
+            Ok(found) => found,
+            Err(e) => {
+                self.fail(&t.src, e);
+                return;
+            }
+        };
+        let (items, vfs) = items;
+        let mut files = Vec::new();
+        let mut targets = Vec::new();
+        for item in items {
+            if !self.alive() {
+                return;
+            }
+            let dst = match item.path.strip_prefix(&t.src) {
+                Ok(rel) if !rel.as_os_str().is_empty() => t.dst.join(rel),
+                _ => t.dst.clone(),
+            };
+            self.progress.current = Some(item.path.clone());
+            let existing = fs::symlink_metadata(&dst);
+            if item.is_dir() {
+                match existing {
+                    Ok(m) if !m.is_dir() => {
+                        self.fail_msg(&dst, "A file with this name already exists");
+                    }
+                    Ok(_) => self.item_done(0),
+                    Err(_) => match fs::create_dir_all(&dst) {
+                        Ok(()) => self.item_done(0),
+                        Err(e) => {
+                            self.fail(&dst, e);
+                        }
+                    },
+                }
+                continue;
+            }
+            if let Ok(dst_meta) = existing {
+                if dst_meta.is_dir() {
+                    self.fail_msg(&dst, "A folder with this name already exists");
+                    continue;
+                }
+                match self.resolve(&item.path, (item.size, item.modified.map(Into::into)), &dst, &dst_meta) {
+                    Resolution::Overwrite => {}
+                    Resolution::Cancel => {
+                        self.control.cancel();
+                        return;
+                    }
+                    _ => {
+                        self.outcome.skipped += 1;
+                        self.item_done(item.size);
+                        continue;
+                    }
+                }
+            }
+            files.push(item.path.clone());
+            targets.push((dst, item));
+        }
+        let mut failures = Vec::new();
+        let result = vfs.read_files(&files, &mut |i, input| {
+            let (dst, item) = &targets[i];
+            self.progress.current = Some(item.path.clone());
+            match self.write_out(input, dst, item.modified.map(Into::into)) {
+                Ok(true) => {
+                    self.item_done(0);
+                    Ok(self.alive())
+                }
+                Ok(false) => Ok(false),
+                Err(e) => {
+                    failures.push((item.path.clone(), e));
+                    Ok(true)
+                }
+            }
+        });
+        for (path, e) in failures {
+            self.fail(&path, e);
+        }
+        if let Err(e) = result {
+            self.fail(&t.src, e);
+        }
+    }
+
+    /// Writes `input` to the new file `dst` with progress. Ok(false) means
+    /// cancelled; a partial file is removed.
+    fn write_out(&mut self, input: &mut dyn Read, dst: &Path, modified: Option<SystemTime>) -> io::Result<bool> {
+        let mut output = match File::create(dst) {
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                clear_readonly(dst)?;
+                File::create(dst)?
+            }
+            other => other?,
+        };
+        let result = self.pump(input, &mut output).and_then(|complete| {
+            if let Some(m) = modified.filter(|_| complete) {
+                output.set_modified(m)?;
+            }
+            Ok(complete)
+        });
+        drop(output);
+        if !matches!(result, Ok(true)) {
+            let _ = fs::remove_file(dst);
+        }
+        result
     }
 
     /// Tries a cheap rename first; falls back to copy + delete (e.g. across
@@ -626,6 +739,10 @@ impl Runner<'_> {
 
 /// (bytes, items) under `path`. Links count as one item and aren't followed.
 fn measure(path: &Path) -> (u64, u64) {
+    if crate::vfs::is_virtual(path) {
+        let items = crate::vfs::open(path).and_then(|vfs| vfs.walk(path)).unwrap_or_default();
+        return (items.iter().map(|e| e.size).sum(), items.len().max(1) as u64);
+    }
     let Ok(meta) = fs::symlink_metadata(path) else { return (0, 1) };
     if meta.file_type().is_symlink() {
         let size = fs::metadata(path).map(|m| if m.is_file() { m.len() } else { 0 }).unwrap_or(0);
@@ -764,6 +881,41 @@ mod tests {
         let (o, _) = run_job(Job::Copy(ts), Resolution::Overwrite);
         assert!(o.errors.is_empty());
         assert_eq!(fs::read(&b).unwrap(), b"new");
+    }
+
+    #[test]
+    fn extracts_from_zip() {
+        let tmp = TempDir::new("extract");
+        let zip = tmp.0.join("a.zip");
+        crate::vfs::tests::make_zip(&zip);
+        let out = tmp.0.join("out");
+        fs::create_dir(&out).unwrap();
+        let sources = [zip.join("sub"), zip.join("Readme.md")];
+        let ts = plan_transfer(&sources, &out).unwrap();
+        assert_eq!(ts[0].dst, out.join("sub"));
+        let (o, asked) = run_job(Job::Copy(ts.clone()), Resolution::Skip);
+        assert!(o.errors.is_empty(), "{:?}", o.errors);
+        assert_eq!((asked, o.done_items, o.done_bytes), (0, 4, 5009));
+        assert_eq!(fs::read(out.join("sub/deep/x.txt")).unwrap(), b"deep file");
+        assert_eq!(fs::read(out.join("Readme.md")).unwrap(), vec![b'r'; 5000]);
+
+        // Existing targets: asked once per file, skipped files untouched.
+        fs::write(out.join("Readme.md"), b"mine").unwrap();
+        let (o, asked) = run_job(Job::Copy(ts.clone()), Resolution::Skip);
+        assert_eq!((asked, o.skipped), (2, 2));
+        assert_eq!(fs::read(out.join("Readme.md")).unwrap(), b"mine");
+        let (o, _) = run_job(Job::Copy(ts), Resolution::OverwriteAll);
+        assert!(o.errors.is_empty());
+        assert_eq!(fs::read(out.join("Readme.md")).unwrap(), vec![b'r'; 5000]);
+
+        // Single file under a new name; moving out is refused.
+        let ts = plan_transfer(&[zip.join("a.txt")], &out.join("renamed.txt")).unwrap();
+        let (o, _) = run_job(Job::Copy(ts.clone()), Resolution::Skip);
+        assert!(o.errors.is_empty());
+        assert_eq!(fs::read(out.join("renamed.txt")).unwrap(), b"hello zip");
+        let (o, _) = run_job(Job::Move(ts), Resolution::Skip);
+        assert_eq!(o.errors.len(), 1);
+        assert!(zip.is_file());
     }
 
     #[test]

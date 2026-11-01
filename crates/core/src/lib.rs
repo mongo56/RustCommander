@@ -13,6 +13,7 @@ pub mod ops;
 pub mod panel;
 pub mod rename;
 pub mod search;
+pub mod vfs;
 pub mod viewer;
 
 pub use command::Command;

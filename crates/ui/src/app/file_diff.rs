@@ -110,7 +110,11 @@ impl App {
             async move {
                 let (tx, rx) = iced::futures::channel::oneshot::channel();
                 std::thread::spawn(move || {
-                    let result = fdiff::compare(&a, &b, &cancel).map(Arc::new).map_err(|e| e.to_string());
+                    // Files inside archives are compared via temp copies.
+                    let local = |p: &PathBuf| rc_core::vfs::extract_temp(p).map_err(|e| format!("{}: {e}", p.display()));
+                    let result = local(&a).and_then(|a| Ok((a, local(&b)?))).and_then(|(a, b)| {
+                        fdiff::compare(&a, &b, &cancel).map(Arc::new).map_err(|e| e.to_string())
+                    });
                     let _ = tx.send(result);
                 });
                 rx.await.unwrap_or_else(|_| Err("compare thread failed".into()))

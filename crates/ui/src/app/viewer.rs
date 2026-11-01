@@ -95,6 +95,12 @@ impl Viewer {
         &self.files[self.index]
     }
 
+    /// Where the shown file's bytes are read from: the file itself, or the
+    /// temp copy of a file inside an archive (made by `load_sync`).
+    fn source(&self) -> PathBuf {
+        rc_core::vfs::temp_path(self.path())
+    }
+
     fn doc_arc(&self) -> Option<Arc<Document>> {
         match &self.content {
             Content::Loaded(Loaded::Doc(doc)) => Some(doc.clone()),
@@ -130,7 +136,7 @@ impl Viewer {
     /// row and the hit carries over.
     fn load_window(&mut self, want: u64, keep: u64) {
         let Some(old) = self.doc_arc() else { return };
-        match Document::open_window(&self.files[self.index], want, Some(old.encoding)) {
+        match Document::open_window(&self.source(), want, Some(old.encoding)) {
             Ok(doc) => {
                 let hit = self.hit.and_then(|h| move_hit(&old, &doc, h));
                 self.top = doc.row_of(self.mode, keep);
@@ -174,6 +180,9 @@ fn load(path: PathBuf, seq: u64) -> Task<Message> {
 }
 
 fn load_sync(path: &Path) -> Result<Loaded, String> {
+    // A file inside an archive is viewed from a temp copy.
+    let local = rc_core::vfs::extract_temp(path).map_err(|e| e.to_string())?;
+    let path = local.as_path();
     if ::image::ImageFormat::from_path(path).is_ok() {
         if let Ok(img) = ::image::open(path) {
             let img = if img.width() > MAX_IMAGE_SIDE || img.height() > MAX_IMAGE_SIDE {
@@ -609,7 +618,7 @@ impl App {
         let token = cancel.clone();
         v.note = Some((format!("Searching for \"{}\"…", v.query), Tone::Info));
         let (path, encoding, mode, query, case, size, seq) =
-            (v.path().to_path_buf(), doc.encoding, v.mode, v.query.clone(), v.case, doc.size, v.seq);
+            (v.source(), doc.encoding, v.mode, v.query.clone(), v.case, doc.size, v.seq);
         Task::perform(
             async move {
                 let (tx, rx) = iced::futures::channel::oneshot::channel();

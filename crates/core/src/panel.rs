@@ -1,5 +1,5 @@
 use crate::entry::{Entry, EntryKind};
-use crate::fs::list_dir;
+use crate::vfs;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -123,7 +123,7 @@ impl Panel {
             self.refresh_results();
             return Ok(());
         }
-        let entries = list_dir(&self.path, self.show_hidden)?;
+        let entries = vfs::list(&self.path, self.show_hidden)?;
         self.apply_listing(entries);
         Ok(())
     }
@@ -163,7 +163,7 @@ impl Panel {
     pub fn go(&mut self, nav: Nav) -> io::Result<()> {
         let mut last_err = None;
         while let Some(path) = self.nav_target(&nav) {
-            match list_dir(&path, true) {
+            match vfs::list(&path, true) {
                 Ok(entries) => {
                     self.arrive(&nav, entries);
                     return Ok(());
@@ -375,6 +375,10 @@ impl Panel {
         match entry.kind {
             EntryKind::Parent => self.parent_nav().map_or(Activated::Nothing, Activated::Navigate),
             EntryKind::Dir => Activated::Navigate(Nav::to(entry.path.clone())),
+            // Archives open like folders (archives inside archives don't).
+            EntryKind::File if vfs::is_archive_name(&entry.name) && !vfs::in_archive(&self.path) => {
+                Activated::Navigate(Nav::to(entry.path.clone()))
+            }
             EntryKind::File => Activated::File(entry.path.clone()),
         }
     }
@@ -807,6 +811,37 @@ mod tests {
         assert_eq!(panel.path, root);
         assert_eq!(panel.results(), None);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn browses_into_and_out_of_a_zip() {
+        let dir = crate::vfs::tests::TempDir::new("panel");
+        let zip = dir.0.join("a.zip");
+        crate::vfs::tests::make_zip(&zip);
+        let mut panel = Panel::open(&dir.0).unwrap();
+        panel.focus("a.zip");
+        let Activated::Navigate(nav) = panel.activate() else { panic!("zip should open like a folder") };
+        panel.go(nav).unwrap();
+        assert_eq!(panel.path, zip);
+        let names: Vec<&str> = panel.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["..", "sub", "a.txt", "Readme.md"]);
+
+        panel.focus("sub");
+        let Activated::Navigate(nav) = panel.activate() else { panic!() };
+        panel.go(nav).unwrap();
+        assert_eq!(panel.path, zip.join("sub"));
+        panel.reload().unwrap();
+        assert_eq!(panel.entries.len(), 2);
+        panel.go_parent().unwrap();
+        assert_eq!(panel.current().unwrap().name, "sub");
+        // `..` at the archive root: back in the folder, cursor on the archive.
+        panel.go_parent().unwrap();
+        assert_eq!(panel.path, dir.0);
+        assert_eq!(panel.current().unwrap().name, "a.zip");
+
+        panel.navigate(zip.clone(), None).unwrap();
+        panel.focus("a.txt");
+        assert!(matches!(panel.activate(), Activated::File(p) if p == zip.join("a.txt")));
     }
 
     #[test]

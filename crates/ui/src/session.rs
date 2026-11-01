@@ -111,7 +111,13 @@ impl TabState {
     /// Opens the tab's folder, or its closest existing parent if the folder
     /// is gone. `None` when nothing on the path exists any more.
     pub fn open(&self) -> Option<Panel> {
-        let mut panel = self.path.ancestors().find(|p| p.is_dir()).and_then(|p| Panel::open(p).ok())?;
+        // The folder, or the nearest one that still exists (an archive or a
+        // folder in one counts).
+        let mut panel = self
+            .path
+            .ancestors()
+            .filter(|p| p.is_dir() || rc_core::vfs::in_archive(p))
+            .find_map(|p| Panel::open(p).ok())?;
         panel.sort.key = match self.sort.as_str() {
             "ext" => SortKey::Ext,
             "size" => SortKey::Size,

@@ -17,7 +17,7 @@ use iced::{event, keyboard, mouse, window, Event, Point, Size, Subscription, Tas
 use rc_core::ops::{self, Conflict, Job, JobEvent, JobHandle, Outcome, Progress, Resolution};
 use rc_core::compare::{CompareOptions, Differences};
 use rc_core::entry::Entry;
-use rc_core::{Activated, Command, EntryKind, Nav, Panel, SortKey};
+use rc_core::{vfs, Activated, Command, EntryKind, Nav, Panel, SortKey};
 use rc_platform::{DragOutcome, MenuAction};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -296,6 +296,8 @@ pub enum Message {
     Find(find_files::FindMsg),
     /// Background listing for a pending navigation: (side, seq, listing).
     Navigated(usize, u64, Listing),
+    /// A file inside an archive was extracted to a temp copy to be opened.
+    Extracted(Result<PathBuf, String>),
     /// Subfolders of a folder, for path bar suggestions.
     Subfolders(PathBuf, Vec<String>),
     /// A folder size: (folder listed, entry name, size).
@@ -422,7 +424,9 @@ impl App {
             }));
         }
         // Watch the folders the visible tabs show, to refresh them on change.
-        let mut dirs: Vec<PathBuf> = (0..2).map(|side| self.panel(side).path.clone()).collect();
+        // (Archives aren't watched.)
+        let mut dirs: Vec<PathBuf> =
+            (0..2).map(|side| self.panel(side).path.clone()).filter(|p| !vfs::in_archive(p)).collect();
         dirs.dedup();
         // And the settings folder, to apply `config.toml` edits right away.
         if let Some(config) = crate::config::dir().filter(|d| !dirs.contains(d) && d.is_dir()) {
@@ -728,6 +732,12 @@ impl App {
                 return self.list_in_background(path);
             }
             Message::Listed(path, seq, result) => self.apply_listing(path, seq, result),
+            Message::Extracted(result) => {
+                self.status = Some(match result.and_then(|p| launch(&p).map_err(|e| e.to_string())) {
+                    Ok(msg) => (msg, Tone::Success),
+                    Err(e) => (e, Tone::Error),
+                });
+            }
             Message::ViewerLoaded(seq, result) => return self.viewer_loaded(seq, result),
             Message::ViewerFound(seq, result, cancel) => self.viewer_found(seq, result, &cancel),
             Message::ViewerWheel(lines) => self.viewer_wheel(lines),
@@ -761,6 +771,7 @@ impl App {
         ("Esc", "Cancel a slow folder change, drop the filter, then clear the selection"),
         ("Click, double-click", "Move the cursor, open"),
         ("Middle-click a folder", "Open it in a new tab"),
+        ("Enter / Ctrl+PgDn on a .zip, .jar, .7z", "Browse the archive like a folder (read-only: view, copy out, Enter opens a temp copy)"),
         ("Right-click", "Explorer context menu"),
         ("Drag and drop", "Copy (Shift = move) between panels and other apps; right drag = drop menu"),
         ("Mouse wheel", "Scroll the view (the cursor stays)"),
@@ -949,6 +960,20 @@ impl App {
         let active = self.active;
         let other = 1 - active;
 
+        // Archives are read-only for now.
+        let refused = match cmd {
+            Edit | EditNew => Some("edit files"),
+            MakeDir => Some("create folders"),
+            Rename | MultiRename => Some("rename"),
+            Delete | DeletePermanent => Some("delete"),
+            _ => None,
+        };
+        if let Some(what) = refused {
+            if self.refuse_in_archive(active, what) {
+                return Task::none();
+            }
+        }
+
         // Commands that touch more than the active panel or open dialogs.
         match cmd {
             Quit => return self.quit(),
@@ -1110,6 +1135,8 @@ impl App {
             CursorEnd => Ok(panel.cursor_end()),
             CursorBy(n) => Ok(panel.move_cursor(n as isize)),
             Open => match panel.activate() {
+                // Inside an archive: extract to a temp copy first.
+                Activated::File(path) if vfs::is_virtual(&path) => return open_extracted(path),
                 Activated::File(path) => launch(&path).map(|msg| info = Some(msg)),
                 _ => Ok(()),
             },
@@ -1485,6 +1512,10 @@ impl App {
         if sources.is_empty() {
             return Task::none();
         }
+        if let Some(msg) = archive_transfer_problem(is_move, &sources, target) {
+            self.status = Some((msg.into(), Tone::Info));
+            return Task::none();
+        }
         let mut input = target.display().to_string();
         if !input.ends_with(MAIN_SEPARATOR) {
             input.push(MAIN_SEPARATOR);
@@ -1505,6 +1536,10 @@ impl App {
             Dialog::Transfer { is_move, sources, base, input } => {
                 let target = PathBuf::from(input.trim());
                 let target = if target.is_relative() { base.join(target) } else { target };
+                if let Some(msg) = archive_transfer_problem(is_move, &sources, &target) {
+                    self.status = Some((msg.into(), Tone::Info));
+                    return Task::none();
+                }
                 match ops::plan_transfer(&sources, &target) {
                     Ok(transfers) => {
                         let title = format!(
@@ -1587,6 +1622,10 @@ impl App {
             if outside {
                 if let Some(drag) = self.drag.take() {
                     self.hover = None;
+                    if vfs::in_archive(&self.panel(drag.side).path) {
+                        self.status = Some(("Can't drag files out of archives yet; copy them with F5".into(), Tone::Info));
+                        return Task::none();
+                    }
                     return self.drag_out(drag);
                 }
             }
@@ -1624,7 +1663,9 @@ impl App {
         }
         let Some(target) = self.drop_target(&drag) else { return Task::none() };
         self.active = drag.side;
-        if drag.right {
+        // The shell's drop menu can't take files inside archives.
+        let in_archive = vfs::in_archive(&self.panel(drag.side).path) || vfs::in_archive(&target);
+        if drag.right && !in_archive {
             return self.drop_menu(drag, target);
         }
         self.open_transfer(self.modifiers.shift(), drag.sources, &target)
@@ -1699,7 +1740,11 @@ impl App {
 
     // ---- context menu -----------------------------------------------------
 
-    fn context_menu(&self, side: usize, background: bool) -> Task<Message> {
+    fn context_menu(&mut self, side: usize, background: bool) -> Task<Message> {
+        if vfs::in_archive(&self.panel(side).path) {
+            self.status = Some(("No context menu inside archives".into(), Tone::Info));
+            return Task::none();
+        }
         let items = if background { Vec::new() } else { self.target_paths(side) };
         let (folder, items) = self.shell_items(side, items);
         let extended = self.modifiers.shift();
@@ -1770,6 +1815,16 @@ impl App {
 
     // ---- helpers ----------------------------------------------------------
 
+    /// Archives are read-only: if `side` shows one (or a folder in one),
+    /// says that `what` can't be done there and returns true.
+    fn refuse_in_archive(&mut self, side: usize, what: &str) -> bool {
+        let refused = vfs::in_archive(&self.panel(side).path);
+        if refused {
+            self.status = Some((format!("Archives are read-only: can't {what} here"), Tone::Info));
+        }
+        refused
+    }
+
     /// Re-reads the visible tab on both sides after something changed.
     fn reload_panels(&mut self) {
         for side in 0..2 {
@@ -1809,6 +1864,11 @@ impl App {
             cancel.store(true, Ordering::Relaxed);
         }
         let opts = CompareOptions { show_hidden: self.panel(0).show_hidden && self.panel(1).show_hidden, ..self.compare_opts };
+        if opts.reads_disk() && (0..2).any(|side| vfs::in_archive(&self.panel(side).path)) {
+            let msg = "Compare by content or with subfolders doesn't work in archives yet";
+            self.status = Some((msg.into(), Tone::Info));
+            return Task::none();
+        }
         if !opts.reads_disk() {
             let never = AtomicBool::new(false);
             let diff = rc_core::compare::compare_with(&self.panel(0).entries, &self.panel(1).entries, opts, &never);
@@ -1857,7 +1917,13 @@ impl App {
         let (tx, rx) = iced::futures::channel::mpsc::unbounded();
         std::thread::spawn(move || {
             for name in names {
-                let size = rc_core::fs::dir_size(&dir.join(&name), &cancel);
+                let path = dir.join(&name);
+                let size = if vfs::is_virtual(&path) {
+                    // Inside an archive: sum the sizes from its index.
+                    vfs::open(&path).and_then(|v| v.walk(&path)).map_or(0, |items| items.iter().map(|e| e.size).sum())
+                } else {
+                    rc_core::fs::dir_size(&path, &cancel)
+                };
                 if cancel.load(Ordering::Relaxed) || tx.unbounded_send((dir.clone(), name, size)).is_err() {
                     break;
                 }
@@ -1900,7 +1966,7 @@ impl App {
                 let (tx, rx) = iced::futures::channel::oneshot::channel();
                 let dir = path.clone();
                 std::thread::spawn(move || {
-                    let _ = tx.send(rc_core::fs::list_dir(&dir, true).map_err(|e| e.to_string()));
+                    let _ = tx.send(vfs::list(&dir, true).map_err(|e| e.to_string()));
                 });
                 let result = rx.await.unwrap_or_else(|_| Err("listing thread failed".into()));
                 (path, result)
@@ -2133,6 +2199,32 @@ fn is_modifier_key(key: Named) -> bool {
     )
 }
 
+/// Copying into archives and moving out of them isn't supported yet.
+fn archive_transfer_problem(is_move: bool, sources: &[PathBuf], target: &Path) -> Option<&'static str> {
+    if vfs::in_archive(target) {
+        Some("Archives are read-only: can't copy or move files into them")
+    } else if is_move && sources.iter().any(|p| vfs::is_virtual(p)) {
+        Some("Archives are read-only: can't move files out of them (copy with F5)")
+    } else {
+        None
+    }
+}
+
+/// Enter on a file inside an archive: extracts it to a temp copy on a
+/// worker thread, then opens that (`Message::Extracted`).
+fn open_extracted(path: PathBuf) -> Task<Message> {
+    Task::perform(
+        async move {
+            let (tx, rx) = iced::futures::channel::oneshot::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(vfs::extract_temp(&path).map_err(|e| format!("Can't extract {}: {e}", path.display())));
+            });
+            rx.await.unwrap_or_else(|_| Err("extract thread failed".into()))
+        },
+        Message::Extracted,
+    )
+}
+
 /// Opens or runs a file, returning a status line describing what happened.
 fn launch(path: &Path) -> io::Result<String> {
     rc_platform::open_default(path)?;
@@ -2176,12 +2268,12 @@ pub struct Listed {
 /// Lists a navigation target (with hidden entries); runs on a worker
 /// thread. With `file_ok`, a file lists its parent folder instead.
 fn list_nav_target(path: &Path, file_ok: bool) -> Listing {
-    match rc_core::fs::list_dir(path, true) {
+    match vfs::list(path, true) {
         Ok(entries) => Ok(Listed { file: None, entries }),
-        Err(_) if file_ok && path.is_file() => {
+        Err(_) if file_ok && (path.is_file() || vfs::is_virtual(path)) => {
             let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
             let parent = path.parent().ok_or("No parent folder")?;
-            let entries = rc_core::fs::list_dir(parent, true).map_err(|e| e.to_string())?;
+            let entries = vfs::list(parent, true).map_err(|e| e.to_string())?;
             Ok(Listed { file: name, entries })
         }
         Err(e) if file_ok && e.kind() == io::ErrorKind::NotFound => Err(format!("Path not found: {}", path.display())),
