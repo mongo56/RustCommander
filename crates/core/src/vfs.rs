@@ -31,7 +31,7 @@ use std::fs::{self, File};
 use std::io::{self, BufReader, Read};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 /// A file system a panel can list and copy out of.
 pub trait Vfs: Send + Sync {
@@ -239,6 +239,10 @@ fn mount(parent: &Path, logical: &Path) -> Option<PathBuf> {
             return Some(disk);
         }
     }
+    {
+        let _lock = TEMP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        mark_used(&disk).ok()?;
+    }
     fs::create_dir_all(disk.parent()?).ok()?;
     index
         .read_files(&[logical.to_path_buf()], &mut |_, reader| {
@@ -400,12 +404,114 @@ pub fn temp_path(path: &Path) -> PathBuf {
     }
 }
 
+/// The folder for temp copies: `RustCommander` in the temp dir, with a
+/// folder per archive or server (named by a 16-digit hash, see
+/// [`temp_path`]) and `copy-*` folders of jobs copying between archives.
+pub fn temp_root() -> PathBuf {
+    std::env::temp_dir().join("RustCommander")
+}
+
+/// How long temp copies are kept after they were last made: [`clean_temp`]
+/// deletes older ones on startup.
+pub const TEMP_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Suffix of the marker file next to each archive's temp folder in
+/// [`temp_root`]: its date says when a copy was last made there.
+const USED: &str = ".used";
+
+/// Held while [`clean_temp`] checks and deletes a temp folder, and while a
+/// copy marks its folder as used, so a copy made meanwhile isn't deleted.
+static TEMP_LOCK: Mutex<()> = Mutex::new(());
+
+/// Marks the folder in [`temp_root`] that holds `copy` as used now.
+fn mark_used(copy: &Path) -> io::Result<()> {
+    let root = temp_root();
+    let Some(Component::Normal(dir)) = copy.strip_prefix(&root).ok().and_then(|rest| rest.components().next()) else {
+        return Ok(());
+    };
+    let mut name = dir.to_os_string();
+    name.push(USED);
+    fs::create_dir_all(&root)?;
+    let stamp = File::options().write(true).create(true).truncate(false).open(root.join(name))?;
+    stamp.set_modified(SystemTime::now())
+}
+
+/// Deletes temp copies in [`temp_root`] (of earlier runs or other
+/// instances) whose folder wasn't used for `max_age`. Files that can't be
+/// deleted (open in another program) are left, and so is anything in
+/// there this didn't make. Run it off the UI thread.
+pub fn clean_temp(max_age: Duration) {
+    clean_temp_in(&temp_root(), max_age);
+}
+
+fn clean_temp_in(root: &Path, max_age: Duration) {
+    let Ok(entries) = fs::read_dir(root) else { return };
+    let now = SystemTime::now();
+    let stale = |t: Option<SystemTime>| t.is_none_or(|t| now.duration_since(t).is_ok_and(|age| age > max_age));
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()).map(str::to_owned) else { continue };
+        let _lock = TEMP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(meta) = fs::symlink_metadata(&path) else { continue };
+        let hashed = |n: &str| n.len() == 16 && n.bytes().all(|b| b.is_ascii_hexdigit());
+        if meta.is_dir() && (hashed(&name) || name.starts_with("copy-")) {
+            let stamp = root.join(format!("{name}{USED}"));
+            // Folders from before the markers: the newest date in them.
+            let used = match fs::metadata(&stamp).and_then(|m| m.modified()) {
+                Ok(t) => Some(t),
+                Err(_) => newest_date(&path),
+            };
+            if stale(used) && remove_tree(&path) {
+                let _ = fs::remove_file(&stamp);
+            }
+        } else if meta.is_file() {
+            let Some(dir) = name.strip_suffix(USED).filter(|d| hashed(d)) else { continue };
+            // A marker whose folder is gone.
+            if fs::symlink_metadata(root.join(dir)).is_err() && stale(meta.modified().ok()) {
+                let _ = fs::remove_file(&path);
+            }
+        }
+    }
+}
+
+/// The latest creation or modification date of `dir` or anything in it.
+fn newest_date(dir: &Path) -> Option<SystemTime> {
+    let dates = |m: &fs::Metadata| [m.created().ok(), m.modified().ok()].into_iter().flatten().max();
+    let mut newest = fs::symlink_metadata(dir).ok().as_ref().and_then(dates);
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let date = match entry.file_type() {
+            Ok(t) if t.is_dir() => newest_date(&entry.path()),
+            _ => fs::symlink_metadata(entry.path()).ok().as_ref().and_then(dates),
+        };
+        newest = newest.max(date);
+    }
+    newest
+}
+
+/// Deletes what it can in `dir` and then `dir` itself, deepest first;
+/// links are removed, never followed. True if `dir` is gone.
+fn remove_tree(dir: &Path) -> bool {
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        match entry.file_type() {
+            Ok(t) if t.is_dir() => {
+                remove_tree(&path);
+            }
+            // A link to a folder is removed with remove_dir on Windows.
+            _ => {
+                let _ = fs::remove_file(&path).or_else(|_| fs::remove_dir(&path));
+            }
+        }
+    }
+    fs::remove_dir(dir).is_ok()
+}
+
 /// [`temp_path`] of `inner` in the archive `file`.
 fn temp_path_in(file: &Path, inner: &Path) -> PathBuf {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     file.hash(&mut hasher);
-    let mut out = std::env::temp_dir().join("RustCommander").join(format!("{:016x}", hasher.finish()));
+    let mut out = temp_root().join(format!("{:016x}", hasher.finish()));
     out.extend(inner.components().filter_map(|c| match c {
         Component::Normal(n) => Some(n),
         _ => None,
@@ -429,6 +535,10 @@ pub fn extract_temp(path: &Path) -> io::Result<PathBuf> {
 pub fn extract_temp_all(paths: &[PathBuf]) -> io::Result<Vec<PathBuf>> {
     let Some(first) = paths.iter().find(|p| is_virtual(p)) else { return Ok(paths.to_vec()) };
     let vfs = open(first)?;
+    {
+        let _lock = TEMP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        mark_used(&temp_path(first))?;
+    }
     let (mut files, mut targets) = (Vec::new(), Vec::new());
     for path in paths {
         for entry in vfs.walk(path)? {
@@ -1133,8 +1243,64 @@ pub(crate) mod tests {
         assert_eq!(all, [temp_path(&zip.join("sub")), temp_path(&zip.join("a.txt"))]);
         assert_eq!(fs::read(all[0].join("deep").join("x.txt")).unwrap(), b"deep file");
         assert_eq!(fs::read(&all[1]).unwrap(), b"hello zip");
-        let _ = fs::remove_dir_all(local.parent().unwrap().parent().unwrap().parent().unwrap());
+        // The archive's temp folder is marked as used, for clean_temp.
+        let folder = local.parent().unwrap().parent().unwrap().parent().unwrap();
+        let mut stamp = folder.as_os_str().to_os_string();
+        stamp.push(USED);
+        let age = fs::metadata(&stamp).unwrap().modified().unwrap().elapsed().unwrap_or_default();
+        assert!(age < Duration::from_secs(60));
+        let _ = fs::remove_dir_all(folder);
+        let _ = fs::remove_file(&stamp);
         assert_eq!(extract_temp(&zip).unwrap(), zip);
+    }
+
+    #[test]
+    fn cleans_old_temp_copies() {
+        let dir = TempDir::new("clean");
+        let root = &dir.0;
+        let file = |rel: &str| {
+            let p = root.join(rel);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(&p, b"x").unwrap();
+        };
+        let stamp = |name: &str, age: Duration| {
+            let f = File::create(root.join(format!("{name}{USED}"))).unwrap();
+            f.set_modified(SystemTime::now() - age).unwrap();
+        };
+        let day = Duration::from_secs(24 * 60 * 60);
+        file("aaaaaaaaaaaaaaaa/sub/f.txt");
+        stamp("aaaaaaaaaaaaaaaa", 2 * day);
+        file("bbbbbbbbbbbbbbbb/f.txt");
+        stamp("bbbbbbbbbbbbbbbb", Duration::ZERO);
+        stamp("cccccccccccccccc", 2 * day);
+        file("copy-9-9/0/f.txt");
+        file("other/f.txt");
+        file("notes.txt");
+        let exists = |rel: &str| root.join(rel).exists();
+
+        clean_temp_in(root, TEMP_MAX_AGE);
+        // Used two days ago: gone with its marker; a marker without a folder too.
+        assert!(!exists("aaaaaaaaaaaaaaaa") && !exists("aaaaaaaaaaaaaaaa.used") && !exists("cccccccccccccccc.used"));
+        // Used now, or (no marker) made now: kept. Not ours: kept.
+        assert!(exists("bbbbbbbbbbbbbbbb/f.txt") && exists("bbbbbbbbbbbbbbbb.used") && exists("copy-9-9/0/f.txt"));
+        assert!(exists("other/f.txt") && exists("notes.txt"));
+
+        // A file in use (not shared for deleting) stays, with its folders.
+        #[cfg(windows)]
+        let open = {
+            use std::os::windows::fs::OpenOptionsExt;
+            File::options().read(true).share_mode(0).open(root.join("bbbbbbbbbbbbbbbb/f.txt")).unwrap()
+        };
+        std::thread::sleep(Duration::from_millis(20));
+        clean_temp_in(root, Duration::ZERO);
+        assert!(!exists("copy-9-9") && exists("other/f.txt") && exists("notes.txt"));
+        #[cfg(windows)]
+        {
+            assert!(exists("bbbbbbbbbbbbbbbb/f.txt") && exists("bbbbbbbbbbbbbbbb.used"));
+            drop(open);
+            clean_temp_in(root, Duration::ZERO);
+        }
+        assert!(!exists("bbbbbbbbbbbbbbbb") && !exists("bbbbbbbbbbbbbbbb.used"));
     }
 
     #[test]
@@ -1173,7 +1339,7 @@ pub(crate) mod tests {
 
     /// A tar with `docs/` (explicit), `docs/one.txt`, `deep/x/two.txt`
     /// (implicit folders), a symlink (left out) and `top.txt`.
-    fn make_tar(out: impl Write) {
+    pub(crate) fn make_tar(out: impl Write) {
         let mut b = tar::Builder::new(out);
         let mut add = |name: &str, kind: tar::EntryType, data: &[u8]| {
             let mut h = tar::Header::new_gnu();

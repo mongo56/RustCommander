@@ -331,6 +331,7 @@ pub fn run(job: &Job, control: &Control, reporter: &mut dyn Reporter) -> Outcome
         sticky: None,
         buffer: vec![0; BUFFER_SIZE],
         last_report: Instant::now(),
+        staged: Vec::new(),
     };
 
     match job {
@@ -357,10 +358,20 @@ pub fn run(job: &Job, control: &Control, reporter: &mut dyn Reporter) -> Outcome
             } else if let (Some(t), Some(_)) = (from_server, dst_archive(transfers)) {
                 runner.fail_msg(&t.src, "Can't copy from a server into an archive: copy to a local folder first");
             } else if let Some(archive) = dst_archive(transfers) {
-                if transfers.iter().any(|t| vfs::is_virtual(&t.src)) {
-                    runner.relocate(&archive, transfers, !is_move);
-                } else {
-                    runner.pack(&archive, transfers, is_move);
+                let inside = |t: &Transfer| {
+                    vfs::inner_path(&t.src).is_some_and(|(file, inner)| !inner.is_empty() && same_path(&file, &archive))
+                };
+                let (within, other): (Vec<Transfer>, Vec<Transfer>) = transfers.iter().cloned().partition(inside);
+                let (from_archives, local): (Vec<Transfer>, Vec<Transfer>) =
+                    other.into_iter().partition(|t| vfs::is_virtual(&t.src));
+                if !within.is_empty() {
+                    runner.relocate(&archive, &within, !is_move);
+                }
+                if !from_archives.is_empty() && runner.alive() {
+                    runner.copy_between_archives(&archive, &from_archives, is_move);
+                }
+                if !local.is_empty() && runner.alive() {
+                    runner.pack(&archive, &local, is_move);
                 }
             } else {
                 // Moved out of archives: deleted there once extracted.
@@ -504,6 +515,10 @@ struct Runner<'a> {
     sticky: Option<Resolution>,
     buffer: Vec<u8>,
     last_report: Instant,
+    /// Temp copies of files from another archive, being packed into a zip:
+    /// (temp path, the original), to show the original in errors and
+    /// questions.
+    staged: Vec<(PathBuf, PathBuf)>,
 }
 
 impl Runner<'_> {
@@ -529,8 +544,22 @@ impl Runner<'_> {
     }
 
     fn fail_msg(&mut self, path: &Path, msg: impl Into<String>) -> bool {
-        self.outcome.errors.push((path.to_path_buf(), msg.into()));
+        let path = self.origin(path);
+        self.outcome.errors.push((path, msg.into()));
         false
+    }
+
+    /// `path`, or the file in another archive it's a temp copy of.
+    fn origin(&self, path: &Path) -> PathBuf {
+        for (temp, original) in &self.staged {
+            if let Ok(rest) = path.strip_prefix(temp) {
+                return match rest.as_os_str().is_empty() {
+                    true => original.clone(),
+                    false => original.join(rest),
+                };
+            }
+        }
+        path.to_path_buf()
     }
 
     /// Copies `src` to `dst` (recursively). With `is_move`, each source is
@@ -701,7 +730,7 @@ impl Runner<'_> {
             Some(sticky) => sticky,
             None => {
                 let conflict = Conflict {
-                    src: src.to_path_buf(),
+                    src: self.origin(src),
                     dst: dst.to_path_buf(),
                     src_size,
                     dst_size,
@@ -933,16 +962,17 @@ impl Runner<'_> {
     /// Copies or moves local files and folders into the zip `archive` (the
     /// transfers' destinations are inside it; it's created if missing).
     /// Conflicts are asked first, then the archive is rewritten once.
-    fn pack(&mut self, archive: &Path, transfers: &[Transfer], is_move: bool) {
+    /// Returns the transfers that were packed completely.
+    fn pack(&mut self, archive: &Path, transfers: &[Transfer], is_move: bool) -> Vec<usize> {
         // Not 7z, tar, ... nor archives inside archives (temp copies).
         if vfs::archive_writable(archive) == Some(false) {
             self.fail_msg(archive, "Only zip archives can be changed (not ones inside other archives)");
-            return;
+            return Vec::new();
         }
         let index = match archive.exists() {
             true => match self.open_writable(archive) {
                 Some(v) => Some(v),
-                None => return,
+                None => return Vec::new(),
             },
             false => None,
         };
@@ -965,7 +995,8 @@ impl Runner<'_> {
             };
             for item in items {
                 if !self.alive() {
-                    return self.restore(saved);
+                    self.restore(saved);
+                    return Vec::new();
                 }
                 // Never the archive itself (packing its own folder).
                 if same_path(&item.path, archive) {
@@ -998,7 +1029,8 @@ impl Runner<'_> {
                         Resolution::Overwrite => edits.remove.push(inner.clone()),
                         Resolution::Cancel => {
                             self.control.cancel();
-                            return self.restore(saved);
+                            self.restore(saved);
+                            return Vec::new();
                         }
                         _ => {
                             self.outcome.skipped += 1;
@@ -1011,14 +1043,83 @@ impl Runner<'_> {
                 adds.push(Add::File { src: item.path, inner, modified, size: item.size, transfer: ti });
             }
         }
-        let Some(failed) = self.rewrite(archive, &edits, &adds, &[], saved) else { return };
+        let Some(failed) = self.rewrite(archive, &edits, &adds, &[], saved) else { return Vec::new() };
+        let done: Vec<usize> = (0..transfers.len()).filter(|ti| complete[*ti] && !failed.contains(ti)).collect();
         if is_move {
-            for (ti, t) in transfers.iter().enumerate() {
-                if complete[ti] && !failed.contains(&ti) {
-                    self.remove_source(&t.src);
-                }
+            for &ti in &done {
+                self.remove_source(&transfers[ti].src);
             }
         }
+        done
+    }
+
+    /// Copies or moves files and folders from other archives (any kind that
+    /// can be read, also ones inside archives) into the zip `archive`:
+    /// they're extracted to a temp folder, packed like local files, and the
+    /// temp folder is removed. A move then deletes the sources, so it needs
+    /// them in a zip too.
+    fn copy_between_archives(&mut self, archive: &Path, transfers: &[Transfer], is_move: bool) {
+        if vfs::archive_writable(archive) == Some(false) {
+            self.fail_msg(archive, "Only zip archives can be changed (not 7z, tar, gz or ones inside other archives)");
+            return;
+        }
+        if archive.exists() && self.open_writable(archive).is_none() {
+            return;
+        }
+        let stage = vfs::temp_root().join(format!("copy-{}-{}", std::process::id(), unique_id()));
+        // Left by a crashed run whose process id was the same.
+        let _ = fs::remove_dir_all(&stage);
+        let mut staged = Vec::new();
+        // Per staged transfer: its source, and whether all of it was extracted.
+        let mut sources = Vec::new();
+        let before = (self.progress.done_bytes, self.progress.done_items);
+        for (i, t) in transfers.iter().enumerate() {
+            if !self.alive() {
+                break;
+            }
+            if is_move && vfs::archive_writable(&t.src) == Some(false) {
+                self.fail_msg(&t.src, "Can't move out of a read-only archive (only zips can be changed): copy with F5 instead");
+                continue;
+            }
+            let Some(name) = t.src.file_name() else {
+                self.fail_msg(&t.src, "Not a path inside an archive");
+                continue;
+            };
+            let folder = stage.join(i.to_string());
+            if let Err(e) = fs::create_dir_all(&folder) {
+                self.fail(&folder, e);
+                continue;
+            }
+            let temp = folder.join(name);
+            let problems = (self.outcome.errors.len(), self.outcome.skipped);
+            self.extract(&Transfer { src: t.src.clone(), dst: temp.clone() });
+            if fs::symlink_metadata(&temp).is_ok() {
+                sources.push((t.src.clone(), problems == (self.outcome.errors.len(), self.outcome.skipped)));
+                self.staged.push((temp.clone(), t.src.clone()));
+                staged.push(Transfer { src: temp, dst: t.dst.clone() });
+            }
+        }
+        // Packing counts it all once more (taken off again at the end, so
+        // the outcome counts each item once).
+        let extracted = (self.progress.done_bytes - before.0, self.progress.done_items - before.1);
+        self.progress.total_bytes += extracted.0;
+        self.progress.total_items += extracted.1;
+        if !staged.is_empty() && self.alive() {
+            let done = self.pack(archive, &staged, false);
+            let moved: Vec<PathBuf> =
+                done.into_iter().filter(|&i| is_move && sources[i].1).map(|i| sources[i].0.clone()).collect();
+            if !moved.is_empty() && self.alive() {
+                let saved = self.snapshot();
+                self.delete_in_archives(&moved);
+                self.restore(saved);
+            }
+        }
+        self.staged.clear();
+        let _ = fs::remove_dir_all(&stage);
+        let p = &mut self.progress;
+        (p.total_bytes, p.total_items) = (p.total_bytes - extracted.0, p.total_items - extracted.1);
+        (p.done_bytes, p.done_items) = (p.done_bytes.saturating_sub(extracted.0), p.done_items.saturating_sub(extracted.1));
+        self.report(true);
     }
 
     /// Moves (or with `keep`, copies) items within the zip `archive`: the
@@ -1512,6 +1613,12 @@ fn inner_of(archive: &Path, path: &Path) -> Option<String> {
     let rest = path.strip_prefix(archive).ok()?;
     let parts: Vec<String> = rest.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
     Some(parts.join("/"))
+}
+
+/// A number not returned before in this process (for temp folder names).
+fn unique_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 /// The folder holding the inner path `inner` (`""` = the archive root).
@@ -2014,6 +2121,82 @@ mod tests {
         assert_eq!(o.errors.len(), 1);
         assert!(o.errors[0].1.contains("ZipCrypto"), "{:?}", o.errors);
         assert_eq!(fs::read(&zip).unwrap(), ZIPCRYPTO);
+    }
+
+    #[test]
+    fn copies_and_moves_between_archives() {
+        struct Asked(Vec<PathBuf>);
+        impl Reporter for Asked {
+            fn progress(&mut self, _: &Progress) {}
+            fn conflict(&mut self, c: Conflict) -> Resolution {
+                self.0.push(c.src);
+                Resolution::Skip
+            }
+        }
+        let staging_left = || {
+            let prefix = format!("copy-{}-", std::process::id());
+            fs::read_dir(vfs::temp_root()).into_iter().flatten().flatten()
+                .any(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+        };
+        let tmp = TempDir::new("zip-zip");
+        let from = tmp.0.join("from.zip");
+        let to = tmp.0.join("to.zip");
+        crate::vfs::tests::make_zip(&from);
+        crate::vfs::tests::make_zip(&to);
+        let from_names = zip_names(&from);
+
+        // A folder and a file into a folder of the other zip.
+        let ts = plan_transfer(&[from.join("sub"), from.join("Readme.md")], &to.join("sub")).unwrap();
+        assert_eq!(ts[0].dst, to.join("sub").join("sub"));
+        let (o, asked) = run_job(Job::Copy(ts.clone()), Resolution::Cancel);
+        assert!(o.errors.is_empty(), "{:?}", o.errors);
+        assert_eq!(asked, 0);
+        // Counted once, though extracted and then packed.
+        assert_eq!((o.done_items, o.done_bytes), (4, 5009));
+        assert_eq!(zip_read(&to.join("sub/sub/deep/x.txt")), b"deep file");
+        assert_eq!(zip_read(&to.join("sub/Readme.md")), vec![b'r'; 5000]);
+        assert!(zip_names(&to).contains(&"sub/sub/deep".to_string()));
+        // Entries that were there are kept.
+        assert_eq!(zip_read(&to.join("sub/deep/x.txt")), b"deep file");
+        assert_eq!(zip_read(&to.join("a.txt")), b"hello zip");
+        assert_eq!(zip_names(&from), from_names);
+        assert!(!staging_left());
+
+        // Again: questions name the original files, skipped ones stay.
+        let mut r = Asked(Vec::new());
+        let o = run(&Job::Copy(ts), &Control::default(), &mut r);
+        assert!(o.errors.is_empty(), "{:?}", o.errors);
+        r.0.sort();
+        assert_eq!(r.0, [from.join("Readme.md"), from.join("sub").join("deep").join("x.txt")]);
+        assert_eq!(o.skipped, 2);
+
+        // A move deletes the source once it's in.
+        let ts = plan_transfer(&[from.join("a.txt")], &to.join("sub")).unwrap();
+        let (o, _) = run_job(Job::Move(ts), Resolution::Cancel);
+        assert!(o.errors.is_empty(), "{:?}", o.errors);
+        assert_eq!(zip_read(&to.join("sub/a.txt")), b"hello zip");
+        assert!(!zip_names(&from).contains(&"a.txt".to_string()));
+        assert!(!staging_left());
+
+        // From a tar: copying works, moving is refused (read-only source).
+        let tar = tmp.0.join("t.tar");
+        crate::vfs::tests::make_tar(File::create(&tar).unwrap());
+        let ts = plan_transfer(&[tar.join("docs")], &to).unwrap();
+        let before = fs::read(&to).unwrap();
+        let (o, _) = run_job(Job::Move(ts.clone()), Resolution::Cancel);
+        assert_eq!(o.errors.len(), 1, "{:?}", o.errors);
+        assert_eq!(fs::read(&to).unwrap(), before);
+        let (o, _) = run_job(Job::Copy(ts), Resolution::Cancel);
+        assert!(o.errors.is_empty(), "{:?}", o.errors);
+        assert_eq!(zip_read(&to.join("docs/one.txt")), b"first");
+
+        // Into a tar: refused.
+        let ts = plan_transfer(&[from.join("Readme.md")], &tar).unwrap();
+        let before = fs::read(&tar).unwrap();
+        let (o, _) = run_job(Job::Copy(ts), Resolution::Cancel);
+        assert_eq!(o.errors.len(), 1, "{:?}", o.errors);
+        assert_eq!(fs::read(&tar).unwrap(), before);
+        assert!(!staging_left());
     }
 
     #[test]

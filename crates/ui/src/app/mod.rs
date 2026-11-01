@@ -904,7 +904,7 @@ impl App {
         ("F2 / Shift+F6 (renaming)", "Select the name without extension, the extension, the whole name; Enter renames, Esc cancels"),
         ("Click, double-click", "Move the cursor, open"),
         ("Middle-click a folder or drive", "Open it in a new tab"),
-        ("Enter / Ctrl+PgDn on a .zip, .7z, .tar, .tar.gz, .gz, ...", "Browse the archive like a folder: view, copy out, Enter opens a temp copy; in a zip also copy/move in, F7, F2, F8 (others are read-only)"),
+        ("Enter / Ctrl+PgDn on a .zip, .7z, .tar, .tar.gz, .gz, ...", "Browse the archive like a folder: view, copy out, Enter opens a temp copy; in a zip also copy/move in (also from other archives), F7, F2, F8 (others are read-only)"),
         ("Ctrl+F, then Enter", "Connect to an SFTP/FTP/FTPS server: browse, F3 view, F5/F6 download and upload, F7, F2, F8 work there; Ctrl+Shift+F disconnects"),
         ("Right-click", "Explorer context menu"),
         ("Drag and drop", "Copy (Shift = move) between panels and other apps; right drag = drop menu"),
@@ -2597,7 +2597,8 @@ fn is_modifier_key(key: Named) -> bool {
     )
 }
 
-/// Copying into archives and moving out of them isn't supported yet.
+/// Transfers involving archives or servers that can't be done: into a
+/// read-only archive, moving out of one, between servers, ...
 fn archive_transfer_problem(is_move: bool, sources: &[PathBuf], target: &Path) -> Option<&'static str> {
     let server = |p: &Path| remote::split(p).map(|(key, _)| key.to_lowercase());
     let from_server = sources.iter().find_map(|p| server(p));
@@ -2617,10 +2618,8 @@ fn archive_transfer_problem(is_move: bool, sources: &[PathBuf], target: &Path) -
         (_, Some((file, _))) if vfs::archive_writable(file) == Some(false) => {
             Some("Read-only archive (only zips, not inside archives, can be changed)")
         }
-        (Some((a, _)), Some((b, _))) if !ops::same_path(a, b) => {
-            Some("Can't copy between archives: copy out to a folder first")
-        }
-        (Some((a, _)), None) if is_move && vfs::archive_writable(a) == Some(false) => {
+        // Into another (writable) archive is fine: extracted, then packed.
+        (Some((a, _)), _) if is_move && vfs::archive_writable(a) == Some(false) => {
             Some("This archive is read-only (only zips can be changed): copy out with F5 instead")
         }
         _ => None,

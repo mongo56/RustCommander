@@ -54,6 +54,8 @@ fn main() -> iced::Result {
         print_version();
         return Ok(());
     }
+    // Temp copies of files in archives or on servers left by earlier runs.
+    std::thread::spawn(|| rc_core::vfs::clean_temp(rc_core::vfs::TEMP_MAX_AGE));
     let mut session = session::load();
     if let Some(dir) = config::dir() {
         // SFTP host keys are trusted in known_hosts there.
