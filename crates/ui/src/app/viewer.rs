@@ -5,7 +5,7 @@
 use super::*;
 use crate::theme::filled;
 use iced::widget::text::{Span, Wrapping};
-use iced::widget::scrollable::{self, AbsoluteOffset, Direction, RelativeOffset};
+use iced::widget::scrollable::{self, AbsoluteOffset, Direction};
 use iced::{Point, Size};
 use iced::widget::{center, column, container, mouse_area, responsive, rich_text, row, text, Column, Space};
 use iced::{Alignment, ContentFit, Element, Font, Length};
@@ -54,10 +54,25 @@ const MAX_IMAGE_SIDE: u32 = 8192;
 const ZOOM_STEP: f32 = 1.25;
 const ZOOM_MIN: f32 = 0.05;
 const ZOOM_MAX: f32 = 32.0;
-/// Pixels the arrow keys pan a zoomed image by.
-const PAN_STEP: f32 = 48.0;
+/// Room the image scrollbars take at the view's right and bottom edges
+/// (a press there doesn't start a pan).
+const IMAGE_BAR: f32 = scrollbar::WIDTH + 2.0;
 /// Longest prefix of a line measured when clamping horizontal scroll.
 const MEASURE_MAX: usize = 100_000;
+
+/// Which image `viewer_step_image` goes to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    Prev,
+    Next,
+    First,
+    Last,
+}
+
+/// The file's extension names an image format (`load_sync` tries to decode it).
+fn is_image_name(path: &Path) -> bool {
+    ::image::ImageFormat::from_path(path).is_ok()
+}
 
 fn image_scroll_id() -> scrollable::Id {
     scrollable::Id::new("viewer-image")
@@ -117,6 +132,9 @@ pub(super) struct Viewer {
     /// Mouse selection, by file offsets; `selecting` while the left button drags it.
     sel: Option<Selection>,
     selecting: bool,
+    /// Window position of the pointer while the left button drags (pans) a
+    /// zoomed image.
+    pan: Option<Point>,
     /// Window position of the body's top-left corner (from pointer moves),
     /// to place the pointer while a selection drag leaves the body.
     origin: Point,
@@ -215,7 +233,7 @@ fn load_sync(path: &Path) -> Result<Loaded, String> {
     // A file inside an archive is viewed from a temp copy.
     let local = rc_core::vfs::extract_temp(path).map_err(|e| e.to_string())?;
     let path = local.as_path();
-    if ::image::ImageFormat::from_path(path).is_ok() {
+    if is_image_name(path) {
         if let Ok(img) = ::image::open(path) {
             let img = if img.width() > MAX_IMAGE_SIDE || img.height() > MAX_IMAGE_SIDE {
                 img.resize(MAX_IMAGE_SIDE, MAX_IMAGE_SIDE, ::image::imageops::FilterType::Triangle)
@@ -264,6 +282,7 @@ impl App {
             cancel: Arc::new(AtomicBool::new(false)),
             sel: None,
             selecting: false,
+            pan: None,
             origin: Point::ORIGIN,
         });
         self.viewer_show(index)
@@ -282,6 +301,7 @@ impl App {
         v.hit = None;
         v.sel = None;
         v.selecting = false;
+        v.pan = None;
         v.note = None;
         v.zoom = None;
         v.offset = AbsoluteOffset { x: 0.0, y: 0.0 };
@@ -410,30 +430,55 @@ impl App {
         ("Ctrl+A", "Select the whole file"),
         ("+, -, Ctrl+wheel", "Zoom an image in / out"),
         ("0, *", "Fit the image to the window"),
-        ("Arrows, PgUp, PgDn, Home, End", "Pan a zoomed image"),
+        ("Mouse drag", "Pan a zoomed image"),
+        ("Left/Up/PgUp, Right/Down/PgDn", "Images: previous / next image in the panel"),
+        ("Home, End", "Images: first / last image in the panel"),
     ];
 
-    /// Image-only keys: zoom and pan. `None` when the key is not one of them.
+    /// Image-only keys: zoom, and stepping through the panel's images.
+    /// `None` when the key is not one of them, or no image is shown (or
+    /// loading).
     fn viewer_image_key(&mut self, named: Option<Named>, typed: Option<&str>) -> Option<Task<Message>> {
-        self.viewer.as_ref()?.image_size()?;
-        let page = (self.window_height - VIEWER_CHROME_H - 40.0).max(PAN_STEP);
-        let pan = |x: f32, y: f32| scrollable::scroll_by(image_scroll_id(), AbsoluteOffset { x, y });
-        let zoomed = self.viewer.as_ref()?.zoom.is_some();
+        let v = self.viewer.as_ref()?;
+        let loading_image = matches!(v.content, Content::Loading) && is_image_name(v.path());
+        if !v.is_image() && !loading_image {
+            return None;
+        }
         Some(match (named, typed) {
             (_, Some("+" | "=")) => self.viewer_set_zoom(|z| Some(z * ZOOM_STEP)),
             (_, Some("-")) => self.viewer_set_zoom(|z| Some(z / ZOOM_STEP)),
             (_, Some("0" | "*")) => self.viewer_set_zoom(|_| None),
             (_, Some("1")) => self.viewer_set_zoom(|_| Some(1.0)),
-            (Some(Named::ArrowLeft), _) if zoomed => pan(-PAN_STEP, 0.0),
-            (Some(Named::ArrowRight), _) if zoomed => pan(PAN_STEP, 0.0),
-            (Some(Named::ArrowUp), _) if zoomed => pan(0.0, -PAN_STEP),
-            (Some(Named::ArrowDown), _) if zoomed => pan(0.0, PAN_STEP),
-            (Some(Named::PageUp), _) if zoomed => pan(0.0, -page),
-            (Some(Named::PageDown), _) if zoomed => pan(0.0, page),
-            (Some(Named::Home), _) if zoomed => scrollable::snap_to(image_scroll_id(), RelativeOffset::START),
-            (Some(Named::End), _) if zoomed => scrollable::snap_to(image_scroll_id(), RelativeOffset::END),
+            (Some(Named::ArrowLeft | Named::ArrowUp | Named::PageUp), _) => self.viewer_step_image(Step::Prev),
+            (Some(Named::ArrowRight | Named::ArrowDown | Named::PageDown), _) => self.viewer_step_image(Step::Next),
+            (Some(Named::Home), _) => self.viewer_step_image(Step::First),
+            (Some(Named::End), _) => self.viewer_step_image(Step::Last),
             _ => return None,
         })
+    }
+
+    /// Shows another image file of the viewer's list (files named as
+    /// images; one that doesn't decode opens as text). N/P step through
+    /// all files instead.
+    fn viewer_step_image(&mut self, step: Step) -> Task<Message> {
+        let Some(v) = &mut self.viewer else { return Task::none() };
+        let (i, n) = (v.index, v.files.len());
+        let mut range: Box<dyn Iterator<Item = usize>> = match step {
+            Step::Prev => Box::new((0..i).rev()),
+            Step::Next => Box::new(i + 1..n),
+            Step::First => Box::new(0..n),
+            Step::Last => Box::new((0..n).rev()),
+        };
+        let found = range.find(|&k| is_image_name(&v.files[k]));
+        match found {
+            Some(index) if index != i => self.viewer_show(index),
+            Some(_) => Task::none(),
+            None => {
+                let msg = if step == Step::Prev { "No previous image in the panel" } else { "No next image in the panel" };
+                v.note = Some((msg.into(), Tone::Info));
+                Task::none()
+            }
+        }
     }
 
     pub(super) fn viewer_panned(&mut self, offset: AbsoluteOffset) {
@@ -455,17 +500,34 @@ impl App {
         }
     }
 
-    /// The viewer wants window-wide pointer moves: a document is shown
-    /// (to learn the body's position for selection drags past its edges).
+    /// The viewer wants window-wide pointer moves and left presses: a
+    /// document is shown (to learn the body's position for selection drags
+    /// past its edges), or a zoomed image (drag panning).
     pub(super) fn viewer_tracks_mouse(&self) -> bool {
-        self.viewer.as_ref().is_some_and(|v| v.doc().is_some())
+        self.viewer.as_ref().is_some_and(|v| v.doc().is_some() || (v.is_image() && v.zoom.is_some()))
     }
 
-    /// A window-wide pointer move (`self.mouse`): over the body it fixes the
-    /// body's origin; outside it, it carries a selection drag on.
-    pub(super) fn viewer_mouse_moved(&mut self) {
+    /// A zoomed image larger than the view on some axis, so dragging pans it.
+    fn viewer_can_pan(&self) -> bool {
+        let Some(v) = &self.viewer else { return false };
+        let (Some((w, h)), Some(zoom)) = (v.image_size(), v.zoom) else { return false };
+        let view = self.viewer_body_size();
+        w as f32 * zoom > view.width || h as f32 * zoom > view.height
+    }
+
+    /// A window-wide pointer move (`self.mouse`): pans a dragged image; over
+    /// the body it fixes the body's origin; outside it, it carries a
+    /// selection drag on.
+    pub(super) fn viewer_mouse_moved(&mut self) -> Task<Message> {
         let mouse = self.mouse;
-        let Some(v) = &mut self.viewer else { return };
+        let Some(v) = &mut self.viewer else { return Task::none() };
+        if let Some(last) = v.pan {
+            v.pan = Some(mouse);
+            // The scrollable clamps, and reports the offset it ends up at
+            // through `ViewerPanned`.
+            let by = AbsoluteOffset { x: last.x - mouse.x, y: last.y - mouse.y };
+            return scrollable::scroll_by(image_scroll_id(), by);
+        }
         match v.pointer {
             Some(p) => v.origin = Point::new(mouse.x - p.x, mouse.y - p.y),
             None if v.selecting => {
@@ -474,13 +536,26 @@ impl App {
             }
             None => {}
         }
+        Task::none()
     }
 
-    /// Left button pressed (anywhere; acts over the body): starts a selection there, or with
-    /// Shift extends the current one.
+    /// Left button pressed (anywhere; acts over the body): starts a
+    /// selection there, or with Shift extends the current one; on a zoomed
+    /// image, starts panning it.
     pub(super) fn viewer_press(&mut self) {
         let shift = self.modifiers.shift();
-        let Some(v) = &self.viewer else { return };
+        let can_pan = self.viewer_can_pan();
+        let view = self.viewer_body_size();
+        let mouse = self.mouse;
+        let Some(v) = &mut self.viewer else { return };
+        if v.is_image() {
+            // Not over the body, or on its scrollbars.
+            let on_image = v.pointer.is_some_and(|p| p.x < view.width - IMAGE_BAR && p.y < view.height - IMAGE_BAR);
+            if can_pan && on_image {
+                v.pan = Some(mouse);
+            }
+            return;
+        }
         // Not over the body, or on the scrollbar in its right padding.
         let Some(p) = v.pointer.filter(|p| p.x < self.window_width - TEXT_PAD) else { return };
         let keep = v.sel.filter(|_| shift);
@@ -498,6 +573,7 @@ impl App {
     pub(super) fn viewer_release(&mut self) {
         if let Some(v) = &mut self.viewer {
             v.selecting = false;
+            v.pan = None;
             if v.sel.is_some_and(|s| s.is_empty()) {
                 v.sel = None;
             }
@@ -966,7 +1042,13 @@ impl App {
             },
             Content::Loaded(Loaded::Doc(doc)) => self.text_body(v, doc),
         };
-        let body = mouse_area(container(body).width(Length::Fill).height(Length::Fill).style(filled(theme::c().panel)))
+        let mut body = mouse_area(container(body).width(Length::Fill).height(Length::Fill).style(filled(theme::c().panel)));
+        if v.pan.is_some() {
+            body = body.interaction(mouse::Interaction::Grabbing);
+        } else if self.viewer_can_pan() {
+            body = body.interaction(mouse::Interaction::Grab);
+        }
+        let body = body
             .on_move(|at| Message::ViewerPointer(Some(at)))
             .on_exit(Message::ViewerPointer(None))
             .on_scroll(|delta| {
@@ -1000,7 +1082,7 @@ impl App {
             );
         }
         let help = if v.image_size().is_some() {
-            "Esc close · N/P next/prev file · +/- or Ctrl+wheel zoom · 0 fit · 1 actual size · arrows/PgUp/PgDn pan"
+            "Esc close · ←/→ prev/next image · N/P next/prev file · +/- or Ctrl+wheel zoom · 0 fit · 1 actual size · drag to pan"
         } else {
             "Esc close · N/P next/prev file · 1 text · 3 hex · W wrap · F7 find · F3/Shift+F3 next/prev · C match case · drag select · Ctrl+C copy"
         };

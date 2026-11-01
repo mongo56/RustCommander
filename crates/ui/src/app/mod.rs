@@ -624,8 +624,8 @@ impl App {
             }
             Message::MouseMoved(position) => {
                 self.mouse = position;
-                self.viewer_mouse_moved();
-                return self.update_drag();
+                let pan = self.viewer_mouse_moved();
+                return Task::batch([pan, self.update_drag()]);
             }
             Message::MouseUp(right) => {
                 if !right {
