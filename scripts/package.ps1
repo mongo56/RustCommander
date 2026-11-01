@@ -10,13 +10,26 @@ if ($LASTEXITCODE -ne 0) { throw 'cargo build failed' }
 
 $version = (Select-String -Path 'Cargo.toml' -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
 $name = "RustCommander-$version-win64"
-$stage = Join-Path $root "dist\$name"
+# Stage outside dist/ so an Explorer window open there can't block the rebuild.
+$stage = Join-Path ([IO.Path]::GetTempPath()) "rc-package\$name"
 if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
+New-Item -ItemType Directory -Force (Join-Path $root 'dist') | Out-Null
 New-Item -ItemType Directory -Force $stage | Out-Null
 Copy-Item 'target\release\rustcommander.exe' $stage
-foreach ($f in 'README.md', 'LICENSE', 'LICENSE-MIT', 'LICENSE-APACHE') {
+foreach ($f in 'LICENSE', 'LICENSE-MIT', 'LICENSE-APACHE') {
     if (Test-Path $f) { Copy-Item $f $stage }
 }
+# README without images (the screenshots aren't shipped): drop image lines
+# and the Screenshots section.
+$out = New-Object System.Collections.Generic.List[string]
+$skip = $false
+foreach ($line in Get-Content 'README.md' -Encoding UTF8) {
+    if ($line -match '^## ') { $skip = $line -eq '## Screenshots' }
+    if ($skip -or $line -match '!\[') { continue }
+    $out.Add($line)
+}
+$text = ($out -join "`n") -replace "`n{3,}", "`n`n"
+[IO.File]::WriteAllText((Join-Path $stage 'README.md'), $text + "`n")
 $zip = Join-Path $root "dist\$name.zip"
 if (Test-Path $zip) { Remove-Item -Force $zip }
 Compress-Archive -Path $stage -DestinationPath $zip
