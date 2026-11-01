@@ -590,6 +590,7 @@ impl App {
         let header = container(
             row![
                 text("Settings").size(16),
+                text(concat!("v", env!("CARGO_PKG_VERSION"))).size(12).color(colors.muted),
                 tabs,
                 Space::with_width(Length::Fill),
                 text(path).size(12).color(colors.muted).wrapping(Wrapping::None),

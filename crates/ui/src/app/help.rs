@@ -187,6 +187,7 @@ impl App {
         let header = container(
             row![
                 text("Help: keys and features").size(16),
+                text(concat!("RustCommander ", env!("CARGO_PKG_VERSION"))).size(12).color(colors.muted),
                 search,
                 Space::with_width(Length::Fill),
                 text(format!("{count} shown")).size(12).color(colors.muted),
