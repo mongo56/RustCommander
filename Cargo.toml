@@ -18,8 +18,13 @@ trash = "5"
 
 # Optimise dependencies (iced, wgpu, text shaping) even in debug builds so
 # the UI stays smooth during development; our own crates still build fast.
+[profile.dev]
+# Line tables only: backtraces keep file:line, PDBs stay small.
+debug = "line-tables-only"
+
 [profile.dev.package."*"]
 opt-level = 2
+debug = false
 
 [profile.release]
 lto = "thin"
