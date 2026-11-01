@@ -822,7 +822,7 @@ impl App {
         ("F2 / Shift+F6 (renaming)", "Select the name without extension, the extension, the whole name; Enter renames, Esc cancels"),
         ("Click, double-click", "Move the cursor, open"),
         ("Middle-click a folder", "Open it in a new tab"),
-        ("Enter / Ctrl+PgDn on a .zip, .jar, .7z", "Browse the archive like a folder: view, copy out, Enter opens a temp copy; in a zip also copy/move in, F7, F2, F8 (7z is read-only)"),
+        ("Enter / Ctrl+PgDn on a .zip, .7z, .tar, .tar.gz, .gz, ...", "Browse the archive like a folder: view, copy out, Enter opens a temp copy; in a zip also copy/move in, F7, F2, F8 (others are read-only)"),
         ("Right-click", "Explorer context menu"),
         ("Drag and drop", "Copy (Shift = move) between panels and other apps; right drag = drop menu"),
         ("Mouse wheel", "Scroll the view (the cursor stays)"),
@@ -1017,7 +1017,7 @@ impl App {
         let active = self.active;
         let other = 1 - active;
 
-        // In archives: zips can be changed (as jobs), 7z can't; nothing can
+        // In archives: zips can be changed (as jobs), others can't; nothing can
         // be edited in place. `bool` = allowed in a zip.
         let refused = match cmd {
             Edit | EditNew => Some(("edit files", false)),
@@ -1902,14 +1902,14 @@ impl App {
 
     /// If `side` shows an archive (or a folder in one) where `what` can't be
     /// done, says so and returns true. `zip_ok`: it can be done in a zip
-    /// (7z archives are read-only).
+    /// (other archives are read-only).
     fn refuse_in_archive(&mut self, side: usize, what: &str, zip_ok: bool) -> bool {
         let Some(writable) = vfs::archive_writable(&self.panel(side).path) else { return false };
         if zip_ok && writable {
             return false;
         }
         let msg = match zip_ok {
-            true => format!("7z archives are read-only (only zips can be changed): can't {what} here"),
+            true => format!("Only zip archives can be changed: can't {what} here"),
             false => format!("Can't {what} inside archives"),
         };
         self.status = Some((msg, Tone::Info));
@@ -1950,7 +1950,7 @@ impl App {
             .map(|e| e.path.clone())
             .collect();
         if archives.is_empty() {
-            self.status = Some(("Select zip or 7z archives to unpack".into(), Tone::Info));
+            self.status = Some(("Select archives (zip, 7z, tar, ...) to unpack".into(), Tone::Info));
             return Task::none();
         }
         if archives.iter().any(|p| vfs::is_virtual(p)) {
@@ -2350,13 +2350,13 @@ fn archive_transfer_problem(is_move: bool, sources: &[PathBuf], target: &Path) -
     let into = vfs::split_archive(target);
     match (&from, &into) {
         (_, Some((file, _))) if vfs::archive_writable(file) == Some(false) => {
-            Some("7z archives are read-only (only zips can be changed)")
+            Some("Only zip archives can be changed (this one is read-only)")
         }
         (Some((a, _)), Some((b, _))) if !ops::same_path(a, b) => {
             Some("Can't copy between archives: copy out to a folder first")
         }
         (Some((a, _)), None) if is_move && vfs::archive_writable(a) == Some(false) => {
-            Some("7z archives are read-only: can't move files out of them (copy with F5)")
+            Some("This archive is read-only (only zips can be changed): copy out with F5 instead")
         }
         _ => None,
     }

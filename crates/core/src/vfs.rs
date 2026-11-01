@@ -4,10 +4,13 @@
 //! (`C:\x\a.zip\sub\f.txt`) is served by that archive's [`Vfs`]; anything
 //! else is the local file system ([`LocalFs`]). Archives can be listed,
 //! walked and read (copy out, view); zips can also be changed (see
-//! `zip_edit`, driven by the jobs in `ops`), 7z archives are read-only.
+//! `zip_edit`, driven by the jobs in `ops`), the others are read-only.
 //! Supported: zip (`.zip`, `.jar`) via the `zip` crate, 7z via
-//! `sevenz-rust2`. Parsed archive indexes are cached by path, size and
-//! modification time, so browsing an archive reads its directory once.
+//! `sevenz-rust2`, tar (`.tar`, `.tar.gz`/`.tgz`, `.tar.bz2`/`.tbz2`) via
+//! `tar` + `flate2`/`bzip2`, and a single gzipped file (`.gz`). Parsed
+//! archive indexes are cached by path, size and modification time, so
+//! browsing an archive reads its directory once (a tar has no directory:
+//! listing reads it all, and so does reading files from it).
 
 use crate::entry::{Entry, EntryKind};
 use chrono::{DateTime, Local, TimeZone};
@@ -99,14 +102,27 @@ impl Vfs for LocalFs {
 enum Format {
     Zip,
     SevenZ,
+    Tar,
+    TarGz,
+    TarBz2,
+    /// One gzipped file (`x.txt.gz` holds `x.txt`).
+    Gz,
 }
 
 /// The archive format a file name stands for (by extension), if any.
 fn format_of(name: &OsStr) -> Option<Format> {
-    let ext = Path::new(name).extension()?.to_string_lossy().to_ascii_lowercase();
-    match ext.as_str() {
+    let name = name.to_string_lossy().to_ascii_lowercase();
+    let ext = Path::new(&name).extension()?.to_str()?;
+    let inner_tar = name.trim_end_matches(&format!(".{ext}")).ends_with(".tar");
+    match ext {
         "zip" | "jar" => Some(Format::Zip),
         "7z" => Some(Format::SevenZ),
+        "tar" => Some(Format::Tar),
+        "tgz" => Some(Format::TarGz),
+        "tbz2" | "tbz" => Some(Format::TarBz2),
+        "gz" if inner_tar => Some(Format::TarGz),
+        "bz2" if inner_tar => Some(Format::TarBz2),
+        "gz" => Some(Format::Gz),
         _ => None,
     }
 }
@@ -308,6 +324,8 @@ fn archive(file: &Path) -> io::Result<Arc<Archive>> {
     let raw = match format {
         Format::Zip => read_zip_index(file)?,
         Format::SevenZ => read_7z_index(file)?,
+        Format::Tar | Format::TarGz | Format::TarBz2 => read_tar_index(file, format)?,
+        Format::Gz => read_gz_index(file)?,
     };
     let archive = Arc::new(Archive::build(file.to_path_buf(), format, raw));
     let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
@@ -385,6 +403,65 @@ fn read_7z_index(file: &Path) -> io::Result<Vec<Raw>> {
         });
     }
     Ok(raw)
+}
+
+/// The decompressed contents of a tar-like or gz `file`.
+fn open_stream(file: &Path, format: Format) -> io::Result<Box<dyn Read>> {
+    let input = BufReader::new(File::open(file)?);
+    Ok(match format {
+        Format::TarGz | Format::Gz => Box::new(flate2::read::MultiGzDecoder::new(input)),
+        Format::TarBz2 => Box::new(bzip2::read::MultiBzDecoder::new(input)),
+        _ => Box::new(input),
+    })
+}
+
+/// A tar entry's kind: `Some(is_dir)` for folders and files; links and
+/// special files are left out.
+fn tar_kind(entry: &tar::Entry<'_, Box<dyn Read>>) -> Option<bool> {
+    use tar::EntryType;
+    match entry.header().entry_type() {
+        EntryType::Directory => Some(true),
+        EntryType::Regular | EntryType::Continuous | EntryType::GNUSparse => Some(false),
+        _ => None,
+    }
+}
+
+/// `source` numbers the entries the `tar` crate yields (meta entries such
+/// as long names are folded in by it), counting the left out ones too.
+fn read_tar_index(file: &Path, format: Format) -> io::Result<Vec<Raw>> {
+    let mut tar = tar::Archive::new(open_stream(file, format)?);
+    let mut raw = Vec::new();
+    for (i, entry) in tar.entries()?.enumerate() {
+        let entry = entry?;
+        let Some(is_dir) = tar_kind(&entry) else { continue };
+        let header = entry.header();
+        let modified = header.mtime().ok().and_then(|s| Local.timestamp_opt(s as i64, 0).single());
+        raw.push(Raw {
+            name: entry.path()?.to_string_lossy().into_owned(),
+            is_dir,
+            size: if is_dir { 0 } else { entry.size() },
+            modified,
+            hidden: false,
+            source: i,
+        });
+    }
+    Ok(raw)
+}
+
+/// A `.gz` holds one file, named like the archive without `.gz`. Its size
+/// is in the trailer (modulo 4 GiB), its date is the archive's.
+fn read_gz_index(file: &Path) -> io::Result<Vec<Raw>> {
+    use std::io::{Seek, SeekFrom};
+    let mut f = File::open(file)?;
+    let mut size = [0u8; 4];
+    let len = f.seek(SeekFrom::End(0))?;
+    if len >= 18 {
+        f.seek(SeekFrom::End(-4))?;
+        f.read_exact(&mut size)?;
+    }
+    let modified = f.metadata()?.modified().ok().map(DateTime::<Local>::from);
+    let name = file.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+    Ok(vec![Raw { name, is_dir: false, size: u32::from_le_bytes(size).into(), modified, hidden: false, source: 0 }])
 }
 
 impl Archive {
@@ -508,6 +585,45 @@ impl Archive {
         Ok(())
     }
 
+    /// Tar: reads through the archive, handing over the wanted entries.
+    fn read_tar(&self, files: &[PathBuf], each: &mut dyn FnMut(usize, &mut dyn Read) -> io::Result<bool>)
+        -> io::Result<()> {
+        let mut want: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (i, src) in self.sources(files)? {
+            if let Some(src) = src {
+                want.entry(src).or_default().push(i);
+            }
+        }
+        if self.format == Format::Gz {
+            if let Some(indexes) = want.remove(&0) {
+                let mut stream = open_stream(&self.file, self.format)?;
+                for i in indexes {
+                    if !each(i, &mut stream)? {
+                        break;
+                    }
+                }
+            }
+            return Ok(());
+        }
+        let mut tar = tar::Archive::new(open_stream(&self.file, self.format)?);
+        for (n, entry) in tar.entries()?.enumerate() {
+            if want.is_empty() {
+                break;
+            }
+            let mut entry = entry?;
+            // A file listed twice is read once (the later copy wins in the
+            // index, as `source` points at it).
+            if let Some(indexes) = want.remove(&n) {
+                for i in indexes {
+                    if !each(i, &mut entry)? {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// 7z: decodes only the blocks holding wanted files (a solid block is
     /// read from its start up to the last wanted file in it).
     fn read_7z(&self, files: &[PathBuf], each: &mut dyn FnMut(usize, &mut dyn Read) -> io::Result<bool>)
@@ -604,6 +720,7 @@ impl Vfs for Archive {
         match self.format {
             Format::Zip => self.read_zip(files, each),
             Format::SevenZ => self.read_7z(files, each),
+            Format::Tar | Format::TarGz | Format::TarBz2 | Format::Gz => self.read_tar(files, each),
         }
     }
 
@@ -695,6 +812,10 @@ pub(crate) mod tests {
         assert!(!is_virtual(&zip));
         assert!(in_archive(&zip));
         assert!(is_archive_name("X.ZIP") && is_archive_name("b.7z") && !is_archive_name("zip"));
+        assert_eq!(format_of(OsStr::new("a.TAR.GZ")), Some(Format::TarGz));
+        assert_eq!(format_of(OsStr::new("a.tbz2")), Some(Format::TarBz2));
+        assert_eq!(format_of(OsStr::new("a.txt.gz")), Some(Format::Gz));
+        assert_eq!(format_of(OsStr::new("a.txt.bz2")), None);
     }
 
     #[test]
@@ -798,6 +919,62 @@ pub(crate) mod tests {
         let vfs = open(&solid).unwrap();
         let read = read_all(&*vfs, &[solid.join("s").join("3"), solid.join("s").join("2")]);
         assert_eq!(read, [(0, b"three".to_vec()), (1, b"two".to_vec())]);
+    }
+
+    /// A tar with `docs/` (explicit), `docs/one.txt`, `deep/x/two.txt`
+    /// (implicit folders), a symlink (left out) and `top.txt`.
+    fn make_tar(out: impl Write) {
+        let mut b = tar::Builder::new(out);
+        let mut add = |name: &str, kind: tar::EntryType, data: &[u8]| {
+            let mut h = tar::Header::new_gnu();
+            h.set_entry_type(kind);
+            h.set_size(data.len() as u64);
+            h.set_mode(0o644);
+            h.set_mtime(1_600_000_000);
+            if kind == tar::EntryType::Symlink {
+                h.set_link_name("top.txt").unwrap();
+            }
+            b.append_data(&mut h, name, data).unwrap();
+        };
+        add("docs/", tar::EntryType::Directory, b"");
+        add("docs/one.txt", tar::EntryType::Regular, b"first");
+        add("deep/x/two.txt", tar::EntryType::Regular, b"second!");
+        add("link", tar::EntryType::Symlink, b"");
+        add("top.txt", tar::EntryType::Regular, &[b't'; 3000]);
+        b.into_inner().unwrap();
+    }
+
+    #[test]
+    fn browses_tar_formats() {
+        let dir = TempDir::new("tar");
+        let plain = dir.0.join("a.tar");
+        make_tar(File::create(&plain).unwrap());
+        let gz = dir.0.join("b.tar.gz");
+        make_tar(flate2::write::GzEncoder::new(File::create(&gz).unwrap(), flate2::Compression::default()));
+        let bz = dir.0.join("c.tbz2");
+        make_tar(bzip2::write::BzEncoder::new(File::create(&bz).unwrap(), bzip2::Compression::default()));
+        for path in [plain, gz, bz] {
+            assert_eq!(names(&list(&path, true).unwrap()), ["..", "deep", "docs", "top.txt"], "{path:?}");
+            let docs = list(&path.join("docs"), true).unwrap();
+            let one = docs.iter().find(|e| e.name == "one.txt").unwrap();
+            assert_eq!(one.size, 5);
+            assert_eq!(one.modified.unwrap().timestamp(), 1_600_000_000);
+            let vfs = open(&path).unwrap();
+            assert!(!vfs.writable());
+            let files = [path.join("top.txt"), path.join("deep/x/two.txt"), path.join("docs/one.txt")];
+            let read = read_all(&*vfs, &files);
+            assert_eq!(read, [(0, vec![b't'; 3000]), (1, b"second!".to_vec()), (2, b"first".to_vec())]);
+        }
+
+        let single = dir.0.join("notes.txt.gz");
+        let mut w = flate2::write::GzEncoder::new(File::create(&single).unwrap(), flate2::Compression::default());
+        w.write_all(b"gzipped text").unwrap();
+        w.finish().unwrap();
+        let entries = list(&single, true).unwrap();
+        assert_eq!(names(&entries), ["..", "notes.txt"]);
+        assert_eq!(entries[1].size, 12);
+        let vfs = open(&single).unwrap();
+        assert_eq!(read_all(&*vfs, &[single.join("notes.txt")]), [(0, b"gzipped text".to_vec())]);
     }
 
     #[test]

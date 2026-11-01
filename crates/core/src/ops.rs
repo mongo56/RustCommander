@@ -899,7 +899,7 @@ impl Runner<'_> {
         match vfs::open(archive) {
             Ok(v) if v.writable() => Some(v),
             Ok(_) => {
-                self.fail_msg(archive, "Only zip archives can be changed (7z is read-only)");
+                self.fail_msg(archive, "Only zip archives can be changed (7z, tar and gz are read-only)");
                 None
             }
             Err(e) => {
