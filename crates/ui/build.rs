@@ -30,6 +30,29 @@ fn main() {
     let out = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR")).join("icon.res");
     std::fs::write(&out, icon_res()).expect("write icon.res");
     println!("cargo:rustc-link-arg-bins={}", out.display());
+    // The same icon as a .ico file, for the installer (scripts/package.ps1).
+    std::fs::write(out.with_file_name("icon.ico"), icon_ico()).expect("write icon.ico");
+}
+
+/// An .ico file with the PNG images: header, directory, then the images.
+fn icon_ico() -> Vec<u8> {
+    let images: Vec<Vec<u8>> = SIZES.iter().map(|&size| png(size)).collect();
+    let mut out = Vec::new();
+    out.extend([0u16, 1, SIZES.len() as u16].iter().flat_map(|v| v.to_le_bytes()));
+    let mut offset = 6 + 16 * SIZES.len() as u32;
+    for (&size, image) in SIZES.iter().zip(&images) {
+        let side = if size >= 256 { 0 } else { size as u8 };
+        out.extend([side, side, 0, 0]);
+        out.extend(1u16.to_le_bytes()); // planes
+        out.extend(32u16.to_le_bytes()); // bits per pixel
+        out.extend((image.len() as u32).to_le_bytes());
+        out.extend(offset.to_le_bytes());
+        offset += image.len() as u32;
+    }
+    for image in &images {
+        out.extend(image);
+    }
+    out
 }
 
 fn png(size: u32) -> Vec<u8> {

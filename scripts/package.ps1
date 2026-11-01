@@ -34,3 +34,24 @@ $zip = Join-Path $root "dist\$name.zip"
 if (Test-Path $zip) { Remove-Item -Force $zip }
 Compress-Archive -Path $stage -DestinationPath $zip
 Write-Host ("Created {0} ({1:N1} MB)" -f $zip, ((Get-Item $zip).Length / 1MB))
+
+# Installer (Inno Setup 6, installer\rustcommander.iss), next to the zip.
+$iscc = @(
+    (Get-Command 'ISCC.exe' -ErrorAction SilentlyContinue | ForEach-Object Source),
+    "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+    "$env:ProgramFiles\Inno Setup 6\ISCC.exe",
+    "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
+) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+if (-not $iscc) {
+    Write-Host 'Skipped the installer: Inno Setup 6 (ISCC.exe) is not installed. Get it with: winget install JRSoftware.InnoSetup'
+    return
+}
+# The .ico that crates\ui\build.rs writes next to the exe's icon resource.
+$ico = Get-ChildItem 'target\release\build\rustcommander-*\out\icon.ico' -ErrorAction SilentlyContinue |
+    Sort-Object LastWriteTime -Descending | Select-Object -First 1
+$isccArgs = @('/Q', "/DAppVersion=$version", "/DSourceDir=$stage", "/DOutputDir=$(Join-Path $root 'dist')")
+if ($ico) { $isccArgs += "/DIconFile=$($ico.FullName)" }
+& $iscc @isccArgs 'installer\rustcommander.iss'
+if ($LASTEXITCODE -ne 0) { throw 'Inno Setup failed' }
+$setup = Join-Path $root "dist\RustCommander-$version-setup.exe"
+Write-Host ("Created {0} ({1:N1} MB)" -f $setup, ((Get-Item $setup).Length / 1MB))

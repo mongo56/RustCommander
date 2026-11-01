@@ -97,13 +97,18 @@ with a modern, minimalist look. Written in Rust with [iced](https://iced.rs).
 [Releases](../../releases) page, unzip it anywhere and run `rustcommander.exe`.
 No installer and no extra runtime are needed.
 
+**Installer**: `RustCommander-<version>-setup.exe` (same Releases page) installs
+to Program Files (or just for you), with a Start menu shortcut, an optional
+desktop icon and an uninstaller. Your settings in `%APPDATA%\RustCommander`
+are kept unless you choose to remove them.
+
 **From source** (needs a Rust toolchain with the MSVC target):
 
 ```sh
 cargo run -p rustcommander --release    # run
 cargo build --release                   # build only
 cargo test                              # tests
-powershell -File scripts\package.ps1    # portable zip in dist/
+powershell -File scripts\package.ps1    # zip + installer (Inno Setup 6) in dist/
 ```
 
 ## Configuration
