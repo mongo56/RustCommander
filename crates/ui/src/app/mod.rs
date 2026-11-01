@@ -103,6 +103,9 @@ pub struct App {
     multi_rename: Option<multi_rename::MultiRename>,
     /// Its settings, kept between uses.
     rename_opts: rc_core::rename::Options,
+    /// `(new, old)` paths of the last multi-rename batch, kept after the
+    /// tool closes so Ctrl+Z in a reopened tool still undoes it.
+    rename_undo: Vec<(PathBuf, PathBuf)>,
     /// Last good `config.toml` and the key bindings built from it.
     config: crate::config::Config,
     keymap: keymap::Keymap,
@@ -343,6 +346,7 @@ impl App {
             viewer: None,
             multi_rename: None,
             rename_opts: rc_core::rename::Options::default(),
+            rename_undo: Vec::new(),
             config: crate::config::Config::default(),
             keymap: keymap::Keymap::default(),
             config_stamp: None,

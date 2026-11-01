@@ -1,15 +1,20 @@
 //! Multi-rename tool (Ctrl+M, TC's `cm_MultiRenameFiles`): fills the window
 //! while open. Masks, search & replace and a case change give every
 //! selected file a new name, previewed live; Enter renames the batch, which
-//! Ctrl+Z undoes. Name logic lives in `rc_core::rename`.
+//! Ctrl+Z undoes (also after closing: the last batch's undo is kept and
+//! offered when the tool is reopened). A new name can be typed by hand:
+//! click it, or F2 then Up/Down (Enter/Esc finish; clear the box to go back
+//! to the computed name). Name logic lives in `rc_core::rename`.
 
 use super::*;
 use crate::theme::filled;
 use iced::widget::text::Wrapping;
-use iced::widget::{button, checkbox, column, container, row, scrollable, text, text_input, Column, Row, Space};
+use iced::widget::{
+    button, checkbox, column, container, mouse_area, row, scrollable, text, text_input, Column, Row, Space,
+};
 use iced::{Alignment, Element, Length};
 use rc_core::rename::{self, Case, Options, Preview};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Rows drawn in the preview list; the rest are summarised.
 const MAX_ROWS: usize = 2000;
@@ -17,6 +22,14 @@ const LABEL_W: f32 = 76.0;
 
 fn name_input_id() -> text_input::Id {
     text_input::Id::new("multi-rename-name")
+}
+
+fn edit_input_id() -> text_input::Id {
+    text_input::Id::new("multi-rename-edit")
+}
+
+fn list_id() -> scrollable::Id {
+    scrollable::Id::new("multi-rename-list")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +47,15 @@ pub(super) struct MultiRename {
     side: usize,
     dir: PathBuf,
     entries: Vec<Entry>,
+    /// The panel had a selection when the tool opened: renamed files are
+    /// selected again under their new names.
+    had_selection: bool,
+    /// Names typed by hand, by entry index (may be empty while typing).
+    edits: HashMap<usize, String>,
+    /// Row whose new name is being edited.
+    editing: Option<usize>,
+    /// Last row edited, where F2 resumes.
+    last_edit: usize,
     /// [`rename::name_key`]s of the folder's other names.
     others: HashSet<String>,
     opts: Options,
@@ -59,7 +81,7 @@ impl MultiRename {
         })();
         self.preview = counter.and_then(|c| {
             self.opts.counter = c;
-            rename::preview(&self.entries, &self.opts, &self.others)
+            rename::preview(&self.entries, &self.opts, &self.others, &self.edits)
         });
     }
 
@@ -89,6 +111,9 @@ impl MultiRename {
     fn rename(&mut self, pairs: &[(PathBuf, PathBuf)], verb: &str) -> Vec<(PathBuf, PathBuf)> {
         let (done, failed) = rename::rename_all(pairs);
         self.moved(&done);
+        // Hand-typed names were applied (or are stale now).
+        self.edits.clear();
+        self.editing = None;
         self.read_others();
         self.refresh();
         self.note = Some(match failed.first() {
@@ -105,6 +130,17 @@ impl MultiRename {
             ),
         });
         done.into_iter().map(|(from, to)| (to, from)).collect()
+    }
+}
+
+impl MultiRename {
+    /// Ends editing a row; an emptied box goes back to the computed name.
+    fn finish_edit(&mut self) {
+        if let Some(i) = self.editing.take() {
+            if self.edits.get(&i).is_some_and(String::is_empty) {
+                self.edits.remove(&i);
+            }
+        }
     }
 }
 
@@ -125,20 +161,28 @@ impl App {
             return Task::none();
         }
         let dir = panel.path.clone();
+        let had_selection = panel.selected_count() > 0;
         self.leave_edits();
+        let undo = std::mem::take(&mut self.rename_undo);
+        let note = (!undo.is_empty())
+            .then(|| (format!("Ctrl+Z undoes the last batch ({})", plural(undo.len(), "file")), Tone::Info));
         let c = self.rename_opts.counter;
         let mut mr = MultiRename {
             side,
             dir,
             entries,
+            had_selection,
+            edits: HashMap::new(),
+            editing: None,
+            last_edit: 0,
             others: HashSet::new(),
             opts: self.rename_opts.clone(),
             start: c.start.to_string(),
             step: c.step.to_string(),
             digits: c.digits.to_string(),
             preview: Ok(Vec::new()),
-            undo: Vec::new(),
-            note: None,
+            undo,
+            note,
         };
         mr.read_others();
         mr.refresh();
@@ -147,16 +191,56 @@ impl App {
     }
 
     fn close_multi_rename(&mut self) {
+        self.sync_rename_panel();
         if let Some(mr) = self.multi_rename.take() {
             self.rename_opts = mr.opts;
-            // The panels were re-read after each batch; put the cursor on
-            // the first file under its current name.
-            if let Some(first) = mr.entries.first() {
-                if self.panel(mr.side).path == mr.dir {
-                    self.panel_mut(mr.side).focus(&first.name);
-                }
-            }
+            self.rename_undo = mr.undo;
         }
+    }
+
+    /// After a batch (the panels were re-read): selects the tool's files in
+    /// their panel under their current names (if they were selected when it
+    /// opened) and puts the cursor on the first.
+    fn sync_rename_panel(&mut self) {
+        let Some(mr) = &self.multi_rename else {
+            return;
+        };
+        if self.panel(mr.side).path != mr.dir {
+            return;
+        }
+        let names: Vec<String> = mr.entries.iter().map(|e| e.name.clone()).collect();
+        let (side, had_selection) = (mr.side, mr.had_selection);
+        let panel = self.panel_mut(side);
+        if had_selection {
+            panel.set_selection(names.iter().cloned());
+        }
+        if let Some(first) = names.first() {
+            panel.focus(first);
+        }
+    }
+
+    /// Starts editing the new name of row `i` (clamped), focusing its box.
+    fn edit_row(&mut self, i: usize, scroll: bool) -> Task<Message> {
+        let Some(mr) = self.multi_rename.as_mut() else {
+            return Task::none();
+        };
+        let n = mr.entries.len().min(MAX_ROWS);
+        if n == 0 {
+            return Task::none();
+        }
+        let i = i.min(n - 1);
+        mr.finish_edit();
+        mr.refresh();
+        mr.editing = Some(i);
+        mr.last_edit = i;
+        let focus = Task::batch([text_input::focus(edit_input_id()), text_input::move_cursor_to_end(edit_input_id())]);
+        if !scroll {
+            return focus;
+        }
+        // Rows are about the same height, so the row's share of the list
+        // keeps it in view.
+        let y = if n > 1 { i as f32 / (n - 1) as f32 } else { 0.0 };
+        Task::batch([focus, scrollable::snap_to(list_id(), scrollable::RelativeOffset { x: 0.0, y })])
     }
 
     pub(super) fn multi_rename_update(&mut self, msg: MrMsg) -> Task<Message> {
@@ -188,7 +272,21 @@ impl App {
                 mr.opts.case = case;
                 mr.refresh();
             }
+            MrMsg::Edit(i) => return self.edit_row(i, false),
+            MrMsg::EditInput(value) => {
+                if let Some(i) = mr.editing {
+                    mr.edits.insert(i, value);
+                    mr.refresh();
+                }
+            }
+            MrMsg::EditDone => {
+                mr.finish_edit();
+                mr.refresh();
+                return Task::batch([text_input::focus(name_input_id()), text_input::move_cursor_to_end(name_input_id())]);
+            }
             MrMsg::Run => {
+                mr.finish_edit();
+                mr.refresh();
                 let previews = match &mr.preview {
                     Err(e) => {
                         mr.note = Some((e.clone(), Tone::Error));
@@ -214,6 +312,7 @@ impl App {
                 }
                 mr.undo = mr.rename(&pairs, "Renamed");
                 self.reload_panels();
+                self.sync_rename_panel();
             }
             MrMsg::Undo => {
                 if mr.undo.is_empty() {
@@ -223,6 +322,7 @@ impl App {
                 let pairs = std::mem::take(&mut mr.undo);
                 mr.rename(&pairs, "Undone:");
                 self.reload_panels();
+                self.sync_rename_panel();
             }
             MrMsg::Close => self.close_multi_rename(),
         }
@@ -236,7 +336,17 @@ impl App {
         mods: keyboard::Modifiers,
         captured: bool,
     ) -> Task<Message> {
+        let editing = self.multi_rename.as_ref().and_then(|mr| mr.editing);
         let msg = match named {
+            Some(Named::Escape) if editing.is_some() => MrMsg::EditDone,
+            Some(Named::ArrowUp) if editing.is_some() => {
+                return self.edit_row(editing.unwrap_or(0).saturating_sub(1), true);
+            }
+            Some(Named::ArrowDown) if editing.is_some() => return self.edit_row(editing.unwrap_or(0) + 1, true),
+            Some(Named::F2) => {
+                let last = self.multi_rename.as_ref().map_or(0, |mr| mr.last_edit);
+                return self.edit_row(last, true);
+            }
             Some(Named::Escape) => MrMsg::Close,
             Some(Named::Tab) if mods.shift() => return iced::widget::focus_previous(),
             Some(Named::Tab) => return iced::widget::focus_next(),
@@ -370,9 +480,24 @@ impl App {
                         None if p.unchanged(&e.name) => (p.new_name.clone(), colors.muted),
                         None => (p.new_name.clone(), colors.selected),
                     };
+                    let new = if p.edited && p.problem.is_none() { format!("{new}   (edited)") } else { new };
                     let bg = if i % 2 == 1 { colors.zebra } else { colors.panel };
+                    let new_cell: Element<'a, Message> = if mr.editing == Some(i) {
+                        let value = mr.edits.get(&i).map_or(p.new_name.as_str(), String::as_str);
+                        text_input("", value)
+                            .id(edit_input_id())
+                            .on_input(|v| Message::MultiRename(MrMsg::EditInput(v)))
+                            .on_submit(Message::MultiRename(MrMsg::EditDone))
+                            .padding([0, 4])
+                            .size(13)
+                            .width(Length::FillPortion(1))
+                            .style(theme::input)
+                            .into()
+                    } else {
+                        mouse_area(cell(new, color)).on_press(Message::MultiRename(MrMsg::Edit(i))).into()
+                    };
                     rows = rows.push(
-                        container(row![cell(e.name.clone(), old_color), cell(new, color)].spacing(16))
+                        container(row![cell(e.name.clone(), old_color), new_cell].spacing(16))
                             .padding([2, 14])
                             .style(filled(bg)),
                     );
@@ -383,7 +508,7 @@ impl App {
                             .padding([4, 14]),
                     );
                 }
-                scrollable(rows).height(Length::Fill).into()
+                scrollable(rows).id(list_id()).height(Length::Fill).into()
             }
         };
 
@@ -396,7 +521,7 @@ impl App {
                 };
                 text(msg.as_str()).size(12).color(color).wrapping(Wrapping::None).into()
             }
-            None => text("Enter rename \u{b7} Ctrl+Z undo \u{b7} Ctrl+R regex \u{b7} Ctrl+E match case \u{b7} Ctrl+U case \u{b7} Tab next field \u{b7} Esc close")
+            None => text("Enter rename \u{b7} Ctrl+Z undo \u{b7} click a new name or F2 to edit it \u{b7} Ctrl+R regex \u{b7} Ctrl+E match case \u{b7} Ctrl+U case \u{b7} Tab next field \u{b7} Esc close")
                 .size(11)
                 .color(colors.muted)
                 .wrapping(Wrapping::None)
@@ -433,6 +558,10 @@ pub enum MrMsg {
     Regex(bool),
     MatchCase(bool),
     Case(Case),
+    /// Edit the new name of a row by hand.
+    Edit(usize),
+    EditInput(String),
+    EditDone,
     Run,
     Undo,
     Close,

@@ -384,6 +384,8 @@ pub fn invalid_name(name: &str) -> Option<&'static str> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Preview {
     pub new_name: String,
+    /// The name was typed by hand (an `edits` entry), not computed.
+    pub edited: bool,
     /// Why this file can't be renamed as shown.
     pub problem: Option<String>,
 }
@@ -395,23 +397,37 @@ impl Preview {
 }
 
 /// New names for `entries` (all in one folder). `others` holds the
-/// [`name_key`]s of that folder's names that aren't being renamed.
-pub fn preview(entries: &[Entry], opts: &Options, others: &HashSet<String>) -> Result<Vec<Preview>, String> {
+/// [`name_key`]s of that folder's names that aren't being renamed. `edits`
+/// are names typed by hand, by entry index; they replace the computed name
+/// (an empty one is ignored).
+pub fn preview(
+    entries: &[Entry],
+    opts: &Options,
+    others: &HashSet<String>,
+    edits: &HashMap<usize, String>,
+) -> Result<Vec<Preview>, String> {
     let renamer = Renamer::new(opts)?;
-    let names: Vec<String> = entries.iter().enumerate().map(|(i, e)| renamer.apply(e, i)).collect();
+    let names: Vec<(String, bool)> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| match edits.get(&i).filter(|n| !n.is_empty()) {
+            Some(n) => (n.clone(), true),
+            None => (renamer.apply(e, i), false),
+        })
+        .collect();
     let mut count: HashMap<String, usize> = HashMap::new();
-    for n in &names {
+    for (n, _) in &names {
         *count.entry(name_key(n)).or_default() += 1;
     }
     Ok(names
         .into_iter()
-        .map(|new_name| {
+        .map(|(new_name, edited)| {
             let key = name_key(&new_name);
             let problem = invalid_name(&new_name)
                 .map(str::to_owned)
                 .or_else(|| (count[&key] > 1).then(|| "duplicate name".into()))
                 .or_else(|| others.contains(&key).then(|| "already exists".into()));
-            Preview { new_name, problem }
+            Preview { new_name, edited, problem }
         })
         .collect())
 }
@@ -503,7 +519,7 @@ mod tests {
 
     fn names(files: &[&str], opts: &Options) -> Vec<String> {
         let entries: Vec<Entry> = files.iter().map(|n| file(n)).collect();
-        preview(&entries, opts, &HashSet::new()).unwrap().into_iter().map(|p| p.new_name).collect()
+        preview(&entries, opts, &HashSet::new(), &HashMap::new()).unwrap().into_iter().map(|p| p.new_name).collect()
     }
 
     fn mask(name: &str, ext: &str) -> Options {
@@ -566,12 +582,32 @@ mod tests {
         let entries = [file("a.txt"), file("b.txt"), file("c.txt")];
         let others: HashSet<String> = [name_key("x.txt")].into();
         let opts = mask("x", "[E]");
-        let p = preview(&entries[..1], &opts, &others).unwrap();
+        let p = preview(&entries[..1], &opts, &others, &HashMap::new()).unwrap();
         assert_eq!(p[0].problem.as_deref(), Some("already exists"));
-        let p = preview(&entries[1..], &opts, &others).unwrap();
+        let p = preview(&entries[1..], &opts, &others, &HashMap::new()).unwrap();
         assert!(p.iter().all(|p| p.problem.is_some()));
-        let p = preview(&entries[..1], &mask("a?b", ""), &others).unwrap();
+        let p = preview(&entries[..1], &mask("a?b", ""), &others, &HashMap::new()).unwrap();
         assert!(p[0].problem.is_some());
+    }
+
+    #[test]
+    fn edits_override_computed_names() {
+        let entries = [file("a.txt"), file("b.txt"), file("c.txt")];
+        let opts = mask("[N]_x", "[E]");
+        let edits: HashMap<usize, String> = [(1, "hand.md".to_string()), (2, String::new())].into();
+        let p = preview(&entries, &opts, &HashSet::new(), &edits).unwrap();
+        let got: Vec<(&str, bool)> = p.iter().map(|p| (p.new_name.as_str(), p.edited)).collect();
+        assert_eq!(got, [("a_x.txt", false), ("hand.md", true), ("c_x.txt", false)]);
+        assert!(p.iter().all(|p| p.problem.is_none()));
+        // An edit clashing with a computed name is a duplicate.
+        let edits: HashMap<usize, String> = [(1, "A_X.txt".to_string())].into();
+        let p = preview(&entries, &opts, &HashSet::new(), &edits).unwrap();
+        if cfg!(windows) {
+            assert_eq!(p[0].problem.as_deref(), Some("duplicate name"));
+            assert_eq!(p[1].problem.as_deref(), Some("duplicate name"));
+        }
+        let edits: HashMap<usize, String> = [(0, "bad?".to_string())].into();
+        assert!(preview(&entries, &opts, &HashSet::new(), &edits).unwrap()[0].problem.is_some());
     }
 
     #[test]
