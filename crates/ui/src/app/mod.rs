@@ -36,6 +36,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// Width of the divider between the panels, and the narrowest a panel gets.
+const SPLIT_W: f32 = 5.0;
+const MIN_PANEL: f32 = 200.0;
 const ROW_H: f32 = 22.0;
 /// Approximate height of everything that isn't file rows (tabs, headers,
 /// footers, function-key bar). Only used to size PageUp/PageDown jumps.
@@ -111,6 +114,12 @@ pub struct App {
     /// Last known mouse position (window coordinates); tracked while a
     /// mouse button is down.
     mouse: Point,
+    /// Share of the width the left panel gets (0.5 = equal).
+    split: f32,
+    /// The divider between the panels is being dragged.
+    split_drag: bool,
+    /// When the divider was last pressed (double click resets it).
+    split_click: Option<Instant>,
     /// Row under the mouse while dragging: (side, index).
     hover: Option<(usize, usize)>,
     modifiers: keyboard::Modifiers,
@@ -312,6 +321,8 @@ pub enum Message {
     Hover(usize, usize),
     HoverEnd(usize),
     MouseMoved(Point),
+    /// Press on the divider between the panels / double click on it.
+    SplitPress,
     /// Mouse button released; `true` for the right button.
     MouseUp(bool),
     DragOutDone(usize, Result<DragOutcome, String>),
@@ -448,6 +459,9 @@ impl App {
             drag: None,
             dropped: Vec::new(),
             mouse: Point::ORIGIN,
+            split: session.as_ref().map_or(0.5, |s| s.split).clamp(0.0, 1.0),
+            split_drag: false,
+            split_click: None,
             hover: None,
             modifiers: keyboard::Modifiers::default(),
             icons: RefCell::new(HashMap::new()),
@@ -530,7 +544,7 @@ impl App {
         // Mouse moves re-render the window, so only listen while a drag may
         // be starting or in progress, or the viewer shows a document (mouse
         // selection).
-        if self.drag.is_some() || self.viewer_tracks_mouse() {
+        if self.drag.is_some() || self.split_drag || self.viewer_tracks_mouse() {
             subs.push(event::listen_with(|event, _status, _window| match event {
                 Event::Mouse(mouse::Event::CursorMoved { position }) => Some(Message::MouseMoved(position)),
                 _ => None,
@@ -699,10 +713,29 @@ impl App {
             }
             Message::MouseMoved(position) => {
                 self.mouse = position;
+                if self.split_drag {
+                    let room = (self.window_width - SPLIT_W).max(1.0);
+                    self.split = (position.x - SPLIT_W / 2.0) / room;
+                    self.split = self.left_width() / room;
+                    self.sync_grids();
+                }
                 let pan = self.viewer_mouse_moved();
                 return Task::batch([pan, self.update_drag()]);
             }
+            Message::SplitPress => {
+                let now = Instant::now();
+                if matches!(self.split_click, Some(t) if now - t < DOUBLE_CLICK) {
+                    self.split_click = None;
+                    self.split_drag = false;
+                    self.split = 0.5;
+                    self.sync_grids();
+                } else {
+                    self.split_click = Some(now);
+                    self.split_drag = true;
+                }
+            }
             Message::MouseUp(right) => {
+                self.split_drag = false;
                 if !right {
                     self.viewer_release();
                 }
@@ -755,7 +788,7 @@ impl App {
             Message::DropPosition(position) => {
                 let sources = std::mem::take(&mut self.dropped);
                 self.status = None;
-                let side = position.map(|(x, _)| usize::from(x >= self.window_width / 2.0)).unwrap_or(self.active);
+                let side = position.map(|(x, _)| usize::from(x >= self.split_x())).unwrap_or(self.active);
                 self.active = side;
                 let target = self.panel(side).path.clone();
                 return self.open_transfer(false, sources, &target);
@@ -2071,7 +2104,7 @@ impl App {
 
     /// Side the mouse is over (0 = left, 1 = right).
     fn side_under_mouse(&self) -> usize {
-        usize::from(self.mouse.x >= self.window_width / 2.0)
+        usize::from(self.mouse.x >= self.split_x())
     }
 
     /// Where a drop at the current mouse position would go: the folder row
@@ -2614,6 +2647,7 @@ impl App {
             hotlist: self.hotlist.clone(),
             compare: self.compare_unsaved,
             recent_commands: self.recent_commands.iter().map(|c| c.id().to_owned()).collect(),
+            split: self.split,
             window: self.placement.map(Into::into),
             editor: String::new(),
         }

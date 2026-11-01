@@ -33,7 +33,11 @@ impl Columns {
 
 impl App {
     pub fn view(&self) -> Element<'_, Message> {
-        let panels = row![self.side_view(0), vline(), self.side_view(1)].height(Length::Fill);
+        let panels = row![
+            container(self.side_view(0)).width(Length::Fixed(self.left_width())),
+            self.divider(),
+            self.side_view(1)
+        ].height(Length::Fill);
 
         let base: Element<'_, Message> = if let Some(h) = &self.help {
             self.help_view(h)
@@ -69,9 +73,36 @@ impl App {
         base
     }
 
-    /// Width of one panel; the two sides share the window equally.
-    fn panel_width(&self, _side: usize) -> f32 {
-        ((self.window_width - 1.0) / 2.0).max(1.0)
+    /// Width of the left panel: the split share, kept within bounds so
+    /// neither panel gets too narrow.
+    pub(super) fn left_width(&self) -> f32 {
+        let room = (self.window_width - SPLIT_W).max(1.0);
+        let min = MIN_PANEL.min(room / 2.0);
+        (room * self.split).clamp(min, room - min).round()
+    }
+
+    /// Window x of the middle of the divider.
+    pub(super) fn split_x(&self) -> f32 {
+        self.left_width() + SPLIT_W / 2.0
+    }
+
+    fn panel_width(&self, side: usize) -> f32 {
+        let left = self.left_width();
+        if side == 0 { left } else { (self.window_width - SPLIT_W - left).max(1.0) }
+    }
+
+    /// Draggable divider between the panels (double click: back to equal, see
+    /// `Message::SplitPress`).
+    fn divider(&self) -> Element<'_, Message> {
+        let line = row![
+            Space::new(Length::Fixed(2.0), Length::Fill),
+            container(Space::new(Length::Fixed(1.0), Length::Fill)).style(filled(theme::c().border)),
+            Space::new(Length::Fixed(2.0), Length::Fill),
+        ];
+        mouse_area(line)
+            .on_press(Message::SplitPress)
+            .interaction(mouse::Interaction::ResizingHorizontally)
+            .into()
     }
 
     pub(super) fn dragging(&self) -> bool {
@@ -237,7 +268,7 @@ impl App {
             _ => mouse_area(
                 container(match self.pending_nav(side) {
                     // Waiting for a slow folder: show where we're going.
-                    Some(target) => text(elide_left(&format!("{}  (reading…)", rc_core::remote::display(target)), self.path_chars()))
+                    Some(target) => text(elide_left(&format!("{}  (reading…)", rc_core::remote::display(target)), self.path_chars(side)))
                         .size(13)
                         .color(theme::c().muted)
                         .wrapping(Wrapping::None),
@@ -246,7 +277,7 @@ impl App {
                             Some(what) => format!("{}  \u{2014} search results: {what}", rc_core::remote::display(&panel.path)),
                             None => rc_core::remote::display(&panel.path),
                         },
-                        self.path_chars(),
+                        self.path_chars(side),
                     ))
                         .size(13)
                         .color(if active { theme::c().text } else { theme::c().muted })
@@ -918,8 +949,8 @@ impl App {
     }
 
     /// Roughly how many path characters fit in a panel's path bar.
-    fn path_chars(&self) -> usize {
-        ((self.window_width / 2.0 - 40.0) / 7.0).max(10.0) as usize
+    fn path_chars(&self, side: usize) -> usize {
+        ((self.panel_width(side) - 40.0) / 7.0).max(10.0) as usize
     }
 }
 
@@ -961,10 +992,6 @@ fn dialog_button(label: &str, message: Message, primary: bool, focused: bool) ->
 
 fn small_button(label: &str, message: Message) -> Element<'_, Message> {
     button(text(label).size(12)).on_press(message).padding([2, 10]).style(theme::fkey).into()
-}
-
-fn vline<'a>() -> Element<'a, Message> {
-    container(Space::new(Length::Fixed(1.0), Length::Fill)).style(filled(theme::c().border)).into()
 }
 
 fn hline<'a>() -> Element<'a, Message> {

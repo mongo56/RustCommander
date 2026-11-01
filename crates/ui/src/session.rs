@@ -22,6 +22,9 @@ pub struct Session {
     /// Window position and maximised state (Windows).
     #[serde(default)]
     pub window: Option<WindowState>,
+    /// Share of the width the left panel gets; older files lack it.
+    #[serde(default = "default_split")]
+    pub split: f32,
     /// Compare-folders options from older versions, moved to `config.toml`
     /// on start (`main`). Written back only while that move failed, so
     /// they aren't lost.
@@ -34,6 +37,10 @@ pub struct Session {
     /// Editor setting from older versions; read once to seed `config.toml`.
     #[serde(default, skip_serializing)]
     pub editor: String,
+}
+
+fn default_split() -> f32 {
+    0.5
 }
 
 /// [`rc_platform::Placement`] in the session file.
@@ -168,11 +175,13 @@ mod tests {
             window: Some(WindowState { left: -8, top: 0, right: 1200, bottom: 800, maximized: true }),
             compare: Some(CompareState { by_content: true, ignore_date: false, subfolders: true }),
             recent_commands: vec!["cm_MkDir".into(), "cm_Copy".into()],
+            split: 0.3,
             editor: r#""my editor.exe" -n %1"#.into(),
         };
         let text = toml::to_string_pretty(&session).unwrap();
         let back: Session = toml::from_str(&text).unwrap();
         assert_eq!(back.active, 1);
+        assert_eq!(back.split, 0.3);
         assert_eq!(back.hotlist, session.hotlist);
         assert_eq!(back.recent_commands, session.recent_commands);
         // Compare options not yet moved to config.toml are kept...
@@ -209,6 +218,7 @@ mod tests {
         assert_eq!(session.compare, Some(CompareState { by_content: true, ignore_date: false, subfolders: true }));
         let folders = [r"C:\Users", r"D:\Work"].map(|p| HotItem::Folder(PathBuf::from(p)));
         assert_eq!(session.hotlist, folders);
+        assert_eq!(session.split, 0.5);
         // Saved again, plain folders keep the old form.
         let saved = toml::to_string_pretty(&session).unwrap();
         assert!(saved.contains("Users"), "{saved}");
