@@ -355,6 +355,15 @@ const DEFAULTS: &[(&str, Command)] = {
         ("f8", Delete),
         ("f9", Terminal),
         ("f10", Configuration),
+        // Shift+cursor keys just move (TC selects while moving; there is no
+        // range selection yet), so they aren't dead keys for TC users.
+        ("shift+up", CursorUp),
+        ("shift+down", CursorDown),
+        ("shift+pageup", PageUp),
+        ("shift+pagedown", PageDown),
+        ("shift+home", CursorHome),
+        ("shift+end", CursorEnd),
+        ("shift+tab", SwitchPanel),
         ("ctrl+up", OpenInNewTab),
         ("alt+down", DirHistory),
         ("alt+left", HistoryBack),
@@ -373,6 +382,7 @@ const DEFAULTS: &[(&str, Command)] = {
         ("shift+f4", EditNew),
         ("ctrl+f5", SortBy(SortKey::Modified)),
         ("alt+f5", Pack),
+        ("shift+f5", Copy),
         ("ctrl+f6", SortBy(SortKey::Size)),
         ("shift+f6", Rename),
         ("alt+f7", FindFiles),
@@ -432,11 +442,13 @@ mod tests {
         let bindings = Keymap::default().bindings();
         let keys = |cmd| Keymap::keys_for(&bindings, cmd);
         assert_eq!(keys(Command::Help), ["F1"]);
-        assert_eq!(keys(Command::Copy), ["F5"]);
+        assert_eq!(keys(Command::Copy), ["F5", "Shift+F5"]);
+        assert_eq!(keys(Command::SwitchPanel), ["Tab", "Shift+Tab"]);
+        assert_eq!(keys(Command::PageDown), ["PgDn", "Shift+PgDn"]);
         assert_eq!(keys(Command::Open), ["Enter", "Ctrl+PgDn"]);
         assert_eq!(keys(Command::CountDirSizes), ["Alt+Shift+Enter"]);
-        assert_eq!(keys(Command::CursorDown), ["Down"]);
-        assert_eq!(keys(Command::CursorUp), ["Up"]);
+        assert_eq!(keys(Command::CursorDown), ["Down", "Shift+Down"]);
+        assert_eq!(keys(Command::CursorUp), ["Up", "Shift+Up"]);
         assert_eq!(keys(Command::OpenInNewTab), ["Ctrl+Up"]);
         assert_eq!(keys(Command::GoRoot), ["Ctrl+\\"]);
         assert_eq!(keys(Command::DeletePermanent), ["Shift+Del", "Shift+F8"]);
@@ -511,6 +523,19 @@ mod tests {
             ("alt+x", None),
             ("f11", None),
             ("ctrl+left", None),
+            ("shift+up", Some(CursorUp)),
+            ("shift+down", Some(CursorDown)),
+            ("shift+pageup", Some(PageUp)),
+            ("shift+pagedown", Some(PageDown)),
+            ("shift+home", Some(CursorHome)),
+            ("shift+end", Some(CursorEnd)),
+            ("shift+tab", Some(SwitchPanel)),
+            ("shift+f5", Some(Copy)),
+            ("ctrl+f8", None),
+            ("alt+f8", None),
+            ("ctrl+delete", None),
+            ("ctrl+alt+a", None),
+            ("ctrl+alt+\\", None),
         ];
         for (name, cmd) in cases {
             assert_eq!(map.command_of(name), cmd, "{name}");
@@ -553,9 +578,10 @@ mod tests {
         let keys = |cmd| Keymap::keys_for(&bindings, cmd);
         assert_eq!(keys(Command::Move), ["F6", "F5"]);
         assert_eq!(keys(Command::MakeDir), ["F7", "Ctrl+K"]);
-        // F5 now moves; no other key copies.
-        assert!(keys(Command::Copy).is_empty());
-        assert_eq!(map.command(&Key::Named(Named::F5), Modifiers::SHIFT), None);
+        // F5 now moves; Shift+F5 is its own binding and still copies.
+        assert_eq!(keys(Command::Copy), ["Shift+F5"]);
+        assert_eq!(map.command(&Key::Named(Named::F5), Modifiers::SHIFT), Some(Command::Copy));
+        assert_eq!(map.command(&Key::Named(Named::F5), Modifiers::ALT | Modifiers::SHIFT), None);
         // F8 unbound: only Del deletes, Shift+F8 still deletes permanently.
         assert_eq!(keys(Command::Delete), ["Del"]);
         assert_eq!(map.command(&Key::Named(Named::F8), Modifiers::CTRL), None);
