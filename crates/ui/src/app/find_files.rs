@@ -324,7 +324,7 @@ impl App {
         ("Ctrl+E", "Match case on / off"),
         ("Ctrl+S", "Search subfolders on / off"),
         ("Ctrl+H", "Search hidden files on / off"),
-        ("Ctrl+P", "Search inside archives (zip, 7z, tar, gz) on / off"),
+        ("Ctrl+P", "Search inside archives (zip, 7z, rar, tar, gz) on / off"),
         ("*.txt;*.md|skip*", "Name masks: ; separates, | starts exclusions"),
     ];
 

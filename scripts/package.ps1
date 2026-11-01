@@ -16,7 +16,7 @@ if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
 New-Item -ItemType Directory -Force (Join-Path $root 'dist') | Out-Null
 New-Item -ItemType Directory -Force $stage | Out-Null
 Copy-Item 'target\release\rustcommander.exe' $stage
-foreach ($f in 'LICENSE', 'LICENSE-MIT', 'LICENSE-APACHE') {
+foreach ($f in 'LICENSE', 'LICENSE-MIT', 'LICENSE-APACHE', 'THIRD-PARTY-NOTICES.txt') {
     if (Test-Path $f) { Copy-Item $f $stage }
 }
 # README without images (the screenshots aren't shipped): drop image lines

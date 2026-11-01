@@ -27,7 +27,7 @@ with a modern, minimalist look. Written in Rust with [iced](https://iced.rs).
 - Streams huge files; mouse selection and copy
 
 **Archives**
-- Browse zip, 7z, tar, tar.gz, tar.bz2 and gz like folders; pack (Alt+F5) and unpack (Alt+F9)
+- Browse zip, 7z, rar (rar4/rar5, multi-volume, encrypted; read-only), tar, tar.gz, tar.bz2 and gz like folders; pack (Alt+F5) and unpack (Alt+F9)
 - Add, change and delete files inside zip archives
 
 **Remote (SFTP, FTP, FTPS)**
@@ -153,3 +153,10 @@ shell integration and the build are Windows-specific.
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+Third-party notice: RAR archives are read with RARLAB's UnRAR library,
+compiled into the program (via the `unrar_sys` crate). UnRAR is freeware, not
+open source: it may be used free of charge to handle RAR archives, but not to
+build a RAR-compatible archiver or re-create the RAR compression algorithm.
+Its full license is in [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt),
+which ships with the zip and the installer.

@@ -989,7 +989,7 @@ impl App {
         ("Shift+Up/Down/PgUp/PgDn/Home/End", "Move and select the range from the cursor's starting point"),
         ("Thumbnail view (Ctrl+Shift+F5)", "Arrows move in the grid (Shift+arrows select), PgUp/PgDn by a screen; Enter, Space/Ins, quick search, clicks and dragging work as in the list. Picture size: thumbnail_size in config.toml"),
         ("Middle-click a folder or drive", "Open it in a new tab"),
-        ("Enter / Ctrl+PgDn on a .zip, .7z, .tar, .tar.gz, .gz, ...", "Browse the archive like a folder: view, copy out, Enter opens a temp copy; in a zip also copy/move in (also from other archives), F7, F2, F8 (others are read-only)"),
+        ("Enter / Ctrl+PgDn on a .zip, .7z, .rar, .tar, .tar.gz, .gz, ...", "Browse the archive like a folder: view, copy out, Enter opens a temp copy; in a zip also copy/move in (also from other archives), F7, F2, F8 (others are read-only)"),
         ("Ctrl+F, then Enter", "Connect to an SFTP/FTP/FTPS server: browse, F3 view, F5/F6 download and upload, F7, F2, F8 work there; Ctrl+Shift+F disconnects"),
         ("Right-click", "Explorer context menu"),
         ("Drag and drop", "Copy (Shift = move) between panels and other apps; right drag = drop menu"),
@@ -2289,7 +2289,7 @@ impl App {
             .map(|e| e.path.clone())
             .collect();
         if archives.is_empty() {
-            self.status = Some(("Select archives (zip, 7z, tar, ...) to unpack".into(), Tone::Info));
+            self.status = Some(("Select archives (zip, 7z, rar, tar, ...) to unpack".into(), Tone::Info));
             return Task::none();
         }
         if archives.iter().any(|a| remote::is_remote(a)) {

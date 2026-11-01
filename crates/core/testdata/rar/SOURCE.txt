@@ -1,0 +1,12 @@
+These RAR fixtures are copied unchanged from the test data of the `unrar`
+crate 0.5.8 (https://github.com/muja/unrar.rs, data/ folder), which is
+licensed MIT OR Apache-2.0. No tool that creates RAR archives was available
+to make our own.
+
+version.rar               rar4, one file (VERSION = "unrar-0.4.0")
+archive.part1.rar         rar4, first volume of a multi-volume archive with
+                          folders; the second volume is not included
+crypted.rar               rar4, encrypted file data (password "unrar")
+solid.rar                 rar5, solid
+unicode.rar               rar5, Unicode file name
+comment-hpw-password.rar  rar5, encrypted names (password "password")

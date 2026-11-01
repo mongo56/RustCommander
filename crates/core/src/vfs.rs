@@ -8,7 +8,8 @@
 //! read-only.
 //! Supported: zip (`.zip`, `.jar`) via the `zip` crate, 7z via
 //! `sevenz-rust2`, tar (`.tar`, `.tar.gz`/`.tgz`, `.tar.bz2`/`.tbz2`) via
-//! `tar` + `flate2`/`bzip2`, and a single gzipped file (`.gz`). Parsed
+//! `tar` + `flate2`/`bzip2`, a single gzipped file (`.gz`), and rar (rar4,
+//! rar5, multi-volume; read-only) via UnRAR (`rar` module). Parsed
 //! archive indexes are cached by path, size and modification time, so
 //! browsing an archive reads its directory once (a tar has no directory:
 //! listing reads it all, and so does reading files from it).
@@ -18,10 +19,10 @@
 //! through it and again when it changed): paths stay logical, only reads go
 //! to the copy. Nested archives are read-only.
 //!
-//! Encrypted zips (ZipCrypto, AES) and 7z archives (AES, also with
+//! Encrypted zips (ZipCrypto, AES), 7z and rar archives (also with
 //! encrypted names) are read with a password given by [`try_password`],
 //! kept per archive for the session. Without one, reading an encrypted
-//! file (or listing a 7z with encrypted names) fails with an error whose
+//! file (or listing a 7z or rar with encrypted names) fails with an error whose
 //! text contains [`PASSWORD_REQUIRED`].
 
 use crate::entry::{Entry, EntryKind};
@@ -33,6 +34,8 @@ use std::io::{self, BufReader, Read};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
+
+mod rar;
 
 /// A file system a panel can list and copy out of.
 pub trait Vfs: Send + Sync {
@@ -153,6 +156,8 @@ pub(crate) enum Format {
     TarBz2,
     /// One gzipped file (`x.txt.gz` holds `x.txt`).
     Gz,
+    /// rar4/rar5 (read-only).
+    Rar,
 }
 
 impl Format {
@@ -170,6 +175,7 @@ pub(crate) fn format_of(name: &OsStr) -> Option<Format> {
     match ext {
         "zip" | "jar" => Some(Format::Zip),
         "7z" => Some(Format::SevenZ),
+        "rar" => Some(Format::Rar),
         "tar" => Some(Format::Tar),
         "tgz" => Some(Format::TarGz),
         "tbz2" | "tbz" => Some(Format::TarBz2),
@@ -304,7 +310,7 @@ pub fn in_archive(path: &Path) -> bool {
 }
 
 /// For an archive or a path inside one: whether the archive can be changed
-/// (zip and tar yes, 7z and gz no). One inside another archive can be
+/// (zip and tar yes, 7z, gz and rar no). One inside another archive can be
 /// changed if that one can (it's rewritten and then put back). `None` for
 /// local paths.
 pub fn archive_writable(path: &Path) -> Option<bool> {
@@ -669,6 +675,7 @@ fn archive(file: &Path) -> io::Result<Arc<Archive>> {
         Format::SevenZ => read_7z_index(file, &disk)?,
         Format::Tar | Format::TarGz | Format::TarBz2 => read_tar_index(&disk, format)?,
         Format::Gz => read_gz_index(&disk)?,
+        Format::Rar => rar::read_index(file, &disk)?,
     };
     let archive = Arc::new(Archive::build(file.to_path_buf(), disk, format, raw));
     let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
@@ -1113,6 +1120,7 @@ impl Vfs for Archive {
         match self.format {
             Format::Zip => self.read_zip(files, each),
             Format::SevenZ => self.read_7z(files, each),
+            Format::Rar => self.read_rar(files, each),
             Format::Tar | Format::TarGz | Format::TarBz2 | Format::Gz => self.read_tar(files, each),
         }
     }
@@ -1505,5 +1513,98 @@ pub(crate) mod tests {
         assert_eq!(clean_parts("../evil"), None);
         assert_eq!(clean_parts("C:/evil"), None);
         assert_eq!(clean_parts("/"), None);
+    }
+
+    /// Copies the rar fixture `name` (from the `unrar` crate's test data,
+    /// see testdata/rar/SOURCE.txt) into `dir`.
+    fn rar_fixture(dir: &TempDir, name: &str) -> PathBuf {
+        let path = dir.0.join(name);
+        fs::copy(Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata").join("rar").join(name), &path).unwrap();
+        path
+    }
+
+    #[test]
+    fn browses_rar() {
+        let dir = TempDir::new("rar");
+        assert!(is_archive_name("x.RAR") && is_archive_name("x.part1.rar"));
+        // rar4, one file.
+        let rar = rar_fixture(&dir, "version.rar");
+        assert_eq!(names(&list(&rar, true).unwrap()), ["..", "VERSION"]);
+        let vfs = open(&rar).unwrap();
+        let version = vfs.stat(&rar.join("version")).unwrap().unwrap();
+        assert_eq!((version.kind, version.size), (EntryKind::File, 11));
+        assert!(version.modified.is_some_and(|d| d.format("%Y").to_string() == "2015"));
+        assert_eq!(read_all(&*vfs, &[rar.join("VERSION")]), [(0, b"unrar-0.4.0".to_vec())]);
+        assert_eq!(fs::read(extract_temp(&rar.join("VERSION")).unwrap()).unwrap(), b"unrar-0.4.0");
+        // Read-only.
+        assert!(!vfs.writable() && archive_writable(&rar) == Some(false));
+        assert!(vfs.make_dir(&rar.join("new")).is_err());
+
+        // rar5 (solid), and a Unicode name.
+        let solid = rar_fixture(&dir, "solid.rar");
+        let vfs = open(&solid).unwrap();
+        assert_eq!(read_all(&*vfs, &[solid.join(".gitignore")]), [(0, b"target\nCargo.lock\n".to_vec())]);
+        let unicode = rar_fixture(&dir, "unicode.rar");
+        assert_eq!(names(&list(&unicode, true).unwrap()), ["..", "te\u{2026}\u{2015}st\u{270c}"]);
+        let vfs = open(&unicode).unwrap();
+        assert_eq!(read_all(&*vfs, &[unicode.join("te\u{2026}\u{2015}st\u{270c}")])[0].1.len(), 17);
+    }
+
+    #[test]
+    fn browses_rar_volumes_and_folders() {
+        // The first volume of a multi-volume rar4 whose second volume is
+        // missing: what it holds is listed and read, the file running into
+        // the missing volume fails clearly.
+        let dir = TempDir::new("rar-volumes");
+        let rar = rar_fixture(&dir, "archive.part1.rar");
+        assert_eq!(names(&list(&rar, true).unwrap()), ["..", "Cargo.toml", "build.rs", "examples", "src", "vendor"]);
+        let unrar = rar.join("vendor").join("unrar");
+        assert_eq!(names(&list(&unrar, true).unwrap()), ["..", "acknow.txt", "arccmt.cpp", "archive.cpp"]);
+        assert_eq!(list(&unrar, true).unwrap()[0].path, rar.join("vendor"));
+        let vfs = open(&rar).unwrap();
+        assert_eq!(vfs.walk(&rar.join("vendor")).unwrap().len(), 5);
+        // Several files at once, out of archive order, keep their indexes.
+        let files = [rar.join("examples/lister.rs"), rar.join("build.rs"), unrar.join("acknow.txt")];
+        let read = read_all(&*vfs, &files);
+        assert_eq!(read.iter().map(|(i, b)| (*i, b.len())).collect::<Vec<_>>(), [(0, 2693), (1, 2396), (2, 4280)]);
+        // Stopping early is fine.
+        let mut seen = 0;
+        vfs.read_files(&files, &mut |_, _| {
+            seen += 1;
+            Ok(false)
+        })
+        .unwrap();
+        assert_eq!(seen, 1);
+        let err = vfs.read_files(&[unrar.join("archive.cpp")], &mut |_, r| io::copy(r, &mut io::sink()).map(|_| true));
+        assert!(err.unwrap_err().to_string().contains("volume"));
+        let copy = extract_temp(&rar.join("src").join("lib.rs")).unwrap();
+        assert_eq!(fs::metadata(copy).unwrap().len(), 7870);
+    }
+
+    #[test]
+    fn reads_encrypted_rars_with_a_password() {
+        let dir = TempDir::new("rar-password");
+        // rar4 with encrypted files: listing works, reading needs it.
+        let rar = rar_fixture(&dir, "crypted.rar");
+        assert_eq!(names(&list(&rar, true).unwrap()), ["..", ".gitignore"]);
+        assert!(needs_password(&rar));
+        let vfs = open(&rar).unwrap();
+        let err = vfs.read_files(&[rar.join(".gitignore")], &mut |_, r| io::copy(r, &mut io::sink()).map(|_| true));
+        assert!(err.unwrap_err().to_string().contains(PASSWORD_REQUIRED));
+        assert!(!try_password(&rar, "wrong").unwrap());
+        assert!(try_password(&rar, "unrar").unwrap());
+        assert!(!needs_password(&rar));
+        let vfs = open(&rar).unwrap();
+        assert_eq!(read_all(&*vfs, &[rar.join(".gitignore")]), [(0, b"target\nCargo.lock\n".to_vec())]);
+
+        // rar5 with encrypted names: listing needs it.
+        let hidden = rar_fixture(&dir, "comment-hpw-password.rar");
+        let err = list(&hidden, true).unwrap_err();
+        assert!(err.to_string().contains(PASSWORD_REQUIRED), "{err}");
+        assert!(!try_password(&hidden, "nope").unwrap());
+        assert!(try_password(&hidden, "password").unwrap());
+        assert_eq!(names(&list(&hidden, true).unwrap()), ["..", ".gitignore"]);
+        let vfs = open(&hidden).unwrap();
+        assert_eq!(read_all(&*vfs, &[hidden.join(".gitignore")]), [(0, b"target\nCargo.lock\n".to_vec())]);
     }
 }
