@@ -54,6 +54,8 @@ pub enum Command {
     PrevTab,
     /// Open the folder under the cursor in a new tab.
     OpenInNewTab,
+    /// Open `config.toml` in the editor (Ctrl+,).
+    EditConfig,
     Quit,
 }
 
@@ -76,7 +78,8 @@ impl Command {
             HistoryForward => "cm_NextDir",
             Hotlist => "cm_DirectoryHotlist",
             SwitchPanel => "cm_FocusSwap",
-            ToggleSelect { .. } => "cm_Select",
+            ToggleSelect { advance: true } => "cm_Select",
+            ToggleSelect { advance: false } => "cm_SelectNoMove",
             CountDirSizes => "cm_CountDirContent",
             SelectAll => "cm_SelectAll",
             DeselectAll => "cm_ClearAll",
@@ -102,7 +105,80 @@ impl Command {
             NextTab => "cm_SwitchToNextTab",
             PrevTab => "cm_SwitchToPreviousTab",
             OpenInNewTab => "cm_OpenDirInNewTab",
+            EditConfig => "cm_EditConfig",
             Quit => "cm_Exit",
         }
+    }
+
+    /// The command with this id (case-insensitive), for config files.
+    pub fn from_id(id: &str) -> Option<Command> {
+        Self::ALL.iter().copied().find(|c| c.id().eq_ignore_ascii_case(id))
+    }
+
+    /// Every command a key can be bound to (all but the mouse-only ones).
+    pub const ALL: &'static [Command] = {
+        use Command::*;
+        &[
+            CursorUp,
+            CursorDown,
+            PageUp,
+            PageDown,
+            CursorHome,
+            CursorEnd,
+            Open,
+            GoParent,
+            GoRoot,
+            HistoryBack,
+            HistoryForward,
+            Hotlist,
+            SwitchPanel,
+            ToggleSelect { advance: true },
+            ToggleSelect { advance: false },
+            CountDirSizes,
+            SelectAll,
+            DeselectAll,
+            Refresh,
+            ToggleHidden,
+            QuickFilter,
+            SortBy(SortKey::Name),
+            SortBy(SortKey::Ext),
+            SortBy(SortKey::Size),
+            SortBy(SortKey::Modified),
+            SyncOtherPanel,
+            View,
+            Edit,
+            EditNew,
+            Copy,
+            Move,
+            Rename,
+            MakeDir,
+            Delete,
+            DeletePermanent,
+            NewTab,
+            CloseTab,
+            NextTab,
+            PrevTab,
+            OpenInNewTab,
+            EditConfig,
+            Quit,
+        ]
+    };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ids_are_unique_and_round_trip() {
+        let mut ids: Vec<_> = Command::ALL.iter().map(|c| c.id()).collect();
+        for &c in Command::ALL {
+            assert_eq!(Command::from_id(c.id()), Some(c));
+        }
+        assert_eq!(Command::from_id("CM_COPY"), Some(Command::Copy));
+        assert_eq!(Command::from_id("cm_Nope"), None);
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), Command::ALL.len());
     }
 }

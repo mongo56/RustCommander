@@ -92,6 +92,12 @@ pub struct App {
     nav: [Option<PendingNav>; 2],
     /// Built-in viewer (F3), covering the whole window while open.
     viewer: Option<viewer::Viewer>,
+    /// Last good `config.toml` and the key bindings built from it.
+    config: crate::config::Config,
+    keymap: keymap::Keymap,
+    /// Modification time of `config.toml` when it was last read; `None` =
+    /// not read yet.
+    config_stamp: Option<Option<std::time::SystemTime>>,
 }
 
 /// A navigation whose target folder is being listed in the background.
@@ -278,7 +284,7 @@ impl App {
         };
         let (width, height) = session.as_ref().map_or((1280.0, 800.0), |s| (s.width, s.height));
 
-        let app = Self {
+        let mut app = Self {
             sides: [
                 restore(session.as_ref().map(|s| &s.left), left),
                 restore(session.as_ref().map(|s| &s.right), right),
@@ -310,7 +316,11 @@ impl App {
             next_listing: 0,
             nav: [None, None],
             viewer: None,
+            config: crate::config::Config::default(),
+            keymap: keymap::Keymap::default(),
+            config_stamp: None,
         };
+        app.refresh_config();
         (app, Task::none())
     }
 
@@ -362,6 +372,10 @@ impl App {
         // Watch the folders the visible tabs show, to refresh them on change.
         let mut dirs: Vec<PathBuf> = (0..2).map(|side| self.panel(side).path.clone()).collect();
         dirs.dedup();
+        // And the settings folder, to apply `config.toml` edits right away.
+        if let Some(config) = crate::config::dir().filter(|d| !dirs.contains(d) && d.is_dir()) {
+            dirs.push(config);
+        }
         subs.push(watch::folders(dirs).map(Message::FsChanged));
         Subscription::batch(subs)
     }
@@ -629,7 +643,15 @@ impl App {
                     job.handle.answer(resolution);
                 }
             }
-            Message::FsChanged(path) => return self.list_in_background(path),
+            Message::FsChanged(path) => {
+                if crate::config::dir().as_ref() == Some(&path) {
+                    self.refresh_config();
+                    if (0..2).all(|side| self.panel(side).path != path) {
+                        return Task::none();
+                    }
+                }
+                return self.list_in_background(path);
+            }
             Message::Listed(path, seq, result) => self.apply_listing(path, seq, result),
             Message::ViewerLoaded(seq, result) => return self.viewer_loaded(seq, result),
             Message::ViewerFound(seq, result, cancel) => self.viewer_found(seq, result, &cancel),
@@ -658,6 +680,7 @@ impl App {
         text: Option<String>,
         captured: bool,
     ) -> Task<Message> {
+        self.refresh_config();
         let named = match &key {
             keyboard::Key::Named(n) => Some(*n),
             _ => None,
@@ -747,7 +770,7 @@ impl App {
                 _ => {
                     self.filter_edit = None;
                     // Ctrl+S again just closes the box, keeping the filter.
-                    if keymap::command_for(&key, mods) == Some(Command::QuickFilter) {
+                    if self.keymap.command(&key, mods) == Some(Command::QuickFilter) {
                         return Task::none();
                     }
                 }
@@ -776,7 +799,7 @@ impl App {
             }
         }
 
-        match keymap::command_for(&key, mods) {
+        match self.keymap.command(&key, mods) {
             Some(cmd) => self.run(cmd),
             None => Task::none(),
         }
@@ -800,6 +823,14 @@ impl App {
                 if let Some(e) = self.panel(active).current().filter(|e| e.kind == EntryKind::File) {
                     let (path, name) = (e.path.clone(), e.name.clone());
                     self.edit_file(&path, &name);
+                }
+                return Task::none();
+            }
+            EditConfig => {
+                if let Err(e) = crate::config::create_if_missing("") {
+                    self.status = Some((format!("Can't create config.toml: {e}"), Tone::Error));
+                } else if let Some(path) = crate::config::file() {
+                    self.edit_file(&path, "config.toml");
                 }
                 return Task::none();
             }
@@ -1746,16 +1777,38 @@ impl App {
         }
     }
 
+    /// Re-reads `config.toml` if it changed since the last read and applies
+    /// it (key bindings, colours). A broken file keeps the previous settings
+    /// and reports the error.
+    fn refresh_config(&mut self) {
+        let stamp = crate::config::file().and_then(|p| std::fs::metadata(p).ok()).and_then(|m| m.modified().ok());
+        if self.config_stamp == Some(stamp) {
+            return;
+        }
+        let first = self.config_stamp.is_none();
+        self.config_stamp = Some(stamp);
+        let loaded = crate::config::load().and_then(|config| {
+            let keymap = keymap::Keymap::new(&config.keys).map_err(|e| format!("config.toml [keys]: {e}"))?;
+            let colors = theme::DARK.with(&config.colors).map_err(|e| format!("config.toml [colors]: {e}"))?;
+            Ok((config, keymap, colors))
+        });
+        match loaded {
+            Ok((config, keymap, colors)) => {
+                self.config = config;
+                self.keymap = keymap;
+                theme::set(colors);
+                if !first {
+                    self.status = Some(("Settings reloaded".into(), Tone::Info));
+                }
+            }
+            Err(e) => self.status = Some((format!("Bad config: {e}"), Tone::Error)),
+        }
+    }
+
     /// Opens `path` in the editor from `config.toml` (F4, Shift+F4).
     fn edit_file(&mut self, path: &Path, name: &str) {
-        let config = match crate::config::load() {
-            Ok(config) => config,
-            Err(e) => {
-                self.status = Some((format!("Bad config: {e}"), Tone::Error));
-                return;
-            }
-        };
-        self.status = Some(match crate::editor::launch(&config.editor, path) {
+        self.refresh_config();
+        self.status = Some(match crate::editor::launch(&self.config.editor, path) {
             Ok(()) => (format!("Editing {name}"), Tone::Success),
             Err(e) => (format!("Can't start the editor: {e}"), Tone::Error),
         });

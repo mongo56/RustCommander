@@ -680,18 +680,18 @@ impl App {
             row![
                 text(name).size(14).wrapping(Wrapping::None),
                 Space::with_width(Length::Fill),
-                text(info.join("   ")).size(12).color(theme::MUTED).wrapping(Wrapping::None),
+                text(info.join("   ")).size(12).color(theme::c().muted).wrapping(Wrapping::None),
             ]
             .spacing(16)
             .align_y(Alignment::Center),
         )
         .padding([6, 12])
         .clip(true)
-        .style(filled(theme::HEADER));
+        .style(filled(theme::c().header));
 
         let body: Element<'a, Message> = match &v.content {
-            Content::Loading => center(text("Loading…").size(13).color(theme::MUTED)).into(),
-            Content::Failed(e) => center(text(format!("Can't open: {e}")).size(13).color(theme::ERROR)).into(),
+            Content::Loading => center(text("Loading…").size(13).color(theme::c().muted)).into(),
+            Content::Failed(e) => center(text(format!("Can't open: {e}")).size(13).color(theme::c().error)).into(),
             Content::Loaded(Loaded::Image { handle, width, height }) => match v.zoom {
                 None => center(
                     image(handle.clone()).content_fit(ContentFit::ScaleDown).filter_method(image::FilterMethod::Linear),
@@ -702,7 +702,7 @@ impl App {
             },
             Content::Loaded(Loaded::Doc(doc)) => self.text_body(v, doc),
         };
-        let body = mouse_area(container(body).width(Length::Fill).height(Length::Fill).style(filled(theme::PANEL)))
+        let body = mouse_area(container(body).width(Length::Fill).height(Length::Fill).style(filled(theme::c().panel)))
             .on_move(|at| Message::ViewerPointer(Some(at)))
             .on_exit(Message::ViewerPointer(None))
             .on_scroll(|delta| {
@@ -725,14 +725,14 @@ impl App {
                             .padding(5)
                             .size(13)
                             .style(theme::input),
-                        text(if v.case { "Aa (C)" } else { "aa (C)" }).size(12).color(theme::MUTED),
+                        text(if v.case { "Aa (C)" } else { "aa (C)" }).size(12).color(theme::c().muted),
                     ]
                     .spacing(8)
                     .align_y(Alignment::Center),
                 )
                 .padding([4, 12])
                 .height(SEARCH_H)
-                .style(filled(theme::HEADER)),
+                .style(filled(theme::c().header)),
             );
         }
         let help = if v.image_size().is_some() {
@@ -743,16 +743,16 @@ impl App {
         let footer: Element<'a, Message> = match &v.note {
             Some((msg, tone)) => text(msg.as_str())
                 .size(12)
-                .color(if *tone == Tone::Error { theme::ERROR } else { theme::TEXT })
+                .color(if *tone == Tone::Error { theme::c().error } else { theme::c().text })
                 .into(),
             None => text(help)
             .size(12)
-            .color(theme::MUTED)
+            .color(theme::c().muted)
             .wrapping(Wrapping::None)
             .into(),
         };
-        page = page.push(container(footer).padding([4, 12]).width(Length::Fill).clip(true).style(filled(theme::HEADER)));
-        container(page).width(Length::Fill).height(Length::Fill).style(filled(theme::BG)).into()
+        page = page.push(container(footer).padding([4, 12]).width(Length::Fill).clip(true).style(filled(theme::c().header)));
+        container(page).width(Length::Fill).height(Length::Fill).style(filled(theme::c().bg)).into()
     }
 
     fn text_body<'a>(&'a self, v: &'a Viewer, doc: &'a Document) -> Element<'a, Message> {
@@ -853,8 +853,8 @@ fn highlight<'a>(s: &str, marks: &[(usize, usize)]) -> Vec<Span<'a, Message, Fon
         }
         spans.push(
             Span::new(chars[a..b].iter().collect::<String>())
-                .color(theme::BG)
-                .background(theme::SELECTED),
+                .color(theme::c().bg)
+                .background(theme::c().selected),
         );
         pos = b;
     }

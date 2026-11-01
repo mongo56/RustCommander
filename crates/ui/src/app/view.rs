@@ -25,7 +25,7 @@ impl App {
             None => container(column![panels, hline(), self.jobs_view(), self.bottom_bar()])
                 .width(Length::Fill)
                 .height(Length::Fill)
-                .style(filled(theme::BG))
+                .style(filled(theme::c().bg))
                 .into(),
         };
 
@@ -80,11 +80,11 @@ impl App {
 
         // Thin strip marks the active panel (green while it's a drop target).
         let strip = if drop_here {
-            theme::SUCCESS
+            theme::c().success
         } else if active {
-            theme::ACCENT
+            theme::c().accent
         } else {
-            theme::HEADER
+            theme::c().header
         };
         let accent = container(Space::new(Length::Fill, Length::Fixed(2.0))).style(filled(strip));
 
@@ -139,7 +139,7 @@ impl App {
                 .padding(Padding { top: 4.0, right: 8.0, bottom: 0.0, left: 8.0 })
                 .width(Length::Fill)
                 .clip(true)
-                .style(filled(theme::BG)),
+                .style(filled(theme::c().bg)),
         )
         .on_press(Message::TabBarClick(side))
         .into()
@@ -174,7 +174,7 @@ impl App {
             row![
                 buttons,
                 Space::with_width(Length::Fill),
-                text(space).size(12).color(theme::MUTED).wrapping(Wrapping::None),
+                text(space).size(12).color(theme::c().muted).wrapping(Wrapping::None),
             ]
             .spacing(10)
             .align_y(Alignment::Center),
@@ -182,7 +182,7 @@ impl App {
         .padding([4, 8])
         .width(Length::Fill)
         .clip(true)
-        .style(filled(theme::HEADER))
+        .style(filled(theme::c().header))
         .into()
     }
 
@@ -205,11 +205,11 @@ impl App {
                     // Waiting for a slow folder: show where we're going.
                     Some(target) => text(elide_left(&format!("{}  (reading…)", target.display()), self.path_chars()))
                         .size(13)
-                        .color(theme::MUTED)
+                        .color(theme::c().muted)
                         .wrapping(Wrapping::None),
                     None => text(elide_left(&panel.path.display().to_string(), self.path_chars()))
                         .size(13)
-                        .color(if active { theme::TEXT } else { theme::MUTED })
+                        .color(if active { theme::c().text } else { theme::c().muted })
                         .wrapping(Wrapping::None),
                 })
                 .padding([4, 6])
@@ -224,7 +224,7 @@ impl App {
             .padding([2, 4])
             .width(Length::Fill)
             .clip(true)
-            .style(filled(theme::HEADER))
+            .style(filled(theme::c().header))
             .into()
     }
 
@@ -245,7 +245,7 @@ impl App {
                 .style(theme::suggestion(edit.selected == Some(i)))
                 .into()
         }));
-        let hint = text("Tab completes · ↑↓ choose · Enter go").size(11).color(theme::MUTED);
+        let hint = text("Tab completes · ↑↓ choose · Enter go").size(11).color(theme::c().muted);
         let card = container(column![items, container(hint).padding([4, 8])])
             .padding(4)
             .width(Length::Fill)
@@ -257,16 +257,16 @@ impl App {
         if let Some(q) = self.quick_search.as_ref().filter(|q| q.side == side) {
             return container(
                 row![
-                    text("Find").size(12).color(theme::MUTED),
+                    text("Find").size(12).color(theme::c().muted),
                     container(text(&q.text).size(12)).padding([1, 6]).style(theme::drag_label),
-                    text("↑↓ next match · Esc close").size(11).color(theme::MUTED),
+                    text("↑↓ next match · Esc close").size(11).color(theme::c().muted),
                 ]
                 .spacing(8)
                 .align_y(Alignment::Center),
             )
             .padding([2, 10])
             .width(Length::Fill)
-            .style(filled(theme::HEADER))
+            .style(filled(theme::c().header))
             .into();
         }
         let editing = self.filter_edit == Some(side) && self.active == side;
@@ -276,19 +276,19 @@ impl App {
             let hint = if editing { "type to filter · *.ext; wildcards · Esc clear" } else { "Ctrl+S edit · Esc clear" };
             return container(
                 row![
-                    text("Filter").size(12).color(theme::MUTED),
+                    text("Filter").size(12).color(theme::c().muted),
                     container(text(panel.filter()).size(12))
                         .padding([1, 6])
                         .style(theme::drag_label),
                     text(format!("{shown} of {all}")).size(12),
-                    text(hint).size(11).color(theme::MUTED),
+                    text(hint).size(11).color(theme::c().muted),
                 ]
                 .spacing(8)
                 .align_y(Alignment::Center),
             )
             .padding([2, 10])
             .width(Length::Fill)
-            .style(filled(theme::HEADER))
+            .style(filled(theme::c().header))
             .into();
         }
         let (sel, total, sel_bytes, total_bytes) = panel.summary();
@@ -299,11 +299,11 @@ impl App {
                 format::size(total_bytes)
             ))
             .size(12)
-            .color(theme::MUTED),
+            .color(theme::c().muted),
         )
         .padding([4, 10])
         .width(Length::Fill)
-        .style(filled(theme::HEADER))
+        .style(filled(theme::c().header))
         .into()
     }
 
@@ -334,7 +334,7 @@ impl App {
             .spacing(10),
         )
         .padding([4, 10])
-        .style(filled(theme::PANEL))
+        .style(filled(theme::c().panel))
         .into()
     }
 
@@ -350,7 +350,7 @@ impl App {
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .clip(true)
-                .style(filled(theme::PANEL))
+                .style(filled(theme::c().panel))
                 .into()
         });
         let mut area = mouse_area(list)
@@ -373,13 +373,13 @@ impl App {
         let entry = &panel.entries[index];
 
         let color = if panel.is_selected(entry) {
-            theme::SELECTED
+            theme::c().selected
         } else if entry.is_dir() {
-            theme::DIR
+            theme::c().dir
         } else if entry.hidden {
-            theme::MUTED
+            theme::c().muted
         } else {
-            theme::TEXT
+            theme::c().text
         };
         let cell = |s: String, width: Length| text(s).size(13).color(color).wrapping(Wrapping::None).width(width);
 
@@ -423,7 +423,7 @@ impl App {
         };
         let content = content
             .push(cell(size, Length::Fixed(COL_SIZE)).align_x(Alignment::End))
-            .push(cell(format::date(&entry.modified), Length::Fixed(COL_DATE)).color(theme::MUTED))
+            .push(cell(format::date(&entry.modified), Length::Fixed(COL_DATE)).color(theme::c().muted))
             .spacing(10)
             .padding([0, 10])
             .height(ROW_H)
@@ -433,13 +433,13 @@ impl App {
             d.active && self.hover == Some((side, index)) && entry.is_dir() && !d.sources.contains(&entry.path)
         });
         let background = if drop_target {
-            theme::DROP
+            theme::c().drop
         } else if index == panel.cursor {
-            if active { theme::CURSOR } else { theme::CURSOR_INACTIVE }
+            if active { theme::c().cursor } else { theme::c().cursor_inactive }
         } else if index % 2 == 1 {
-            theme::ZEBRA
+            theme::c().zebra
         } else {
-            theme::PANEL
+            theme::c().panel
         };
 
         let mut area = mouse_area(
@@ -481,7 +481,7 @@ impl App {
                 row![
                     column![
                         text(&job.title).size(12).wrapping(Wrapping::None),
-                        text(current).size(11).color(theme::MUTED).wrapping(Wrapping::None),
+                        text(current).size(11).color(theme::c().muted).wrapping(Wrapping::None),
                     ]
                     .width(Length::Fill)
                     .clip(true),
@@ -490,7 +490,7 @@ impl App {
                         .height(Length::Fixed(6.0))
                         .style(theme::progress),
                     text(format!("{:>3.0}%", p.fraction() * 100.0)).size(12).width(Length::Fixed(40.0)),
-                    text(speed).size(12).color(theme::MUTED).width(Length::Fixed(90.0)),
+                    text(speed).size(12).color(theme::c().muted).width(Length::Fixed(90.0)),
                     small_button(if paused { "Resume" } else { "Pause" }, Message::JobPause(job.id)),
                     small_button("Cancel", Message::JobCancel(job.id)),
                 ]
@@ -499,7 +499,7 @@ impl App {
             )
             .padding([2, 10])
             .height(JOB_ROW_H)
-            .style(filled(theme::HEADER))
+            .style(filled(theme::c().header))
             .into()
         }))
         .into()
@@ -549,7 +549,7 @@ impl App {
             Dialog::Hotlist { .. } => unreachable!("drawn by hotlist_view"),
         };
 
-        let mut content = column![text(title).size(16), text(body).size(13).color(theme::MUTED)].spacing(12);
+        let mut content = column![text(title).size(16), text(body).size(13).color(theme::c().muted)].spacing(12);
         if let Some(field) = field {
             content = content.push(field);
         }
@@ -582,25 +582,25 @@ impl App {
                 .unwrap_or_else(|| path.display().to_string());
             let key = if i < 9 { (i + 1).to_string() } else { String::new() };
             let mut content = Row::new().spacing(8).align_y(Alignment::Center);
-            content = content.push(text(key).size(12).color(theme::MUTED).width(Length::Fixed(12.0)));
+            content = content.push(text(key).size(12).color(theme::c().muted).width(Length::Fixed(12.0)));
             if let Some(icon) = self.icon(path, true) {
                 content = content.push(image(icon).width(ICON).height(ICON));
             }
-            let color = if path == here { theme::SELECTED } else { theme::TEXT };
+            let color = if path == here { theme::c().selected } else { theme::c().text };
             content = content
                 .push(text(name).size(13).color(color).wrapping(Wrapping::None))
-                .push(text(elide_left(&path.display().to_string(), 60)).size(11).color(theme::MUTED).wrapping(Wrapping::None));
+                .push(text(elide_left(&path.display().to_string(), 60)).size(11).color(theme::c().muted).wrapping(Wrapping::None));
             items = items.push(row_button(content, i));
         }
         let n = self.hotlist.len();
         let toggle = if self.hotlist.contains(here) { "Remove current folder" } else { "Add current folder" };
         let toggle_row = Row::new()
             .spacing(8)
-            .push(text("A").size(12).color(theme::MUTED).width(Length::Fixed(12.0)))
+            .push(text("A").size(12).color(theme::c().muted).width(Length::Fixed(12.0)))
             .push(text(toggle).size(13));
         items = items.push(row_button(toggle_row, n));
-        let empty = (n == 0).then(|| text("No folders yet.").size(13).color(theme::MUTED));
-        let hint = text("Enter go \u{b7} 1-9 jump \u{b7} Del remove \u{b7} Esc close").size(11).color(theme::MUTED);
+        let empty = (n == 0).then(|| text("No folders yet.").size(13).color(theme::c().muted));
+        let hint = text("Enter go \u{b7} 1-9 jump \u{b7} Del remove \u{b7} Esc close").size(11).color(theme::c().muted);
         let content = column![text("Hotlist").size(16)].push_maybe(empty).push(items).push(hint).spacing(10);
         container(content).padding(16).width(Length::Fixed(520.0)).style(theme::dialog).into()
     }
@@ -609,7 +609,7 @@ impl App {
         let name = c.dst.file_name().unwrap_or_default().to_string_lossy().into_owned();
         let line = |label: &'a str, size: u64, date: &Option<_>| {
             row![
-                text(label).size(13).color(theme::MUTED).width(Length::Fixed(80.0)),
+                text(label).size(13).color(theme::c().muted).width(Length::Fixed(80.0)),
                 text(format::size(size)).size(13).width(Length::Fixed(90.0)),
                 text(format::date(date)).size(13),
             ]
@@ -618,8 +618,8 @@ impl App {
 
         let content = column![
             text("File already exists").size(16),
-            text(name).size(13).color(theme::SELECTED),
-            text(c.dst.display().to_string()).size(12).color(theme::MUTED),
+            text(name).size(13).color(theme::c().selected),
+            text(c.dst.display().to_string()).size(12).color(theme::c().muted),
             column![
                 line("New", c.src_size, &c.src_modified),
                 line("Existing", c.dst_size, &c.dst_modified),
@@ -647,16 +647,16 @@ impl App {
     fn bottom_bar(&self) -> Element<'_, Message> {
         let status = match &self.status {
             Some((msg, tone)) => text(msg.as_str()).size(12).color(match tone {
-                Tone::Info => theme::TEXT,
-                Tone::Success => theme::SUCCESS,
-                Tone::Error => theme::ERROR,
+                Tone::Info => theme::c().text,
+                Tone::Success => theme::c().success,
+                Tone::Error => theme::c().error,
             }),
             None => text(
                 "Type to find · Tab switch panel · Ctrl+T new tab · F2 rename · Drag to copy (Shift = move, \
                  out of the window = other apps) · Click path to edit · Right-click for menu",
             )
             .size(12)
-            .color(theme::MUTED),
+            .color(theme::c().muted),
         };
 
         let keys = [
@@ -670,7 +670,7 @@ impl App {
         ];
         let fkeys = Row::with_children(keys.into_iter().map(|(key, label, cmd)| {
             button(
-                container(row![text(key).size(12).color(theme::ACCENT), text(label).size(12)].spacing(6))
+                container(row![text(key).size(12).color(theme::c().accent), text(label).size(12)].spacing(6))
                     .center_x(Length::Fill),
             )
             .on_press(Message::Run(cmd))
@@ -717,9 +717,9 @@ fn small_button(label: &str, message: Message) -> Element<'_, Message> {
 }
 
 fn vline<'a>() -> Element<'a, Message> {
-    container(Space::new(Length::Fixed(1.0), Length::Fill)).style(filled(theme::BORDER)).into()
+    container(Space::new(Length::Fixed(1.0), Length::Fill)).style(filled(theme::c().border)).into()
 }
 
 fn hline<'a>() -> Element<'a, Message> {
-    container(Space::new(Length::Fill, Length::Fixed(1.0))).style(filled(theme::BORDER)).into()
+    container(Space::new(Length::Fill, Length::Fixed(1.0))).style(filled(theme::c().border)).into()
 }
