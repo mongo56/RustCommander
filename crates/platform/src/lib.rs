@@ -206,3 +206,35 @@ pub fn cursor_in_window(window: isize) -> Option<(f32, f32)> {
         None
     }
 }
+
+/// A window's restored rectangle (screen pixels, Windows workspace
+/// coordinates) and maximised state, saved between sessions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Placement {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+    pub maximized: bool,
+}
+
+/// Where the window is and whether it's maximised; `None` where unsupported.
+pub fn window_placement(window: isize) -> Option<Placement> {
+    #[cfg(windows)]
+    {
+        win::window_placement(window)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = window;
+        None
+    }
+}
+
+/// Puts the window back where [`window_placement`] found it and shows it.
+pub fn restore_placement(window: isize, placement: &Placement) {
+    #[cfg(windows)]
+    win::restore_placement(window, placement);
+    #[cfg(not(windows))]
+    let _ = (window, placement);
+}

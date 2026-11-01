@@ -436,3 +436,39 @@ pub fn cursor_in_window(window: isize) -> Option<(f32, f32)> {
         Some((pt.x as f32 / scale, pt.y as f32 / scale))
     }
 }
+
+/// The window's restored ("normal") rectangle and whether it's maximised.
+pub fn window_placement(window: isize) -> Option<crate::Placement> {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowPlacement, SW_SHOWMAXIMIZED, SW_SHOWMINIMIZED, WINDOWPLACEMENT, WPF_RESTORETOMAXIMIZED,
+    };
+    let hwnd = HWND(window as *mut c_void);
+    let mut wp = WINDOWPLACEMENT { length: size_of::<WINDOWPLACEMENT>() as u32, ..Default::default() };
+    unsafe { GetWindowPlacement(hwnd, &mut wp).ok()? };
+    let show = wp.showCmd;
+    let maximized = show == SW_SHOWMAXIMIZED.0 as u32
+        || (show == SW_SHOWMINIMIZED.0 as u32 && wp.flags.0 & WPF_RESTORETOMAXIMIZED.0 != 0);
+    let r = wp.rcNormalPosition;
+    Some(crate::Placement { left: r.left, top: r.top, right: r.right, bottom: r.bottom, maximized })
+}
+
+/// Moves the window to `p` and shows it (maximised if it was). Windows
+/// pulls a rectangle that would be off every screen back into view.
+pub fn restore_placement(window: isize, p: &crate::Placement) {
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SetWindowPlacement, ShowWindow, SW_SHOW, SW_SHOWMAXIMIZED, WINDOWPLACEMENT,
+    };
+    let hwnd = HWND(window as *mut c_void);
+    let wp = WINDOWPLACEMENT {
+        length: size_of::<WINDOWPLACEMENT>() as u32,
+        showCmd: if p.maximized { SW_SHOWMAXIMIZED.0 as u32 } else { SW_SHOWNORMAL.0 as u32 },
+        rcNormalPosition: RECT { left: p.left, top: p.top, right: p.right, bottom: p.bottom },
+        ..Default::default()
+    };
+    unsafe {
+        if SetWindowPlacement(hwnd, &wp).is_err() {
+            let _ = ShowWindow(hwnd, SW_SHOW);
+        }
+    }
+}

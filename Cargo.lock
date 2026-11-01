@@ -3107,6 +3107,7 @@ dependencies = [
  "iced",
  "image",
  "notify",
+ "png",
  "raw-window-handle",
  "rc-core",
  "rc-platform",

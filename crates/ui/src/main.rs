@@ -5,6 +5,7 @@ mod app;
 mod config;
 mod editor;
 mod icon;
+mod icon_art;
 mod keymap;
 mod session;
 mod theme;
@@ -24,6 +25,7 @@ fn main() -> iced::Result {
         .window(iced::window::Settings {
             size,
             icon: icon::window_icon(),
+            visible: !app::hidden_until_placed(&session),
             // Closing goes through the app so it can save the session.
             exit_on_close_request: false,
             ..Default::default()

@@ -14,3 +14,6 @@ raw-window-handle = "0.6"
 notify = "8"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+
+[build-dependencies]
+png = "0.17"

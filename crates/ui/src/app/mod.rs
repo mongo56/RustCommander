@@ -103,6 +103,9 @@ pub struct App {
     /// Modification time of `config.toml` when it was last read; `None` =
     /// not read yet.
     config_stamp: Option<Option<std::time::SystemTime>>,
+    /// Window position from the last session or the last quit, saved with
+    /// the session.
+    placement: Option<rc_platform::Placement>,
 }
 
 /// A navigation whose target folder is being listed in the background.
@@ -229,6 +232,8 @@ pub enum Message {
     Sort(usize, SortKey),
     Resized(Size),
     CloseRequested,
+    /// Quitting, with the window position read just before.
+    Quit(Option<rc_platform::Placement>),
     TabSelect(usize, usize),
     TabClose(usize, usize),
     TabNew(usize),
@@ -327,9 +332,14 @@ impl App {
             config: crate::config::Config::default(),
             keymap: keymap::Keymap::default(),
             config_stamp: None,
+            placement: session.as_ref().and_then(|s| s.window).map(Into::into),
         };
         app.refresh_config();
-        (app, Task::none())
+        let show = match app.placement {
+            Some(p) if hidden_until_placed(&session) => restore_window(p),
+            _ => Task::none(),
+        };
+        (app, show)
     }
 
     pub fn theme(&self) -> Theme {
@@ -547,6 +557,13 @@ impl App {
                 self.panel_mut(side).sort_by(key);
             }
             Message::CloseRequested => return self.quit(),
+            Message::Quit(placement) => {
+                if placement.is_some() {
+                    self.placement = placement;
+                }
+                self.save_session();
+                return iced::exit();
+            }
             // Minimising reports a zero size; keep the last real one.
             Message::Resized(size) if size.width > 0.0 && size.height > 0.0 => {
                 self.window_width = size.width;
@@ -1789,6 +1806,7 @@ impl App {
             left: side(&self.sides[0]),
             right: side(&self.sides[1]),
             hotlist: self.hotlist.clone(),
+            window: self.placement.map(Into::into),
             editor: String::new(),
         }
     }
@@ -1836,9 +1854,15 @@ impl App {
         }
     }
 
+    /// Reads the window position, then saves the session and exits
+    /// (`Message::Quit`).
     fn quit(&self) -> Task<Message> {
-        self.save_session();
-        iced::exit()
+        window::get_oldest()
+            .then(|id| match id {
+                Some(id) => window::run_with_handle(id, |h| rc_platform::window_placement(native_handle(&h))),
+                None => Task::done(None),
+            })
+            .map(Message::Quit)
     }
 
     fn after_change(&mut self) {
@@ -2045,4 +2069,21 @@ fn open_panel(path: Option<PathBuf>) -> Panel {
         .or_else(|| rc_platform::home_dir().and_then(|p| Panel::open(p).ok()))
         .or_else(|| Panel::open(if cfg!(windows) { "C:\\" } else { "/" }).ok())
         .expect("could not open any starting folder")
+}
+
+/// Whether `main` creates the window hidden, for [`restore_window`] to move
+/// it into place before it's first shown (no jump from the default spot).
+pub fn hidden_until_placed(session: &Option<Session>) -> bool {
+    cfg!(windows) && session.as_ref().is_some_and(|s| s.window.is_some())
+}
+
+/// Moves the (hidden) window to its saved place and shows it.
+fn restore_window(p: rc_platform::Placement) -> Task<Message> {
+    window::get_oldest().then(move |id| match id {
+        Some(id) => window::run_with_handle(id, move |h| rc_platform::restore_placement(native_handle(&h), &p))
+            // Let winit know it's visible (and show it if placing failed).
+            .chain(window::change_mode(id, window::Mode::Windowed)),
+        None => Task::none(),
+    })
+    .discard()
 }

@@ -16,9 +16,34 @@ pub struct Session {
     /// Directory hotlist (Ctrl+D), in menu order.
     #[serde(default)]
     pub hotlist: Vec<PathBuf>,
+    /// Window position and maximised state (Windows).
+    #[serde(default)]
+    pub window: Option<WindowState>,
     /// Editor setting from older versions; read once to seed `config.toml`.
     #[serde(default, skip_serializing)]
     pub editor: String,
+}
+
+/// [`rc_platform::Placement`] in the session file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowState {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+    pub maximized: bool,
+}
+
+impl From<rc_platform::Placement> for WindowState {
+    fn from(p: rc_platform::Placement) -> Self {
+        Self { left: p.left, top: p.top, right: p.right, bottom: p.bottom, maximized: p.maximized }
+    }
+}
+
+impl From<WindowState> for rc_platform::Placement {
+    fn from(w: WindowState) -> Self {
+        Self { left: w.left, top: w.top, right: w.right, bottom: w.bottom, maximized: w.maximized }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -113,6 +138,7 @@ mod tests {
             },
             right: SideState::default(),
             hotlist: vec![dir.clone()],
+            window: Some(WindowState { left: -8, top: 0, right: 1200, bottom: 800, maximized: true }),
             editor: r#""my editor.exe" -n %1"#.into(),
         };
         let text = toml::to_string_pretty(&session).unwrap();
