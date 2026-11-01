@@ -122,6 +122,9 @@ impl App {
         text: Option<&str>,
     ) -> Task<Message> {
         let page = (self.window_height - HELP_CHROME_H).max(LINE);
+        // The help key (F1 or whatever it is bound to) closes help again.
+        let again = (named.is_some() || mods.control() || mods.alt())
+            && self.keymap.command(key, mods) == Some(Command::Help);
         let Some(h) = &mut self.help else {
             return Task::none();
         };
@@ -133,6 +136,7 @@ impl App {
                 return top();
             }
             Some(Named::Escape | Named::F1) => self.help = None,
+            _ if again => self.help = None,
             Some(Named::Backspace) => {
                 h.query.pop();
                 return top();

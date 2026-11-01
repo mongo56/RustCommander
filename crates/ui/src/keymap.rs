@@ -1,5 +1,8 @@
 //! Key bindings: Total Commander-like defaults plus the overrides from the
 //! `[keys]` table of `config.toml` (`"Ctrl+F5" = "cm_Copy"`, `""` unbinds).
+//! Every binding is one exact key + modifier combination: rebinding or
+//! unbinding F7 leaves Ctrl+F7, Shift+F7 etc. as they were (unbound unless
+//! `DEFAULTS` or `[keys]` names them).
 
 use iced::keyboard::{key::Named, Key, Modifiers};
 use rc_core::{Command, SortKey};
@@ -43,22 +46,9 @@ impl Keymap {
         (name.to_owned(), value)
     }
 
-    /// The changes that leave `cmd` without any key. Unbinding a key can
-    /// expose a modifier variant that did the same (Ctrl+F8 once F8 is
-    /// unbound), so this repeats until nothing is left.
+    /// The changes that leave `cmd` without any key.
     pub fn unbind(&self, cmd: Command) -> Vec<KeyEdit> {
-        let mut map = Keymap { overrides: self.overrides.clone() };
-        let mut edits = Vec::new();
-        for _ in 0..8 {
-            let names: Vec<String> = map.named_bindings().into_iter().filter(|(_, c)| *c == cmd).map(|(n, _)| n).collect();
-            if names.is_empty() {
-                break;
-            }
-            let round: Vec<KeyEdit> = names.iter().map(|n| map.bind(n, None)).collect();
-            map.apply(&round);
-            edits.extend(round);
-        }
-        edits
+        self.named_bindings().into_iter().filter(|(_, c)| *c == cmd).map(|(n, _)| self.bind(&n, None)).collect()
     }
 
     /// The changes that give `cmd` back its default keys: drops every
@@ -80,6 +70,7 @@ impl Keymap {
     }
 
     /// Applies `[keys]` changes (as `config.toml` would after writing them).
+    #[cfg(test)]
     pub fn apply(&mut self, edits: &[KeyEdit]) {
         for (name, value) in edits {
             match value {
@@ -93,11 +84,10 @@ impl Keymap {
         }
     }
 
+    /// The command of a key press: exactly that key with exactly those
+    /// modifiers (Ctrl+F7 is not F7).
     pub fn command(&self, key: &Key, m: Modifiers) -> Option<Command> {
-        match key_name(key, m).and_then(|name| self.overrides.get(&name)) {
-            Some(&cmd) => cmd,
-            None => default_command(key, m),
-        }
+        self.command_of(&key_name(key, m)?)
     }
 
     /// The function-key bar: (key label, command bound to exactly that key,
@@ -123,59 +113,24 @@ impl Keymap {
     }
 
     /// Every effective binding as (display name, command), defaults with the
-    /// overrides applied. Defaults are found by trying every bindable key
-    /// with every modifier combination; a combination is left out when the
-    /// same key with fewer modifiers does the same (Shift+Down = Down).
-    /// Each command's keys come with the fewest modifiers first.
+    /// overrides applied. Each command's keys come with the fewest modifiers
+    /// first (defaults in `DEFAULTS` order, then the overrides).
     pub fn bindings(&self) -> Vec<(String, Command)> {
         self.named_bindings().into_iter().map(|(name, cmd)| (display_key(&name), cmd)).collect()
     }
 
     /// `bindings` with canonical key names.
     pub fn named_bindings(&self) -> Vec<(String, Command)> {
-        let mut bases: Vec<Key> = Vec::new();
-        for (_, named) in NAMED {
-            let key = Key::Named(*named);
-            if !bases.contains(&key) {
-                bases.push(key);
-            }
-        }
-        bases.extend(BINDABLE_CHARS.chars().map(|c| Key::Character(c.to_string().into())));
-
-        // Modifier sets as bit masks: ctrl, alt, shift, logo.
-        let mods = |bits: u8| {
-            let mut m = Modifiers::empty();
-            for (bit, flag) in [(1, Modifiers::CTRL), (2, Modifiers::ALT), (4, Modifiers::SHIFT), (8, Modifiers::LOGO)] {
-                if bits & bit != 0 {
-                    m |= flag;
-                }
-            }
-            m
-        };
-        let mut out: Vec<(String, Command, u32)> = Vec::new();
-        for key in &bases {
-            for bits in 0u8..16 {
-                let m = mods(bits);
-                let Some(name) = key_name(key, m) else { continue };
-                if self.overrides.contains_key(&name) {
-                    continue; // listed below
-                }
-                let Some(cmd) = default_command(key, m) else { continue };
-                // Does the key with a proper subset of the modifiers do the same?
-                let redundant = (0..bits).any(|sub| sub & bits == sub && self.command(key, mods(sub)) == Some(cmd));
-                if !redundant {
-                    out.push((name, cmd, bits.count_ones()));
-                }
-            }
-        }
+        let mut out: Vec<(String, Command)> = DEFAULTS
+            .iter()
+            .filter(|(name, _)| !self.overrides.contains_key(*name))
+            .map(|&(name, cmd)| (name.to_owned(), cmd))
+            .collect();
         let mut overrides: Vec<_> = self.overrides.iter().filter_map(|(n, c)| c.map(|c| (n.clone(), c))).collect();
         overrides.sort_by(|a, b| a.0.cmp(&b.0));
-        for (name, cmd) in overrides {
-            let count = ["ctrl+", "alt+", "shift+", "win+"].iter().filter(|p| name.contains(*p)).count() as u32;
-            out.push((name, cmd, count));
-        }
-        out.sort_by_key(|&(_, _, count)| count);
-        out.into_iter().map(|(name, cmd, _)| (name, cmd)).collect()
+        out.extend(overrides);
+        out.sort_by_key(|(name, _)| modifier_count(name));
+        out
     }
 
     /// The display names of the keys bound to `cmd`, from `bindings`.
@@ -188,7 +143,6 @@ impl Keymap {
 /// (`Some("cm_Copy")`, `Some("")` unbinds) or `None` to drop the entry.
 pub type KeyEdit = (String, Option<String>);
 
-/// The default command of a canonical key name.
 /// The slots of the function-key bar: display label and canonical key name.
 const FKEY_BAR: [(&str, &str); 11] = [
     ("F1", "f1"),
@@ -204,12 +158,22 @@ const FKEY_BAR: [(&str, &str); 11] = [
     ("Alt+F4", "alt+f4"),
 ];
 
+/// The default command of a canonical key name.
 fn default_of(name: &str) -> Option<Command> {
-    let (key, m) = press_of(name)?;
-    default_command(&key, m)
+    DEFAULTS.iter().find(|(n, _)| *n == name).map(|&(_, cmd)| cmd)
+}
+
+/// How many modifiers a canonical key name has (`ctrl++` has one).
+fn modifier_count(name: &str) -> usize {
+    let mods = match name.strip_suffix("++") {
+        Some(rest) => rest,
+        None => name.rsplit_once('+').map_or("", |(mods, _)| mods),
+    };
+    mods.split('+').filter(|p| !p.is_empty()).count()
 }
 
 /// The key press a canonical key name stands for.
+#[cfg(test)]
 fn press_of(name: &str) -> Option<(Key, Modifiers)> {
     let (mods, base) = match name.strip_suffix("++") {
         Some(rest) => (rest, "+"),
@@ -232,9 +196,6 @@ fn press_of(name: &str) -> Option<(Key, Modifiers)> {
     };
     Some((key, m))
 }
-
-/// Character keys tried when listing the default bindings.
-const BINDABLE_CHARS: &str = "abcdefghijklmnopqrstuvwxyz0123456789`-=[]\\;',./+*";
 
 /// Display form of a canonical key name: `ctrl+shift+pageup` -> `Ctrl+Shift+PgUp`.
 pub fn display_key(name: &str) -> String {
@@ -364,87 +325,78 @@ pub fn parse_key(text: &str) -> Option<String> {
     Some(join(ctrl, alt, shift, logo, base))
 }
 
-fn default_command(key: &Key, m: Modifiers) -> Option<Command> {
+/// The default bindings (Total Commander's where it has one), one entry per
+/// exact key + modifier combination as a canonical name (see `key_name`);
+/// a combination not listed is unbound. Among keys with as many modifiers,
+/// this is also the order they are listed in.
+const DEFAULTS: &[(&str, Command)] = {
     use Command::*;
-    let ctrl = m.control();
-    let alt = m.alt();
-    let shift = m.shift();
-
-    let cmd = match key.as_ref() {
-        Key::Named(named) => match named {
-            Named::ArrowUp if !ctrl => CursorUp,
-            Named::ArrowDown if alt => DirHistory,
-            Named::ArrowDown => CursorDown,
-            Named::PageUp if ctrl => GoParent,
-            Named::PageUp => PageUp,
-            Named::PageDown if ctrl => Open,
-            Named::PageDown => PageDown,
-            Named::ArrowLeft if alt => HistoryBack,
-            Named::ArrowRight if alt => HistoryForward,
-            Named::Home => CursorHome,
-            Named::End => CursorEnd,
-            Named::Enter if alt && shift => CountDirSizes,
-            Named::Enter => Open,
-            Named::Backspace => GoParent,
-            Named::Tab if ctrl && shift => PrevTab,
-            Named::Tab if ctrl => NextTab,
-            Named::Tab => SwitchPanel,
-            Named::ArrowUp if ctrl => OpenInNewTab,
-            Named::Insert => ToggleSelect { advance: true },
-            Named::Space if ctrl => CommandPalette,
-            Named::Space => ToggleSelect { advance: false },
-            Named::Escape => DeselectAll,
-            Named::F1 => Help,
-            Named::F10 => Configuration,
-            Named::F3 if ctrl => SortBy(SortKey::Name),
-            Named::F4 if ctrl => SortBy(SortKey::Ext),
-            Named::F5 if ctrl => SortBy(SortKey::Modified),
-            Named::F6 if ctrl => SortBy(SortKey::Size),
-            Named::F4 if alt => Quit,
-            Named::F4 if shift => EditNew,
-            Named::F2 if ctrl && shift && !alt => CompareDirsOptions,
-            Named::F2 if ctrl => Refresh,
-            Named::F2 if shift && !alt => CompareDirs,
-            Named::F2 if alt && !ctrl && !shift => CompareFiles,
-            Named::F3 => View,
-            Named::F4 => Edit,
-            Named::F5 if alt && !ctrl && !shift => Pack,
-            Named::F9 if alt && !ctrl && !shift => Unpack,
-            Named::F9 if !alt && !ctrl && !shift => Terminal,
-            Named::F5 => Copy,
-            Named::F6 if shift => Rename,
-            Named::F2 if !ctrl && !alt => Rename,
-            Named::F6 => Move,
-            Named::F7 if alt && !ctrl && !shift => FindFiles,
-            Named::F7 => MakeDir,
-            Named::F8 | Named::Delete if shift => DeletePermanent,
-            Named::F8 | Named::Delete => Delete,
-            _ => return None,
-        },
-        Key::Character(c) if ctrl => match c.to_ascii_lowercase().as_str() {
-            "f" if shift => Disconnect,
-            "f" => Connect,
-            "a" => SelectAll,
-            "t" => NewTab,
-            "w" => CloseTab,
-            "d" => Hotlist,
-            "r" => Refresh,
-            "h" => ToggleHidden,
-            "s" => QuickFilter,
-            "m" => MultiRename,
-            "\\" => GoRoot,
-            "q" => Quit,
-            "," => EditConfig,
-            _ => return None,
-        },
-        Key::Character(c) if alt => match c.to_ascii_lowercase().as_str() {
-            "o" => SyncOtherPanel,
-            _ => return None,
-        },
-        _ => return None,
-    };
-    Some(cmd)
-}
+    &[
+        ("up", CursorUp),
+        ("down", CursorDown),
+        ("pageup", PageUp),
+        ("pagedown", PageDown),
+        ("home", CursorHome),
+        ("end", CursorEnd),
+        ("enter", Open),
+        ("backspace", GoParent),
+        ("tab", SwitchPanel),
+        ("space", ToggleSelect { advance: false }),
+        ("insert", ToggleSelect { advance: true }),
+        ("delete", Delete),
+        ("escape", DeselectAll),
+        ("f1", Help),
+        ("f2", Rename),
+        ("f3", View),
+        ("f4", Edit),
+        ("f5", Copy),
+        ("f6", Move),
+        ("f7", MakeDir),
+        ("f8", Delete),
+        ("f9", Terminal),
+        ("f10", Configuration),
+        ("ctrl+up", OpenInNewTab),
+        ("alt+down", DirHistory),
+        ("alt+left", HistoryBack),
+        ("alt+right", HistoryForward),
+        ("ctrl+pageup", GoParent),
+        ("ctrl+pagedown", Open),
+        ("ctrl+tab", NextTab),
+        ("ctrl+space", CommandPalette),
+        ("shift+delete", DeletePermanent),
+        ("ctrl+f2", Refresh),
+        ("alt+f2", CompareFiles),
+        ("shift+f2", CompareDirs),
+        ("ctrl+f3", SortBy(SortKey::Name)),
+        ("ctrl+f4", SortBy(SortKey::Ext)),
+        ("alt+f4", Quit),
+        ("shift+f4", EditNew),
+        ("ctrl+f5", SortBy(SortKey::Modified)),
+        ("alt+f5", Pack),
+        ("ctrl+f6", SortBy(SortKey::Size)),
+        ("shift+f6", Rename),
+        ("alt+f7", FindFiles),
+        ("shift+f8", DeletePermanent),
+        ("alt+f9", Unpack),
+        ("ctrl+a", SelectAll),
+        ("ctrl+d", Hotlist),
+        ("ctrl+f", Connect),
+        ("ctrl+h", ToggleHidden),
+        ("ctrl+m", MultiRename),
+        ("alt+o", SyncOtherPanel),
+        ("ctrl+q", Quit),
+        ("ctrl+r", Refresh),
+        ("ctrl+s", QuickFilter),
+        ("ctrl+t", NewTab),
+        ("ctrl+w", CloseTab),
+        ("ctrl+\\", GoRoot),
+        ("ctrl+,", EditConfig),
+        ("alt+shift+enter", CountDirSizes),
+        ("ctrl+shift+tab", PrevTab),
+        ("ctrl+shift+f2", CompareDirsOptions),
+        ("ctrl+shift+f", Disconnect),
+    ]
+};
 
 #[cfg(test)]
 mod tests {
@@ -476,7 +428,7 @@ mod tests {
     }
 
     #[test]
-    fn default_bindings_are_listed_without_redundant_modifiers() {
+    fn default_bindings_are_listed_fewest_modifiers_first() {
         let bindings = Keymap::default().bindings();
         let keys = |cmd| Keymap::keys_for(&bindings, cmd);
         assert_eq!(keys(Command::Help), ["F1"]);
@@ -496,6 +448,75 @@ mod tests {
         assert_eq!(map.command(&space, Modifiers::empty()), Some(Command::ToggleSelect { advance: false }));
         assert_eq!(map.command(&space, Modifiers::CTRL), Some(Command::CommandPalette));
         assert_eq!(parse_key("Ctrl+Space").as_deref(), Some("ctrl+space"));
+    }
+
+    #[test]
+    fn defaults_resolve_exactly() {
+        use Command::*;
+        let map = Keymap::default();
+        let cases = [
+            ("f1", Some(Help)),
+            ("f2", Some(Rename)),
+            ("shift+f2", Some(CompareDirs)),
+            ("ctrl+shift+f2", Some(CompareDirsOptions)),
+            ("ctrl+f2", Some(Refresh)),
+            ("alt+f2", Some(CompareFiles)),
+            ("f3", Some(View)),
+            ("ctrl+f3", Some(SortBy(SortKey::Name))),
+            ("f4", Some(Edit)),
+            ("shift+f4", Some(EditNew)),
+            ("alt+f4", Some(Quit)),
+            ("ctrl+f4", Some(SortBy(SortKey::Ext))),
+            ("f5", Some(Copy)),
+            ("alt+f5", Some(Pack)),
+            ("ctrl+f5", Some(SortBy(SortKey::Modified))),
+            ("f6", Some(Move)),
+            ("shift+f6", Some(Rename)),
+            ("ctrl+f6", Some(SortBy(SortKey::Size))),
+            ("f7", Some(MakeDir)),
+            ("alt+f7", Some(FindFiles)),
+            ("f8", Some(Delete)),
+            ("shift+f8", Some(DeletePermanent)),
+            ("delete", Some(Delete)),
+            ("shift+delete", Some(DeletePermanent)),
+            ("f9", Some(Terminal)),
+            ("alt+f9", Some(Unpack)),
+            ("f10", Some(Configuration)),
+            ("enter", Some(Open)),
+            ("alt+shift+enter", Some(CountDirSizes)),
+            ("ctrl+pagedown", Some(Open)),
+            ("ctrl+pageup", Some(GoParent)),
+            ("backspace", Some(GoParent)),
+            ("up", Some(CursorUp)),
+            ("down", Some(CursorDown)),
+            ("ctrl+up", Some(OpenInNewTab)),
+            ("alt+down", Some(DirHistory)),
+            ("alt+left", Some(HistoryBack)),
+            ("alt+right", Some(HistoryForward)),
+            ("tab", Some(SwitchPanel)),
+            ("ctrl+tab", Some(NextTab)),
+            ("ctrl+shift+tab", Some(PrevTab)),
+            ("space", Some(ToggleSelect { advance: false })),
+            ("insert", Some(ToggleSelect { advance: true })),
+            ("ctrl+space", Some(CommandPalette)),
+            ("escape", Some(DeselectAll)),
+            ("ctrl+f", Some(Connect)),
+            ("ctrl+shift+f", Some(Disconnect)),
+            ("ctrl+a", Some(SelectAll)),
+            ("ctrl+q", Some(Quit)),
+            ("ctrl+\\", Some(GoRoot)),
+            ("ctrl+,", Some(EditConfig)),
+            ("alt+o", Some(SyncOtherPanel)),
+            ("ctrl+k", None),
+            ("alt+x", None),
+            ("f11", None),
+            ("ctrl+left", None),
+        ];
+        for (name, cmd) in cases {
+            assert_eq!(map.command_of(name), cmd, "{name}");
+            let (key, m) = press_of(name).unwrap();
+            assert_eq!(map.command(&key, m), cmd, "{name}");
+        }
     }
 
     #[test]
@@ -532,12 +553,13 @@ mod tests {
         let keys = |cmd| Keymap::keys_for(&bindings, cmd);
         assert_eq!(keys(Command::Move), ["F6", "F5"]);
         assert_eq!(keys(Command::MakeDir), ["F7", "Ctrl+K"]);
-        // F5 now moves, but Shift+F5 still copies.
-        assert!(keys(Command::Copy).contains(&"Shift+F5"));
-        assert!(!keys(Command::Copy).contains(&"F5"));
-        // F8 unbound: Ctrl+F8 and Alt+F8 still delete, so they show up.
-        assert!(keys(Command::Delete).starts_with(&["Del", "Ctrl+F8", "Alt+F8"]));
-        assert!(!keys(Command::Delete).contains(&"F8"));
+        // F5 now moves; no other key copies.
+        assert!(keys(Command::Copy).is_empty());
+        assert_eq!(map.command(&Key::Named(Named::F5), Modifiers::SHIFT), None);
+        // F8 unbound: only Del deletes, Shift+F8 still deletes permanently.
+        assert_eq!(keys(Command::Delete), ["Del"]);
+        assert_eq!(map.command(&Key::Named(Named::F8), Modifiers::CTRL), None);
+        assert_eq!(map.command(&Key::Named(Named::F8), Modifiers::SHIFT), Some(Command::DeletePermanent));
 
         // Canonical names map back to the same presses.
         for (name, cmd) in map.named_bindings() {
@@ -588,9 +610,14 @@ mod tests {
         assert_eq!(edits[0], ("f7".to_owned(), Some("cm_Copy".to_owned())));
         map.apply(&edits);
         let bindings = map.bindings();
-        // Modifier variants of F7 still make folders, as with config.toml.
-        let keys = Keymap::keys_for(&bindings, Command::MakeDir);
-        assert!(keys.contains(&"Ctrl+F7") && keys.contains(&"Ctrl+K") && !keys.contains(&"F7"));
+        // Only Ctrl+K makes folders now: no modifier variant of F7 is left.
+        assert_eq!(Keymap::keys_for(&bindings, Command::MakeDir), ["Ctrl+K"]);
+        let f7 = Key::Named(Named::F7);
+        for m in [Modifiers::CTRL, Modifiers::SHIFT, Modifiers::CTRL | Modifiers::SHIFT, Modifiers::LOGO] {
+            assert_eq!(map.command(&f7, m), None, "{m:?}");
+        }
+        // Alt+F7 is its own default and still finds files.
+        assert_eq!(map.command(&f7, Modifiers::ALT), Some(Command::FindFiles));
         assert!(Keymap::keys_for(&bindings, Command::Copy).starts_with(&["F5", "F7"]));
         assert!(map.is_changed(Command::MakeDir) && map.is_changed(Command::Copy));
         assert!(!map.is_changed(Command::Move));
@@ -602,14 +629,62 @@ mod tests {
         assert_eq!(Keymap::keys_for(&map.bindings(), Command::MakeDir), ["F7"]);
         assert!(!map.is_changed(Command::Copy));
 
-        // Unbinding Delete also catches the modifier variants it exposes.
+        // Unbinding Delete writes exactly its two keys.
         let unbind = map.unbind(Command::Delete);
-        assert!(unbind.iter().all(|(_, v)| v.as_deref() == Some("")));
+        assert_eq!(unbind, [("delete".to_owned(), Some(String::new())), ("f8".to_owned(), Some(String::new()))]);
         map.apply(&unbind);
         assert!(Keymap::keys_for(&map.bindings(), Command::Delete).is_empty());
         assert_eq!(map.command(&Key::Named(Named::Delete), Modifiers::CTRL), None);
         assert_eq!(map.command(&Key::Named(Named::Delete), Modifiers::SHIFT), Some(Command::DeletePermanent));
         map.apply(&map.reset(Command::Delete));
         assert_eq!(Keymap::keys_for(&map.bindings(), Command::Delete), ["Del", "F8"]);
+
+        // Unbinding a command that has an override drops that entry too.
+        map.apply(&[map.bind("ctrl+k", Some(Command::Copy))]);
+        map.apply(&map.unbind(Command::Copy));
+        assert!(Keymap::keys_for(&map.bindings(), Command::Copy).is_empty());
+        assert_eq!(map.command_of("ctrl+k"), None);
+        assert_eq!(map.command_of("f5"), None);
+    }
+
+    #[test]
+    fn only_listed_combinations_are_bound() {
+        let keys = BTreeMap::from([
+            ("F7".to_owned(), "cm_Copy".to_owned()),
+            ("Ctrl+Shift+F7".to_owned(), "cm_MkDir".to_owned()),
+            ("Del".to_owned(), String::new()),
+        ]);
+        for map in [Keymap::default(), Keymap::new(&keys).unwrap()] {
+            let listed: HashMap<String, Command> = map.named_bindings().into_iter().collect();
+            let mut bases: Vec<Key> = NAMED.iter().map(|(_, n)| Key::Named(*n)).collect();
+            bases.extend("abcdefghijklmnopqrstuvwxyz0123456789`-=[]\\;',./+*".chars().map(|c| Key::Character(c.to_string().into())));
+            for key in &bases {
+                for bits in 0u8..16 {
+                    let mut m = Modifiers::empty();
+                    for (bit, flag) in [(1, Modifiers::CTRL), (2, Modifiers::ALT), (4, Modifiers::SHIFT), (8, Modifiers::LOGO)] {
+                        if bits & bit != 0 {
+                            m |= flag;
+                        }
+                    }
+                    let name = key_name(key, m).unwrap();
+                    assert_eq!(map.command(key, m), listed.get(&name).copied(), "{name}");
+                }
+            }
+        }
+        // The rebound key and the one override, nothing else of F7.
+        let map = Keymap::new(&keys).unwrap();
+        let f7 = Key::Named(Named::F7);
+        assert_eq!(map.command(&f7, Modifiers::empty()), Some(Command::Copy));
+        assert_eq!(map.command(&f7, Modifiers::CTRL | Modifiers::SHIFT), Some(Command::MakeDir));
+        assert_eq!(map.command(&f7, Modifiers::CTRL), None);
+        assert_eq!(map.command(&f7, Modifiers::SHIFT), None);
+        assert_eq!(map.command(&Key::Named(Named::Delete), Modifiers::empty()), None);
+        assert_eq!(map.command(&Key::Named(Named::Delete), Modifiers::SHIFT), Some(Command::DeletePermanent));
+        // Every default name is canonical and distinct.
+        let mut seen = std::collections::HashSet::new();
+        for (name, _) in DEFAULTS {
+            assert_eq!(parse_key(name).as_deref(), Some(*name));
+            assert!(seen.insert(*name), "{name} twice");
+        }
     }
 }
