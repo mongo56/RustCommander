@@ -76,6 +76,8 @@ pub enum Command {
     OpenInNewTab,
     /// Open `config.toml` in the editor (Ctrl+,).
     EditConfig,
+    /// Settings view: preferences, key bindings, colours (F10).
+    Configuration,
     /// Searchable list of keys and features (F1).
     Help,
     Quit,
@@ -138,6 +140,7 @@ impl Command {
             PrevTab => "cm_SwitchToPreviousTab",
             OpenInNewTab => "cm_OpenDirInNewTab",
             EditConfig => "cm_EditConfig",
+            Configuration => "cm_Configuration",
             Help => "cm_HelpIndex",
             Quit => "cm_Exit",
         }
@@ -200,6 +203,7 @@ impl Command {
             PrevTab => "Previous tab",
             OpenInNewTab => "Open the folder under the cursor in a new tab",
             EditConfig => "Edit config.toml (editor, [keys], [colors])",
+            Configuration => "Settings: preferences, key bindings, colour themes",
             Help => "This help: all keys and features",
             Quit => "Exit",
         }
@@ -265,6 +269,7 @@ impl Command {
             PrevTab,
             OpenInNewTab,
             EditConfig,
+            Configuration,
             Help,
             Quit,
         ]

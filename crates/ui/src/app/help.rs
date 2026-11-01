@@ -88,7 +88,7 @@ pub(super) fn sections(keymap: &keymap::Keymap) -> Vec<Section> {
     };
     vec![
         Section {
-            title: "Commands (rebind in config.toml [keys], Ctrl+,)",
+            title: "Commands (rebind in the settings, F10, or config.toml [keys], Ctrl+,)",
             items: commands,
         },
         fixed("Panels: typing and mouse", App::PANEL_KEYS),
@@ -99,6 +99,7 @@ pub(super) fn sections(keymap: &keymap::Keymap) -> Vec<Section> {
         fixed("Compare files (Alt+F2)", App::DIFF_KEYS),
         fixed("Find files (Alt+F7)", App::FIND_KEYS),
         fixed("Connect to server (Ctrl+F)", App::CONNECT_KEYS),
+        fixed("Settings (F10)", App::SETTINGS_KEYS),
     ]
 }
 

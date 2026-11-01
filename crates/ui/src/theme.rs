@@ -67,6 +67,102 @@ pub const DARK: Colors = Colors {
     drop: rgb(0x24452f),
 };
 
+pub const LIGHT: Colors = Colors {
+    bg: rgb(0xeceff3),
+    panel: rgb(0xffffff),
+    zebra: rgb(0xf5f7fa),
+    header: rgb(0xe2e6ec),
+    border: rgb(0xc9cfd8),
+    text: rgb(0x1f2328),
+    muted: rgb(0x687180),
+    dir: rgb(0x1a5fb4),
+    accent: rgb(0x2f6fd6),
+    selected: rgb(0xb35900),
+    error: rgb(0xc62828),
+    cursor: rgb(0xcfe0fb),
+    cursor_inactive: rgb(0xe3e7ee),
+    success: rgb(0x2e7d32),
+    drop: rgb(0xcdeccf),
+};
+
+pub const NORD: Colors = Colors {
+    bg: rgb(0x2e3440),
+    panel: rgb(0x323845),
+    zebra: rgb(0x363c4a),
+    header: rgb(0x3b4252),
+    border: rgb(0x4c566a),
+    text: rgb(0xd8dee9),
+    muted: rgb(0x8c96a8),
+    dir: rgb(0x88c0d0),
+    accent: rgb(0x81a1c1),
+    selected: rgb(0xebcb8b),
+    error: rgb(0xbf616a),
+    cursor: rgb(0x40506a),
+    cursor_inactive: rgb(0x3d4454),
+    success: rgb(0xa3be8c),
+    drop: rgb(0x3e5040),
+};
+
+pub const GRUVBOX: Colors = Colors {
+    bg: rgb(0x1d2021),
+    panel: rgb(0x282828),
+    zebra: rgb(0x2d2c2a),
+    header: rgb(0x32302f),
+    border: rgb(0x45403d),
+    text: rgb(0xebdbb2),
+    muted: rgb(0x928374),
+    dir: rgb(0x83a598),
+    accent: rgb(0x8ec07c),
+    selected: rgb(0xfabd2f),
+    error: rgb(0xfb4934),
+    cursor: rgb(0x504945),
+    cursor_inactive: rgb(0x3c3836),
+    success: rgb(0xb8bb26),
+    drop: rgb(0x3d4a2a),
+};
+
+/// A built-in colour set, chosen with `theme = "<id>"` in `config.toml`;
+/// `[colors]` overrides apply on top.
+#[derive(Debug)]
+pub struct Preset {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub colors: Colors,
+}
+
+pub const PRESETS: &[Preset] = &[
+    Preset { id: "dark", name: "Dark", colors: DARK },
+    Preset { id: "light", name: "Light", colors: LIGHT },
+    Preset { id: "nord", name: "Nord", colors: NORD },
+    Preset { id: "gruvbox", name: "Gruvbox", colors: GRUVBOX },
+];
+
+/// The preset with this id (case-insensitive); empty = the dark default.
+pub fn preset(id: &str) -> Option<&'static Preset> {
+    let id = id.trim();
+    let id = if id.is_empty() { "dark" } else { id };
+    PRESETS.iter().find(|p| p.id.eq_ignore_ascii_case(id))
+}
+
+/// What each colour is for, by name (`NAMES` order), for the settings view.
+pub const PURPOSES: &[&str] = &[
+    "Window background",
+    "File list background",
+    "Every other file row",
+    "Column headers, dialogs, the current tab",
+    "Lines and frames",
+    "Normal text",
+    "Secondary text (sizes, dates, hints)",
+    "Folder names",
+    "Focus frames, progress bars, the default button",
+    "Selected (marked) entries",
+    "Error messages",
+    "Cursor row in the active panel",
+    "Cursor row in the other panel",
+    "Success messages",
+    "Folder row under the mouse while dragging",
+];
+
 /// Colour names as written in `config.toml`, in display order.
 pub const NAMES: &[&str] = &["bg", "panel", "zebra", "header", "border", "text", "muted", "dir", "accent", "selected", "error", "cursor", "cursor_inactive", "success", "drop"];
 
@@ -140,7 +236,7 @@ fn mix(a: Color, b: Color, t: f32) -> Color {
 
 pub fn theme() -> Theme {
     Theme::custom(
-        "RustCommander Dark".to_string(),
+        "RustCommander".to_string(),
         iced::theme::Palette {
             background: c().bg,
             text: c().text,
@@ -318,5 +414,25 @@ mod tests {
         assert_eq!(set("Accent", "#ff0000").unwrap().accent, rgb(0xff0000));
         assert!(set("nope", "#ff0000").unwrap_err().contains("nope"));
         assert!(set("accent", "red").unwrap_err().contains("red"));
+    }
+
+    #[test]
+    fn presets_are_complete_and_distinct() {
+        assert_eq!(PURPOSES.len(), NAMES.len());
+        assert_eq!(preset("").unwrap().colors, DARK);
+        assert_eq!(preset("Light").unwrap().colors, LIGHT);
+        assert!(preset("nope").is_none());
+        for (i, p) in PRESETS.iter().enumerate() {
+            assert_eq!(preset(p.id).unwrap().id, p.id);
+            // Every colour survives the hex round trip used by config.toml.
+            for name in NAMES {
+                let hex = to_hex(p.colors.get(name).unwrap());
+                assert_eq!(parse_hex(&hex).map(to_hex), Some(hex), "{} {name}", p.id);
+            }
+            // Text stands out from the list background.
+            let lum = |c: Color| 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;
+            assert!((lum(p.colors.text) - lum(p.colors.panel)).abs() > 0.5, "{}", p.id);
+            assert!(PRESETS[..i].iter().all(|q| q.colors != p.colors));
+        }
     }
 }

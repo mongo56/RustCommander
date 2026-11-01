@@ -7,6 +7,7 @@ mod help;
 mod hotlist;
 mod find_files;
 mod multi_rename;
+mod settings;
 mod viewer;
 
 use crate::keymap;
@@ -123,6 +124,8 @@ pub struct App {
     /// of `folder` arrives (after a job on a server).
     focus_after_listing: Vec<(PathBuf, String)>,
     help: Option<help::Help>,
+    /// Settings view (F10), covering the whole window while open.
+    settings: Option<settings::Settings>,
     /// Multi-rename settings, kept between uses.
     rename_opts: rc_core::rename::Options,
     /// `(new, old)` paths of the last multi-rename batch, kept after the
@@ -341,6 +344,7 @@ pub enum Message {
     FileDiff(file_diff::DiffMsg),
     Find(find_files::FindMsg),
     Connect(connect::ConnectMsg),
+    Settings(settings::SettingsMsg),
     /// Background listing for a pending navigation: (side, seq, listing).
     Navigated(usize, u64, Listing),
     /// A file inside an archive was extracted to a temp copy to be opened.
@@ -413,6 +417,7 @@ impl App {
             connect: None,
             focus_after_listing: Vec::new(),
             help: None,
+            settings: None,
             rename_opts: rc_core::rename::Options::default(),
             rename_undo: Vec::new(),
             config: crate::config::Config::default(),
@@ -421,6 +426,15 @@ impl App {
             placement: session.as_ref().and_then(|s| s.window).map(Into::into),
         };
         app.refresh_config();
+        // First start: hidden files as configured.
+        if session.is_none() && app.config.show_hidden {
+            for side in &mut app.sides {
+                for tab in &mut side.tabs {
+                    tab.show_hidden = true;
+                    let _ = tab.reload();
+                }
+            }
+        }
         let show = match app.placement {
             Some(p) if hidden_until_placed(&session) => restore_window(p),
             _ => Task::none(),
@@ -820,6 +834,7 @@ impl App {
             Message::FileDiff(msg) => return self.file_diff_update(msg),
             Message::Find(msg) => return self.find_update(msg),
             Message::Connect(msg) => return self.connect_update(msg),
+            Message::Settings(msg) => return self.settings_update(msg),
             Message::Navigated(side, seq, result) => {
                 let current = self.sides[side].current;
                 let pending = self.nav[side].take_if(|p| p.seq == seq && p.tab == current);
@@ -881,6 +896,12 @@ impl App {
                 return Task::none();
             }
             return self.help_key(named, &key, mods, text.as_deref());
+        }
+        if self.settings.is_some() {
+            if named.is_some_and(is_modifier_key) {
+                return Task::none();
+            }
+            return self.settings_key(named, &key, mods, captured);
         }
         if self.multi_rename.is_some() {
             if named.is_some_and(is_modifier_key) {
@@ -1073,6 +1094,7 @@ impl App {
             Connect => return self.open_connect(),
             Disconnect => return self.disconnect(),
             Help => return self.open_help(),
+            Configuration => return self.open_settings(),
             Edit => {
                 if let Some(e) = self.panel(active).current().filter(|e| e.kind == EntryKind::File) {
                     let (path, name) = (e.path.clone(), e.name.clone());
@@ -2363,22 +2385,31 @@ impl App {
         }
         let first = self.config_stamp.is_none();
         self.config_stamp = Some(stamp);
-        let loaded = crate::config::load().and_then(|config| {
-            let keymap = keymap::Keymap::new(&config.keys).map_err(|e| format!("config.toml [keys]: {e}"))?;
-            let colors = theme::DARK.with(&config.colors).map_err(|e| format!("config.toml [colors]: {e}"))?;
-            Ok((config, keymap, colors))
-        });
-        match loaded {
-            Ok((config, keymap, colors)) => {
-                self.config = config;
-                self.keymap = keymap;
-                theme::set(colors);
-                if !first {
-                    self.status = Some(("Settings reloaded".into(), Tone::Info));
-                }
-            }
+        match self.apply_config() {
+            Ok(()) if !first => self.status = Some(("Settings reloaded".into(), Tone::Info)),
+            Ok(()) => {}
             Err(e) => self.status = Some((format!("Bad config: {e}"), Tone::Error)),
         }
+    }
+
+    /// Reads `config.toml` now (after the settings view wrote it) and
+    /// applies it; `refresh_config` then sees it unchanged.
+    fn reload_config(&mut self) -> Result<(), String> {
+        let stamp = crate::config::file().and_then(|p| std::fs::metadata(p).ok()).and_then(|m| m.modified().ok());
+        self.config_stamp = Some(stamp);
+        self.apply_config()
+    }
+
+    /// Loads `config.toml` and applies it (key bindings, colours); a broken
+    /// file keeps the previous settings.
+    fn apply_config(&mut self) -> Result<(), String> {
+        let config = crate::config::load()?;
+        let keymap = keymap::Keymap::new(&config.keys).map_err(|e| format!("config.toml [keys]: {e}"))?;
+        let colors = config.colors().map_err(|e| format!("config.toml: {e}"))?;
+        self.config = config;
+        self.keymap = keymap;
+        theme::set(colors);
+        Ok(())
     }
 
     /// Opens `path` in the editor from `config.toml` (F4, Shift+F4).

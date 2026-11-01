@@ -1,6 +1,8 @@
-//! User settings in `config.toml` (next to `session.toml`). The app never
-//! rewrites this file: it only creates a commented template when it's missing.
-//! It is re-read where a setting is used, so edits apply without a restart.
+//! User settings in `config.toml` (next to `session.toml`). A commented
+//! template is created when it's missing; the settings view (F10) changes
+//! single entries with `toml_edit` (`write`), keeping the user's comments,
+//! layout and unknown keys. It is re-read where a setting is used, so edits
+//! apply without a restart.
 
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -12,11 +14,113 @@ pub struct Config {
     /// Editor for F4: a program, optionally with arguments; `%1` stands for
     /// the file (appended when missing). Empty = the platform default.
     pub editor: String,
+    /// Colour theme: a `theme::PRESETS` id; empty = dark.
+    pub theme: String,
+    /// Hidden files shown at the first start (no session yet); the
+    /// settings view also applies a change to every open tab.
+    pub show_hidden: bool,
     /// Key bindings on top of the defaults: key (`Ctrl+Shift+F5`) ->
     /// command id (`cm_Copy`), `""` unbinds the key.
     pub keys: BTreeMap<String, String>,
     /// Colour overrides: name (see `theme::NAMES`) -> `#rrggbb`.
     pub colors: BTreeMap<String, String>,
+}
+
+impl Config {
+    /// The theme preset with the `[colors]` overrides on top.
+    pub fn colors(&self) -> Result<crate::theme::Colors, String> {
+        let preset = crate::theme::preset(&self.theme).ok_or_else(|| format!("unknown theme \"{}\"", self.theme))?;
+        preset.colors.with(&self.colors).map_err(|e| format!("[colors]: {e}"))
+    }
+}
+
+/// One change to `config.toml`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Edit {
+    /// A top-level text setting (`editor`, `theme`).
+    Text(&'static str, String),
+    /// A top-level switch (`show_hidden`).
+    Flag(&'static str, bool),
+    /// A `[keys]` entry by canonical key name (`keymap::KeyEdit`): `Some`
+    /// sets it, `None` drops every spelling of that key.
+    Key(crate::keymap::KeyEdit),
+    /// A `[colors]` entry: `Some("#rrggbb")` sets it, `None` drops it.
+    Color(String, Option<String>),
+    /// Drops every `[colors]` entry (a theme was picked).
+    ClearColors,
+}
+
+/// Applies `edits` to the text of `config.toml`; comments, layout and
+/// unknown keys stay as they are. A changed value keeps its trailing
+/// comment; new `[keys]` entries are spelled like `Ctrl+Shift+F5`.
+pub fn apply(text: &str, edits: &[Edit]) -> Result<String, String> {
+    use toml_edit::{DocumentMut, Item, TableLike, Value};
+
+    /// Sets `key` in `table` to `value`, keeping the old value's comments.
+    fn put(table: &mut dyn TableLike, key: &str, value: Value) {
+        match table.get_mut(key) {
+            Some(Item::Value(old)) => {
+                let decor = old.decor().clone();
+                *old = value;
+                *old.decor_mut() = decor;
+            }
+            _ => {
+                table.insert(key, Item::Value(value));
+            }
+        }
+    }
+    fn table<'a>(doc: &'a mut DocumentMut, name: &str) -> Result<&'a mut dyn TableLike, String> {
+        doc.entry(name).or_insert(toml_edit::table()).as_table_like_mut().ok_or_else(|| format!("{name} is not a table"))
+    }
+    /// Sets (`Some`) or drops the entry of `table` whose key `same` matches;
+    /// the first spelling found is kept, other spellings of it go.
+    fn change(table: &mut dyn TableLike, same: impl Fn(&str) -> bool, new_key: String, value: Option<&str>) {
+        let mut found: Vec<String> = table.iter().map(|(k, _)| k.to_owned()).filter(|k| same(k)).collect();
+        if let Some(value) = value {
+            let key = if found.is_empty() { new_key } else { found.remove(0) };
+            put(table, &key, Value::from(value));
+        }
+        for key in found {
+            table.remove(&key);
+        }
+    }
+
+    let mut doc: DocumentMut = text.parse().map_err(|e: toml_edit::TomlError| e.message().to_owned())?;
+    for edit in edits {
+        match edit {
+            Edit::Text(key, value) => put(doc.as_table_mut(), key, Value::from(value.as_str())),
+            Edit::Flag(key, value) => put(doc.as_table_mut(), key, Value::from(*value)),
+            Edit::Key((name, value)) => {
+                let same = |k: &str| crate::keymap::parse_key(k).as_deref() == Some(name.as_str());
+                change(table(&mut doc, "keys")?, same, crate::keymap::display_key(name), value.as_deref());
+            }
+            Edit::Color(name, value) => {
+                let same = |k: &str| k.eq_ignore_ascii_case(name);
+                change(table(&mut doc, "colors")?, same, name.clone(), value.as_deref());
+            }
+            Edit::ClearColors => {
+                if let Some(colors) = doc.get_mut("colors").and_then(Item::as_table_like_mut) {
+                    change(colors, |_| true, String::new(), None);
+                }
+            }
+        }
+    }
+    let out = doc.to_string();
+    parse(&out)?;
+    Ok(out)
+}
+
+/// Applies `edits` to `config.toml` (created from the template first if
+/// it's missing).
+pub fn write(edits: &[Edit]) -> Result<(), String> {
+    create_if_missing("").map_err(|e| e.to_string())?;
+    let path = file().ok_or("no config folder")?;
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let out = apply(&text, edits).map_err(|e| format!("{}: {e}", path.display()))?;
+    if out != text {
+        std::fs::write(&path, out).map_err(|e| format!("{}: {e}", path.display()))?;
+    }
+    Ok(())
 }
 
 /// The folder holding `config.toml` and `session.toml`.
@@ -65,6 +169,8 @@ pub fn create_if_missing(editor: &str) -> std::io::Result<()> {
 
 fn template(editor: &str) -> String {
     let editor = toml::Value::String(editor.to_owned());
+    let themes: Vec<&str> = crate::theme::PRESETS.iter().map(|p| p.id).collect();
+    let themes = themes.join(", ");
     let commands: Vec<&str> = rc_core::Command::ALL.iter().map(|c| c.id()).collect();
     let mut command_list = String::new();
     for line in commands.chunks(4) {
@@ -77,13 +183,20 @@ fn template(editor: &str) -> String {
     }
     format!(
         "# RustCommander settings. Changes apply as soon as the file is saved.\n\
-         # Ctrl+, opens this file in the editor.\n\
+         # Ctrl+, opens this file in the editor; F10 opens the settings view, which\n\
+         # changes single entries and keeps your comments.\n\
          \n\
          # Editor for F4 / Shift+F4: a program, optionally with arguments.\n\
          # %1 stands for the file (appended when missing); quote paths with spaces.\n\
          # Empty = Notepad on Windows, else $VISUAL / $EDITOR.\n\
          # Example: editor = '\"C:\\Program Files\\Notepad++\\notepad++.exe\" -multiInst %1'\n\
          editor = {editor}\n\
+         \n\
+         # Show hidden files at the first start (Ctrl+H toggles them per tab).\n\
+         show_hidden = false\n\
+         \n\
+         # Colour theme: {themes}. [colors] below overrides single colours.\n\
+         theme = \"dark\"\n\
          \n\
          # Key bindings for the panels, on top of the Total Commander-like defaults.\n\
          # \"Key\" = \"command\"; an empty command unbinds the key. Modifiers: Ctrl, Alt,\n\
@@ -96,7 +209,7 @@ fn template(editor: &str) -> String {
          # \"Ctrl+K\" = \"cm_MkDir\"\n\
          # \"F8\" = \"\"\n\
          \n\
-         # Colours as \"#rrggbb\"; the values below are the defaults.\n\
+         # Colours as \"#rrggbb\"; the values below are the dark theme's.\n\
          [colors]\n\
          {colors}"
     )
@@ -116,6 +229,59 @@ mod tests {
         // The commented-out colour lines are valid settings once uncommented.
         let uncommented = template("").replace("\n# bg = ", "\nbg = ");
         assert_eq!(parse(&uncommented).unwrap().colors["bg"], "#14161a");
+    }
+
+    #[test]
+    fn edits_keep_comments_and_unknown_keys() {
+        let text = "# my editor\neditor = 'ed' # trailing\nfuture = 1\n\n[keys]\n# mine\n\"ctrl+k\" = \"cm_MkDir\"\nF8 = \"\"\n\n[colors]\nAccent = \"#ff0000\"\n";
+        let out = apply(
+            text,
+            &[
+                Edit::Text("editor", "vim %1".into()),
+                Edit::Text("theme", "light".into()),
+                Edit::Flag("show_hidden", true),
+                Edit::Key(("ctrl+k".into(), Some("cm_Copy".into()))),
+                Edit::Key(("f8".into(), None)),
+                Edit::Key(("ctrl+shift+f5".into(), Some("cm_RenMov".into()))),
+                Edit::Color("accent".into(), Some("#00ff00".into())),
+                Edit::Color("bg".into(), Some("#000000".into())),
+            ],
+        )
+        .unwrap();
+        for kept in ["# my editor\n", "# trailing", "future = 1", "# mine\n\"ctrl+k\" = \"cm_Copy\""] {
+            assert!(out.contains(kept), "{kept} in {out}");
+        }
+        assert!(!out.contains("F8"));
+        let config = parse(&out).unwrap();
+        assert_eq!(config.editor, "vim %1");
+        assert_eq!(config.theme, "light");
+        assert!(config.show_hidden);
+        assert_eq!(config.keys["Ctrl+Shift+F5"], "cm_RenMov");
+        assert_eq!(config.colors["Accent"], "#00ff00");
+        assert_eq!(config.colors["bg"], "#000000");
+        // New top-level settings land above the first table.
+        assert!(out.find("theme =").unwrap() < out.find("[keys]").unwrap());
+
+        let cleared = apply(&out, &[Edit::ClearColors, Edit::Color("bg".into(), None)]).unwrap();
+        assert!(parse(&cleared).unwrap().colors.is_empty());
+        assert!(cleared.contains("[colors]"));
+        assert!(apply("editor = ", &[]).is_err());
+        assert!(apply("keys = 1", &[Edit::Key(("f5".into(), None))]).is_err());
+    }
+
+    #[test]
+    fn template_edits_round_trip() {
+        let text = template("notepad");
+        assert_eq!(apply(&text, &[]).unwrap(), text);
+        let edits = [Edit::Text("theme", "nord".into()), Edit::Key(("ctrl+k".into(), Some("cm_MkDir".into())))];
+        let out = apply(&text, &edits).unwrap();
+        // Only the changed lines differ.
+        let changed: Vec<_> = out.lines().filter(|l| !text.lines().any(|t| t == *l)).collect();
+        assert_eq!(changed, ["theme = \"nord\"", "\"Ctrl+K\" = \"cm_MkDir\""]);
+        let config = parse(&out).unwrap();
+        assert_eq!(config.colors().unwrap(), crate::theme::NORD);
+        assert!(crate::keymap::Keymap::new(&config.keys).is_ok());
+        assert!(parse("theme = 'pink'").unwrap().colors().is_err());
     }
 
     #[test]

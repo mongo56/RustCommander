@@ -22,6 +22,8 @@ impl App {
 
         let base: Element<'_, Message> = if let Some(h) = &self.help {
             self.help_view(h)
+        } else if let Some(s) = &self.settings {
+            self.settings_view(s)
         } else {
             match (&self.find, &self.multi_rename, &self.viewer, &self.file_diff) {
                 _ if self.connect.is_some() => self.connect_view(self.connect.as_ref().unwrap()),
@@ -812,6 +814,7 @@ impl App {
             ("F6", "Move", Command::Move),
             ("F7", "MkDir", Command::MakeDir),
             ("F8", "Delete", Command::Delete),
+            ("F10", "Settings", Command::Configuration),
             ("Alt+F4", "Exit", Command::Quit),
         ];
         let fkeys = Row::with_children(keys.into_iter().map(|(key, label, cmd)| {

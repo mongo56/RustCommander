@@ -28,6 +28,71 @@ impl Keymap {
         Ok(Keymap { overrides })
     }
 
+    /// The command bound to a canonical key name (`ctrl+k`).
+    pub fn command_of(&self, name: &str) -> Option<Command> {
+        match self.overrides.get(name) {
+            Some(&cmd) => cmd,
+            None => default_of(name),
+        }
+    }
+
+    /// The `[keys]` change that binds the canonical key `name` to `cmd`
+    /// (`None` = unbinds it): the entry is dropped when that's the default.
+    pub fn bind(&self, name: &str, cmd: Option<Command>) -> KeyEdit {
+        let value = (default_of(name) != cmd).then(|| cmd.map_or(String::new(), |c| c.id().to_owned()));
+        (name.to_owned(), value)
+    }
+
+    /// The changes that leave `cmd` without any key. Unbinding a key can
+    /// expose a modifier variant that did the same (Ctrl+F8 once F8 is
+    /// unbound), so this repeats until nothing is left.
+    pub fn unbind(&self, cmd: Command) -> Vec<KeyEdit> {
+        let mut map = Keymap { overrides: self.overrides.clone() };
+        let mut edits = Vec::new();
+        for _ in 0..8 {
+            let names: Vec<String> = map.named_bindings().into_iter().filter(|(_, c)| *c == cmd).map(|(n, _)| n).collect();
+            if names.is_empty() {
+                break;
+            }
+            let round: Vec<KeyEdit> = names.iter().map(|n| map.bind(n, None)).collect();
+            map.apply(&round);
+            edits.extend(round);
+        }
+        edits
+    }
+
+    /// The changes that give `cmd` back its default keys: drops every
+    /// override that binds it or that took one of its default keys.
+    pub fn reset(&self, cmd: Command) -> Vec<KeyEdit> {
+        let mut names: Vec<&String> = self
+            .overrides
+            .iter()
+            .filter(|(name, over)| **over == Some(cmd) || default_of(name) == Some(cmd))
+            .map(|(name, _)| name)
+            .collect();
+        names.sort();
+        names.into_iter().map(|n| (n.clone(), None)).collect()
+    }
+
+    /// Whether `[keys]` changes anything for `cmd`.
+    pub fn is_changed(&self, cmd: Command) -> bool {
+        !self.reset(cmd).is_empty()
+    }
+
+    /// Applies `[keys]` changes (as `config.toml` would after writing them).
+    pub fn apply(&mut self, edits: &[KeyEdit]) {
+        for (name, value) in edits {
+            match value {
+                None => {
+                    self.overrides.remove(name);
+                }
+                Some(id) => {
+                    self.overrides.insert(name.clone(), Command::from_id(id));
+                }
+            }
+        }
+    }
+
     pub fn command(&self, key: &Key, m: Modifiers) -> Option<Command> {
         match key_name(key, m).and_then(|name| self.overrides.get(&name)) {
             Some(&cmd) => cmd,
@@ -41,6 +106,11 @@ impl Keymap {
     /// same key with fewer modifiers does the same (Shift+Down = Down).
     /// Each command's keys come with the fewest modifiers first.
     pub fn bindings(&self) -> Vec<(String, Command)> {
+        self.named_bindings().into_iter().map(|(name, cmd)| (display_key(&name), cmd)).collect()
+    }
+
+    /// `bindings` with canonical key names.
+    pub fn named_bindings(&self) -> Vec<(String, Command)> {
         let mut bases: Vec<Key> = Vec::new();
         for (_, named) in NAMED {
             let key = Key::Named(*named);
@@ -83,13 +153,47 @@ impl Keymap {
             out.push((name, cmd, count));
         }
         out.sort_by_key(|&(_, _, count)| count);
-        out.into_iter().map(|(name, cmd, _)| (display_key(&name), cmd)).collect()
+        out.into_iter().map(|(name, cmd, _)| (name, cmd)).collect()
     }
 
     /// The display names of the keys bound to `cmd`, from `bindings`.
     pub fn keys_for(bindings: &[(String, Command)], cmd: Command) -> Vec<&str> {
         bindings.iter().filter(|(_, c)| *c == cmd).map(|(k, _)| k.as_str()).collect()
     }
+}
+
+/// A change to `[keys]`: canonical key name and the value to write
+/// (`Some("cm_Copy")`, `Some("")` unbinds) or `None` to drop the entry.
+pub type KeyEdit = (String, Option<String>);
+
+/// The default command of a canonical key name.
+fn default_of(name: &str) -> Option<Command> {
+    let (key, m) = press_of(name)?;
+    default_command(&key, m)
+}
+
+/// The key press a canonical key name stands for.
+fn press_of(name: &str) -> Option<(Key, Modifiers)> {
+    let (mods, base) = match name.strip_suffix("++") {
+        Some(rest) => (rest, "+"),
+        None if name == "+" => ("", "+"),
+        None => name.rsplit_once('+').unwrap_or(("", name)),
+    };
+    let mut m = Modifiers::empty();
+    for part in mods.split('+').filter(|p| !p.is_empty()) {
+        m |= match part {
+            "ctrl" => Modifiers::CTRL,
+            "alt" => Modifiers::ALT,
+            "shift" => Modifiers::SHIFT,
+            "win" => Modifiers::LOGO,
+            _ => return None,
+        };
+    }
+    let key = match NAMED.iter().find(|(alias, _)| *alias == base) {
+        Some((_, named)) => Key::Named(*named),
+        None => Key::Character(base.into()),
+    };
+    Some((key, m))
 }
 
 /// Character keys tried when listing the default bindings.
@@ -173,7 +277,7 @@ const NAMED: &[(&str, Named)] = &[
 
 /// Canonical name of a key press: modifiers in a fixed order, then the key,
 /// all lower case, e.g. `ctrl+shift+f5`, `alt+o`.
-fn key_name(key: &Key, m: Modifiers) -> Option<String> {
+pub fn key_name(key: &Key, m: Modifiers) -> Option<String> {
     let base = match key.as_ref() {
         Key::Named(named) => NAMED.iter().find(|(_, n)| *n == named)?.0.to_owned(),
         Key::Character(c) => c.to_lowercase(),
@@ -195,7 +299,7 @@ fn join(ctrl: bool, alt: bool, shift: bool, logo: bool, base: &str) -> String {
 
 /// Parses a key as written in `config.toml` (`Ctrl+Shift+F5`, `Alt+O`,
 /// `Ctrl++`) into its canonical name.
-fn parse_key(text: &str) -> Option<String> {
+pub fn parse_key(text: &str) -> Option<String> {
     let text = text.trim().to_lowercase();
     // A trailing "+" is the plus key itself ("Ctrl++", "+").
     let (mods, base) = match text.strip_suffix('+') {
@@ -253,6 +357,7 @@ fn default_command(key: &Key, m: Modifiers) -> Option<Command> {
             Named::Space => ToggleSelect { advance: false },
             Named::Escape => DeselectAll,
             Named::F1 => Help,
+            Named::F10 => Configuration,
             Named::F3 if ctrl => SortBy(SortKey::Name),
             Named::F4 if ctrl => SortBy(SortKey::Ext),
             Named::F5 if ctrl => SortBy(SortKey::Modified),
@@ -387,8 +492,52 @@ mod tests {
         assert!(keys(Command::Delete).starts_with(&["Del", "Ctrl+F8", "Alt+F8"]));
         assert!(!keys(Command::Delete).contains(&"F8"));
 
+        // Canonical names map back to the same presses.
+        for (name, cmd) in map.named_bindings() {
+            assert_eq!(map.command_of(&name), Some(cmd), "{name}");
+            let (key, m) = press_of(&name).unwrap();
+            assert_eq!(key_name(&key, m).as_deref(), Some(name.as_str()));
+        }
+
         let bad = |k: &str, v: &str| Keymap::new(&BTreeMap::from([(k.to_owned(), v.to_owned())])).unwrap_err();
         assert!(bad("F5", "cm_Nope").contains("cm_Nope"));
         assert!(bad("Ctrl+Nope", "cm_Copy").contains("Ctrl+Nope"));
+    }
+
+    #[test]
+    fn rebinding_reports_conflicts_and_resets() {
+        let mut map = Keymap::default();
+        // Binding a default key to its default command writes nothing.
+        assert_eq!(map.bind("f5", Some(Command::Copy)), ("f5".to_owned(), None));
+        // F7 is taken by MakeDir: a conflict the settings view asks about.
+        assert_eq!(map.command_of("f7"), Some(Command::MakeDir));
+        assert_eq!(map.command_of("ctrl+k"), None);
+        let edits = vec![map.bind("f7", Some(Command::Copy)), map.bind("ctrl+k", Some(Command::MakeDir))];
+        assert_eq!(edits[0], ("f7".to_owned(), Some("cm_Copy".to_owned())));
+        map.apply(&edits);
+        let bindings = map.bindings();
+        // Modifier variants of F7 still make folders, as with config.toml.
+        let keys = Keymap::keys_for(&bindings, Command::MakeDir);
+        assert!(keys.contains(&"Ctrl+F7") && keys.contains(&"Ctrl+K") && !keys.contains(&"F7"));
+        assert!(Keymap::keys_for(&bindings, Command::Copy).starts_with(&["F5", "F7"]));
+        assert!(map.is_changed(Command::MakeDir) && map.is_changed(Command::Copy));
+        assert!(!map.is_changed(Command::Move));
+
+        // Resetting MakeDir drops Ctrl+K and gives F7 back.
+        let reset = map.reset(Command::MakeDir);
+        assert_eq!(reset, [("ctrl+k".to_owned(), None), ("f7".to_owned(), None)]);
+        map.apply(&reset);
+        assert_eq!(Keymap::keys_for(&map.bindings(), Command::MakeDir), ["F7"]);
+        assert!(!map.is_changed(Command::Copy));
+
+        // Unbinding Delete also catches the modifier variants it exposes.
+        let unbind = map.unbind(Command::Delete);
+        assert!(unbind.iter().all(|(_, v)| v.as_deref() == Some("")));
+        map.apply(&unbind);
+        assert!(Keymap::keys_for(&map.bindings(), Command::Delete).is_empty());
+        assert_eq!(map.command(&Key::Named(Named::Delete), Modifiers::CTRL), None);
+        assert_eq!(map.command(&Key::Named(Named::Delete), Modifiers::SHIFT), Some(Command::DeletePermanent));
+        map.apply(&map.reset(Command::Delete));
+        assert_eq!(Keymap::keys_for(&map.bindings(), Command::Delete), ["Del", "F8"]);
     }
 }
