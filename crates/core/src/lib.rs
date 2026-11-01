@@ -17,6 +17,7 @@ pub mod search;
 pub mod vfs;
 mod gz_edit;
 mod tar_edit;
+mod tar_sparse;
 mod zip_edit;
 pub mod viewer;
 

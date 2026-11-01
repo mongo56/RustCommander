@@ -6,12 +6,18 @@
 //! ones keep everything but the name. Until [`TarEdit::commit`] the archive
 //! is untouched; dropping an uncommitted edit removes the temp files.
 //!
-//! Refused (an error, nothing changed): GNU sparse members, and removing or
-//! moving a file that a hard link elsewhere in the archive points at.
+//! GNU sparse members (old 'S' type with its extension blocks, or pax
+//! `GNU.sparse.*` forms) are copied like any other; renamed, they stay
+//! sparse. Hard links whose target is removed, moved or replaced are kept
+//! working: the first link left takes the target's place (a regular member
+//! with its old data, under the link's name) and later links point at it;
+//! links to a moved target get its new name. Refused (an error, nothing
+//! changed): removing or moving the target of a hard link that comes before
+//! it in the archive.
 
 use crate::vfs::{clean_parts, Format};
 use crate::zip_edit::{key, matches, Edits};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -69,9 +75,13 @@ impl Write for Out {
 
 /// A member of the source archive as read: its long-name / pax headers
 /// (header, data) and its own header. Its data follows in the stream.
+#[derive(Clone)]
 struct Member {
     exts: Vec<(Header, Vec<u8>)>,
     header: Header,
+    /// Old GNU sparse members: the extension blocks after the header (more
+    /// of the sparse map), as read.
+    sparse: Vec<u8>,
     /// Bytes of data (pax `size` wins over the header's).
     size: u64,
 }
@@ -93,8 +103,18 @@ impl Member {
         Some(data.split(|b| *b == 0).next().unwrap_or_default().to_vec())
     }
 
-    /// The name, as readers see it (GNU long name, pax `path`, header).
+    /// The real name of a pax-form sparse file (its header and `path` hold
+    /// a made-up `…/GNUSparseFile.N/…` one).
+    fn sparse_name(&self) -> Option<Vec<u8>> {
+        self.pax().find(|(k, _)| *k == b"GNU.sparse.name").map(|(_, v)| v.to_vec())
+    }
+
+    /// The name, as readers see it (sparse name, GNU long name, pax
+    /// `path`, header).
     fn name(&self) -> Vec<u8> {
+        if let Some(name) = self.sparse_name() {
+            return name;
+        }
         if let Some(long) = self.long(false) {
             return long;
         }
@@ -179,10 +199,18 @@ impl<R: Read> Reader<R> {
                 exts.push((header, data));
                 continue;
             }
-            if kind.is_gnu_sparse() {
-                return Err(io::Error::other("This tar has sparse files, which can't be kept when changing it"));
+            // Old GNU sparse: more of the map may follow in extension
+            // blocks (each says if another follows); then the data.
+            let mut sparse = Vec::new();
+            let mut extended = kind.is_gnu_sparse() && header.as_bytes()[482] != 0;
+            while extended {
+                if sparse.len() as u64 >= META_LIMIT {
+                    return Err(corrupt());
+                }
+                self.copy_exact(BLOCK as u64, &mut sparse)?;
+                extended = sparse[sparse.len() - BLOCK + 504] != 0;
             }
-            let mut member = Member { exts, header, size: 0 };
+            let mut member = Member { exts, header, sparse, size: 0 };
             let pax_size = member.pax().find(|(k, _)| *k == b"size").map(|(_, v)| v.to_vec());
             member.size = match pax_size {
                 Some(v) => std::str::from_utf8(&v).ok().and_then(|s| s.parse().ok()).ok_or_else(corrupt)?,
@@ -237,12 +265,25 @@ fn write_block(out: &mut dyn Write, header: &mut Header, data: &[u8]) -> io::Res
 /// Puts `name` into `header`; a name too long for it gets a GNU long-name
 /// header first (written to `out`).
 fn write_name(out: &mut dyn Write, header: &mut Header, name: &[u8]) -> io::Result<()> {
+    write_long(out, header, name, false)
+}
+
+/// Puts `name` into `header` as its name or, with `link`, its link target;
+/// one too long for it gets a GNU long-name / long-link header first
+/// (written to `out`).
+fn write_long(out: &mut dyn Write, header: &mut Header, name: &[u8], link: bool) -> io::Result<()> {
     let old = header.as_old_mut();
-    old.name = [0; 100];
+    let field = match link {
+        true => &mut old.linkname,
+        false => &mut old.name,
+    };
+    *field = [0; 100];
     let short = name.len().min(100);
-    old.name[..short].copy_from_slice(&name[..short]);
-    if let Some(ustar) = header.as_ustar_mut() {
-        ustar.prefix = [0; 155];
+    field[..short].copy_from_slice(&name[..short]);
+    if !link {
+        if let Some(ustar) = header.as_ustar_mut() {
+            ustar.prefix = [0; 155];
+        }
     }
     if name.len() > 100 {
         let mut long = Header::new_gnu();
@@ -251,7 +292,7 @@ fn write_name(out: &mut dyn Write, header: &mut Header, name: &[u8]) -> io::Resu
         long.set_mtime(0);
         long.set_uid(0);
         long.set_gid(0);
-        long.set_entry_type(EntryType::GNULongName);
+        long.set_entry_type(if link { EntryType::GNULongLink } else { EntryType::GNULongName });
         let mut data = name.to_vec();
         data.push(0);
         long.set_size(data.len() as u64);
@@ -275,6 +316,110 @@ fn pax_record(key: &[u8], value: &[u8]) -> Vec<u8> {
     record
 }
 
+/// The header name GNU tar gives a pax-form sparse file named `name`:
+/// `<folder>/GNUSparseFile.0/<file>`, its real name being in a pax record.
+fn made_up_sparse_name(name: &str) -> Vec<u8> {
+    let (folder, file) = name.rsplit_once('/').unwrap_or((".", name));
+    format!("{folder}/GNUSparseFile.0/{file}").into_bytes()
+}
+
+/// The name readers show for `member`, and its parts if it's one that
+/// can be shown and changed (not a global pax header, nor like `../x`).
+fn shown(member: &Member) -> (String, Option<Vec<String>>) {
+    let name = String::from_utf8_lossy(&member.name()).into_owned();
+    let parts = clean_parts(&name)
+        .filter(|_| !member.header.entry_type().is_pax_global_extensions())
+        .map(|parts| parts.into_iter().map(str::to_owned).collect());
+    (name, parts)
+}
+
+/// The key of a hard link's target.
+fn link_key(member: &Member) -> String {
+    key(&String::from_utf8_lossy(&member.link_name().unwrap_or_default()))
+}
+
+/// What became of a member that hard links point at, as an edit goes.
+enum Fate {
+    /// It's stored under this name now.
+    Moved(Vec<u8>),
+    /// It was removed: its data waits in a spool file for the first link
+    /// left, which takes its place.
+    Spooled(PathBuf, Box<Member>),
+    /// A removed link: links to it follow its target (this key).
+    Alias(String),
+}
+
+/// The fate of the member `key` names (through removed links), and the key
+/// it's stored under.
+fn resolve<'a>(fates: &'a HashMap<String, Fate>, key: &str) -> Option<(&'a str, &'a Fate)> {
+    let mut key = key;
+    for _ in 0..64 {
+        match fates.get_key_value(key)? {
+            (_, Fate::Alias(next)) => key = next,
+            (at, fate) => return Some((at, fate)),
+        }
+    }
+    None
+}
+
+/// Hard links in an archive, found before changing it.
+#[derive(Default)]
+struct Links {
+    /// Keys of the members that links which stay point at (directly or
+    /// through other links).
+    needed: HashSet<String>,
+    /// Keys of all members.
+    present: HashSet<String>,
+}
+
+/// Reads through `archive` for its hard links; `removed` says which
+/// members the edit drops.
+fn scan_links(archive: &Path, format: Format, removed: &dyn Fn(&str) -> bool) -> io::Result<Links> {
+    match format {
+        // Plain tars: data skipped by seeking.
+        Format::Tar => {
+            let reader = Reader { input: BufReader::new(File::open(archive)?) };
+            scan_links_in(reader, |r, n| r.input.seek_relative(n as i64), removed)
+        }
+        _ => scan_links_in(Reader { input: crate::vfs::open_stream(archive, format)? }, |r, n| r.skip(n), removed),
+    }
+}
+
+fn scan_links_in<R: Read>(
+    mut reader: Reader<R>,
+    skip: fn(&mut Reader<R>, u64) -> io::Result<()>,
+    removed: &dyn Fn(&str) -> bool,
+) -> io::Result<Links> {
+    let mut links = Links::default();
+    let mut target_of: HashMap<String, String> = HashMap::new();
+    let mut staying = Vec::new();
+    while let Some(member) = reader.member()? {
+        skip(&mut reader, member.size + padding(member.size))?;
+        let (_, Some(parts)) = shown(&member) else { continue };
+        let key = parts.join("/").to_lowercase();
+        if member.header.entry_type().is_hard_link() {
+            let target = link_key(&member);
+            if !removed(&key) {
+                staying.push(target.clone());
+            }
+            target_of.insert(key.clone(), target);
+        }
+        links.present.insert(key);
+    }
+    for mut target in staying {
+        for _ in 0..64 {
+            if !links.needed.insert(target.clone()) {
+                break;
+            }
+            match target_of.get(&target) {
+                Some(next) => target = next.clone(),
+                None => break,
+            }
+        }
+    }
+    Ok(links)
+}
+
 /// A file being added: its contents go to a spool file first, so its size
 /// is known (and it can be dropped) before its header is written.
 struct Pending {
@@ -292,6 +437,8 @@ pub(crate) struct TarEdit {
     pending: Option<Pending>,
     /// Keys of the folder entries written so far.
     dirs: HashSet<String>,
+    /// Spool files of removed members that hard links point at.
+    link_spools: Vec<PathBuf>,
 }
 
 impl TarEdit {
@@ -309,6 +456,7 @@ impl TarEdit {
             out: Some(out),
             pending: None,
             dirs: HashSet::new(),
+            link_spools: Vec::new(),
         })
     }
 
@@ -322,89 +470,171 @@ impl TarEdit {
         if !self.archive.exists() {
             return Ok(true);
         }
-        let mut reader = Reader { input: crate::vfs::open_stream(&self.archive, self.format)? };
         let remove: Vec<String> = edits.remove.iter().map(|r| key(r)).collect();
         let relocate: Vec<(String, &str, bool)> = edits.relocate.iter().map(|(f, t, k)| (key(f), t.as_str(), *k)).collect();
-        // Removed, or moved away (a hard link to it would break).
-        let gone = |key: &str| {
-            remove.iter().any(|r| matches(key, r).is_some())
-                || relocate.iter().any(|(from, _, keep)| !keep && matches(key, from).is_some())
+        let removed = |key: &str| remove.iter().any(|r| matches(key, r).is_some());
+        let place = |key: &str| relocate.iter().find_map(|(from, to, keep)| matches(key, from).map(|depth| (depth, *to, *keep)));
+        // Removed, or moved away.
+        let gone = |key: &str| removed(key) || place(key).is_some_and(|(_, _, keep)| !keep);
+        // Hard links to members that go are rewritten: find which members
+        // the links left point at first.
+        let links = match remove.is_empty() && relocate.iter().all(|(_, _, keep)| *keep) {
+            true => Links::default(),
+            false => scan_links(&self.archive, self.format, &removed)?,
         };
+        let mut fates: HashMap<String, Fate> = HashMap::new();
+        let mut reader = Reader { input: crate::vfs::open_stream(&self.archive, self.format)? };
         while let Some(member) = reader.member()? {
             if !alive() {
                 return Ok(false);
             }
             let kind = member.header.entry_type();
-            let name = String::from_utf8_lossy(&member.name()).into_owned();
-            // Global pax headers and names that can't be shown (`../x`)
-            // are kept as they are.
-            let parts = clean_parts(&name).filter(|_| !kind.is_pax_global_extensions());
+            let (name, parts) = shown(&member);
             let Some(parts) = parts else {
-                self.copy_member(&mut reader, &member, None)?;
+                self.copy_member(&mut reader, &member, None, None)?;
                 continue;
             };
             let key = parts.join("/").to_lowercase();
-            let removed = remove.iter().any(|r| matches(&key, r).is_some());
-            if kind.is_hard_link() && !removed {
-                let target = member.link_name().map(|t| String::from_utf8_lossy(&t).into_owned()).unwrap_or_default();
-                if gone(&crate::zip_edit::key(&target)) {
-                    return Err(io::Error::other(format!(
-                        "{name} in the archive is a hard link to {target}, which would be lost: not changed"
-                    )));
+            let needed = links.needed.contains(&key);
+            if removed(&key) {
+                if !needed {
+                    reader.skip(member.size + padding(member.size))?;
+                } else if kind.is_hard_link() {
+                    // Links to this one follow its target.
+                    reader.skip(member.size + padding(member.size))?;
+                    let target = link_key(&member);
+                    let fate = match resolve(&fates, &target) {
+                        Some(_) => Fate::Alias(target),
+                        None => Fate::Moved(member.link_name().unwrap_or_default()),
+                    };
+                    fates.insert(key, fate);
+                } else {
+                    // Kept for the first link left, which takes its place.
+                    let spool = self.archive.with_file_name(format!(
+                        ".{}.{}.{}.rcspool",
+                        self.archive.file_name().unwrap_or_default().to_string_lossy(),
+                        std::process::id(),
+                        self.link_spools.len()
+                    ));
+                    self.link_spools.push(spool.clone());
+                    let mut file = BufWriter::new(File::create(&spool)?);
+                    reader.copy(member.size, &mut file)?;
+                    file.into_inner().map_err(|e| e.into_error())?;
+                    fates.insert(key, Fate::Spooled(spool, Box::new(member)));
                 }
-            }
-            if removed {
-                reader.skip(member.size + padding(member.size))?;
                 continue;
             }
             if kind == EntryType::Directory {
                 self.dirs.insert(key.clone());
             }
-            let moved = relocate.iter().find_map(|(from, to, keep)| matches(&key, from).map(|depth| (depth, *to, *keep)));
-            let Some((depth, to, keep)) = moved else {
-                self.copy_member(&mut reader, &member, None)?;
+            let moved = place(&key);
+            let renamed = moved.map(|(depth, to, _)| {
+                let mut renamed = to.trim_end_matches('/').to_owned();
+                for part in &parts[depth..] {
+                    renamed.push('/');
+                    renamed.push_str(part);
+                }
+                if kind == EntryType::Directory {
+                    self.dirs.insert(crate::zip_edit::key(&renamed));
+                    renamed.push('/');
+                }
+                renamed
+            });
+            let keep = moved.is_some_and(|(_, _, keep)| keep);
+            if let (Some(renamed), false, true) = (&renamed, keep, needed) {
+                fates.insert(key.clone(), Fate::Moved(renamed.clone().into_bytes()));
+            }
+            // A hard link whose target went: pointed at its new name, or
+            // given its data.
+            let mut relink = None;
+            if kind.is_hard_link() {
+                let target = link_key(&member);
+                match resolve(&fates, &target) {
+                    Some((_, Fate::Moved(to))) => relink = Some(to.clone()),
+                    Some((at, Fate::Spooled(..))) => {
+                        let at = at.to_owned();
+                        reader.skip(member.size + padding(member.size))?;
+                        let first = match (&renamed, keep) {
+                            (Some(renamed), false) => renamed.clone(),
+                            _ => name,
+                        };
+                        let Some(Fate::Spooled(spool, target)) = fates.insert(at, Fate::Moved(first.clone().into_bytes()))
+                        else {
+                            unreachable!("resolved to a spooled member")
+                        };
+                        self.copy_spooled(&spool, &target, &first)?;
+                        if let (Some(renamed), true) = (&renamed, keep) {
+                            self.copy_spooled(&spool, &target, renamed)?;
+                        }
+                        let _ = fs::remove_file(&spool);
+                        continue;
+                    }
+                    _ if gone(&target) && links.present.contains(&target) => {
+                        let target = String::from_utf8_lossy(&member.link_name().unwrap_or_default()).into_owned();
+                        return Err(io::Error::other(format!(
+                            "{name} in the archive is a hard link to {target}, which comes after it and would be lost: not changed"
+                        )));
+                    }
+                    _ => {}
+                }
+            }
+            let relink = relink.as_deref();
+            let Some(renamed) = renamed else {
+                self.copy_member(&mut reader, &member, None, relink)?;
                 continue;
             };
-            let mut renamed = to.trim_end_matches('/').to_owned();
-            for part in &parts[depth..] {
-                renamed.push('/');
-                renamed.push_str(part);
-            }
-            if kind == EntryType::Directory {
-                self.dirs.insert(crate::zip_edit::key(&renamed));
-                renamed.push('/');
-            }
             if !keep {
-                self.copy_member(&mut reader, &member, Some(&renamed))?;
+                self.copy_member(&mut reader, &member, Some(&renamed), relink)?;
                 continue;
             }
             // Written twice: the data goes through the spool file.
             let mut spool = File::options().read(true).write(true).create(true).truncate(true).open(&self.spool)?;
             reader.copy(member.size, &mut spool)?;
             spool.seek(SeekFrom::Start(0))?;
-            self.copy_member(&mut Reader { input: BufReader::new(&spool) }, &member, None)?;
+            self.copy_member(&mut Reader { input: BufReader::new(&spool) }, &member, None, relink)?;
             spool.seek(SeekFrom::Start(0))?;
-            self.copy_member(&mut Reader { input: BufReader::new(&spool) }, &member, Some(&renamed))?;
+            self.copy_member(&mut Reader { input: BufReader::new(&spool) }, &member, Some(&renamed), relink)?;
         }
         // To the end, so the gz/bz2 checksum is checked too.
         io::copy(&mut reader.input, &mut io::sink())?;
         Ok(true)
     }
 
+    /// Writes the removed `target`, its data kept in `spool`, as `name`.
+    fn copy_spooled(&mut self, spool: &Path, target: &Member, name: &str) -> io::Result<()> {
+        let file = File::open(spool)?;
+        self.copy_member(&mut Reader { input: BufReader::new(file) }, target, Some(name), None)
+    }
+
     /// Writes `member` (its data read from `reader`), under `rename` if
-    /// given: then its long-name header and pax `path` are dropped.
-    fn copy_member<R: Read>(&mut self, reader: &mut Reader<R>, member: &Member, rename: Option<&str>) -> io::Result<()> {
+    /// given: then its long-name header and pax `path` are dropped (a
+    /// pax-form sparse file gets its sparse name changed and a made-up
+    /// header name, as GNU tar does). `relink` likewise gives a link a new
+    /// target.
+    fn copy_member<R: Read>(
+        &mut self,
+        reader: &mut Reader<R>,
+        member: &Member,
+        rename: Option<&str>,
+        relink: Option<&[u8]>,
+    ) -> io::Result<()> {
         let out = self.out.as_mut().expect("output is present until commit");
         for (h, data) in &member.exts {
             let kind = h.entry_type();
             let mut h = h.clone();
-            match rename {
-                Some(_) if kind.is_gnu_longname() => {}
-                Some(_) if kind.is_pax_local_extensions() => {
+            match (rename, relink) {
+                (Some(_), _) if kind.is_gnu_longname() => {}
+                (_, Some(_)) if kind.is_gnu_longlink() => {}
+                (Some(_), _) | (_, Some(_)) if kind.is_pax_local_extensions() => {
                     let kept: Vec<u8> = tar::PaxExtensions::new(data)
                         .filter_map(|e| e.ok())
-                        .filter(|e| e.key_bytes() != b"path")
-                        .flat_map(|e| pax_record(e.key_bytes(), e.value_bytes()))
+                        .filter_map(|e| match (e.key_bytes(), rename) {
+                            (b"path", Some(_)) => None,
+                            (b"linkpath", _) if relink.is_some() => None,
+                            (b"GNU.sparse.name", Some(name)) => Some(pax_record(e.key_bytes(), name.as_bytes())),
+                            (k, _) => Some(pax_record(k, e.value_bytes())),
+                        })
+                        .flatten()
                         .collect();
                     if !kept.is_empty() {
                         h.set_size(kept.len() as u64);
@@ -418,15 +648,21 @@ impl TarEdit {
                 }
             }
         }
-        match rename {
-            Some(name) => {
-                let mut h = member.header.clone();
-                write_name(out, &mut h, name.as_bytes())?;
-                h.set_cksum();
-                out.write_all(h.as_bytes())?;
-            }
-            None => out.write_all(member.header.as_bytes())?,
+        let mut h = member.header.clone();
+        if let Some(target) = relink {
+            write_long(out, &mut h, target, true)?;
         }
+        if let Some(name) = rename {
+            match member.sparse_name() {
+                Some(_) => write_long(out, &mut h, &made_up_sparse_name(name), false)?,
+                None => write_long(out, &mut h, name.as_bytes(), false)?,
+            }
+        }
+        if rename.is_some() || relink.is_some() {
+            h.set_cksum();
+        }
+        out.write_all(h.as_bytes())?;
+        out.write_all(&member.sparse)?;
         reader.copy(member.size, out)
     }
 
@@ -500,6 +736,9 @@ impl Drop for TarEdit {
         drop(self.out.take());
         drop(self.pending.take());
         let _ = fs::remove_file(&self.spool);
+        for spool in &self.link_spools {
+            let _ = fs::remove_file(spool);
+        }
         let _ = fs::remove_file(&self.temp);
     }
 }
@@ -678,23 +917,372 @@ mod tests {
         }
     }
 
+    /// A tar written by hand, member by member.
+    #[derive(Default)]
+    struct Hand(Vec<u8>);
+
+    impl Hand {
+        fn header(name: &str, kind: EntryType, size: u64) -> Header {
+            let mut h = Header::new_gnu();
+            h.set_entry_type(kind);
+            h.set_mode(0o640);
+            h.set_uid(1000);
+            h.set_gid(100);
+            h.set_mtime(1_600_000_000);
+            h.set_size(size);
+            h.as_old_mut().name[..name.len()].copy_from_slice(name.as_bytes());
+            h
+        }
+
+        fn file(&mut self, name: &str, data: &[u8]) {
+            write_block(&mut self.0, &mut Hand::header(name, EntryType::Regular, data.len() as u64), data).unwrap();
+        }
+
+        fn link(&mut self, name: &str, target: &str) {
+            let mut h = Hand::header(name, EntryType::Link, 0);
+            h.as_old_mut().linkname[..target.len()].copy_from_slice(target.as_bytes());
+            write_block(&mut self.0, &mut h, &[]).unwrap();
+        }
+
+        fn pax(&mut self, records: &[(&str, &str)]) {
+            let data: Vec<u8> = records.iter().flat_map(|(k, v)| pax_record(k.as_bytes(), v.as_bytes())).collect();
+            let mut x = Hand::header("PaxHeader/x", EntryType::XHeader, data.len() as u64);
+            write_block(&mut self.0, &mut x, &data).unwrap();
+        }
+
+        fn save(mut self, path: &Path) {
+            self.0.extend_from_slice(&[0; 2 * BLOCK]);
+            fs::write(path, &self.0).unwrap();
+        }
+    }
+
+    /// Writes `v` as a NUL-ended octal number filling `field`.
+    fn octal(field: &mut [u8], v: u64) {
+        let s = format!("{:0w$o}", v, w = field.len() - 1);
+        field[..s.len()].copy_from_slice(s.as_bytes());
+        field[s.len()] = 0;
+    }
+
+    /// A sparse file's contents (`size` bytes, data in `segments`, zeros
+    /// between), and its data as stored.
+    fn sparse_data(size: u64, segments: &[(u64, u64)], seed: u8) -> (Vec<u8>, Vec<u8>) {
+        let mut full = vec![0u8; size as usize];
+        let mut packed = Vec::new();
+        for (n, &(offset, len)) in segments.iter().enumerate() {
+            for i in offset..offset + len {
+                let b = (i % 251) as u8 ^ seed ^ (n as u8 + 1) | 1;
+                full[i as usize] = b;
+                packed.push(b);
+            }
+        }
+        (full, packed)
+    }
+
+    /// A tar holding sparse files in each GNU form (old 'S' with a map that
+    /// goes on in an extension block; pax 0.0, 0.1 and 1.0), a plain file
+    /// and a hard link to the old-style sparse file. Returns the sparse
+    /// files' names and contents.
+    fn make_sparse(path: &Path) -> Vec<(&'static str, Vec<u8>)> {
+        let mut tar = Hand::default();
+        // Old GNU: four segments in the header, more in an extension
+        // block; data 512-aligned but for the last, a hole at the end (an
+        // empty segment at the end, as GNU tar writes it).
+        let segments = [(0, 512), (1024, 512), (2048, 512), (3072, 512), (4096, 100), (6000, 0)];
+        let (old, packed) = sparse_data(6000, &segments, 0x10);
+        let mut h = Hand::header("sp/old.bin", EntryType::GNUSparse, packed.len() as u64);
+        let b = h.as_mut_bytes();
+        for (i, &(offset, len)) in segments[..4].iter().enumerate() {
+            octal(&mut b[386 + 24 * i..398 + 24 * i], offset);
+            octal(&mut b[398 + 24 * i..410 + 24 * i], len);
+        }
+        b[482] = 1;
+        octal(&mut b[483..495], 6000);
+        h.set_cksum();
+        let mut ext = [0u8; BLOCK];
+        octal(&mut ext[0..12], 4096);
+        octal(&mut ext[12..24], 100);
+        octal(&mut ext[24..36], 6000);
+        octal(&mut ext[36..48], 0);
+        tar.0.extend_from_slice(h.as_bytes());
+        tar.0.extend_from_slice(&ext);
+        tar.0.extend_from_slice(&packed);
+        tar.0.resize(tar.0.len().next_multiple_of(BLOCK), 0);
+        // Pax 0.0: offset / numbytes records, the real name as the path.
+        let (v00, packed) = sparse_data(900, &[(5, 7), (300, 20)], 0x20);
+        let size = packed.len().to_string();
+        tar.pax(&[
+            ("path", "sp/v00.bin"),
+            ("GNU.sparse.size", "900"),
+            ("GNU.sparse.numblocks", "2"),
+            ("GNU.sparse.offset", "5"),
+            ("GNU.sparse.numbytes", "7"),
+            ("GNU.sparse.offset", "300"),
+            ("GNU.sparse.numbytes", "20"),
+            ("size", &size),
+        ]);
+        tar.file("sp/v00.bin", &packed);
+        // Pax 0.1: a map record and the real name, a made-up header name.
+        let (v01, packed) = sparse_data(2000, &[(0, 3), (1990, 10)], 0x30);
+        tar.pax(&[("GNU.sparse.size", "2000"), ("GNU.sparse.numblocks", "2"), ("GNU.sparse.map", "0,3,1990,10"), (
+            "GNU.sparse.name",
+            "sp/v01.bin",
+        )]);
+        tar.file("sp/GNUSparseFile.7/v01.bin", &packed);
+        // Pax 1.0: the map at the start of the data.
+        let (v1, packed) = sparse_data(70_000, &[(3, 10), (700, 5), (65_536, 1000)], 0x40);
+        let mut data = b"3\n3\n10\n700\n5\n65536\n1000\n".to_vec();
+        data.resize(BLOCK, 0);
+        data.extend_from_slice(&packed);
+        tar.pax(&[
+            ("GNU.sparse.major", "1"),
+            ("GNU.sparse.minor", "0"),
+            ("GNU.sparse.name", "sp/v1.bin"),
+            ("GNU.sparse.realsize", "70000"),
+        ]);
+        tar.file("sp/GNUSparseFile.7/v1.bin", &data);
+        tar.file("sp/plain.txt", b"plain");
+        tar.file("keep.txt", b"keep");
+        tar.link("hl", "sp/old.bin");
+        tar.save(path);
+        vec![("old.bin", old), ("v00.bin", v00), ("v01.bin", v01), ("v1.bin", v1)]
+    }
+
+    /// The members as stored: name, member, all its bytes (headers before
+    /// it, its header, sparse blocks, data).
+    fn stored(path: &Path) -> Vec<(String, Member, Vec<u8>)> {
+        let mut r = Reader { input: crate::vfs::open_stream(path, Format::Tar).unwrap() };
+        let mut all = Vec::new();
+        while let Some(m) = r.member().unwrap() {
+            let mut bytes = Vec::new();
+            for (h, d) in &m.exts {
+                bytes.extend_from_slice(h.as_bytes());
+                bytes.extend_from_slice(d);
+                bytes.resize(bytes.len().next_multiple_of(BLOCK), 0);
+            }
+            bytes.extend_from_slice(m.header.as_bytes());
+            bytes.extend_from_slice(&m.sparse);
+            r.copy(m.size, &mut bytes).unwrap();
+            all.push((String::from_utf8_lossy(&m.name()).into_owned(), m, bytes));
+        }
+        all
+    }
+
+    fn stored_one<'a>(all: &'a [(String, Member, Vec<u8>)], name: &str) -> &'a (String, Member, Vec<u8>) {
+        all.iter().find(|m| m.0 == name).unwrap_or_else(|| panic!("{name} not in {:?}", all.iter().map(|m| &m.0).collect::<Vec<_>>()))
+    }
+
+    /// Lists `folder` (inside an archive) and copies it out: the files' names,
+    /// sizes and contents must be `want`.
+    fn check_out(folder: &Path, out: &Path, want: &[(&str, Vec<u8>)]) {
+        let mut listed: Vec<(String, u64)> =
+            crate::vfs::list(folder, true).unwrap().into_iter().filter(|e| e.name != "..").map(|e| (e.name, e.size)).collect();
+        listed.sort();
+        let mut expected: Vec<(String, u64)> = want.iter().map(|(n, d)| (n.to_string(), d.len() as u64)).collect();
+        expected.sort();
+        assert_eq!(listed, expected);
+        fs::create_dir_all(out).unwrap();
+        ok(Job::Copy(ops::plan_transfer(&[folder.to_path_buf()], out).unwrap()));
+        let name = folder.file_name().unwrap();
+        for (file, data) in want {
+            assert!(fs::read(out.join(name).join(file)).unwrap() == *data, "{file}");
+        }
+    }
+
+    /// If a `tar` program is at hand, it extracts `tar` and agrees on the
+    /// `files`' contents (the test doesn't need it).
+    fn system_tar_agrees(tar: &Path, out: &Path, files: &[(&str, &[u8])]) {
+        let tool = || std::process::Command::new("tar");
+        if !tool().arg("--version").output().is_ok_and(|o| o.status.success()) {
+            return;
+        }
+        fs::create_dir_all(out).unwrap();
+        let o = tool().arg("-xf").arg(tar).arg("-C").arg(out).output().unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        for (name, data) in files {
+            assert!(fs::read(out.join(name)).unwrap() == *data, "{name}");
+        }
+    }
+
     #[test]
-    fn refuses_breaking_hard_links() {
+    fn keeps_sparse_files() {
+        let tmp = TempDir::new("tar-sparse");
+        let tar = tmp.0.join("s.tar");
+        let mut want = make_sparse(&tar);
+        want.push(("plain.txt", b"plain".to_vec()));
+        // Shown with their real names and sizes, read expanded.
+        check_out(&tar.join("sp"), &tmp.0.join("out1"), &want);
+        let before = stored(&tar);
+
+        // Other members changed: the sparse ones are copied byte for byte.
+        ok(Job::Delete { paths: vec![tar.join("keep.txt")], to_trash: false });
+        ok(Job::MakeDir(tar.join("new")));
+        let after = stored(&tar);
+        for name in ["sp/old.bin", "sp/v00.bin", "sp/v01.bin", "sp/v1.bin", "hl"] {
+            assert!(stored_one(&after, name).2 == stored_one(&before, name).2, "{name}");
+        }
+
+        // Renamed (with their folder): still sparse, the link follows.
+        ok(Job::Rename { from: tar.join("sp"), to: tar.join("moved") });
+        check_out(&tar.join("moved"), &tmp.0.join("out2"), &want);
+        let after = stored(&tar);
+        let old = stored_one(&after, "moved/old.bin");
+        assert_eq!(old.1.header.entry_type(), EntryType::GNUSparse);
+        assert_eq!(old.1.sparse, stored_one(&before, "sp/old.bin").1.sparse);
+        let v1 = &stored_one(&after, "moved/v1.bin").1;
+        let pax: Vec<(&[u8], &[u8])> = v1.pax().collect();
+        assert!(pax.contains(&(&b"GNU.sparse.major"[..], &b"1"[..])), "{pax:?}");
+        assert_eq!(v1.header.path_bytes().as_ref(), b"moved/GNUSparseFile.0/v1.bin");
+        assert_eq!(stored_one(&after, "hl").1.link_name().unwrap(), b"moved/old.bin");
+
+        // Replaced: a plain file now.
+        let entry = tar.join("moved").join("v1.bin");
+        let stamp = ops::entry_stamp(&entry).unwrap();
+        let copy = tmp.0.join("v1.bin");
+        fs::write(&copy, b"not sparse").unwrap();
+        ok(Job::Update { src: copy, dst: entry, expect: stamp });
+        let after = stored(&tar);
+        let v1 = &stored_one(&after, "moved/v1.bin").1;
+        assert!(v1.exts.is_empty() && v1.header.entry_type() == EntryType::Regular);
+        want[3].1 = b"not sparse".to_vec();
+        check_out(&tar.join("moved"), &tmp.0.join("out3"), &want);
+
+        // The link's sparse target removed: the link becomes a sparse file.
+        ok(Job::Delete { paths: vec![tar.join("moved").join("old.bin")], to_trash: false });
+        let after = stored(&tar);
+        assert_eq!(stored_one(&after, "hl").1.header.entry_type(), EntryType::GNUSparse);
+        fs::create_dir_all(tmp.0.join("out4")).unwrap();
+        ok(Job::Copy(ops::plan_transfer(&[tar.join("hl")], &tmp.0.join("out4")).unwrap()));
+        assert!(fs::read(tmp.0.join("out4").join("hl")).unwrap() == want[0].1);
+        let files: Vec<(String, &[u8])> = want[1..].iter().map(|(n, d)| (format!("moved/{n}"), d.as_slice())).collect();
+        let mut files: Vec<(&str, &[u8])> = files.iter().map(|(n, d)| (n.as_str(), *d)).collect();
+        files.push(("hl", &want[0].1));
+        system_tar_agrees(&tar, &tmp.0.join("system"), &files);
+        assert!(leftovers(&tmp.0).is_empty());
+    }
+
+    /// Kinds and link targets as the `tar` crate reads them, and the
+    /// files it unpacks.
+    fn links_of(tar: &Path) -> Vec<(String, EntryType, Option<String>)> {
+        let mut archive = tar::Archive::new(File::open(tar).unwrap());
+        let entries = archive.entries().unwrap().map(|e| e.unwrap());
+        let link = |e: &tar::Entry<File>| e.link_name().unwrap().map(|l| l.to_string_lossy().into_owned());
+        entries.map(|e| (e.path().unwrap().to_string_lossy().into_owned(), e.header().entry_type(), link(&e))).collect()
+    }
+
+    fn unpacks(tar: &Path, out: &Path, files: &[(&str, &[u8])]) {
+        tar::Archive::new(File::open(tar).unwrap()).unpack(out).unwrap();
+        for (name, data) in files {
+            assert!(fs::read(out.join(name)).unwrap() == *data, "{name}");
+        }
+    }
+
+    #[test]
+    fn keeps_hard_links_working() {
         let tmp = TempDir::new("tar-hard");
         let tar = tmp.0.join("a.tar");
+        let mut hand = Hand::default();
+        hand.file("t.txt", b"target data");
+        hand.link("a", "t.txt");
+        hand.link("b", "t.txt");
+        hand.link("c", "t.txt");
+        hand.file("other.txt", b"other");
+        hand.save(&tar);
+        use EntryType::{Link, Regular};
+        let some = |s: &str| Some(s.to_owned());
+
+        // The target removed: the first link takes its place, the others
+        // point at it.
+        ok(Job::Delete { paths: vec![tar.join("t.txt")], to_trash: false });
+        let all = links_of(&tar);
+        assert_eq!(all, [
+            ("a".into(), Regular, None),
+            ("b".into(), Link, some("a")),
+            ("c".into(), Link, some("a")),
+            ("other.txt".into(), Regular, None)
+        ]);
+        let a = &stored(&tar)[0].1;
+        assert_eq!((a.header.mode().unwrap(), a.header.uid().unwrap()), (0o640, 1000));
+        unpacks(&tar, &tmp.0.join("x1"), &[("a", b"target data"), ("b", b"target data"), ("c", b"target data")]);
+
+        // The target renamed (to a long name, too): the links follow.
+        ok(Job::Rename { from: tar.join("a"), to: tar.join("z") });
+        assert_eq!(links_of(&tar)[1], ("b".into(), Link, some("z")));
+        let long = format!("dir/{}", "l".repeat(150));
+        ok(Job::Rename { from: tar.join("z"), to: tar.join(&long) });
+        let all = links_of(&tar);
+        assert_eq!((&all[1], &all[2]), (&("b".into(), Link, Some(long.clone())), &("c".into(), Link, Some(long.clone()))));
+        unpacks(&tar, &tmp.0.join("x2"), &[(&long, b"target data"), ("b", b"target data"), ("c", b"target data")]);
+
+        // The target replaced: the links keep the old data.
+        let entry = tar.join(&long);
+        let stamp = ops::entry_stamp(&entry).unwrap();
+        let copy = tmp.0.join("new.txt");
+        fs::write(&copy, b"new data").unwrap();
+        ok(Job::Update { src: copy, dst: entry, expect: stamp });
+        let all = links_of(&tar);
+        let all: Vec<_> = all.into_iter().filter(|m| m.1 != EntryType::Directory).collect();
+        let names: Vec<(&str, EntryType)> = all.iter().map(|m| (m.0.as_str(), m.1)).collect();
+        assert_eq!(names, [("b", Regular), ("c", Link), ("other.txt", Regular), (&long, Regular)]);
+        assert_eq!(all[1].2, some("b"));
+        unpacks(&tar, &tmp.0.join("x3"), &[(&long, b"new data"), ("b", b"target data"), ("c", b"target data")]);
+
+        // Target and link removed together, the last link is moved.
+        ok(Job::Rename { from: tar.join("c"), to: tar.join("dir").join("c") });
+        ok(Job::Delete { paths: vec![tar.join("b")], to_trash: false });
+        assert_eq!(links_of(&tar)[0], ("dir/c".into(), Regular, None));
+        unpacks(&tar, &tmp.0.join("x4"), &[("dir/c", b"target data")]);
+        system_tar_agrees(&tar, &tmp.0.join("system"), &[("dir/c", b"target data"), (&long, b"new data")]);
+        assert!(leftovers(&tmp.0).is_empty());
+    }
+
+    #[test]
+    fn hard_links_through_folders_chains_and_order() {
+        let tmp = TempDir::new("tar-hard-more");
+        let some = |s: &str| Some(s.to_owned());
+        // A folder with the target renamed, then removed.
+        let tar = tmp.0.join("a.tar");
         make(&tar, Format::Tar);
+        ok(Job::Rename { from: tar.join("docs"), to: tar.join("papers") });
+        assert_eq!(links_of(&tar)[4], ("hard".into(), EntryType::Link, some("papers/one.txt")));
+        ok(Job::Copy(ops::plan_transfer(&[tar.join("papers")], &tar.join("copy")).unwrap()));
+        ok(Job::Delete { paths: vec![tar.join("papers")], to_trash: false });
+        let all = links_of(&tar);
+        let hard = all.iter().find(|m| m.0 == "hard").unwrap();
+        assert_eq!(hard, &("hard".into(), EntryType::Regular, None));
+        // (Not unpacked: it has a symlink, which needs rights on Windows.)
+        assert_eq!(find(&members(&tar, Format::Tar), "hard").3, b"first");
+
+        // A link to a link: both removed with the target, the last one
+        // gets the data.
+        let tar = tmp.0.join("chain.tar");
+        let mut hand = Hand::default();
+        hand.file("t", b"data");
+        hand.link("l1", "t");
+        hand.link("l2", "l1");
+        hand.save(&tar);
+        ok(Job::Delete { paths: vec![tar.join("t"), tar.join("l1")], to_trash: false });
+        assert_eq!(links_of(&tar), [("l2".into(), EntryType::Regular, None)]);
+        unpacks(&tar, &tmp.0.join("x2"), &[("l2", b"data")]);
+
+        // A link before its target: refused, nothing changed.
+        let tar = tmp.0.join("order.tar");
+        let mut hand = Hand::default();
+        hand.link("l", "t");
+        hand.file("t", b"data");
+        hand.save(&tar);
         let before = fs::read(&tar).unwrap();
-        for job in [
-            Job::Delete { paths: vec![tar.join("docs").join("one.txt")], to_trash: false },
-            Job::Rename { from: tar.join("docs"), to: tar.join("papers") },
-        ] {
-            let o = run(job);
-            assert!(o.errors.len() == 1 && o.errors[0].1.contains("hard link"), "{:?}", o.errors);
-            assert_eq!(fs::read(&tar).unwrap(), before);
-        }
-        // Copying it is fine, and so is removing the link with it.
-        ok(Job::Copy(ops::plan_transfer(&[tar.join("docs")], &tar.join("copy")).unwrap()));
-        ok(Job::Delete { paths: vec![tar.join("hard"), tar.join("docs")], to_trash: false });
+        let o = run(Job::Delete { paths: vec![tar.join("t")], to_trash: false });
+        assert!(o.errors.len() == 1 && o.errors[0].1.contains("hard link"), "{:?}", o.errors);
+        assert_eq!(fs::read(&tar).unwrap(), before);
+        // Removed with it, or a link to nothing: fine.
+        ok(Job::Delete { paths: vec![tar.join("t"), tar.join("l")], to_trash: false });
+        let tar = tmp.0.join("dangling.tar");
+        let mut hand = Hand::default();
+        hand.link("l", "nothing");
+        hand.file("t", b"data");
+        hand.save(&tar);
+        ok(Job::Delete { paths: vec![tar.join("t")], to_trash: false });
+        assert_eq!(links_of(&tar), [("l".into(), EntryType::Link, some("nothing"))]);
         assert!(leftovers(&tmp.0).is_empty());
     }
 
@@ -735,14 +1323,14 @@ mod tests {
         fs::write(&gz, &zipped).unwrap();
         fail(&gz, Format::TarGz, "gz crc");
 
-        let mut sparse = bytes.clone();
+        // A sparse member whose map goes on in a block that isn't there.
         let mut h = Header::new_old();
-        h.as_mut_bytes().copy_from_slice(&sparse[..BLOCK]);
+        h.as_mut_bytes().copy_from_slice(&bytes[..BLOCK]);
         h.set_entry_type(EntryType::GNUSparse);
+        h.as_mut_bytes()[482] = 1;
         h.set_cksum();
-        sparse[..BLOCK].copy_from_slice(h.as_bytes());
         let sp = tmp.0.join("sparse.tar");
-        fs::write(&sp, &sparse).unwrap();
+        fs::write(&sp, h.as_bytes()).unwrap();
         fail(&sp, Format::Tar, "sparse");
 
         // Cancelled midway, and a file added then dropped.

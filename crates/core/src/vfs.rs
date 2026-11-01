@@ -806,20 +806,32 @@ fn tar_kind(entry: &tar::Entry<'_, Box<dyn Read>>) -> Option<bool> {
     }
 }
 
+/// The GNU sparse description in `entry`'s pax records, if any (the `tar`
+/// crate expands only old-style sparse members itself).
+fn pax_sparse(entry: &mut tar::Entry<'_, Box<dyn Read>>) -> io::Result<Option<crate::tar_sparse::PaxSparse>> {
+    let Some(pax) = entry.pax_extensions()? else { return Ok(None) };
+    crate::tar_sparse::PaxSparse::from_pax(pax.filter_map(|e| e.ok()).map(|e| (e.key_bytes(), e.value_bytes())))
+}
+
 /// `source` numbers the entries the `tar` crate yields (meta entries such
 /// as long names are folded in by it), counting the left out ones too.
 fn read_tar_index(file: &Path, format: Format) -> io::Result<Vec<Raw>> {
     let mut tar = tar::Archive::new(open_stream(file, format)?);
     let mut raw = Vec::new();
     for (i, entry) in tar.entries()?.enumerate() {
-        let entry = entry?;
+        let mut entry = entry?;
         let Some(is_dir) = tar_kind(&entry) else { continue };
+        let sparse = pax_sparse(&mut entry)?;
         let header = entry.header();
         let modified = header.mtime().ok().and_then(|s| Local.timestamp_opt(s as i64, 0).single());
+        let name = match sparse.as_ref().and_then(|s| s.name.as_deref()) {
+            Some(name) => String::from_utf8_lossy(name).into_owned(),
+            None => entry.path()?.to_string_lossy().into_owned(),
+        };
         raw.push(Raw {
-            name: entry.path()?.to_string_lossy().into_owned(),
+            name,
             is_dir,
-            size: if is_dir { 0 } else { entry.size() },
+            size: if is_dir { 0 } else { sparse.as_ref().map_or(entry.size(), |s| s.size) },
             modified,
             hidden: false,
             source: i,
@@ -1020,8 +1032,12 @@ impl Archive {
             // A file listed twice is read once (the later copy wins in the
             // index, as `source` points at it).
             if let Some(indexes) = want.remove(&n) {
+                let mut reader: Box<dyn Read + '_> = match pax_sparse(&mut entry)? {
+                    Some(sparse) => Box::new(sparse.expand(&mut entry)?),
+                    None => Box::new(&mut entry),
+                };
                 for i in indexes {
-                    if !each(i, &mut entry)? {
+                    if !each(i, &mut reader)? {
                         return Ok(());
                     }
                 }
