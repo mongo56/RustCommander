@@ -402,12 +402,19 @@ impl Panel {
         if self.results.is_some() {
             return Some(Nav::to(self.path.clone()));
         }
+        // A server's root has no parent (its path's parent is `sftp:`).
+        if crate::remote::split(&self.path).is_some_and(|(_, remote)| remote == "/") {
+            return None;
+        }
         let parent = self.path.parent()?.to_path_buf();
         let focus = self.path.file_name().map(|n| n.to_string_lossy().into_owned());
         Some(Nav::To { path: parent, focus })
     }
 
     pub fn root_nav(&self) -> Option<Nav> {
+        if let Some((key, remote)) = crate::remote::split(&self.path) {
+            return (remote != "/").then(|| Nav::to(crate::remote::path_of(&key, "/")));
+        }
         let root = self.path.ancestors().last()?;
         (root != self.path).then(|| Nav::to(root))
     }
@@ -425,8 +432,9 @@ impl Panel {
         match entry.kind {
             EntryKind::Parent => self.parent_nav().map_or(Activated::Nothing, Activated::Navigate),
             EntryKind::Dir => Activated::Navigate(Nav::to(entry.path.clone())),
-            // Archives open like folders (also ones inside archives).
-            EntryKind::File if vfs::is_archive_name(&entry.name) => {
+            // Archives open like folders (also ones inside archives), not
+            // on servers.
+            EntryKind::File if vfs::is_archive_name(&entry.name) && !crate::remote::is_remote(&entry.path) => {
                 Activated::Navigate(Nav::to(entry.path.clone()))
             }
             EntryKind::File => Activated::File(entry.path.clone()),
@@ -524,6 +532,11 @@ impl Panel {
     pub fn title(&self) -> String {
         if self.results.is_some() {
             return "Search results".into();
+        }
+        if let Some((key, remote)) = crate::remote::split(&self.path) {
+            return if remote == "/" { key.split_once("://").map_or(key.clone(), |(_, server)| server.to_owned()) } else {
+                remote.rsplit('/').next().unwrap_or_default().to_owned()
+            };
         }
         self.path
             .file_name()

@@ -1,0 +1,558 @@
+//! Remote file systems: SFTP (`russh` + `russh-sftp`) and FTP/FTPS
+//! (`suppaftp` with rustls), browsed like local folders.
+//!
+//! A connected server is a [`Vfs`] reached through paths like
+//! `sftp://user@host/home/user` (`ftp://`, `ftps://`; `:port` after the host
+//! when it isn't the default). Paths stay `PathBuf`s: joins made by the rest
+//! of the program add `\`, which [`split`] reads like `/` (and `Path`
+//! compares them equal); [`display`] shows them with `/`.
+//!
+//! [`connect`] logs in (on the caller's thread: never call it, or any
+//! [`Vfs`] method of a remote path, on the UI thread) and registers the
+//! connection; [`disconnect`] forgets it. Each connection keeps a small pool
+//! of logged-in sessions, so a listing in one panel and a copy job can run
+//! at the same time; an idle session the server dropped is replaced
+//! transparently. Every network wait has a timeout.
+//!
+//! SFTP host keys are checked against `known_hosts` in the settings folder
+//! ([`set_settings_dir`]): an unknown key fails with [`HOST_KEY_UNKNOWN`] in
+//! the error (the UI shows the fingerprint and may call [`trust_host_key`]),
+//! a changed one with [`HOST_KEY_CHANGED`] (never connected).
+
+mod ftp;
+mod sftp;
+
+use crate::entry::{Entry, EntryKind};
+use crate::vfs::Vfs;
+use chrono::{DateTime, Local};
+use std::io::{self, Read, Write};
+use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
+
+/// How long to wait for a server to accept a connection.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long any single network read or write may stall.
+pub const IO_TIMEOUT: Duration = Duration::from_secs(30);
+/// Logged-in sessions kept per connection while idle.
+const IDLE_SESSIONS: usize = 4;
+
+/// In the error of a connection to an SFTP server whose host key isn't
+/// trusted yet.
+pub const HOST_KEY_UNKNOWN: &str = "Unknown host key";
+/// In the error of a connection to an SFTP server whose host key differs
+/// from the trusted one.
+pub const HOST_KEY_CHANGED: &str = "HOST KEY CHANGED";
+/// In the error of a login the server refused.
+pub const LOGIN_FAILED: &str = "Login failed";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Protocol {
+    Sftp,
+    Ftp,
+    /// FTP with explicit TLS (`AUTH TLS`); the certificate is checked
+    /// against the Windows certificate store.
+    Ftps,
+}
+
+impl Protocol {
+    pub const ALL: [Protocol; 3] = [Protocol::Sftp, Protocol::Ftp, Protocol::Ftps];
+
+    pub fn scheme(self) -> &'static str {
+        match self {
+            Protocol::Sftp => "sftp",
+            Protocol::Ftp => "ftp",
+            Protocol::Ftps => "ftps",
+        }
+    }
+
+    pub fn default_port(self) -> u16 {
+        match self {
+            Protocol::Sftp => 22,
+            Protocol::Ftp | Protocol::Ftps => 21,
+        }
+    }
+
+    pub fn parse(scheme: &str) -> Option<Protocol> {
+        Protocol::ALL.into_iter().find(|p| p.scheme().eq_ignore_ascii_case(scheme))
+    }
+}
+
+/// What it takes to log in to a server.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Login {
+    pub protocol: Protocol,
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    /// The password (for a private key: its passphrase, if it has one).
+    pub password: Option<String>,
+    /// SFTP: log in with this private key (OpenSSH/PEM file).
+    pub key_file: Option<PathBuf>,
+}
+
+impl std::fmt::Debug for Login {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Login({})", self.key())
+    }
+}
+
+impl Login {
+    /// `sftp://user@host[:port]`: the start of every path on this server.
+    pub fn key(&self) -> String {
+        let port = if self.port == self.protocol.default_port() { String::new() } else { format!(":{}", self.port) };
+        let user = if self.user.is_empty() { String::new() } else { format!("{}@", self.user) };
+        format!("{}://{user}{}{port}", self.protocol.scheme(), self.host)
+    }
+
+    /// `host:port`, as written in `known_hosts`.
+    fn host_id(&self) -> String {
+        format!("{}:{}", self.host, self.port)
+    }
+}
+
+// ---- paths -------------------------------------------------------------------
+
+/// The path of `remote` (`/`-separated, absolute) on the server `key`.
+pub fn path_of(key: &str, remote: &str) -> PathBuf {
+    let remote = if remote.starts_with('/') { remote.to_owned() } else { format!("/{remote}") };
+    PathBuf::from(format!("{key}{remote}"))
+}
+
+/// True for a path on a server (`sftp://…`, `ftp://…`, `ftps://…`),
+/// connected or not.
+pub fn is_remote(path: &Path) -> bool {
+    split(path).is_some()
+}
+
+/// (server key, absolute `/`-separated path on the server) of a remote
+/// path; `None` for anything else. `..` components are resolved.
+pub fn split(path: &Path) -> Option<(String, String)> {
+    let mut parts = path.components();
+    let Some(Component::Normal(scheme)) = parts.next() else { return None };
+    let scheme = scheme.to_str()?.strip_suffix(':')?;
+    let protocol = Protocol::parse(scheme)?;
+    let Some(Component::Normal(server)) = parts.next() else { return None };
+    let server = server.to_str()?;
+    let mut rest: Vec<String> = Vec::new();
+    for part in parts {
+        match part {
+            Component::Normal(n) => rest.push(n.to_string_lossy().into_owned()),
+            Component::ParentDir => {
+                rest.pop();
+            }
+            _ => {}
+        }
+    }
+    Some((format!("{}://{server}", protocol.scheme()), format!("/{}", rest.join("/"))))
+}
+
+/// A remote path as the user should see it (all `/`); other paths as they
+/// are.
+pub fn display(path: &Path) -> String {
+    match split(path) {
+        Some((key, remote)) => format!("{key}{remote}"),
+        None => path.display().to_string(),
+    }
+}
+
+/// The parent of a remote path on the server (`/a/b` → `/a`); `None` at the
+/// root.
+fn remote_parent(remote: &str) -> Option<&str> {
+    if remote == "/" {
+        return None;
+    }
+    Some(match remote.rfind('/') {
+        Some(0) | None => "/",
+        Some(i) => &remote[..i],
+    })
+}
+
+fn remote_join(dir: &str, name: &str) -> String {
+    if dir.ends_with('/') { format!("{dir}{name}") } else { format!("{dir}/{name}") }
+}
+
+// ---- settings: known hosts -------------------------------------------------------
+
+static SETTINGS_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// Where `known_hosts` lives (the program's settings folder).
+pub fn set_settings_dir(dir: PathBuf) {
+    *SETTINGS_DIR.lock().unwrap_or_else(|e| e.into_inner()) = Some(dir);
+}
+
+fn known_hosts_file() -> io::Result<PathBuf> {
+    let dir = SETTINGS_DIR.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    dir.map(|d| d.join("known_hosts")).ok_or_else(|| io::Error::other("No settings folder for known_hosts"))
+}
+
+/// The trusted keys (`ssh-ed25519 AAAA…`) of `host:port`.
+fn known_keys(host_id: &str) -> Vec<String> {
+    let Ok(file) = known_hosts_file() else { return Vec::new() };
+    let text = std::fs::read_to_string(file).unwrap_or_default();
+    text.lines()
+        .filter_map(|line| line.trim().split_once(' '))
+        .filter(|(host, _)| *host == host_id)
+        .map(|(_, key)| key.trim().to_owned())
+        .collect()
+}
+
+/// Host keys seen on connections that failed with [`HOST_KEY_UNKNOWN`]:
+/// (`host:port`, key), for [`trust_host_key`].
+static OFFERED_KEYS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+
+/// Trusts the host key the server of `login` offered on the last
+/// connection attempt (which failed with [`HOST_KEY_UNKNOWN`]): appends it
+/// to `known_hosts`.
+pub fn trust_host_key(login: &Login) -> io::Result<()> {
+    let host_id = login.host_id();
+    let key = {
+        let offered = OFFERED_KEYS.lock().unwrap_or_else(|e| e.into_inner());
+        offered.iter().rev().find(|(h, _)| *h == host_id).map(|(_, k)| k.clone())
+    };
+    let key = key.ok_or_else(|| io::Error::other("No host key to trust: connect first"))?;
+    let file = known_hosts_file()?;
+    if let Some(dir) = file.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut out = std::fs::OpenOptions::new().create(true).append(true).open(file)?;
+    writeln!(out, "{host_id} {key}")
+}
+
+/// Checks a host key (`ssh-ed25519 AAAA…`, fingerprint for messages):
+/// Ok if trusted, else the error to fail the connection with.
+fn check_host_key(login: &Login, key: &str, fingerprint: &str) -> Result<(), String> {
+    let host_id = login.host_id();
+    let known = known_keys(&host_id);
+    if known.iter().any(|k| k == key) {
+        return Ok(());
+    }
+    if !known.is_empty() {
+        return Err(format!(
+            "{HOST_KEY_CHANGED}: the server {host_id} now identifies with {fingerprint}, not the key \
+             trusted before. Someone may be intercepting the connection. Not connected; if the server's key \
+             really changed, remove its line from {}",
+            known_hosts_file().map(|f| f.display().to_string()).unwrap_or_default()
+        ));
+    }
+    let mut offered = OFFERED_KEYS.lock().unwrap_or_else(|e| e.into_inner());
+    offered.retain(|(h, _)| *h != host_id);
+    offered.push((host_id.clone(), key.to_owned()));
+    Err(format!("{HOST_KEY_UNKNOWN}: {host_id} identifies with {fingerprint}"))
+}
+
+// ---- sessions and connections --------------------------------------------------------
+
+/// A file or folder on a server, as a session reports it.
+#[derive(Debug, Clone)]
+struct Item {
+    name: String,
+    dir: bool,
+    size: u64,
+    modified: Option<SystemTime>,
+}
+
+/// One logged-in session (a control connection / SSH connection). Paths
+/// are absolute and `/`-separated.
+trait Session: Send {
+    /// The folder's entries, without `.` and `..`.
+    fn list(&mut self, dir: &str) -> io::Result<Vec<Item>>;
+    /// `path` itself; `None` if it doesn't exist.
+    fn stat(&mut self, path: &str) -> io::Result<Option<Item>>;
+    /// Calls `each` with a reader of the file's contents; returns what
+    /// `each` returned.
+    fn read(&mut self, path: &str, each: &mut dyn FnMut(&mut dyn Read) -> io::Result<bool>) -> io::Result<bool>;
+    /// Creates or replaces the file `path` with what `fill` writes, then
+    /// sets its modification time where the server allows it. `fill`
+    /// returns Ok(false) to cancel: the partial file is removed.
+    fn write(
+        &mut self,
+        path: &str,
+        modified: Option<SystemTime>,
+        fill: &mut dyn FnMut(&mut dyn Write) -> io::Result<bool>,
+    ) -> io::Result<bool>;
+    fn make_dir(&mut self, path: &str) -> io::Result<()>;
+    fn remove_file(&mut self, path: &str) -> io::Result<()>;
+    /// Removes an empty folder.
+    fn remove_dir(&mut self, path: &str) -> io::Result<()>;
+    fn rename(&mut self, from: &str, to: &str) -> io::Result<()>;
+    /// The folder the server puts us in after logging in.
+    fn home(&mut self) -> io::Result<String>;
+}
+
+fn open_session(login: &Login) -> io::Result<Box<dyn Session>> {
+    match login.protocol {
+        Protocol::Sftp => Ok(Box::new(sftp::Sftp::connect(login)?)),
+        Protocol::Ftp | Protocol::Ftps => Ok(Box::new(ftp::Ftp::connect(login)?)),
+    }
+}
+
+/// Whether an error leaves the session usable (the server answered).
+fn session_survives(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::NotFound
+            | io::ErrorKind::PermissionDenied
+            | io::ErrorKind::AlreadyExists
+            | io::ErrorKind::InvalidInput
+            | io::ErrorKind::Unsupported
+            | io::ErrorKind::DirectoryNotEmpty
+    ) || e.get_ref().is_some_and(|inner| inner.is::<Refused>())
+}
+
+/// A connected server: its login and idle sessions.
+pub struct Connection {
+    key: String,
+    login: Login,
+    idle: Mutex<Vec<Box<dyn Session>>>,
+}
+
+static CONNECTIONS: Mutex<Vec<Arc<Connection>>> = Mutex::new(Vec::new());
+
+/// Logs in to the server (blocking, with timeouts: call it on a worker
+/// thread) and registers the connection, replacing an older one to the
+/// same server. Returns the path of the folder `folder` on it, or of the
+/// login folder if `folder` is empty.
+pub fn connect(login: Login, folder: &str) -> io::Result<PathBuf> {
+    let mut session = open_session(&login)?;
+    let start = if folder.trim().is_empty() { session.home()? } else { folder.trim().to_owned() };
+    let start = if start.starts_with('/') { start } else { format!("/{start}") };
+    let key = login.key();
+    let conn = Arc::new(Connection { key: key.clone(), login, idle: Mutex::new(vec![session]) });
+    let mut all = CONNECTIONS.lock().unwrap_or_else(|e| e.into_inner());
+    all.retain(|c| c.key != key);
+    all.push(conn);
+    Ok(path_of(&key, &start))
+}
+
+/// Forgets the connection serving `path` (sessions in use by running jobs
+/// finish first). False if there was none.
+pub fn disconnect(path: &Path) -> bool {
+    let Some((key, _)) = split(path) else { return false };
+    let mut all = CONNECTIONS.lock().unwrap_or_else(|e| e.into_inner());
+    let (gone, kept): (Vec<_>, Vec<_>) = all.drain(..).partition(|c| c.key.eq_ignore_ascii_case(&key));
+    *all = kept;
+    let found = !gone.is_empty();
+    // Logging out talks to the server: not on the caller's (UI) thread.
+    if found {
+        std::thread::spawn(move || drop(gone));
+    }
+    found
+}
+
+/// Whether the server of `path` is connected.
+pub fn is_connected(path: &Path) -> bool {
+    connection(path).is_ok()
+}
+
+/// The login of the connected server of `path` (to reconnect with).
+pub fn login_of(path: &Path) -> Option<Login> {
+    connection(path).ok().map(|c| c.login.clone())
+}
+
+fn connection(path: &Path) -> io::Result<Arc<Connection>> {
+    let (key, _) = split(path).ok_or_else(|| io::Error::other("Not a remote path"))?;
+    let all = CONNECTIONS.lock().unwrap_or_else(|e| e.into_inner());
+    all.iter().find(|c| c.key.eq_ignore_ascii_case(&key)).cloned().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotConnected, format!("Not connected to {key} (Ctrl+F connects)"))
+    })
+}
+
+/// The file system serving the remote `path`.
+pub(crate) fn open(path: &Path) -> io::Result<Arc<dyn Vfs>> {
+    Ok(connection(path)?)
+}
+
+impl Connection {
+    /// Runs `op` on an idle session (or a new one). If an idle session
+    /// fails in a way that suggests the server dropped it, `op` is retried
+    /// once on a fresh session, unless `retry_ok` says it's too late (data
+    /// was handed out already).
+    fn with_if<T>(
+        &self,
+        mut op: impl FnMut(&mut dyn Session) -> io::Result<T>,
+        retry_ok: impl Fn() -> bool,
+    ) -> io::Result<T> {
+        let pooled = self.idle.lock().unwrap_or_else(|e| e.into_inner()).pop();
+        let fresh = pooled.is_none();
+        let mut session = match pooled {
+            Some(s) => s,
+            None => open_session(&self.login)?,
+        };
+        let mut result = op(session.as_mut());
+        if let Err(e) = &result {
+            if session_survives(e) {
+                self.put_back(session);
+                return result;
+            }
+            if fresh || !retry_ok() {
+                return result;
+            }
+            session = open_session(&self.login)?;
+            result = op(session.as_mut());
+            if result.as_ref().is_err_and(|e| !session_survives(e)) {
+                return result;
+            }
+        }
+        self.put_back(session);
+        result
+    }
+
+    fn with<T>(&self, op: impl FnMut(&mut dyn Session) -> io::Result<T>) -> io::Result<T> {
+        self.with_if(op, || true)
+    }
+
+    fn put_back(&self, session: Box<dyn Session>) {
+        let mut idle = self.idle.lock().unwrap_or_else(|e| e.into_inner());
+        if idle.len() < IDLE_SESSIONS {
+            idle.push(session);
+        }
+    }
+
+    fn remote(&self, path: &Path) -> io::Result<String> {
+        match split(path) {
+            Some((key, remote)) if key.eq_ignore_ascii_case(&self.key) => Ok(remote),
+            _ => Err(io::Error::new(io::ErrorKind::InvalidInput, format!("Not on {}: {}", self.key, path.display()))),
+        }
+    }
+
+    fn entry(&self, dir: &str, item: Item) -> Entry {
+        let remote = remote_join(dir, &item.name);
+        Entry {
+            hidden: item.name.starts_with('.'),
+            path: path_of(&self.key, &remote),
+            kind: if item.dir { EntryKind::Dir } else { EntryKind::File },
+            size: if item.dir { 0 } else { item.size },
+            modified: item.modified.map(DateTime::<Local>::from),
+            name: item.name,
+        }
+    }
+
+    fn list_remote(&self, dir: &str) -> io::Result<Vec<Entry>> {
+        let items = self.with(|s| s.list(dir))?;
+        Ok(items.into_iter().map(|i| self.entry(dir, i)).collect())
+    }
+}
+
+impl Vfs for Connection {
+    fn list(&self, dir: &Path) -> io::Result<Vec<Entry>> {
+        let remote = self.remote(dir)?;
+        let mut entries = Vec::new();
+        if let Some(parent) = remote_parent(&remote) {
+            entries.push(Entry::parent(path_of(&self.key, parent)));
+        }
+        entries.extend(self.list_remote(&remote)?);
+        Ok(entries)
+    }
+
+    fn walk(&self, path: &Path) -> io::Result<Vec<Entry>> {
+        let first = self.stat(path)?.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, format!("Not found: {}", display(path)))
+        })?;
+        let mut out = vec![first];
+        let mut i = 0;
+        while i < out.len() {
+            if out[i].kind == EntryKind::Dir {
+                let dir = self.remote(&out[i].path)?;
+                let children = self.list_remote(&dir)?;
+                out.extend(children);
+            }
+            i += 1;
+        }
+        Ok(out)
+    }
+
+    fn read_files(&self, files: &[PathBuf], each: &mut dyn FnMut(usize, &mut dyn Read) -> io::Result<bool>)
+        -> io::Result<()> {
+        for (i, path) in files.iter().enumerate() {
+            let remote = self.remote(path)?;
+            let started = std::cell::Cell::new(false);
+            let go_on = self.with_if(
+                |s| {
+                    s.read(&remote, &mut |r| {
+                        started.set(true);
+                        each(i, r)
+                    })
+                },
+                || !started.get(),
+            )?;
+            if !go_on {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn stat(&self, path: &Path) -> io::Result<Option<Entry>> {
+        let remote = self.remote(path)?;
+        let Some(parent) = remote_parent(&remote) else {
+            let name = self.key.clone();
+            return Ok(Some(Entry { name, path: path.to_path_buf(), kind: EntryKind::Dir, size: 0, modified: None, hidden: false }));
+        };
+        let item = self.with(|s| s.stat(&remote))?;
+        Ok(item.map(|i| self.entry(parent, i)))
+    }
+
+    fn writable(&self) -> bool {
+        true
+    }
+
+    fn make_dir(&self, path: &Path) -> io::Result<()> {
+        let remote = self.remote(path)?;
+        self.with(|s| s.make_dir(&remote))
+    }
+
+    fn remove(&self, path: &Path, is_dir: bool) -> io::Result<()> {
+        let remote = self.remote(path)?;
+        self.with(|s| if is_dir { s.remove_dir(&remote) } else { s.remove_file(&remote) })
+    }
+
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        let (from, to) = (self.remote(from)?, self.remote(to)?);
+        self.with(|s| s.rename(&from, &to))
+    }
+
+    fn write_file(
+        &self,
+        path: &Path,
+        modified: Option<SystemTime>,
+        fill: &mut dyn FnMut(&mut dyn Write) -> io::Result<bool>,
+    ) -> io::Result<bool> {
+        let remote = self.remote(path)?;
+        let started = std::cell::Cell::new(false);
+        self.with_if(
+            |s| {
+                s.write(&remote, modified, &mut |w| {
+                    started.set(true);
+                    fill(w)
+                })
+            },
+            || !started.get(),
+        )
+    }
+}
+
+/// An error with `kind` and a message naming `path`.
+fn err(kind: io::ErrorKind, path: &str, what: impl std::fmt::Display) -> io::Error {
+    io::Error::new(kind, format!("{what}: {path}"))
+}
+
+/// The server's answer to a request it refused: the session is still fine.
+#[derive(Debug)]
+struct Refused(String);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+/// [`err`] for a request the server refused.
+fn refused(kind: io::ErrorKind, path: &str, what: impl std::fmt::Display) -> io::Error {
+    io::Error::new(kind, Refused(format!("{what}: {path}")))
+}
+
+#[cfg(test)]
+mod tests;

@@ -6,11 +6,17 @@
 //! (copy/move in, delete, new folder, rename, move out) is a single rewrite
 //! of the archive (`zip_edit`), done after all conflicts are answered, so a
 //! cancelled or failed job leaves the archive as it was.
+//!
+//! Servers (`remote`) are written through their [`Vfs`] directly: uploads
+//! file by file (conflicts asked as they come), deletes deepest first;
+//! copies out of them are extracts like from an archive.
 
+use crate::entry::Entry;
+use crate::remote;
 use crate::vfs::{self, LocalFs, Vfs};
 use crate::zip_edit::{Edits, ZipEdit};
 use chrono::{DateTime, Local};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -329,14 +335,28 @@ pub fn run(job: &Job, control: &Control, reporter: &mut dyn Reporter) -> Outcome
 
     match job {
         Job::Copy(transfers) | Job::Move(transfers) => {
-            let sizes: Vec<(u64, u64)> = transfers.iter().map(|t| measure(&t.src)).collect();
+            // A move on a server is a rename: not worth walking the tree.
+            let renamed = |t: &Transfer| remote::is_remote(&t.src) && remote::is_remote(&t.dst);
+            let sizes: Vec<(u64, u64)> =
+                transfers.iter().map(|t| if renamed(t) { (0, 1) } else { measure(&t.src) }).collect();
             for (bytes, items) in &sizes {
                 runner.progress.total_bytes += bytes;
                 runner.progress.total_items += items;
             }
             runner.report(true);
             let is_move = matches!(job, Job::Move(_));
-            if let Some(archive) = dst_archive(transfers) {
+            let from_server = transfers.iter().find(|t| remote::is_remote(&t.src));
+            if transfers.iter().any(|t| remote::is_remote(&t.dst)) {
+                match from_server {
+                    Some(t) if !is_move || !same_server(transfers) => {
+                        runner.fail_msg(&t.src, "Copying between or within servers isn't supported: copy to a local folder first");
+                    }
+                    Some(_) => runner.move_on_server(transfers),
+                    None => runner.upload(transfers, is_move),
+                }
+            } else if let (Some(t), Some(_)) = (from_server, dst_archive(transfers)) {
+                runner.fail_msg(&t.src, "Can't copy from a server into an archive: copy to a local folder first");
+            } else if let Some(archive) = dst_archive(transfers) {
                 if transfers.iter().any(|t| vfs::is_virtual(&t.src)) {
                     runner.relocate(&archive, transfers, !is_move);
                 } else {
@@ -388,6 +408,7 @@ pub fn run(job: &Job, control: &Control, reporter: &mut dyn Reporter) -> Outcome
             runner.progress.total_items = 1;
             runner.report(true);
             match vfs::split_archive(from) {
+                None if remote::is_remote(from) => runner.move_on_server(&[Transfer { src: from.clone(), dst: to.clone() }]),
                 Some((archive, _)) => {
                     runner.relocate(&archive, &[Transfer { src: from.clone(), dst: to.clone() }], false);
                 }
@@ -1049,7 +1070,10 @@ impl Runner<'_> {
     fn delete_in_archives(&mut self, paths: &[PathBuf]) -> bool {
         let mut groups: Vec<(PathBuf, Vec<String>)> = Vec::new();
         let mut ok = true;
-        for path in paths {
+        for path in paths.iter().filter(|p| remote::is_remote(p)) {
+            ok &= self.delete_on_server(path);
+        }
+        for path in paths.iter().filter(|p| !remote::is_remote(p)) {
             match vfs::inner_path(path).filter(|(_, inner)| !inner.is_empty()) {
                 Some((file, inner)) => match groups.iter_mut().find(|(f, _)| *f == file) {
                     Some((_, inners)) => inners.push(inner),
@@ -1077,6 +1101,15 @@ impl Runner<'_> {
 
     /// Creates a folder: inside a zip by rewriting it, else on disk.
     fn make_dir(&mut self, path: &Path) {
+        if remote::is_remote(path) {
+            match vfs::open(path).and_then(|v| make_dirs_on_server(v.as_ref(), path)) {
+                Ok(()) => self.item_done(0),
+                Err(e) => {
+                    self.fail(path, e);
+                }
+            }
+            return;
+        }
         let Some((archive, inner)) = vfs::inner_path(path).filter(|(_, inner)| !inner.is_empty()) else {
             match fs::create_dir_all(path) {
                 Ok(()) => self.item_done(0),
@@ -1094,6 +1127,174 @@ impl Runner<'_> {
         }
         let saved = self.snapshot();
         self.rewrite(&archive, &Edits::default(), &[Add::Dir(inner, Some(SystemTime::now()))], &[], saved);
+    }
+
+    // ---- servers ----------------------------------------------------------
+
+    /// Uploads local files and folders to a server (the transfers'
+    /// destinations are on it). Conflicts are asked file by file; a moved
+    /// source is removed once everything in it was uploaded.
+    fn upload(&mut self, transfers: &[Transfer], is_move: bool) {
+        let Some(first) = transfers.first() else { return };
+        let server = match vfs::open(&first.dst) {
+            Ok(v) => v,
+            Err(e) => {
+                self.fail(&first.dst, e);
+                return;
+            }
+        };
+        // Listings of the target folders, to find conflicts without asking
+        // the server about every file.
+        let mut listed: HashMap<String, Vec<Entry>> = HashMap::new();
+        for t in transfers {
+            if !self.alive() {
+                return;
+            }
+            self.progress.current = Some(t.src.clone());
+            let items = match LocalFs.walk(&t.src) {
+                Ok(items) => items,
+                Err(e) => {
+                    self.fail(&t.src, e);
+                    continue;
+                }
+            };
+            let mut complete = true;
+            for item in items {
+                if !self.alive() {
+                    return;
+                }
+                let dst = match item.path.strip_prefix(&t.src) {
+                    Ok(rel) if !rel.as_os_str().is_empty() => t.dst.join(rel),
+                    _ => t.dst.clone(),
+                };
+                self.progress.current = Some(item.path.clone());
+                let existing = match existing_on_server(server.as_ref(), &mut listed, &dst) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        complete = self.fail(&dst, e);
+                        continue;
+                    }
+                };
+                if item.is_dir() {
+                    match existing {
+                        Some(e) if !e.is_dir() => complete = self.fail_msg(&dst, "A file with this name already exists"),
+                        Some(_) => self.item_done(0),
+                        None => match server.make_dir(&dst) {
+                            Ok(()) => {
+                                listed.insert(remote::display(&dst), Vec::new());
+                                self.item_done(0);
+                            }
+                            Err(e) => complete = self.fail(&dst, e),
+                        },
+                    }
+                    continue;
+                }
+                if let Some(e) = existing {
+                    if e.is_dir() {
+                        complete = self.fail_msg(&dst, "A folder with this name already exists");
+                        continue;
+                    }
+                    let src_stat = (item.size, item.modified.map(Into::into));
+                    match self.resolve(&item.path, src_stat, &dst, (e.size, e.modified.map(Into::into))) {
+                        Resolution::Overwrite => {}
+                        Resolution::Cancel => {
+                            self.control.cancel();
+                            return;
+                        }
+                        _ => {
+                            self.outcome.skipped += 1;
+                            self.item_done(item.size);
+                            complete = false;
+                            continue;
+                        }
+                    }
+                }
+                let mut input = match File::open(&item.path) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        complete = self.fail(&item.path, e);
+                        continue;
+                    }
+                };
+                let modified = item.modified.map(Into::into);
+                match server.write_file(&dst, modified, &mut |out| self.pump(&mut input, out)) {
+                    Ok(true) => self.item_done(0),
+                    Ok(false) => return,
+                    Err(e) => complete = self.fail(&dst, e),
+                }
+            }
+            if is_move && complete && self.alive() {
+                self.remove_source(&t.src);
+            }
+        }
+    }
+
+    /// Moves or renames on one server (the transfers' sources and
+    /// destinations are on the same one).
+    fn move_on_server(&mut self, transfers: &[Transfer]) {
+        let mut moved = 0;
+        for t in transfers {
+            if !self.alive() {
+                return;
+            }
+            self.progress.current = Some(t.src.clone());
+            let server = match vfs::open(&t.src) {
+                Ok(v) => v,
+                Err(e) => {
+                    self.fail(&t.src, e);
+                    continue;
+                }
+            };
+            let result = match server.stat(&t.dst) {
+                Ok(Some(e)) => {
+                    let what = if e.is_dir() { "folder" } else { "file" };
+                    Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("A {what} with this name already exists")))
+                }
+                Ok(None) => server.rename(&t.src, &t.dst),
+                Err(e) => Err(e),
+            };
+            match result {
+                Ok(()) => moved += 1,
+                Err(e) => {
+                    self.fail(&t.dst, e);
+                }
+            }
+        }
+        if moved == transfers.len() {
+            self.progress.done_items = self.progress.total_items;
+            self.progress.done_bytes = self.progress.total_bytes;
+        }
+    }
+
+    /// Deletes a file or folder (with everything in it) on a server.
+    fn delete_on_server(&mut self, path: &Path) -> bool {
+        self.progress.current = Some(path.to_path_buf());
+        let found = vfs::open(path).and_then(|v| Ok((v.walk(path)?, v)));
+        let (items, server) = match found {
+            Ok(found) => found,
+            Err(e) => return self.fail(path, e),
+        };
+        // A folder comes before its contents: delete from the end.
+        let mut ok = true;
+        let mut failed: Vec<PathBuf> = Vec::new();
+        for item in items.iter().rev() {
+            if !self.alive() {
+                return false;
+            }
+            // A folder whose contents couldn't all be deleted stays.
+            if item.is_dir() && failed.iter().any(|f| f.starts_with(&item.path)) {
+                continue;
+            }
+            self.progress.current = Some(item.path.clone());
+            match server.remove(&item.path, item.is_dir()) {
+                Ok(()) => self.item_done(item.size),
+                Err(e) => {
+                    failed.push(item.path.clone());
+                    ok = self.fail(&item.path, e);
+                }
+            }
+        }
+        ok
     }
 
     /// Progress and skip counts, to put back when an archive rewrite doesn't
@@ -1246,6 +1447,51 @@ impl Runner<'_> {
             Err(e) => self.fail(path, e),
         }
     }
+}
+
+/// Whether all transfers stay on one server.
+fn same_server(transfers: &[Transfer]) -> bool {
+    let key = |p: &Path| remote::split(p).map(|(k, _)| k.to_lowercase());
+    transfers.iter().all(|t| key(&t.src).is_some() && key(&t.src) == key(&t.dst))
+}
+
+/// What exists at `path` on `server`, from the listing of its folder
+/// (cached in `listed`; a missing folder lists as empty).
+fn existing_on_server(server: &dyn Vfs, listed: &mut HashMap<String, Vec<Entry>>, path: &Path)
+    -> io::Result<Option<Entry>> {
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else { return Ok(None) };
+    let dir = remote::display(parent);
+    if !listed.contains_key(&dir) {
+        let entries = match server.list(parent) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(e),
+        };
+        listed.insert(dir.clone(), entries);
+    }
+    let name = name.to_string_lossy();
+    Ok(listed[&dir].iter().find(|e| !e.is_parent() && e.name == name).cloned())
+}
+
+/// Creates the folder `path` on a server, with any missing parents.
+fn make_dirs_on_server(server: &dyn Vfs, path: &Path) -> io::Result<()> {
+    if let Some(e) = server.stat(path)? {
+        let what = if e.is_dir() { "folder" } else { "file" };
+        return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("A {what} with this name already exists")));
+    }
+    let mut missing = vec![path.to_path_buf()];
+    let mut cur = path.parent();
+    while let Some(dir) = cur.filter(|d| remote::split(d).is_some_and(|(_, r)| r != "/")) {
+        if server.stat(dir)?.is_some() {
+            break;
+        }
+        missing.push(dir.to_path_buf());
+        cur = dir.parent();
+    }
+    for dir in missing.iter().rev() {
+        server.make_dir(dir)?;
+    }
+    Ok(())
 }
 
 /// Size and modification time, as conflicts show them.

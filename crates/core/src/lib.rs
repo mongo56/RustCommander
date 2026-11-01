@@ -11,6 +11,7 @@ pub mod format;
 pub mod fs;
 pub mod ops;
 pub mod panel;
+pub mod remote;
 pub mod rename;
 pub mod search;
 pub mod vfs;

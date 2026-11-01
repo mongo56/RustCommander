@@ -50,6 +50,40 @@ pub trait Vfs: Send + Sync {
     fn stat(&self, path: &Path) -> io::Result<Option<Entry>>;
     /// Whether files can be created, changed or deleted here.
     fn writable(&self) -> bool;
+
+    // Direct changes, for file systems that support them (servers); the
+    // others fail with `Unsupported` (zips are changed by `zip_edit`).
+
+    /// Creates the folder `path` (its parent exists).
+    fn make_dir(&self, path: &Path) -> io::Result<()> {
+        Err(unsupported(path))
+    }
+    /// Removes a file, or an empty folder if `is_dir`.
+    fn remove(&self, path: &Path, is_dir: bool) -> io::Result<()> {
+        let _ = is_dir;
+        Err(unsupported(path))
+    }
+    /// Renames or moves `from` to `to` within this file system.
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        let _ = to;
+        Err(unsupported(from))
+    }
+    /// Creates or replaces the file `path` with what `fill` writes (Ok(false)
+    /// from `fill` cancels: the partial file is removed) and gives it the
+    /// date `modified` where possible.
+    fn write_file(
+        &self,
+        path: &Path,
+        modified: Option<SystemTime>,
+        fill: &mut dyn FnMut(&mut dyn io::Write) -> io::Result<bool>,
+    ) -> io::Result<bool> {
+        let _ = (modified, fill);
+        Err(unsupported(path))
+    }
+}
+
+fn unsupported(path: &Path) -> io::Error {
+    io::Error::new(io::ErrorKind::Unsupported, format!("Can't change this directly: {}", path.display()))
 }
 
 /// The local file system.
@@ -149,6 +183,9 @@ pub fn is_archive_name(name: &str) -> bool {
 /// archives the archive is the innermost one (a logical path, e.g.
 /// `a.zip\b.zip`), mounted on the way.
 pub fn split_archive(path: &Path) -> Option<(PathBuf, PathBuf)> {
+    if crate::remote::is_remote(path) {
+        return None;
+    }
     let mut archive = PathBuf::new();
     let mut parts = path.components();
     while let Some(part) = parts.next() {
@@ -229,15 +266,16 @@ fn on_disk(file: &Path) -> io::Result<PathBuf> {
     }
 }
 
-/// True for a path *inside* an archive (not the archive file itself).
+/// True for a path *inside* an archive (not the archive file itself) or on
+/// a server: anything read through a [`Vfs`] other than [`LocalFs`].
 pub fn is_virtual(path: &Path) -> bool {
-    split_archive(path).is_some_and(|(_, inner)| !inner.as_os_str().is_empty())
+    crate::remote::is_remote(path) || split_archive(path).is_some_and(|(_, inner)| !inner.as_os_str().is_empty())
 }
 
-/// True for an archive file or a path inside one: anything not listed by
-/// the local file system.
+/// True for an archive file, a path inside one or a path on a server:
+/// anything not listed by the local file system.
 pub fn in_archive(path: &Path) -> bool {
-    split_archive(path).is_some()
+    crate::remote::is_remote(path) || split_archive(path).is_some()
 }
 
 /// For an archive or a path inside one: whether the archive can be changed
@@ -263,6 +301,9 @@ pub fn inner_path(path: &Path) -> Option<(PathBuf, String)> {
 
 /// The file system serving `path`.
 pub fn open(path: &Path) -> io::Result<Arc<dyn Vfs>> {
+    if crate::remote::is_remote(path) {
+        return crate::remote::open(path);
+    }
     match split_archive(path) {
         Some((file, _)) => Ok(archive(&file)?),
         None => Ok(Arc::new(LocalFs)),
@@ -272,16 +313,16 @@ pub fn open(path: &Path) -> io::Result<Arc<dyn Vfs>> {
 /// Lists the folder `path` wherever it lives (local folder or a folder in
 /// an archive), leaving out hidden entries unless `show_hidden`.
 pub fn list(path: &Path, show_hidden: bool) -> io::Result<Vec<Entry>> {
-    match split_archive(path) {
-        None => crate::fs::list_dir(path, show_hidden),
-        Some((file, _)) => {
-            let mut entries = archive(&file)?.list(path)?;
-            if !show_hidden {
-                entries.retain(|e| !e.hidden);
-            }
-            Ok(entries)
-        }
+    let vfs = match split_archive(path) {
+        None if crate::remote::is_remote(path) => crate::remote::open(path)?,
+        None => return crate::fs::list_dir(path, show_hidden),
+        Some((file, _)) => archive(&file)? as Arc<dyn Vfs>,
+    };
+    let mut entries = vfs.list(path)?;
+    if !show_hidden {
+        entries.retain(|e| !e.hidden);
     }
+    Ok(entries)
 }
 
 /// In the error text of reads that need an archive's password.
@@ -350,6 +391,9 @@ pub fn try_password(path: &Path, password: &str) -> io::Result<bool> {
 /// Where [`extract_temp`] puts the copy of a file inside an archive (the
 /// path itself for local files): a folder per archive under the temp dir.
 pub fn temp_path(path: &Path) -> PathBuf {
+    if let Some((key, remote)) = crate::remote::split(path) {
+        return temp_path_in(Path::new(&key), Path::new(remote.trim_start_matches('/')));
+    }
     match split_archive(path).filter(|(_, inner)| !inner.as_os_str().is_empty()) {
         Some((file, inner)) => temp_path_in(&file, &inner),
         None => path.to_path_buf(),

@@ -16,9 +16,17 @@ sevenz-rust2 = { version = "0.24", default-features = false, features = ["bzip2"
 tar = "0.4"
 flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 bzip2 = "0.6"
+suppaftp = { version = "12.2", features = ["rustls-ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-native-certs = "0.8"
+russh = { version = "0.65", default-features = false, features = ["ring", "rsa", "flate2"] }
+russh-sftp = "3.0"
+tokio = { version = "1", features = ["rt-multi-thread", "time", "net", "io-util", "sync"] }
 
 [target.'cfg(windows)'.dependencies]
 junction = "2.1"
 
 [dev-dependencies]
 sevenz-rust2 = { version = "0.24", default-features = false, features = ["compress", "aes256"] }
+libunftp = { version = "0.24", default-features = false, features = ["ring"] }
+unftp-sbe-fs = "0.4"
