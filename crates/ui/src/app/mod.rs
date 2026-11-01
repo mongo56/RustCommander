@@ -5,6 +5,7 @@ mod connect;
 mod file_diff;
 mod help;
 mod hotlist;
+mod palette;
 mod find_files;
 mod multi_rename;
 mod settings;
@@ -70,6 +71,9 @@ pub struct App {
     dialog: Option<Dialog>,
     /// Favourite folders (Ctrl+D), saved with the session.
     hotlist: Vec<crate::hotlist::HotItem>,
+    /// Commands last run from the command palette, most recent first
+    /// (saved with the session).
+    recent_commands: Vec<Command>,
     jobs: Vec<RunningJob>,
     next_job_id: u64,
     /// Tasks started where none can be returned (an archive rename committed
@@ -191,6 +195,8 @@ enum Dialog {
     Hotlist(hotlist::HotlistMenu),
     /// Folder history list (Alt+Down); `selected` indexes `Panel::history`.
     History { selected: usize },
+    /// Command palette (Ctrl+Space).
+    Palette(palette::Palette),
     /// Compare-folders options; Enter compares with them.
     Compare { opts: CompareOptions },
 }
@@ -317,6 +323,8 @@ pub enum Message {
     HotlistPick(usize),
     HotlistBack,
     HistoryPick(usize),
+    /// Run the palette's `n`th shown command (a click).
+    PalettePick(usize),
     Job(u64, JobEvent),
     JobPause(u64),
     JobCancel(u64),
@@ -389,6 +397,10 @@ impl App {
             last_tab_bar_click: None,
             dialog: None,
             hotlist: session.as_ref().map(|s| s.hotlist.clone()).unwrap_or_default(),
+            recent_commands: session
+                .as_ref()
+                .map(|s| s.recent_commands.iter().filter_map(|id| Command::from_id(id)).collect())
+                .unwrap_or_default(),
             jobs: Vec::new(),
             next_job_id: 1,
             deferred: Vec::new(),
@@ -786,6 +798,7 @@ impl App {
             Message::HotlistPick(i) => return self.hotlist_pick(i),
             Message::HotlistBack => self.hotlist_back(),
             Message::HistoryPick(i) => return self.history_pick(i),
+            Message::PalettePick(i) => return self.palette_pick(i),
             Message::Job(id, event) => self.on_job_event(id, event),
             Message::JobPause(id) => {
                 if let Some(job) = self.job(id) {
@@ -936,14 +949,14 @@ impl App {
             }
             return self.viewer_key(&key, mods);
         }
-        if let Some(Dialog::Hotlist(_) | Dialog::History { .. }) = self.dialog {
+        if let Some(Dialog::Hotlist(_) | Dialog::History { .. } | Dialog::Palette(_)) = self.dialog {
             if named.is_some_and(is_modifier_key) {
                 return Task::none();
             }
-            let task = if let Some(Dialog::History { .. }) = self.dialog {
-                self.history_key(named, text.as_deref())
-            } else {
-                self.hotlist_key(named, text.as_deref(), mods)
+            let task = match self.dialog {
+                Some(Dialog::History { .. }) => self.history_key(named, text.as_deref()),
+                Some(Dialog::Palette(_)) => self.palette_key(named, &key, mods, text.as_deref()),
+                _ => self.hotlist_key(named, text.as_deref(), mods),
             };
             return Task::batch([task, self.popup_snap()]);
         }
@@ -1095,6 +1108,7 @@ impl App {
             Disconnect => return self.disconnect(),
             Help => return self.open_help(),
             Configuration => return self.open_settings(),
+            CommandPalette => return self.open_palette(),
             Edit => {
                 if let Some(e) = self.panel(active).current().filter(|e| e.kind == EntryKind::File) {
                     let (path, name) = (e.path.clone(), e.name.clone());
@@ -1733,6 +1747,11 @@ impl App {
                 return self.hotlist_pick(selected);
             }
             Dialog::History { selected } => return self.history_pick(selected),
+            Dialog::Palette(palette) => {
+                let selected = palette.selected;
+                self.dialog = Some(Dialog::Palette(palette));
+                return self.palette_pick(selected);
+            }
             Dialog::Compare { opts } => {
                 self.compare_opts = opts;
                 self.save_session();
@@ -2370,6 +2389,7 @@ impl App {
             right: side(&self.sides[1]),
             hotlist: self.hotlist.clone(),
             compare: self.compare_opts.into(),
+            recent_commands: self.recent_commands.iter().map(|c| c.id().to_owned()).collect(),
             window: self.placement.map(Into::into),
             editor: String::new(),
         }

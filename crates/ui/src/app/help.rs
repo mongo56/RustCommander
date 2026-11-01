@@ -94,6 +94,7 @@ pub(super) fn sections(keymap: &keymap::Keymap) -> Vec<Section> {
         fixed("Panels: typing and mouse", App::PANEL_KEYS),
         fixed("Directory hotlist (Ctrl+D)", App::HOTLIST_KEYS),
         fixed("Folder history list (Alt+Down)", App::HISTORY_KEYS),
+        fixed("Command palette (Ctrl+Space)", App::PALETTE_KEYS),
         fixed("Viewer (F3)", App::VIEWER_KEYS),
         fixed("Multi-rename (Ctrl+M)", App::RENAME_KEYS),
         fixed("Compare files (Alt+F2)", App::DIFF_KEYS),

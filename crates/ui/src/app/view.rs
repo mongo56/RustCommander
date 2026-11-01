@@ -538,6 +538,7 @@ impl App {
         match dialog {
             Dialog::Hotlist(menu) => return self.hotlist_view(menu),
             Dialog::History { selected } => return self.history_view(*selected),
+            Dialog::Palette(palette) => return self.palette_view(palette),
             Dialog::Compare { opts } => return compare_view(opts),
             _ => {}
         }
@@ -606,7 +607,9 @@ impl App {
                 None,
                 "Delete",
             ),
-            Dialog::Hotlist(_) | Dialog::History { .. } | Dialog::Compare { .. } => unreachable!("drawn above"),
+            Dialog::Hotlist(_) | Dialog::History { .. } | Dialog::Palette(_) | Dialog::Compare { .. } => {
+                unreachable!("drawn above")
+            }
         };
 
         let mut content = column![text(title).size(16), text(body).size(13).color(theme::c().muted)].spacing(12);

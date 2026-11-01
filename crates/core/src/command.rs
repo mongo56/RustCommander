@@ -78,6 +78,8 @@ pub enum Command {
     EditConfig,
     /// Settings view: preferences, key bindings, colours (F10).
     Configuration,
+    /// Popup to find a command by name, id or key and run it (Ctrl+Space).
+    CommandPalette,
     /// Searchable list of keys and features (F1).
     Help,
     Quit,
@@ -141,6 +143,7 @@ impl Command {
             OpenInNewTab => "cm_OpenDirInNewTab",
             EditConfig => "cm_EditConfig",
             Configuration => "cm_Configuration",
+            CommandPalette => "cm_CommandPalette",
             Help => "cm_HelpIndex",
             Quit => "cm_Exit",
         }
@@ -204,6 +207,7 @@ impl Command {
             OpenInNewTab => "Open the folder under the cursor in a new tab",
             EditConfig => "Edit config.toml (editor, [keys], [colors])",
             Configuration => "Settings: preferences, key bindings, colour themes",
+            CommandPalette => "Command palette: find a command by name, id or key and run it",
             Help => "This help: all keys and features",
             Quit => "Exit",
         }
@@ -270,6 +274,7 @@ impl Command {
             OpenInNewTab,
             EditConfig,
             Configuration,
+            CommandPalette,
             Help,
             Quit,
         ]

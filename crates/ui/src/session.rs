@@ -24,6 +24,10 @@ pub struct Session {
     /// Compare-folders options (Ctrl+Shift+F2).
     #[serde(default)]
     pub compare: CompareState,
+    /// Ids of the commands last run from the command palette (Ctrl+Space),
+    /// most recent first.
+    #[serde(default)]
+    pub recent_commands: Vec<String>,
     /// Editor setting from older versions; read once to seed `config.toml`.
     #[serde(default, skip_serializing)]
     pub editor: String,
@@ -177,12 +181,14 @@ mod tests {
             ],
             window: Some(WindowState { left: -8, top: 0, right: 1200, bottom: 800, maximized: true }),
             compare: CompareState { by_content: true, ignore_date: false, subfolders: true },
+            recent_commands: vec!["cm_MkDir".into(), "cm_Copy".into()],
             editor: r#""my editor.exe" -n %1"#.into(),
         };
         let text = toml::to_string_pretty(&session).unwrap();
         let back: Session = toml::from_str(&text).unwrap();
         assert_eq!(back.active, 1);
         assert_eq!(back.hotlist, session.hotlist);
+        assert_eq!(back.recent_commands, session.recent_commands);
         let panel = back.left.tabs[0].open().unwrap();
         assert_eq!(panel.sort.key, SortKey::Size);
         assert!(panel.sort.descending && panel.show_hidden);

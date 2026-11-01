@@ -354,6 +354,7 @@ fn default_command(key: &Key, m: Modifiers) -> Option<Command> {
             Named::Tab => SwitchPanel,
             Named::ArrowUp if ctrl => OpenInNewTab,
             Named::Insert => ToggleSelect { advance: true },
+            Named::Space if ctrl => CommandPalette,
             Named::Space => ToggleSelect { advance: false },
             Named::Escape => DeselectAll,
             Named::F1 => Help,
@@ -449,6 +450,14 @@ mod tests {
         assert_eq!(keys(Command::OpenInNewTab), ["Ctrl+Up"]);
         assert_eq!(keys(Command::GoRoot), ["Ctrl+\\"]);
         assert_eq!(keys(Command::DeletePermanent), ["Shift+Del", "Shift+F8"]);
+        assert_eq!(keys(Command::CommandPalette), ["Ctrl+Space"]);
+        assert!(!keys(Command::ToggleSelect { advance: false }).contains(&"Ctrl+Space"));
+        // Plain Space still selects; Ctrl+Space opens the palette.
+        let map = Keymap::default();
+        let space = Key::Named(Named::Space);
+        assert_eq!(map.command(&space, Modifiers::empty()), Some(Command::ToggleSelect { advance: false }));
+        assert_eq!(map.command(&space, Modifiers::CTRL), Some(Command::CommandPalette));
+        assert_eq!(parse_key("Ctrl+Space").as_deref(), Some("ctrl+space"));
     }
 
     #[test]

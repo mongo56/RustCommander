@@ -22,7 +22,7 @@ pub(super) fn popup_list_id() -> iced::widget::scrollable::Id {
 }
 
 impl App {
-    /// Scrolls the hotlist / history popup so the selected row shows: rows
+    /// Scrolls the hotlist / history / command palette popup so the selected row shows: rows
     /// are evenly tall, so the relative offset of the row's index does.
     pub(super) fn popup_snap(&self) -> Task<Message> {
         let (selected, rows) = match &self.dialog {
@@ -32,6 +32,7 @@ impl App {
                 (menu.selected, n + 1 + usize::from(menu.naming.is_some() && !menu.renaming))
             }
             Some(Dialog::History { selected }) => (*selected, self.panel(self.active).history().0.len()),
+            Some(Dialog::Palette(p)) => (p.selected, p.shown.len()),
             _ => return Task::none(),
         };
         let y = if rows > 1 { (selected as f32 / (rows - 1) as f32).min(1.0) } else { 0.0 };
