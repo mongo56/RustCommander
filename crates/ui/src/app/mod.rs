@@ -301,6 +301,7 @@ pub enum Message {
     /// Scrollbar dragged/clicked: first row to show, rows on screen.
     ScrollTo(usize, usize, usize),
     Drive(usize, String),
+    DriveMiddle(usize, String),
     Sort(usize, SortKey),
     Resized(Size),
     CloseRequested,
@@ -675,6 +676,11 @@ impl App {
                 self.drives = rc_platform::roots();
                 return self.start_nav(side, Nav::to(drive));
             }
+            Message::DriveMiddle(side, drive) => {
+                self.leave_edits();
+                self.drives = rc_platform::roots();
+                return self.open_tab(side, PathBuf::from(drive), false);
+            }
             Message::Sort(side, key) => {
                 self.active = side;
                 self.panel_mut(side).sort_by(key);
@@ -870,7 +876,7 @@ impl App {
         ("Esc", "Cancel a slow folder change, drop the filter, then clear the selection"),
         ("F2 / Shift+F6 (renaming)", "Select the name without extension, the extension, the whole name; Enter renames, Esc cancels"),
         ("Click, double-click", "Move the cursor, open"),
-        ("Middle-click a folder", "Open it in a new tab"),
+        ("Middle-click a folder or drive", "Open it in a new tab"),
         ("Enter / Ctrl+PgDn on a .zip, .7z, .tar, .tar.gz, .gz, ...", "Browse the archive like a folder: view, copy out, Enter opens a temp copy; in a zip also copy/move in, F7, F2, F8 (others are read-only)"),
         ("Ctrl+F, then Enter", "Connect to an SFTP/FTP/FTPS server: browse, F3 view, F5/F6 download and upload, F7, F2, F8 work there; Ctrl+Shift+F disconnects"),
         ("Right-click", "Explorer context menu"),

@@ -167,11 +167,14 @@ impl App {
                 content = content.push(image(icon).width(ICON).height(ICON));
             }
             content = content.push(text(letter).size(12));
-            button(content)
-                .on_press(Message::Drive(side, drive.clone()))
-                .padding([2, 6])
-                .style(theme::drive(current))
-                .into()
+            mouse_area(
+                button(content)
+                    .on_press(Message::Drive(side, drive.clone()))
+                    .padding([2, 6])
+                    .style(theme::drive(current)),
+            )
+            .on_middle_press(Message::DriveMiddle(side, drive.clone()))
+            .into()
         }))
         .spacing(2);
 
