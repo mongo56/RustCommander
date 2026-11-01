@@ -390,7 +390,8 @@ impl App {
                 };
                 Message::Wheel(side, lines)
             })
-            .on_right_press(Message::RightClickBackground(side));
+            .on_right_press(Message::RightClickBackground(side))
+            .on_press(Message::ClickBackground(side));
         if self.dragging() {
             area = area.on_exit(Message::HoverEnd(side));
         }

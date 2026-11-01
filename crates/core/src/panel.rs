@@ -583,6 +583,20 @@ impl Panel {
         found.unwrap_or(self.cursor).min(self.entries.len().saturating_sub(1))
     }
 
+    /// Plain click press: moves the cursor to `index` and makes it the anchor.
+    /// The selection is dropped, except when `index` is a selected item (it
+    /// may be about to be dragged); then it returns true and the release
+    /// should call `deselect_all` if no drag started.
+    pub fn click_at(&mut self, index: usize) -> bool {
+        let on_selected = self.entries.get(index).is_some_and(|e| !e.is_parent() && self.is_selected(e));
+        if !on_selected {
+            self.deselect_all();
+        }
+        self.set_cursor(index);
+        self.mark_anchor();
+        on_selected
+    }
+
     /// Ctrl+click: toggles the entry at `index`, moves the cursor there and
     /// makes it the anchor.
     pub fn toggle_at(&mut self, index: usize) {
@@ -933,6 +947,18 @@ mod tests {
         p.select_range_to(0, false);
         assert_eq!(sel(&p), ["f0.txt"]);
         assert_eq!(p.cursor, 0);
+        // Plain click on an unselected row drops the selection.
+        assert!(!p.click_at(2));
+        assert!(sel(&p).is_empty());
+        assert_eq!((p.cursor, p.anchor_index()), (2, 2));
+        // Plain click on a selected row keeps it until the release.
+        p.select_range_to(4, false);
+        assert!(p.click_at(3));
+        assert_eq!(sel(&p), ["f1.txt", "f2.txt", "f3.txt"]);
+        assert_eq!((p.cursor, p.anchor_index()), (3, 3));
+        // Clicking ".." drops the selection.
+        assert!(!p.click_at(0));
+        assert!(sel(&p).is_empty());
         // Without an anchor the range starts at the cursor.
         p.navigate(root.clone(), None).unwrap();
         p.set_cursor(6);

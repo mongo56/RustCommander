@@ -272,6 +272,9 @@ struct Drag {
     /// Started with the right button: a click shows the context menu, a
     /// drop shows the shell's drop menu.
     right: bool,
+    /// Left press on a selected item: if no drag follows, the release
+    /// leaves only that item selected.
+    collapse: bool,
     /// Row the right button went down on.
     index: usize,
 }
@@ -301,6 +304,7 @@ pub enum Message {
     MiddleClick(usize, usize),
     RightPress(usize, usize),
     RightClickBackground(usize),
+    ClickBackground(usize),
     ContextDone(usize, Result<MenuAction, String>),
     Hover(usize, usize),
     HoverEnd(usize),
@@ -595,9 +599,19 @@ impl App {
                     return Task::none();
                 }
                 let panel = self.panel_mut(side);
-                panel.set_cursor(index);
-                panel.mark_anchor();
-                self.drag = Some(Drag { side, start: None, active: false, sources: Vec::new(), right: false, index });
+                // Explorer behaviour: a plain click drops the selection; on a
+                // selected item that waits for the release, so the whole
+                // selection can still be dragged.
+                let on_selected = panel.click_at(index);
+                self.drag = Some(Drag {
+                    side,
+                    start: None,
+                    active: false,
+                    sources: Vec::new(),
+                    right: false,
+                    collapse: on_selected,
+                    index,
+                });
                 let now = Instant::now();
                 let double = matches!(
                     self.last_click,
@@ -630,7 +644,20 @@ impl App {
                 }
                 // The context menu opens on release, unless this turns into
                 // a right-button drag.
-                self.drag = Some(Drag { side, start: None, active: false, sources: Vec::new(), right: true, index });
+                self.drag = Some(Drag {
+                    side,
+                    start: None,
+                    active: false,
+                    sources: Vec::new(),
+                    right: true,
+                    collapse: false,
+                    index,
+                });
+            }
+            Message::ClickBackground(side) => {
+                self.leave_edits();
+                self.active = side;
+                self.panel_mut(side).deselect_all();
             }
             Message::RightClickBackground(side) => {
                 self.leave_edits();
@@ -942,7 +969,7 @@ impl App {
         ("Esc", "Cancel a slow folder change, drop the filter, then clear the selection"),
         ("Dialogs: Left/Right, Tab", "Move the focus between the buttons (Left/Right only without a text box); Enter presses the focused one, Esc cancels"),
         ("F2 / Shift+F6 (renaming)", "Select the name without extension, the extension, the whole name; Enter renames, Esc cancels"),
-        ("Click, double-click", "Move the cursor (the selection stays), open"),
+        ("Click, double-click", "Move the cursor and drop the selection (a selected item keeps it while dragging), open"),
         ("Ctrl+click", "Select / unselect one item"),
         ("Shift+click", "Select the range from the last clicked item to this one"),
         ("Ctrl+Shift+click", "Add that range to the selection"),
@@ -1959,6 +1986,12 @@ impl App {
         let Some(drag) = self.drag.take() else { return Task::none() };
         self.hover = None;
         if !drag.active {
+            if drag.collapse {
+                let panel = self.panel_mut(drag.side);
+                if drag.index < panel.entries.len() {
+                    panel.deselect_all();
+                }
+            }
             if drag.right {
                 let on_parent = self.panel(drag.side).entries.get(drag.index).is_none_or(|e| e.is_parent());
                 return self.context_menu(drag.side, on_parent);
