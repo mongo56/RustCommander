@@ -56,6 +56,11 @@ const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 const DRAG_THRESHOLD: f32 = 6.0;
 /// Quick search closes after this long without typing.
 const QUICK_SEARCH_TIMEOUT: Duration = Duration::from_secs(4);
+/// An Enter key-down arriving within this long of the window regaining focus
+/// is treated as leaked in from the window we had just left (e.g. a
+/// terminal's `exit` key-down landing right after it closed and focus
+/// switched back), and is ignored.
+const FOCUS_LEAK_GRACE: Duration = Duration::from_millis(200);
 const MAX_SUGGESTIONS: usize = 12;
 
 fn dialog_input_id() -> text_input::Id {
@@ -134,6 +139,15 @@ pub struct App {
     /// Row under the mouse while dragging: (side, index).
     hover: Option<(usize, usize)>,
     modifiers: keyboard::Modifiers,
+    /// When the window last gained focus (an Enter right after that may be a
+    /// leak from the window we had just left; see `FOCUS_LEAK_GRACE`).
+    last_focus: Option<Instant>,
+    /// We saw this Enter's key-down and not yet its key-up.
+    enter_down: bool,
+    /// The held Enter leaked in from another window (its key-down arrived
+    /// just after we regained focus); it and its repeats are ignored until
+    /// the key-up.
+    leaked_enter: bool,
     /// Icon cache keyed by `rc_platform::icon_key`. Filled lazily from
     /// `view`, hence the RefCell.
     icons: RefCell<HashMap<String, Option<image::Handle>>>,
@@ -341,6 +355,10 @@ pub enum Message {
     /// Key press with the text it produced; `bool` is true if a widget
     /// (e.g. a text input) already used it.
     Key(keyboard::Key, keyboard::Modifiers, Option<String>, bool),
+    /// A key was released (tracked so a leaked Enter's repeats can be dropped).
+    KeyReleased(keyboard::Key),
+    /// The window gained focus.
+    WindowFocused,
     Modifiers(keyboard::Modifiers),
     Run(Command),
     Click(usize, usize),
@@ -505,6 +523,9 @@ impl App {
             column_click: None,
             hover: None,
             modifiers: keyboard::Modifiers::default(),
+            last_focus: None,
+            enter_down: false,
+            leaked_enter: false,
             icons: RefCell::new(HashMap::new()),
             thumbs: thumbs::Thumbs::default(),
             disk: RefCell::new(HashMap::new()),
@@ -555,6 +576,8 @@ impl App {
                 Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, text, .. }) => Some(
                     Message::Key(key, modifiers, text.map(|t| t.to_string()), status == event::Status::Captured),
                 ),
+                Event::Keyboard(keyboard::Event::KeyReleased { key, .. }) => Some(Message::KeyReleased(key)),
+                Event::Window(window::Event::Focused) => Some(Message::WindowFocused),
                 Event::Keyboard(keyboard::Event::ModifiersChanged(m)) => Some(Message::Modifiers(m)),
                 Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => Some(Message::MouseUp(false)),
                 Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)) => Some(Message::MouseUp(true)),
@@ -644,6 +667,13 @@ impl App {
         match message {
             Message::Thumb(key, handle) => self.thumb_done(key, handle),
             Message::Key(key, mods, text, captured) => return self.on_key(key, mods, text, captured),
+            Message::KeyReleased(key) => {
+                if let keyboard::Key::Named(Named::Enter) = key {
+                    self.enter_down = false;
+                    self.leaked_enter = false;
+                }
+            }
+            Message::WindowFocused => self.last_focus = Some(Instant::now()),
             Message::Modifiers(m) => self.modifiers = m,
             Message::Run(cmd) => return self.run(cmd),
             Message::Click(side, index) => {
@@ -1122,6 +1152,24 @@ impl App {
             _ => None,
         };
         let escape = named == Some(Named::Escape);
+
+        // An Enter whose key-down we never saw, arriving just after the
+        // window regained focus, leaked in from the window we had just left
+        // (e.g. a terminal's `exit` key-down landing right after it closed):
+        // drop it and its repeats until the key-up.
+        if named == Some(Named::Enter) {
+            let leaked = self.leaked_enter
+                || (!self.enter_down
+                    && self
+                        .last_focus
+                        .is_some_and(|t| Instant::now().duration_since(t) < FOCUS_LEAK_GRACE));
+            if leaked {
+                self.leaked_enter = true;
+                self.enter_down = true;
+                return Task::none();
+            }
+            self.enter_down = true;
+        }
 
         // A pending overwrite question blocks everything else.
         if let Some(id) = self.jobs.iter().find(|j| j.conflict.is_some()).map(|j| j.id) {
