@@ -10,6 +10,13 @@ using System; using System.Runtime.InteropServices;
 public class W4 {
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
+  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, IntPtr pid);
+  [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a, uint b, bool attach);
+  [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
   [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
   [DllImport("user32.dll")] public static extern void mouse_event(uint f, int x, int y, uint d, UIntPtr e);
   [DllImport("user32.dll")] public static extern void keybd_event(byte k, byte s, uint f, UIntPtr e);
@@ -26,9 +33,43 @@ else {
   $p = $p[0]
 }
 if (-not $p.Path -or -not $p.Path.StartsWith($repo, 'OrdinalIgnoreCase')) { throw "PID $($p.Id) ($($p.Path)) is not a build from this repo; refusing to drive it." }
+# The window starts hidden until it's placed: wait for it to get a handle.
+$deadline = (Get-Date).AddSeconds(10)
+while ($p.MainWindowHandle -eq [IntPtr]::Zero) {
+  if ((Get-Date) -gt $deadline) { throw "PID $($p.Id) has no visible window after 10 s." }
+  Start-Sleep -Milliseconds 200; $p.Refresh()
+}
 $h = $p.MainWindowHandle
-[W4]::SetForegroundWindow($h) | Out-Null
-Start-Sleep -Milliseconds 400
+# Windows' foreground lock refuses SetForegroundWindow from a background
+# process (it only flashes the taskbar button). Try plain, then attached to
+# the foreground thread's input, then after a synthetic Alt (which makes us
+# the sender of the last input). Verify, so keys never go to another window.
+function Focus-Window([IntPtr]$h) {
+  if ([W4]::IsIconic($h)) { [W4]::ShowWindow($h, 9) | Out-Null }  # SW_RESTORE
+  for ($try = 0; $try -lt 3; $try++) {
+    switch ($try) {
+      0 { [W4]::SetForegroundWindow($h) | Out-Null }
+      1 {
+        $fg = [W4]::GetWindowThreadProcessId([W4]::GetForegroundWindow(), [IntPtr]::Zero)
+        $me = [W4]::GetCurrentThreadId()
+        [W4]::AttachThreadInput($me, $fg, $true) | Out-Null
+        [W4]::BringWindowToTop($h) | Out-Null
+        [W4]::SetForegroundWindow($h) | Out-Null
+        [W4]::AttachThreadInput($me, $fg, $false) | Out-Null
+      }
+      2 {
+        [W4]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero)  # Alt down
+        [W4]::SetForegroundWindow($h) | Out-Null
+        [W4]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)  # Alt up
+      }
+    }
+    Start-Sleep -Milliseconds 300
+    if ([W4]::GetForegroundWindow() -eq $h) { return }
+  }
+  throw "Could not bring PID $($p.Id) to the foreground; not sending input to another window."
+}
+Focus-Window $h
+Start-Sleep -Milliseconds 100
 $r = New-Object W4+RECT; [W4]::GetWindowRect($h, [ref]$r) | Out-Null
 $ws = New-Object -ComObject WScript.Shell
 function MoveTo($x, $y) { [W4]::SetCursorPos($r.L + $x, $r.T + $y) | Out-Null; Start-Sleep -Milliseconds 60 }
