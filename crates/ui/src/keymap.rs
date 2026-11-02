@@ -428,6 +428,27 @@ const DEFAULTS: &[(&str, Command)] = {
 mod tests {
     use super::*;
 
+    #[test]
+    fn parse_key_edge_cases() {
+        assert_eq!(parse_key("CTRL+ALT+SHIFT+WIN+A").as_deref(), Some("ctrl+alt+shift+win+a"));
+        assert_eq!(parse_key("  ctrl + a  ").as_deref(), Some("ctrl+a"));
+        assert_eq!(parse_key("ctrl+ alt + shift+b").as_deref(), Some("ctrl+alt+shift+b"));
+        assert_eq!(parse_key("control+a").as_deref(), Some("ctrl+a"));
+        assert_eq!(parse_key("super+a").as_deref(), Some("win+a"));
+        assert_eq!(parse_key("logo+a").as_deref(), Some("win+a"));
+        assert_eq!(parse_key("cmd+a").as_deref(), Some("win+a"));
+        assert_eq!(parse_key("win+shift+alt+ctrl+a").as_deref(), Some("ctrl+alt+shift+win+a"));
+        assert_eq!(parse_key("+").as_deref(), Some("+"));
+        assert_eq!(parse_key("Ctrl++").as_deref(), Some("ctrl++"));
+        assert_eq!(parse_key("pgup").as_deref(), Some("pageup"));
+        assert_eq!(parse_key("return").as_deref(), Some("enter"));
+        assert_eq!(parse_key("del").as_deref(), Some("delete"));
+        assert_eq!(parse_key("ins").as_deref(), Some("insert"));
+        assert_eq!(parse_key("foo+a").as_deref(), None);
+        assert_eq!(parse_key("ctrl+foo").as_deref(), None);
+        assert_eq!(parse_key("").as_deref(), None);
+    }
+
     fn press(key: Key, m: Modifiers) -> (Key, Modifiers) {
         (key, m)
     }
