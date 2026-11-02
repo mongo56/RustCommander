@@ -374,6 +374,8 @@ pub enum Message {
     /// Mouse button released; `true` for the right button.
     MouseUp(bool),
     DragOutDone(usize, Result<DragOutcome, String>),
+    /// Files put on the system clipboard: how many, and whether cut.
+    ClipboardSet(Result<usize, String>, bool),
     DropMenuDone(usize, Result<DragOutcome, String>),
     FileDropped(PathBuf),
     DropPosition(Option<(f32, f32)>),
@@ -824,6 +826,17 @@ impl App {
                     self.viewer_release();
                 }
                 return self.finish_drag(right);
+            }
+            Message::ClipboardSet(result, cut) => {
+                self.status = Some(match result {
+                    Ok(n) => {
+                        let verb = if cut { "Cut" } else { "Copied" };
+                        let what = if n == 1 { "1 item".to_owned() } else { format!("{n} items") };
+                        (format!("{verb} {what} to the clipboard"), Tone::Success)
+                    }
+                    Err(e) => (format!("Can't use the clipboard: {e}"), Tone::Error),
+                });
+                return Task::none();
             }
             Message::DragOutDone(side, result) => {
                 self.reload_panels();
@@ -1453,6 +1466,8 @@ impl App {
                 let target = self.panel(other).path.clone();
                 return self.open_transfer(cmd == Move, sources, &target);
             }
+            CopyToClipboard | CutToClipboard => return self.clip_files(cmd == CutToClipboard),
+            PasteFromClipboard => return self.paste_files(),
             Rename => return self.start_rename(),
             MakeDir => return self.open_dialog(Dialog::MakeDir { input: String::new() }),
             Pack => return self.open_pack(),
@@ -2223,6 +2238,47 @@ impl App {
                 })
             })
             .map(move |result| Message::DropMenuDone(side, result))
+    }
+
+    /// Ctrl+C / Ctrl+X: puts the active panel's targets on the system
+    /// clipboard. Files in archives are copied as their temp copies; they
+    /// (and files on servers) can't be cut.
+    fn clip_files(&mut self, cut: bool) -> Task<Message> {
+        let side = self.active;
+        let mut items = self.target_paths(side);
+        if items.is_empty() {
+            return Task::none();
+        }
+        if items.iter().any(|p| vfs::is_virtual(p)) {
+            if cut {
+                self.status = Some(("Can't cut files in an archive or on a server: move them with F6".into(), Tone::Info));
+                return Task::none();
+            }
+            match self.shell_items_extracted(side, items) {
+                Some((_, local)) => items = local,
+                None => return Task::none(),
+            }
+        }
+        let n = items.len();
+        window::get_oldest()
+            .and_then(move |id| {
+                let items = items.clone();
+                window::run_with_handle(id, move |handle| {
+                    rc_platform::set_clipboard_files(native_handle(&handle), &items, cut)
+                })
+            })
+            .map(move |result| Message::ClipboardSet(result.map(|()| n), cut))
+    }
+
+    /// Ctrl+V: copies (or, if they were cut, moves) the files on the system
+    /// clipboard into the active panel, through the usual transfer dialog.
+    fn paste_files(&mut self) -> Task<Message> {
+        let Some((sources, cut)) = rc_platform::clipboard_files() else {
+            self.status = Some(("No files on the clipboard".into(), Tone::Info));
+            return Task::none();
+        };
+        let target = self.panel(self.active).path.clone();
+        self.open_transfer(cut, sources, &target)
     }
 
     fn drag_out(&self, side: usize, folder: PathBuf, items: Vec<PathBuf>) -> Task<Message> {

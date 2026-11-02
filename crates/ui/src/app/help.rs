@@ -289,7 +289,8 @@ mod tests {
                 .collect()
         };
         assert_eq!(filter(&all, "").len(), all.len());
-        assert_eq!(found("cm_copy"), ["Copy to the other panel"]);
+        assert_eq!(found("cm_copy f5"), ["Copy to the other panel"]);
+        assert_eq!(found("cm_copytoclipboard"), ["Copy the files to the clipboard"]);
         assert_eq!(found("COPY f5"), ["Copy to the other panel"]);
         // Section titles match too: "viewer" lists all viewer keys.
         assert!(found("viewer hex").contains(&"Hex mode".to_owned()));

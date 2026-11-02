@@ -9,6 +9,8 @@ pub mod credentials;
 mod editors;
 pub use editors::{detect_editors, pick_program, FoundEditor};
 #[cfg(windows)]
+mod clipboard_win;
+#[cfg(windows)]
 mod thumb_win;
 #[cfg(windows)]
 mod win;
@@ -231,6 +233,32 @@ pub fn drag_out(window: isize, folder: &Path, items: &[PathBuf]) -> Result<DragO
     {
         let _ = (window, folder, items);
         Err("Dragging to other apps is not available on this platform yet".into())
+    }
+}
+
+/// Puts files on the system clipboard (Explorer's format) for pasting in
+/// other apps; `cut` marks them to be moved.
+pub fn set_clipboard_files(window: isize, paths: &[PathBuf], cut: bool) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        clipboard_win::set_files(window, paths, cut)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (window, paths, cut);
+        Err("Copying files to the clipboard is not available on this platform yet".into())
+    }
+}
+
+/// Files on the system clipboard and whether they were cut, or `None`.
+pub fn clipboard_files() -> Option<(Vec<PathBuf>, bool)> {
+    #[cfg(windows)]
+    {
+        clipboard_win::get_files()
+    }
+    #[cfg(not(windows))]
+    {
+        None
     }
 }
 

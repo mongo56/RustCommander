@@ -60,6 +60,12 @@ pub enum Command {
     EditNew,
     Copy,
     Move,
+    /// Put the selected files on the system clipboard (Ctrl+C / Ctrl+X),
+    /// for pasting here or in Explorer.
+    CopyToClipboard,
+    CutToClipboard,
+    /// Copy or move the files on the clipboard into the panel (Ctrl+V).
+    PasteFromClipboard,
     /// Rename the cursor entry in place (Shift+F6).
     Rename,
     /// Rename the selected files by mask (Ctrl+M).
@@ -139,6 +145,9 @@ impl Command {
             EditNew => "cm_EditNewFile",
             Copy => "cm_Copy",
             Move => "cm_RenMov",
+            CopyToClipboard => "cm_CopyToClipboard",
+            CutToClipboard => "cm_CutToClipboard",
+            PasteFromClipboard => "cm_PasteFromClipboard",
             Rename => "cm_RenameOnly",
             MultiRename => "cm_MultiRenameFiles",
             MakeDir => "cm_MkDir",
@@ -207,6 +216,9 @@ impl Command {
             EditNew => "Create a new file and edit it",
             Copy => "Copy to the other panel",
             Move => "Move / rename to the other panel",
+            CopyToClipboard => "Copy the files to the clipboard",
+            CutToClipboard => "Cut the files to the clipboard (paste moves them)",
+            PasteFromClipboard => "Paste files from the clipboard into this panel",
             Rename => "Rename in place",
             MultiRename => "Multi-rename the selected files by mask",
             MakeDir => "Create a folder",
@@ -272,6 +284,9 @@ impl Command {
             GoParent => "Up",
             GoRoot => "Root",
             EditConfig => "Config",
+            CopyToClipboard => "ClipCopy",
+            CutToClipboard => "ClipCut",
+            PasteFromClipboard => "Paste",
             _ => {
                 let id = self.id();
                 id.strip_prefix("cm_").unwrap_or(id)
@@ -329,6 +344,9 @@ impl Command {
             EditNew,
             Copy,
             Move,
+            CopyToClipboard,
+            CutToClipboard,
+            PasteFromClipboard,
             Rename,
             MultiRename,
             MakeDir,
