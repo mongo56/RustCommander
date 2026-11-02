@@ -43,6 +43,7 @@ impl App {
     pub(super) const HOTLIST_KEYS: &'static [(&'static str, &'static str)] = &[
         ("Up, Down, Home, End", "Pick an entry"),
         ("Enter, 1-9, click", "Open the folder or submenu"),
+        ("Shift+Enter, middle-click", "Open the folder in a new tab"),
         ("Right / Left, Backspace", "Open the submenu / back to the menu above"),
         ("A, +", "Add / remove the current folder (in the menu shown)"),
         ("N", "New submenu: type its name, Enter"),
@@ -140,6 +141,7 @@ impl App {
             Some(Named::ArrowDown) => select((selected + 1) % count),
             Some(Named::Home | Named::PageUp) => select(0),
             Some(Named::End | Named::PageDown) => select(count - 1),
+            Some(Named::Enter) if mods.shift() => return self.hotlist_new_tab(selected),
             Some(Named::Enter) => return self.hotlist_pick(selected),
             Some(Named::ArrowRight) if is_menu => return self.hotlist_pick(selected),
             Some(Named::ArrowLeft | Named::Backspace) => self.hotlist_back(),
@@ -212,6 +214,18 @@ impl App {
         self.status = Some((msg, Tone::Info));
         self.save_session();
         Task::none()
+    }
+
+    /// Opens folder entry `i` of the menu shown in a new tab and switches to
+    /// it (Shift+Enter / middle-click); submenus and the add/remove row do nothing.
+    pub(super) fn hotlist_new_tab(&mut self, i: usize) -> Task<Message> {
+        let Some(Dialog::Hotlist(menu)) = &self.dialog else { return Task::none() };
+        let at = menu.at.clone();
+        let Some(path) = hotlist::menu(&self.hotlist, &at).get(i).and_then(HotItem::folder) else {
+            return Task::none();
+        };
+        self.dialog = None;
+        self.open_tab(self.active, path.to_path_buf(), true)
     }
 
     pub(super) fn history_key(&mut self, named: Option<Named>, text: Option<&str>) -> Task<Message> {

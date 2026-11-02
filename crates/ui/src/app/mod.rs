@@ -407,6 +407,8 @@ pub enum Message {
     DialogEnter,
     DialogCancel,
     HotlistPick(usize),
+    /// Open hotlist entry `i` in a new tab (Shift+Enter / middle-click).
+    HotlistNewTab(usize),
     HotlistBack,
     HistoryPick(usize),
     /// Run the palette's `n`th shown command (a click).
@@ -1026,6 +1028,7 @@ impl App {
                 self.dialog_focus = None;
             }
             Message::HotlistPick(i) => return self.hotlist_pick(i),
+            Message::HotlistNewTab(i) => return self.hotlist_new_tab(i),
             Message::HotlistBack => self.hotlist_back(),
             Message::HistoryPick(i) => return self.history_pick(i),
             Message::PalettePick(i) => return self.palette_pick(i),

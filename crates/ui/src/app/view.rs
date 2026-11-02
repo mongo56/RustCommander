@@ -799,11 +799,14 @@ impl App {
         let here = &self.panel(self.active).path;
         let entries = hl::menu(&self.hotlist, &menu.at);
         let row_button = |content: Row<'static, Message>, i: usize| {
-            button(content)
-                .on_press(Message::HotlistPick(i))
-                .width(Length::Fill)
-                .padding([4, 8])
-                .style(theme::suggestion(selected == i))
+            mouse_area(
+                button(content)
+                    .on_press(Message::HotlistPick(i))
+                    .width(Length::Fill)
+                    .padding([4, 8])
+                    .style(theme::suggestion(selected == i)),
+            )
+            .on_middle_press(Message::HotlistNewTab(i))
         };
         let mut items = Column::new();
         let new_name = menu.naming.as_ref().filter(|_| !menu.renaming);
@@ -849,7 +852,7 @@ impl App {
         let hint = if menu.naming.is_some() {
             "Type the name \u{b7} Enter OK \u{b7} Esc cancel"
         } else {
-            "Enter go \u{b7} 1-9 jump \u{b7} N submenu \u{b7} Ctrl+arrows move \u{b7} Del remove \u{b7} F1 all keys"
+            "Enter go \u{b7} Shift+Enter new tab \u{b7} 1-9 jump \u{b7} N submenu \u{b7} Ctrl+arrows move \u{b7} Del remove"
         };
         let hint = text(hint).size(11).color(theme::c().muted);
         // Title: the submenu path, with a way back for the mouse.
