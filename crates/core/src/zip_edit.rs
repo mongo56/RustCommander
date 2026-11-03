@@ -1,8 +1,10 @@
 //! Changing zip archives. A zip can't be edited in place, so every change
 //! rewrites it: entries that stay are copied raw (no recompression) into a
 //! temp file next to the archive, new entries are added, and the temp file
-//! then replaces the archive in one rename. Until [`ZipEdit::commit`] the
-//! archive is untouched; dropping an uncommitted edit removes the temp file.
+//! then replaces the archive in one rename. Entries encrypted with ZipCrypto
+//! are copied encrypted and get their encryption flag put back at `commit`.
+//! Until [`ZipEdit::commit`] the archive is untouched; dropping an
+//! uncommitted edit removes the temp file.
 
 use crate::gz_edit::GzEdit;
 use crate::sevenz_edit::SevenZEdit;
@@ -11,7 +13,7 @@ use crate::vfs::{self, clean_parts, Format};
 use chrono::{DateTime, Datelike, Local, Timelike};
 use std::collections::HashSet;
 use std::fs::{self, File};
-use std::io::{self, BufReader, BufWriter, Write};
+use std::io::{self, BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use zip::write::SimpleFileOptions;
@@ -47,6 +49,8 @@ pub(crate) struct ZipEdit {
     writer: Option<ZipWriter<BufWriter<File>>>,
     /// Keys of the folder entries written so far.
     dirs: HashSet<String>,
+    /// Stored name bytes of entries copied raw while encrypted (ZipCrypto).
+    encrypted: Vec<Vec<u8>>,
 }
 
 impl ZipEdit {
@@ -56,7 +60,7 @@ impl ZipEdit {
         let temp = archive.with_file_name(format!(".{}.{}.rctmp", name.to_string_lossy(), std::process::id()));
         let file = File::create(&temp)?;
         let writer = ZipWriter::new(BufWriter::new(file));
-        Ok(ZipEdit { archive: archive.to_path_buf(), temp, writer: Some(writer), dirs: HashSet::new() })
+        Ok(ZipEdit { archive: archive.to_path_buf(), temp, writer: Some(writer), dirs: HashSet::new(), encrypted: Vec::new() })
     }
 
     fn writer(&mut self) -> &mut ZipWriter<BufWriter<File>> {
@@ -114,22 +118,26 @@ impl ZipEdit {
     fn copy_raw(&mut self, source: &mut ZipArchive<BufReader<File>>, i: usize, name: Option<String>, is_dir: bool)
         -> io::Result<()> {
         let file = source.by_index_raw(i).map_err(io_err)?;
-        // The zip crate copies ZipCrypto entries without their encryption
-        // flag, which would leave them unreadable; AES ones survive.
+        // The stored name bytes the writer will put down for this entry.
+        let renamed = name.map(|n| if is_dir { format!("{n}/") } else { n });
+        // The stored name bytes the writer will put down for this entry.
+        let stored = match renamed.as_ref() {
+            Some(n) => n.as_bytes().to_owned(),
+            None => file.name_raw().to_owned(),
+        };
+        let written = renamed.clone().unwrap_or_else(|| file.name().unwrap_or_default().into_owned());
+        // The zip crate's raw copy writes ZipCrypto entries without their
+        // encryption flag (AES ones keep theirs through their AE-x field); the
+        // encrypted bytes themselves are copied as they are, so the flag is
+        // put back over those entries in the temp file at `commit`.
         if file.encrypted() && !file.extra_data_fields().any(|e| matches!(e, zip::ExtraField::AeXEncryption(_))) {
-            return Err(io::Error::other(
-                "This zip has files encrypted with ZipCrypto, which can't be kept when changing it",
-            ));
+            self.encrypted.push(stored);
         }
-        let written = name.clone().unwrap_or_else(|| file.name().unwrap_or_default().into_owned());
         if is_dir {
             self.dirs.insert(key(&written));
         }
-        match name {
-            Some(name) => {
-                let name = if is_dir { format!("{name}/") } else { name };
-                self.writer().raw_copy_file_rename(file, name)
-            }
+        match renamed {
+            Some(name) => self.writer().raw_copy_file_rename(file, name),
             None => self.writer().raw_copy_file(file),
         }
         .map_err(io_err)
@@ -165,9 +173,46 @@ impl ZipEdit {
         let writer = self.writer.take().expect("commit runs once");
         let file = writer.finish().map_err(io_err)?.into_inner().map_err(|e| e.into_error())?;
         file.sync_all()?;
-        drop(file);
+        self.restore_encrypted_flags(file)?;
         fs::rename(&self.temp, &self.archive)?;
         crate::vfs::forget(&self.archive);
+        Ok(())
+    }
+
+    /// Sets the encryption flag (bit 0) back on the local header and central
+    /// directory record of the entries in `encrypted` (stored name bytes, in
+    /// the order copied): their data was copied raw, still encrypted, but the
+    /// zip crate wrote them unflagged. `file` is the finished temp archive,
+    /// the handle the entries were written through.
+    fn restore_encrypted_flags(&mut self, file: File) -> io::Result<()> {
+        let mut names: Vec<Vec<u8>> = self.encrypted.clone();
+        self.encrypted.clear();
+        if names.is_empty() {
+            return Ok(());
+        }
+        // The flag bytes as the reader sees them (through a plain read
+        // handle), encrypted bit set.
+        let mut flags: Vec<(u64, u8)> = Vec::new();
+        {
+            let mut source = ZipArchive::new(BufReader::new(File::open(&self.temp)?)).map_err(io_err)?;
+            for i in 0..source.len() {
+                let entry = source.by_index_raw(i).map_err(io_err)?;
+                if let Some(j) = names.iter().position(|n| n == entry.name_raw()) {
+                    let flag = (entry.flags().as_u16() | 1) as u8;
+                    flags.extend([
+                        (entry.central_header_start() + 8, flag),
+                        (entry.header_start() + 6, flag),
+                    ]);
+                    names.remove(j);
+                }
+            }
+        }
+        let mut file = file;
+        for (at, flag) in flags {
+            file.seek(SeekFrom::Start(at))?;
+            file.write_all(&[flag])?;
+        }
+        file.sync_all()?;
         Ok(())
     }
 }

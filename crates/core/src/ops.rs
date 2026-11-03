@@ -2562,7 +2562,7 @@ mod tests {
     ];
 
     #[test]
-    fn zipcrypto_is_read_but_not_rewritten() {
+    fn zipcrypto_entries_survive_a_rewrite() {
         let tmp = TempDir::new("zipcrypto");
         let zip = tmp.0.join("zc.zip");
         fs::write(&zip, ZIPCRYPTO).unwrap();
@@ -2570,11 +2570,24 @@ mod tests {
         assert!(!vfs::try_password(&zip, "abd").unwrap());
         assert!(vfs::try_password(&zip, "abc").unwrap());
         assert_eq!(zip_read(&zip.join("keep.txt")), b"kept secret");
-        // Its entries would lose their encryption flag: refused, unchanged.
+        // Deleting an entry keeps the encrypted one encrypted and readable.
         let (o, _) = run_job(Job::Delete { paths: vec![zip.join("drop.txt")], to_trash: false }, Resolution::Cancel);
-        assert_eq!(o.errors.len(), 1);
-        assert!(o.errors[0].1.contains("ZipCrypto"), "{:?}", o.errors);
-        assert_eq!(fs::read(&zip).unwrap(), ZIPCRYPTO);
+        assert!(o.errors.is_empty(), "{:?}", o.errors);
+        assert_ne!(fs::read(&zip).unwrap(), ZIPCRYPTO);
+        assert_eq!(zip_names(&zip), ["keep.txt"]);
+        assert_eq!(zip_read(&zip.join("keep.txt")), b"kept secret");
+        // Renaming it keeps it encrypted too.
+        let (o, _) = run_job(Job::Rename { from: zip.join("keep.txt"), to: zip.join("moved.txt") }, Resolution::Cancel);
+        assert!(o.errors.is_empty(), "{:?}", o.errors);
+        assert_eq!(zip_names(&zip), ["moved.txt"]);
+        assert_eq!(zip_read(&zip.join("moved.txt")), b"kept secret");
+        // A plain file can be added next to it.
+        let local = tmp.0.join("note.txt");
+        fs::write(&local, b"note").unwrap();
+        let (o, _) = run_job(Job::Copy(plan_transfer(std::slice::from_ref(&local), &zip).unwrap()), Resolution::Cancel);
+        assert!(o.errors.is_empty(), "{:?}", o.errors);
+        assert_eq!(zip_read(&zip.join("note.txt")), b"note");
+        assert_eq!(zip_read(&zip.join("moved.txt")), b"kept secret");
     }
 
     #[test]
