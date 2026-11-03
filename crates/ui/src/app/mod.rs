@@ -66,6 +66,10 @@ fn dialog_input_id() -> text_input::Id {
     text_input::Id::new("dialog-input")
 }
 
+fn dialog_comment_id() -> text_input::Id {
+    text_input::Id::new("dialog-comment")
+}
+
 fn path_input_id() -> text_input::Id {
     text_input::Id::new("path-input")
 }
@@ -258,6 +262,9 @@ enum Dialog {
     Compare { opts: CompareOptions },
     /// Remove a hotlist group with entries (Del in the hotlist tree).
     RemoveGroup { path: Vec<usize>, name: String, count: usize },
+    /// F2 on a hotlist folder: its display name and comment. `back`: the
+    /// Ctrl+D popup (menu, selected) to return to. `field`: 0 name, 1 comment.
+    HotEdit { path: Vec<usize>, dir: String, name: String, comment: String, back: Option<(Vec<usize>, usize)>, field: u8 },
     /// Check for updates: result, offer, download progress.
     Update(update::UpdateDialog),
 }
@@ -419,6 +426,8 @@ pub enum Message {
     RenameSubmit,
     QuickSearchTimeout(u64),
     DialogInput(String),
+    /// The comment box of the hotlist entry editor.
+    DialogComment(String),
     DialogSubmit,
     /// Enter in a dialog's text box: activates the focused button.
     DialogEnter,
@@ -1067,6 +1076,11 @@ impl App {
                     self.quick_search = None;
                 }
             }
+            Message::DialogComment(value) => {
+                if let Some(Dialog::HotEdit { comment, .. }) = &mut self.dialog {
+                    *comment = value;
+                }
+            }
             Message::DialogInput(value) => {
                 if let Some(
                     Dialog::Transfer { input, .. }
@@ -1078,6 +1092,8 @@ impl App {
                 ) = &mut self.dialog
                 {
                     *input = value;
+                } else if let Some(Dialog::HotEdit { name, .. }) = &mut self.dialog {
+                    *name = value;
                 }
             }
             Message::DialogSubmit => return self.submit_dialog(),
@@ -1330,6 +1346,12 @@ impl App {
             // Dialogs with a text box keep Left/Right for its cursor.
             let has_input =
                 !matches!(self.dialog, Some(Dialog::Delete { .. } | Dialog::Compare { .. } | Dialog::RemoveGroup { .. }));
+            if let (Some(Named::Tab), Some(Dialog::HotEdit { field, .. })) = (named, &mut self.dialog) {
+                // Tab flips between the name and comment boxes.
+                *field = 1 - *field;
+                let id = if *field == 0 { dialog_input_id() } else { dialog_comment_id() };
+                return Task::batch([text_input::focus(id.clone()), text_input::select_all(id)]);
+            }
             let back = match named {
                 Some(Named::Tab) => Some(mods.shift()),
                 Some(Named::ArrowLeft) if !has_input => Some(true),
@@ -2226,6 +2248,15 @@ impl App {
                 return self.palette_pick(selected);
             }
             Dialog::RemoveGroup { path, .. } => self.tree_remove_now(&path),
+            Dialog::HotEdit { path, name, comment, back, .. } => {
+                if let Some(item) = crate::hotlist::get_mut(&mut self.hotlist, &path) {
+                    item.set_note(&name, &comment);
+                    self.save_session();
+                }
+                if let Some((at, selected)) = back {
+                    self.dialog = Some(Dialog::Hotlist(hotlist::HotlistMenu { at, selected, ..Default::default() }));
+                }
+            }
             // Its buttons send their own messages.
             Dialog::Update(d) => self.dialog = Some(Dialog::Update(d)),
             Dialog::Compare { opts } => {

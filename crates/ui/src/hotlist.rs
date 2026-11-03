@@ -6,16 +6,43 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// One hotlist entry. In `session.toml` a folder is a plain path string (the
-/// format older versions wrote) and a submenu an inline table
+/// format older versions wrote) unless it has a display name or comment, then
+/// an inline table `{ path = "…", name = "…", comment = "…" }`; a submenu is
 /// `{ name = "…", items = [...] }`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
+#[serde(from = "Stored", into = "Stored")]
 pub enum HotItem {
-    Folder(PathBuf),
+    Folder {
+        path: PathBuf,
+        /// Shown instead of the folder's name (empty: the folder's own name).
+        name: String,
+        /// Shown as a tooltip (empty: none).
+        comment: String,
+    },
     Menu {
         name: String,
         /// Shown open in the hotlist tree (left panel); saved so the tree
         /// looks the same next time. Written only when set.
+        expanded: bool,
+        items: Vec<HotItem>,
+    },
+}
+
+/// The saved form of [`HotItem`].
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum Stored {
+    Plain(PathBuf),
+    // Before `Menu`: a folder table has a `name` too.
+    Folder {
+        path: PathBuf,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        name: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        comment: String,
+    },
+    Menu {
+        name: String,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         expanded: bool,
         #[serde(default)]
@@ -23,10 +50,35 @@ pub enum HotItem {
     },
 }
 
+impl From<Stored> for HotItem {
+    fn from(s: Stored) -> Self {
+        match s {
+            Stored::Plain(path) => HotItem::folder_at(path),
+            Stored::Folder { path, name, comment } => HotItem::Folder { path, name, comment },
+            Stored::Menu { name, expanded, items } => HotItem::Menu { name, expanded, items },
+        }
+    }
+}
+
+impl From<HotItem> for Stored {
+    fn from(item: HotItem) -> Self {
+        match item {
+            HotItem::Folder { path, name, comment } if name.is_empty() && comment.is_empty() => Stored::Plain(path),
+            HotItem::Folder { path, name, comment } => Stored::Folder { path, name, comment },
+            HotItem::Menu { name, expanded, items } => Stored::Menu { name, expanded, items },
+        }
+    }
+}
+
 impl HotItem {
+    /// A folder entry without a custom name or comment.
+    pub fn folder_at(path: PathBuf) -> Self {
+        HotItem::Folder { path, name: String::new(), comment: String::new() }
+    }
+
     pub fn folder(&self) -> Option<&Path> {
         match self {
-            HotItem::Folder(path) => Some(path),
+            HotItem::Folder { path, .. } => Some(path),
             HotItem::Menu { .. } => None,
         }
     }
@@ -39,19 +91,39 @@ impl HotItem {
     /// How many entries the item holds, at any depth (0 for a folder).
     pub fn count(&self) -> usize {
         match self {
-            HotItem::Folder(_) => 0,
+            HotItem::Folder { .. } => 0,
             HotItem::Menu { items, .. } => items.iter().map(|it| 1 + it.count()).sum(),
         }
     }
 
-    /// The name shown for the item: a group's name, a folder's last
-    /// component (the whole path for a drive root).
+    /// The name shown for the item: a group's name, a folder's custom name or
+    /// last component (the whole path for a drive root).
     pub fn label(&self) -> String {
         match self {
-            HotItem::Folder(path) => {
+            HotItem::Folder { name, .. } if !name.is_empty() => name.clone(),
+            HotItem::Folder { path, .. } => {
                 path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string())
             }
             HotItem::Menu { name, .. } => name.clone(),
+        }
+    }
+
+    /// A folder's tooltip: its comment, then its path; `None` when it has
+    /// neither a custom name nor a comment (and for groups).
+    pub fn tip(&self) -> Option<String> {
+        let HotItem::Folder { path, name, comment } = self else { return None };
+        if name.is_empty() && comment.is_empty() {
+            return None;
+        }
+        let path = rc_core::remote::display(path);
+        Some(if comment.is_empty() { path } else { format!("{comment}\n{path}") })
+    }
+
+    /// Sets a folder's custom name and comment (trimmed; empty clears).
+    pub fn set_note(&mut self, new_name: &str, new_comment: &str) {
+        if let HotItem::Folder { name, comment, .. } = self {
+            *name = new_name.trim().to_owned();
+            *comment = new_comment.trim().to_owned();
         }
     }
 }
@@ -92,7 +164,7 @@ pub fn find(items: &[HotItem], folder: &Path) -> Option<(Vec<usize>, usize)> {
             at.insert(0, i);
             (at, j)
         }),
-        HotItem::Folder(_) => None,
+        HotItem::Folder { .. } => None,
     })
 }
 
@@ -104,7 +176,7 @@ pub fn toggle(items: &mut Vec<HotItem>, folder: &Path) -> bool {
             false
         }
         None => {
-            items.push(HotItem::Folder(folder.to_path_buf()));
+            items.push(HotItem::folder_at(folder.to_path_buf()));
             true
         }
     }
@@ -175,7 +247,7 @@ pub fn get_mut<'a>(top: &'a mut [HotItem], path: &[usize]) -> Option<&'a mut Hot
     }
     match item {
         HotItem::Menu { items, .. } => get_mut(items, rest),
-        HotItem::Folder(_) => None,
+        HotItem::Folder { .. } => None,
     }
 }
 
@@ -185,7 +257,7 @@ pub fn menu_at<'a>(top: &'a [HotItem], at: &[usize]) -> Option<&'a [HotItem]> {
     for &i in at {
         match items.get(i)? {
             HotItem::Menu { items: sub, .. } => items = sub,
-            HotItem::Folder(_) => return None,
+            HotItem::Folder { .. } => return None,
         }
     }
     Some(items)
@@ -197,7 +269,7 @@ pub fn menu_at_mut<'a>(top: &'a mut Vec<HotItem>, at: &[usize]) -> Option<&'a mu
     for &i in at {
         match items.get_mut(i)? {
             HotItem::Menu { items: sub, .. } => items = sub,
-            HotItem::Folder(_) => return None,
+            HotItem::Folder { .. } => return None,
         }
     }
     Some(items)
@@ -277,7 +349,7 @@ pub fn set_expanded(top: &mut [HotItem], path: &[usize], open: Option<bool>) -> 
             *expanded = open.unwrap_or(!*expanded);
             Some(*expanded)
         }
-        HotItem::Folder(_) => None,
+        HotItem::Folder { .. } => None,
     }
 }
 
@@ -286,7 +358,7 @@ mod tests {
     use super::*;
 
     fn f(p: &str) -> HotItem {
-        HotItem::Folder(PathBuf::from(p))
+        HotItem::folder_at(PathBuf::from(p))
     }
 
     fn sub(name: &str, items: Vec<HotItem>) -> HotItem {
@@ -399,6 +471,34 @@ mod tests {
         assert_eq!(move_to(&mut top, &[7], &[], 0), None);
         assert_eq!(move_to(&mut top, &[0], &[0], 0), None);
         assert_eq!(top, start);
+    }
+
+    #[test]
+    fn notes_round_trip_and_old_files_load() {
+        #[derive(Serialize, Deserialize)]
+        struct S {
+            hotlist: Vec<HotItem>,
+        }
+        let mut named = f("c");
+        named.set_note("  Mine ", "");
+        let mut both = f("d");
+        both.set_note("", " the notes ");
+        let s = S { hotlist: vec![f("a"), named, open("G", vec![both.clone()])] };
+        let text = toml::to_string_pretty(&s).unwrap();
+        // Entries without a note stay plain strings.
+        assert_eq!(text.matches("path").count(), 2, "{text}");
+        assert_eq!(text.matches("comment").count(), 1, "{text}");
+        let back: S = toml::from_str(&text).unwrap();
+        assert_eq!(back.hotlist, s.hotlist);
+        assert_eq!(back.hotlist[1].label(), "Mine");
+        assert_eq!(back.hotlist[1].tip().as_deref(), Some("c"));
+        assert_eq!(both.label(), "d");
+        assert_eq!(both.tip().as_deref(), Some("the notes\nd"));
+        assert_eq!(f("a").tip(), None);
+        let old: S = toml::from_str("hotlist = ['a', { path = 'b', name = 'B' }, { name = 'G', items = ['g'] }]").unwrap();
+        assert_eq!(old.hotlist[0], f("a"));
+        assert_eq!(old.hotlist[1].label(), "B");
+        assert_eq!(old.hotlist[2], sub("G", vec![f("g")]));
     }
 
     #[test]

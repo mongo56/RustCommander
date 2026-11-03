@@ -47,7 +47,7 @@ impl App {
         ("Right / Left, Backspace", "Open the submenu / back to the menu above"),
         ("A, +", "Add / remove the current folder (in the menu shown)"),
         ("N", "New submenu: type its name, Enter"),
-        ("F2", "Rename the submenu"),
+        ("F2", "Rename the submenu; on a folder: edit its display name and comment (tooltip)"),
         ("Ctrl+Up, Ctrl+Down", "Move the entry up / down"),
         ("Ctrl+Right", "Move the entry into the submenu above it"),
         ("Ctrl+Left", "Move the entry out of the submenu"),
@@ -150,6 +150,7 @@ impl App {
                 menu.naming = Some(name.clone());
                 menu.renaming = true;
             }
+            Some(Named::F2) if selected < count - 1 => return self.hotlist_edit(hotlist_path(&at, selected), Some((at, selected))),
             Some(Named::Delete) if selected < count - 1 => {
                 hotlist::remove(hotlist::menu_mut(&mut self.hotlist, &at), selected);
                 let count = hotlist::menu(&self.hotlist, &at).len() + 1;
@@ -197,7 +198,7 @@ impl App {
                 menu.selected = 0;
                 return Task::none();
             }
-            Some(HotItem::Folder(path)) => {
+            Some(HotItem::Folder { path, .. }) => {
                 let path = path.clone();
                 self.dialog = None;
                 return self.start_nav(self.active, Nav::to(path));
@@ -258,5 +259,31 @@ impl App {
             Some(nav) => self.start_nav(self.active, nav),
             None => Task::none(),
         }
+    }
+}
+
+/// The full index path of entry `i` of the menu at `at`.
+fn hotlist_path(at: &[usize], i: usize) -> Vec<usize> {
+    let mut path = at.to_vec();
+    path.push(i);
+    path
+}
+
+impl App {
+    /// Opens the editor for the display name and comment of the folder entry
+    /// at `path`; `back`: the Ctrl+D popup place to return to afterwards.
+    pub(super) fn hotlist_edit(&mut self, path: Vec<usize>, back: Option<(Vec<usize>, usize)>) -> Task<Message> {
+        let Some(HotItem::Folder { path: dir, name, comment }) = hotlist::get(&self.hotlist, &path) else {
+            return Task::none();
+        };
+        let dialog = Dialog::HotEdit {
+            dir: rc_core::remote::display(dir),
+            name: name.clone(),
+            comment: comment.clone(),
+            path,
+            back,
+            field: 0,
+        };
+        self.open_dialog(dialog)
     }
 }

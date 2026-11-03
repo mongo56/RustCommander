@@ -167,14 +167,14 @@ impl App {
         ("Right / Left", "Open the group (then to its first entry) / close it, or go to the group holding the entry"),
         ("Space", "Open or close the group"),
         ("F7 (new folder key)", "New group after the cursor: type its name, Enter"),
-        ("F2", "Rename the group"),
+        ("F2", "Rename the group; on a folder: edit its display name and comment (tooltip)"),
         ("+", "Add the last active panel's folder (into the group, or after the entry)"),
         ("Del", "Remove the entry (asks first for a group with entries)"),
         ("Ctrl+Up, Ctrl+Down", "Move the entry up / down"),
         ("Ctrl+Right / Ctrl+Left", "Move the entry into the group above it / out of its group"),
         ("Drag", "Move entries and groups, also into and out of groups; a folder dropped on a panel opens there"),
         ("Drag folders from a panel", "Add them to the hotlist where dropped (Explorer drops: at the end)"),
-        ("Right-click", "Menu: open in a new tab, new group, rename, add the last active panel's folder, remove"),
+        ("Right-click", "Menu: open in a new tab, rename or comment, new group, add the last active panel's folder, remove"),
         ("Other keys", "Commands act on the last active panel as if it had the focus (Ctrl+S, Shift+F6 move the focus there)"),
     ];
 
@@ -314,6 +314,10 @@ impl App {
     }
 
     fn tree_start_naming(&mut self, path: Vec<usize>, new: bool) -> Task<Message> {
+        if matches!(hotlist::get(&self.hotlist, &path), Some(HotItem::Folder { .. })) {
+            self.tree_set_cursor(path.clone());
+            return self.hotlist_edit(path, None);
+        }
         let Some(HotItem::Menu { name, .. }) = hotlist::get(&self.hotlist, &path) else { return Task::none() };
         self.tree.naming = Some(Naming { path: path.clone(), text: name.clone(), new });
         self.tree_set_cursor(path);
@@ -340,7 +344,7 @@ impl App {
     fn tree_add_spot(&self, target: Option<&[usize]>) -> (Vec<usize>, usize) {
         match target.and_then(|p| Some((p, hotlist::get(&self.hotlist, p)?))) {
             Some((p, HotItem::Menu { items, .. })) => (p.to_vec(), items.len()),
-            Some((p, HotItem::Folder(_))) => {
+            Some((p, HotItem::Folder { .. })) => {
                 let (&last, at) = p.split_last().unwrap_or((&0, &[]));
                 (at.to_vec(), last + 1)
             }
@@ -376,7 +380,7 @@ impl App {
         };
         let mut last = None;
         for (k, dir) in new.into_iter().enumerate() {
-            last = hotlist::insert(&mut self.hotlist, at, index + k, HotItem::Folder(dir));
+            last = hotlist::insert(&mut self.hotlist, at, index + k, HotItem::folder_at(dir));
         }
         self.tree_expand_to(at);
         if let Some(path) = last {
@@ -404,7 +408,7 @@ impl App {
     /// there); the focus stays where it is. A group opens or closes instead.
     fn tree_open(&mut self, path: &[usize], new_tab: bool) -> Task<Message> {
         match hotlist::get(&self.hotlist, path) {
-            Some(HotItem::Folder(dir)) => {
+            Some(HotItem::Folder { path: dir, .. }) => {
                 let dir = dir.clone();
                 self.tree_set_cursor(path.to_vec());
                 let side = self.active;
@@ -444,7 +448,7 @@ impl App {
     pub(super) fn tree_remove_now(&mut self, path: &[usize]) {
         let Some(item) = hotlist::take(&mut self.hotlist, path) else { return };
         let what = match &item {
-            HotItem::Folder(dir) => dir.display().to_string(),
+            HotItem::Folder { path, .. } => path.display().to_string(),
             HotItem::Menu { name, .. } => format!("the group \"{name}\""),
         };
         self.status = Some((format!("Removed {what} from the hotlist"), Tone::Info));
@@ -536,7 +540,7 @@ impl App {
                 return none;
             }
             Some(Named::Enter) if mods.shift() && !mods.control() => return Some(self.tree_open(&cur, true)),
-            Some(Named::F2) if plain && is_group => return Some(self.tree_start_naming(cur, false)),
+            Some(Named::F2) if plain && row.is_some() => return Some(self.tree_start_naming(cur, false)),
             _ => {}
         }
         if let Some(t) = text.filter(|t| plain && !t.is_empty() && !t.chars().any(char::is_control)) {
@@ -571,7 +575,7 @@ impl App {
             OpenInNewTab if row.is_some() => return Some(self.tree_open(&cur, true)),
             GoParent if cur.len() > 1 => self.tree_set_cursor(cur[..cur.len() - 1].to_vec()),
             ToggleSelect { .. } if is_group => self.tree_toggle_group(&cur, None),
-            Rename if is_group => return Some(self.tree_start_naming(cur, false)),
+            Rename if row.is_some() => return Some(self.tree_start_naming(cur, false)),
             MakeDir => return Some(self.tree_new_group(row.map(|_| cur))),
             Delete | DeletePermanent if row.is_some() => return Some(self.tree_remove(cur)),
             Open | OpenInNewTab | GoParent | ToggleSelect { .. } | Rename | Delete | DeletePermanent => {}
@@ -611,7 +615,7 @@ impl App {
     fn tree_actions(&self, target: Option<&[usize]>) -> Vec<Action> {
         use Action::*;
         match target.and_then(|p| hotlist::get(&self.hotlist, p)) {
-            Some(HotItem::Folder(_)) => vec![Open, OpenNewTab, NewGroup, AddCurrent, Remove],
+            Some(HotItem::Folder { .. }) => vec![Open, OpenNewTab, Rename, NewGroup, AddCurrent, Remove],
             Some(HotItem::Menu { .. }) => vec![Expand, Rename, NewGroup, AddCurrent, Remove],
             None => vec![NewGroup, AddCurrent],
         }
@@ -678,7 +682,7 @@ impl App {
     /// The panel a folder dragged out of the tree would open in.
     pub(super) fn tree_drop_side(&self) -> Option<usize> {
         let press = self.tree.press.as_ref().filter(|p| p.active)?;
-        let folder = matches!(hotlist::get(&self.hotlist, &press.path), Some(HotItem::Folder(_)));
+        let folder = matches!(hotlist::get(&self.hotlist, &press.path), Some(HotItem::Folder { .. }));
         (folder && self.tree.over.is_none() && !self.tree_under_mouse()).then(|| self.side_under_mouse())
     }
 
@@ -691,7 +695,7 @@ impl App {
         // A folder dragged onto a panel opens there, which gets the focus.
         if let Some(side) = self.tree_drop_side() {
             let press = self.tree.press.take();
-            if let Some(HotItem::Folder(dir)) = press.and_then(|p| hotlist::get(&self.hotlist, &p.path)) {
+            if let Some(HotItem::Folder { path: dir, .. }) = press.and_then(|p| hotlist::get(&self.hotlist, &p.path)) {
                 let dir = dir.clone();
                 self.focus_panel(side);
                 return self.start_nav(side, Nav::to(dir));
@@ -800,7 +804,7 @@ impl App {
         let spot = self.tree_spot(&rows);
         Some(match dirs.as_slice() {
             [] => "Only folders go into the hotlist".to_owned(),
-            [one] => format!("Add {} to the hotlist{}", HotItem::Folder(one.clone()).label(), into(&spot)),
+            [one] => format!("Add {} to the hotlist{}", HotItem::folder_at(one.clone()).label(), into(&spot)),
             many => format!("Add {} folders to the hotlist{}", many.len(), into(&spot)),
         })
     }
@@ -1111,7 +1115,7 @@ impl App {
                         ),
                 };
             }
-            HotItem::Folder(dir) => {
+            HotItem::Folder { path: dir, .. } => {
                 content = content.push(Space::with_width(CHEVRON));
                 content = content.push(match self.icon(dir, true) {
                     Some(icon) => Element::from(image(icon).width(ICON).height(ICON)),
@@ -1162,7 +1166,16 @@ impl App {
         if naming.is_none() {
             area = area.on_press(Message::Tree(TreeMsg::Press(path)));
         }
-        area.into()
+        match item.tip().filter(|_| naming.is_none() && self.tree.press.is_none()) {
+            Some(tip) => tooltip(
+                area,
+                container(text(tip).size(12)).padding([3, 8]).max_width(420).style(theme::drag_label),
+                tooltip::Position::Bottom,
+            )
+            .gap(2)
+            .into(),
+            None => area.into(),
+        }
     }
 
     /// The right-click menu, over everything at the mouse.
@@ -1171,7 +1184,7 @@ impl App {
         let c = theme::c();
         let actions = self.tree_actions(menu.target.as_deref());
         let item = menu.target.as_deref().and_then(|p| hotlist::get(&self.hotlist, p));
-        let current = HotItem::Folder(self.panel(self.active).path.clone()).label();
+        let current = HotItem::folder_at(self.panel(self.active).path.clone()).label();
         let panel = if self.active == 0 { "left panel" } else { "right panel" };
         let mut list = Column::new().spacing(1);
         let mut height = 10.0;
@@ -1183,7 +1196,10 @@ impl App {
                     let open = matches!(item, Some(HotItem::Menu { expanded: true, .. }));
                     (if open { "Collapse" } else { "Expand" }.to_owned(), "Enter")
                 }
-                Action::Rename => ("Rename group".to_owned(), "F2"),
+                Action::Rename => match item {
+                    Some(HotItem::Menu { .. }) => ("Rename group".to_owned(), "F2"),
+                    _ => ("Name and comment...".to_owned(), "F2"),
+                },
                 Action::NewGroup => ("New group".to_owned(), "F7"),
                 Action::AddCurrent => match item {
                     Some(HotItem::Menu { .. }) => (format!("Add \"{current}\" ({panel}) here"), "+"),
@@ -1238,7 +1254,7 @@ fn count_folders(items: &[HotItem]) -> usize {
     items
         .iter()
         .map(|it| match it {
-            HotItem::Folder(_) => 1,
+            HotItem::Folder { .. } => 1,
             HotItem::Menu { items, .. } => count_folders(items),
         })
         .sum()

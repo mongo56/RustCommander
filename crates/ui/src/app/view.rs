@@ -6,7 +6,7 @@ use crate::theme::filled;
 use iced::widget::text::Wrapping;
 use iced::widget::{
     button, center, checkbox, column, container, image, mouse_area, opaque, progress_bar, responsive, row,
-    stack, text, text_input, Column, Row, Space,
+    stack, text, text_input, tooltip, Column, Row, Space,
 };
 use iced::{Alignment, Element, Length, Padding, Vector};
 use rc_core::format;
@@ -708,6 +708,38 @@ impl App {
         .into()
     }
 
+    /// The editor of a hotlist folder's display name and comment.
+    fn hot_edit_view<'a>(&'a self, dir: &'a str, name: &'a str, comment: &'a str, focus: usize) -> Element<'a, Message> {
+        let field = |hint: &'static str, value: &'a str, id: iced::widget::text_input::Id, on_input: fn(String) -> Message| {
+            text_input(hint, value)
+                .id(id)
+                .on_input(on_input)
+                .on_submit(Message::DialogEnter)
+                .padding(8)
+                .size(13)
+                .style(theme::input)
+        };
+        let label = |s: &'static str| text(s).size(12).color(theme::c().muted);
+        let content = column![
+            text("Hotlist entry").size(16),
+            text(dir).size(13).color(theme::c().muted),
+            label("Display name (empty: the folder's own name)"),
+            field("Name", name, dialog_input_id(), Message::DialogInput),
+            label("Comment (shown as a tooltip)"),
+            field("Comment", comment, dialog_comment_id(), Message::DialogComment),
+            row![
+                text("Tab switches boxes").size(11).color(theme::c().muted),
+                Space::with_width(Length::Fill),
+                dialog_button("Cancel", Message::DialogCancel, false, focus == 0),
+                dialog_button("OK", Message::DialogSubmit, true, focus == 1),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        ]
+        .spacing(8);
+        container(content).padding(20).width(Length::Fixed(520.0)).style(theme::dialog).into()
+    }
+
     fn dialog_view<'a>(&'a self, dialog: &'a Dialog) -> Element<'a, Message> {
         match dialog {
             Dialog::Hotlist(menu) => return self.hotlist_view(menu),
@@ -715,6 +747,9 @@ impl App {
             Dialog::Palette(palette) => return self.palette_view(palette),
             Dialog::Compare { opts } => return compare_view(opts, self.dialog_focus.unwrap_or(1)),
             Dialog::Update(d) => return self.update_view(d),
+            Dialog::HotEdit { dir, name, comment, .. } => {
+                return self.hot_edit_view(dir, name, comment, self.dialog_focus.unwrap_or(1));
+            }
             _ => {}
         }
         let input_field = |value: &'a str| {
@@ -791,7 +826,7 @@ impl App {
                 None,
                 "Remove",
             ),
-            Dialog::Hotlist(_) | Dialog::History { .. } | Dialog::Palette(_) | Dialog::Compare { .. } | Dialog::Update(_) => {
+            Dialog::Hotlist(_) | Dialog::History { .. } | Dialog::Palette(_) | Dialog::Compare { .. } | Dialog::Update(_) | Dialog::HotEdit { .. } => {
                 unreachable!("drawn above")
             }
         };
@@ -858,13 +893,9 @@ impl App {
                 items = items.push_maybe(new_name.map(|typed| new_submenu_row(typed)));
             }
             let content = match item {
-                HotItem::Folder(path) => {
-                    let name = path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| path.display().to_string());
+                HotItem::Folder { path, .. } => {
                     let color = if path == here { theme::c().selected } else { theme::c().text };
-                    self.popup_row(i, Some(path), name, color, path.display().to_string())
+                    self.popup_row(i, Some(path), item.label(), color, path.display().to_string())
                 }
                 HotItem::Menu { name, items, .. } => {
                     let name = match &menu.naming {
@@ -878,7 +909,17 @@ impl App {
                     self.popup_row(i, None, name, theme::c().text, count)
                 }
             };
-            items = items.push(row_button(content, i));
+            items = items.push(match item.tip() {
+                Some(tip) => Element::from(
+                    tooltip(
+                        row_button(content, i),
+                        container(text(tip).size(12)).padding([3, 8]).max_width(420).style(theme::drag_label),
+                        tooltip::Position::Bottom,
+                    )
+                    .gap(2),
+                ),
+                None => row_button(content, i).into(),
+            });
         }
         let n = entries.len();
         if selected >= n {

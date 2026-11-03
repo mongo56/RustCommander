@@ -196,8 +196,8 @@ mod tests {
             },
             right: SideState::default(),
             hotlist: vec![
-                HotItem::Folder(dir.clone()),
-                HotItem::Menu { name: "Work".into(), expanded: true, items: vec![HotItem::Folder(dir.join("x"))] },
+                HotItem::folder_at(dir.clone()),
+                HotItem::Menu { name: "Work".into(), expanded: true, items: vec![HotItem::folder_at(dir.join("x"))] },
                 HotItem::Menu { name: "Empty".into(), expanded: false, items: vec![] },
             ],
             hotlist_tree: true,
@@ -252,7 +252,7 @@ mod tests {
         "#;
         let session: Session = toml::from_str(text).unwrap();
         assert_eq!(session.compare, Some(CompareState { by_content: true, ignore_date: false, subfolders: true }));
-        let folders = [r"C:\Users", r"D:\Work"].map(|p| HotItem::Folder(PathBuf::from(p)));
+        let folders = [r"C:\Users", r"D:\Work"].map(|p| HotItem::folder_at(PathBuf::from(p)));
         assert_eq!(session.hotlist, folders);
         assert_eq!(session.split, 0.5);
         assert!(!session.hotlist_tree);
