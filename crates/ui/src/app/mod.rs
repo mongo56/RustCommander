@@ -1205,7 +1205,7 @@ impl App {
         ("Middle-click a folder or drive", "Open it in a new tab"),
         ("Right-click a drive", "Windows menu for the drive"),
         ("Enter on a .iso, .img, .vhd, .vhdx", "Mount the disk image (Windows' Mount) and open the new drive"),
-        ("Enter / Ctrl+PgDn on a .zip, .7z, .rar, .tar, .tar.gz, .gz, ...", "Browse the archive like a folder: view, copy out, Enter opens a temp copy; in a zip also copy/move in (also from other archives), F7, F2, F8 (others are read-only)"),
+        ("Enter / Ctrl+PgDn on a .zip, .7z, .rar, .tar, .tar.gz, .gz, ...", "Browse the archive like a folder: view, copy out, Enter opens a temp copy; in a zip, 7z, tar or gz also copy/move in (also from other archives), F7, F2, F8 (rar is read-only)"),
         ("Ctrl+F, then Enter", "Connect to an SFTP/FTP/FTPS server: browse, F3 view, F5/F6 download and upload, F7, F2, F8 work there; Ctrl+Shift+F disconnects"),
         ("Right-click", "Explorer context menu"),
         ("Drag and drop", "Copy (Shift = move) between panels and other apps; right drag = drop menu"),
@@ -2653,8 +2653,8 @@ impl App {
     // ---- helpers ----------------------------------------------------------
 
     /// If `side` shows an archive (or a folder in one) where `what` can't be
-    /// done, says so and returns true. `zip_ok`: it can be done in a zip
-    /// (other archives are read-only).
+    /// done, says so and returns true. `zip_ok`: it can be done in an archive
+    /// that can be changed (rar is read-only).
     fn refuse_in_archive(&mut self, side: usize, what: &str, zip_ok: bool) -> bool {
         if remote::is_remote(&self.panel(side).path) {
             if !zip_ok {
@@ -2667,7 +2667,7 @@ impl App {
             return false;
         }
         let msg = match zip_ok {
-            true => format!("Read-only archive (only zip, tar and gz archives can be changed): can't {what} here"),
+            true => format!("Read-only archive (only zip, 7z, tar and gz archives can be changed): can't {what} here"),
             false => format!("Can't {what} inside archives"),
         };
         self.status = Some((msg, Tone::Info));

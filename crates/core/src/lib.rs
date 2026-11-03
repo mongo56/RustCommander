@@ -16,6 +16,7 @@ pub mod rename;
 pub mod search;
 pub mod vfs;
 mod gz_edit;
+mod sevenz_edit;
 mod tar_edit;
 mod tar_sparse;
 mod zip_edit;

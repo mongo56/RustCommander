@@ -28,7 +28,7 @@ with a modern, minimalist look. Written in Rust with [iced](https://iced.rs).
 
 **Archives**
 - Browse zip, 7z, rar (rar4/rar5, multi-volume, encrypted; read-only), tar, tar.gz, tar.bz2 and gz like folders; pack (Alt+F5) and unpack (Alt+F9)
-- Add, change and delete files inside zip archives
+- Add, change and delete files inside zip, 7z, tar and gz archives
 
 **Remote (SFTP, FTP, FTPS)**
 - Servers appear as folders (Ctrl+F connect, Ctrl+Shift+F disconnect)

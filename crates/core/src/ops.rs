@@ -26,7 +26,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 const BUFFER_SIZE: usize = 1024 * 1024;
 const REPORT_INTERVAL: Duration = Duration::from_millis(50);
-const READONLY: &str = "Only zip, tar and gz archives can be changed (not 7z or rar, nor ones inside those)";
+const READONLY: &str = "Only zip, 7z, tar and gz archives can be changed (not rar or ones inside those)";
 
 /// One top-level source and where it should end up (full path, not folder).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,12 +46,12 @@ pub enum Job {
     MakeDir(PathBuf),
     /// Renames inside an archive (`to` is the full new path).
     Rename { from: PathBuf, to: PathBuf },
-    /// Packs `sources` into the zip `archive` (created if missing, else
+    /// Packs `sources` into the archive `archive` (created if missing, else
     /// added to).
     Pack { sources: Vec<PathBuf>, archive: PathBuf },
     /// Unpacks each archive's contents into the folder `target`.
     Unpack { archives: Vec<PathBuf>, target: PathBuf },
-    /// Puts the edited temp copy `src` back into its zip as the file `dst`
+    /// Puts the edited temp copy `src` back into its archive as the file `dst`
     /// (F4 inside an archive), replacing it without asking, but only if
     /// that file is still as `expect` says (see [`entry_stamp`]); otherwise
     /// it changed in the archive meanwhile and nothing is overwritten.
@@ -543,7 +543,7 @@ struct Runner<'a> {
     sticky: Option<Resolution>,
     buffer: Vec<u8>,
     last_report: Instant,
-    /// Temp copies of files from another archive, being packed into a zip:
+    /// Temp copies of files from another archive, being packed into an archive:
     /// (temp path, the original), to show the original in errors and
     /// questions.
     staged: Vec<(PathBuf, PathBuf)>,
@@ -972,12 +972,12 @@ impl Runner<'_> {
     // ---- archives ---------------------------------------------------------
 
     /// Opens `archive` for changing: an error is recorded (and `None`
-    /// returned) if it can't be read or isn't a zip.
+    /// returned) if it can't be read or can't be changed.
     fn open_writable(&mut self, archive: &Path) -> Option<std::sync::Arc<dyn Vfs>> {
         match vfs::open(archive) {
             Ok(v) if v.writable() => Some(v),
             Ok(_) => {
-                self.fail_msg(archive, "Only zip, tar and gz archives can be changed (7z and rar are read-only)");
+                self.fail_msg(archive, "Only zip, 7z, tar and gz archives can be changed (rar is read-only)");
                 None
             }
             Err(e) => {
@@ -987,7 +987,7 @@ impl Runner<'_> {
         }
     }
 
-    /// Copies or moves local files and folders into the zip `archive` (the
+    /// Copies or moves local files and folders into the archive `archive` (the
     /// transfers' destinations are inside it; it's created if missing).
     /// Conflicts are asked first, then the archive is rewritten once.
     /// Returns the transfers that were packed completely.
@@ -1091,7 +1091,7 @@ impl Runner<'_> {
         done
     }
 
-    /// [`Job::Update`]: replaces the file `dst` in its zip with `src`, if
+    /// [`Job::Update`]: replaces the file `dst` in its archive with `src`, if
     /// it's still as `expect` says.
     fn update_entry(&mut self, src: &Path, dst: &Path, expect: &Stamp) {
         let Some((archive, _)) = vfs::split_archive(dst) else {
@@ -1124,10 +1124,10 @@ impl Runner<'_> {
     }
 
     /// Copies or moves files and folders from other archives (any kind that
-    /// can be read, also ones inside archives) into the zip `archive`:
+    /// can be read, also ones inside archives) into the archive `archive`:
     /// they're extracted to a temp folder, packed like local files, and the
     /// temp folder is removed. A move then deletes the sources, so it needs
-    /// them in a zip too.
+    /// them in an archive that can be changed too.
     fn copy_between_archives(&mut self, archive: &Path, transfers: &[Transfer], is_move: bool) {
         if vfs::archive_writable(archive) == Some(false) {
             self.fail_msg(archive, READONLY);
@@ -1148,7 +1148,7 @@ impl Runner<'_> {
                 break;
             }
             if is_move && vfs::archive_writable(&t.src) == Some(false) {
-                self.fail_msg(&t.src, "Can't move out of a read-only archive (only zip, tar and gz archives can be changed): copy with F5 instead");
+                self.fail_msg(&t.src, "Can't move out of a read-only archive (only zip, 7z, tar and gz archives can be changed): copy with F5 instead");
                 continue;
             }
             let Some(name) = t.src.file_name() else {
@@ -1192,7 +1192,7 @@ impl Runner<'_> {
         self.report(true);
     }
 
-    /// Moves (or with `keep`, copies) items within the zip `archive`: the
+    /// Moves (or with `keep`, copies) items within the archive `archive`: the
     /// transfers' sources and destinations are both inside it. An existing
     /// destination is an error (no merging).
     fn relocate(&mut self, archive: &Path, transfers: &[Transfer], keep: bool) {
@@ -1247,7 +1247,7 @@ impl Runner<'_> {
         }
     }
 
-    /// Deletes paths inside zip archives (one rewrite per archive). True if
+    /// Deletes paths inside archives (one rewrite per archive). True if
     /// all of them were deleted.
     fn delete_in_archives(&mut self, paths: &[PathBuf]) -> bool {
         let mut groups: Vec<(PathBuf, Vec<String>)> = Vec::new();
@@ -1326,7 +1326,7 @@ impl Runner<'_> {
         self.rewrite(&outer, &edits, &[], &keep_dirs, saved).is_some()
     }
 
-    /// Creates a folder: inside a zip by rewriting it, else on disk.
+    /// Creates a folder: inside an archive by rewriting it, else on disk.
     fn make_dir(&mut self, path: &Path) {
         if remote::is_remote(path) {
             match vfs::open(path).and_then(|v| make_dirs_on_server(v.as_ref(), path)) {
@@ -1549,7 +1549,7 @@ impl Runner<'_> {
         if edits.remove.is_empty() && edits.relocate.is_empty() && adds.is_empty() {
             return Some(failed);
         }
-        let result = self.write_zip(archive, edits, adds, keep_dirs, &mut failed);
+        let result = self.write_archive(archive, edits, adds, keep_dirs, &mut failed);
         match result {
             Ok(true) => Some(failed),
             Ok(false) => {
@@ -1564,7 +1564,7 @@ impl Runner<'_> {
         }
     }
 
-    fn write_zip(
+    fn write_archive(
         &mut self,
         archive: &Path,
         edits: &Edits,
@@ -1821,7 +1821,7 @@ fn inner_parent(inner: &str) -> &str {
     inner.rfind('/').map_or("", |i| &inner[..i])
 }
 
-/// Something to add to a zip.
+/// Something to add to an archive.
 enum Add {
     Dir(String, Option<SystemTime>),
     /// A local file; `transfer` indexes the job's transfers.
@@ -2214,9 +2214,16 @@ mod tests {
         assert!(o.errors.len() == 1 && o.errors[0].1.contains("removed"), "{:?}", o.errors);
         assert_eq!(entry_stamp(&entry).unwrap(), None);
 
-        // Not in a zip (a 7z, or a zip inside one): refused.
-        let (o, _) = run_job(Job::Update { src: copy.clone(), dst: tmp.0.join("a.7z").join("x.txt"), expect: None }, Resolution::Cancel);
-        assert_eq!(o.errors.len(), 1);
+        // In a 7z it works the same way: the file is put back into the 7z.
+        let seven = tmp.0.join("s.7z");
+        let mut w = sevenz_rust2::ArchiveWriter::create(&seven).unwrap();
+        w.push_archive_entry(sevenz_rust2::ArchiveEntry::new_file("x.txt"), Some(&b"old"[..])).unwrap();
+        w.finish().unwrap();
+        let in_seven = seven.join("x.txt");
+        let expect = entry_stamp(&in_seven).unwrap();
+        let (o, _) = run_job(Job::Update { src: copy.clone(), dst: in_seven.clone(), expect }, Resolution::Cancel);
+        assert!(o.errors.is_empty(), "{:?}", o.errors);
+        assert_eq!(zip_read(&in_seven), b"mine");
     }
 
     /// Shift+F4 in a zip: an empty file is added with `expect: None`, which
@@ -2290,6 +2297,177 @@ mod tests {
 
         ok(Job::Delete { paths: vec![zip.join("folder"), zip.join("B.txt")], to_trash: false });
         assert!(zip_names(&zip).is_empty());
+    }
+
+    /// A 7z with a run of two files (one block) and one file of its own.
+    fn make_7z(at: &Path) {
+        let mut w = sevenz_rust2::ArchiveWriter::create(at).unwrap();
+        let entries: Vec<sevenz_rust2::ArchiveEntry> =
+            ["sub/deep/x.txt", "sub/Readme.md"].map(sevenz_rust2::ArchiveEntry::new_file).to_vec();
+        let data: [&[u8]; 2] = [b"hello 7z", &[b'r'; 5000]];
+        w.push_archive_entries(entries, data.into_iter().map(Into::into).collect()).unwrap();
+        w.push_archive_entry(sevenz_rust2::ArchiveEntry::new_file("a.txt"), Some(&b"hello 7z"[..])).unwrap();
+        w.finish().unwrap();
+    }
+
+    #[test]
+    fn edits_inside_7z() {
+        let tmp = TempDir::new("7z-edit");
+        let seven = tmp.0.join("a.7z");
+        make_7z(&seven);
+        assert_eq!(zip_names(&seven), ["a.txt", "sub", "sub/Readme.md", "sub/deep", "sub/deep/x.txt"]);
+        let ok = |job| {
+            let (o, _) = run_job(job, Resolution::Cancel);
+            assert!(o.errors.is_empty() && !o.cancelled, "{:?}", o.errors);
+            o
+        };
+
+        // Deleting the only file of an implicit folder keeps the folder.
+        let o = ok(Job::Delete { paths: vec![seven.join("sub/deep/x.txt")], to_trash: true });
+        assert_eq!(o.done_items, 1);
+        assert_eq!(zip_names(&seven), ["a.txt", "sub", "sub/Readme.md", "sub/deep"]);
+
+        ok(Job::MakeDir(seven.join("sub/new/inner")));
+        assert_eq!(
+            zip_names(&seven),
+            ["a.txt", "sub", "sub/Readme.md", "sub/deep", "sub/new", "sub/new/inner"]
+        );
+        let (o, _) = run_job(Job::MakeDir(seven.join("SUB")), Resolution::Cancel);
+        assert_eq!(o.errors.len(), 1);
+
+        // Rename a file (also case only) and a folder with its contents.
+        ok(Job::Rename { from: seven.join("a.txt"), to: seven.join("b.txt") });
+        ok(Job::Rename { from: seven.join("b.txt"), to: seven.join("B.txt") });
+        ok(Job::Rename { from: seven.join("sub"), to: seven.join("folder") });
+        assert_eq!(zip_names(&seven), ["B.txt", "folder", "folder/Readme.md", "folder/deep", "folder/new", "folder/new/inner"]);
+        assert_eq!(zip_read(&seven.join("B.txt")), b"hello 7z");
+        assert_eq!(zip_read(&seven.join("folder/Readme.md")), &[b'r'; 5000]);
+        let (o, _) = run_job(Job::Rename { from: seven.join("B.txt"), to: seven.join("folder") }, Resolution::Cancel);
+        assert_eq!(o.errors.len(), 1);
+
+        // Copy and move within the archive.
+        let ts = plan_transfer(&[seven.join("B.txt")], &seven.join("folder")).unwrap();
+        ok(Job::Copy(ts));
+        let ts = plan_transfer(&[seven.join("folder/Readme.md")], &seven.join("folder").join("new")).unwrap();
+        ok(Job::Move(ts));
+        assert_eq!(zip_read(&seven.join("folder/B.txt")), b"hello 7z");
+        assert_eq!(zip_read(&seven.join("folder/new/Readme.md")), &[b'r'; 5000]);
+        assert_eq!(
+            zip_names(&seven),
+            [
+                "B.txt", "folder", "folder/B.txt", "folder/deep", "folder/new",
+                "folder/new/Readme.md", "folder/new/inner"
+            ]
+        );
+
+        // Pack a folder in, then drop everything.
+        let local = tmp.0.join("in");
+        fs::create_dir_all(local.join("deep")).unwrap();
+        fs::write(local.join("deep/note.txt"), b"note").unwrap();
+        ok(Job::Pack { sources: vec![local], archive: seven.clone() });
+        assert_eq!(zip_read(&seven.join("in/deep/note.txt")), b"note");
+        ok(Job::Delete { paths: vec![seven.join("in"), seven.join("folder"), seven.join("B.txt")], to_trash: false });
+        assert!(zip_names(&seven).is_empty());
+    }
+
+    #[test]
+    fn files_move_out_of_7z() {
+        // A file moved out of a 7z into a folder, and copied back in.
+        let tmp = TempDir::new("7z-out");
+        let seven = tmp.0.join("a.7z");
+        make_7z(&seven);
+        let out = tmp.0.join("out");
+        fs::create_dir(&out).unwrap();
+        let (o, _) = run_job(Job::Move(plan_transfer(&[seven.join("sub/Readme.md")], &out).unwrap()), Resolution::Cancel);
+        assert!(o.errors.is_empty(), "{:?}", o.errors);
+        assert_eq!(zip_read(&out.join("Readme.md")), &[b'r'; 5000]);
+        assert_eq!(zip_names(&seven), ["a.txt", "sub", "sub/deep", "sub/deep/x.txt"]);
+        let (o, _) = run_job(Job::Copy(plan_transfer(&[out.join("Readme.md")], &seven).unwrap()), Resolution::Cancel);
+        assert!(o.errors.is_empty(), "{:?}", o.errors);
+        assert_eq!(zip_read(&seven.join("Readme.md")), &[b'r'; 5000]);
+    }
+
+    #[test]
+    fn encrypted_7z_is_not_changed() {
+        // Encrypted files (names plain) and encrypted names (password given):
+        // both refused, the archive untouched.
+        use sevenz_rust2::{encoder_options::AesEncoderOptions, ArchiveEntry, ArchiveWriter, EncoderMethod};
+        let tmp = TempDir::new("7z-aes");
+        let local = tmp.0.join("note.txt");
+        fs::write(&local, b"note").unwrap();
+        for hide_names in [false, true] {
+            let seven = tmp.0.join(format!("s{hide_names}.7z"));
+            let mut w = ArchiveWriter::create(&seven).unwrap();
+            w.set_content_methods(vec![AesEncoderOptions::new("pw".into()).into(), EncoderMethod::LZMA2.into()]);
+            w.set_encrypt_header(hide_names);
+            w.push_archive_entry(ArchiveEntry::new_file("x.txt"), Some(&b"secret"[..])).unwrap();
+            w.finish().unwrap();
+            if hide_names {
+                assert!(vfs::try_password(&seven, "pw").unwrap());
+            }
+            let before = fs::read(&seven).unwrap();
+            let (o, _) = run_job(Job::Copy(plan_transfer(std::slice::from_ref(&local), &seven).unwrap()), Resolution::Cancel);
+            assert!(o.errors.len() == 1 && o.errors[0].1.contains("encrypted"), "{:?}", o.errors);
+            assert_eq!(fs::read(&seven).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn cancelled_7z_write_leaves_archive_intact() {
+        let tmp = TempDir::new("7z-fail");
+        let seven = tmp.0.join("a.7z");
+        make_7z(&seven);
+        let original = fs::read(&seven).unwrap();
+        let no_temp = || {
+            let left: Vec<_> =
+                fs::read_dir(&tmp.0).unwrap().flatten().filter(|e| {
+                    let entry = e.file_name();
+                    let n = entry.to_string_lossy();
+                    n.ends_with(".rctmp") || n.ends_with(".rcspool")
+                }).collect();
+            assert!(left.is_empty(), "temp files left behind: {:?}", left);
+        };
+
+        // Cancelled while writing: the temp file exists by the second report.
+        struct CancelOnSecondProgress(Arc<Control>, usize);
+        impl Reporter for CancelOnSecondProgress {
+            fn progress(&mut self, p: &Progress) {
+                self.1 += 1;
+                if self.1 >= 2 && p.current.is_some() {
+                    self.0.cancel();
+                }
+            }
+            fn conflict(&mut self, _: Conflict) -> Resolution {
+                Resolution::Cancel
+            }
+        }
+        let control = Arc::new(Control::default());
+        let ts = plan_transfer(&[seven.join("a.txt")], &seven.join("sub")).unwrap();
+        let o = run(&Job::Move(ts), &control, &mut CancelOnSecondProgress(control.clone(), 0));
+        assert!(o.cancelled && o.errors.is_empty());
+        assert_eq!(fs::read(&seven).unwrap(), original);
+        no_temp();
+
+        // Cancelled at a conflict: a disk file copied into the archive twice.
+        let local = tmp.0.join("note.txt");
+        fs::write(&local, b"note").unwrap();
+        let (o, _) = run_job(Job::Copy(plan_transfer(std::slice::from_ref(&local), &seven).unwrap()), Resolution::Cancel);
+        assert_eq!(o.done_items, 1);
+        let with_copy = fs::read(&seven).unwrap();
+        // Cancelled at the conflict of the same copy again.
+        let (o, asked) = run_job(Job::Copy(plan_transfer(&[local], &seven).unwrap()), Resolution::Cancel);
+        assert!(o.cancelled && asked == 1);
+        assert_eq!(fs::read(&seven).unwrap(), with_copy);
+        no_temp();
+
+        // The temp file can't be made: an error, the archive is untouched.
+        let blocker = tmp.0.join(format!(".a.7z.{}.rctmp", std::process::id()));
+        fs::create_dir(&blocker).unwrap();
+        let (o, _) = run_job(Job::Delete { paths: vec![seven.join("sub/deep/x.txt")], to_trash: false }, Resolution::Cancel);
+        assert_eq!(o.errors.len(), 1);
+        assert_eq!(fs::read(&seven).unwrap(), with_copy);
+        fs::remove_dir(&blocker).unwrap();
+        no_temp();
     }
 
     #[test]
@@ -2467,27 +2645,26 @@ mod tests {
         assert_eq!(zip_read(&to.join("top.txt")), vec![b't'; 3000]);
         assert!(!zip_names(&tar).contains(&"top.txt".to_string()));
 
-        // From a 7z: moving is refused (read-only source).
+        // From a 7z: moving works, and the file is dropped from the 7z.
         let seven = tmp.0.join("s.7z");
         let mut w = sevenz_rust2::ArchiveWriter::create(&seven).unwrap();
-        w.push_archive_entry(sevenz_rust2::ArchiveEntry::new_file("x.txt"), Some(&b"x"[..])).unwrap();
+        w.push_archive_entry(sevenz_rust2::ArchiveEntry::new_file("x.txt"), Some(&b"seven"[..])).unwrap();
         w.finish().unwrap();
         let ts = plan_transfer(&[seven.join("x.txt")], &to).unwrap();
-        let before = fs::read(&to).unwrap();
         let (o, _) = run_job(Job::Move(ts), Resolution::Cancel);
-        assert_eq!(o.errors.len(), 1, "{:?}", o.errors);
-        assert_eq!(fs::read(&to).unwrap(), before);
+        assert!(o.errors.is_empty(), "{:?}", o.errors);
+        assert_eq!(zip_read(&to.join("x.txt")), b"seven");
+        assert_eq!(entry_stamp(&seven.join("x.txt")).unwrap(), None);
 
-        // Into a tar: added; into a 7z: refused.
+        // Into a tar and into a 7z: added.
         let ts = plan_transfer(&[from.join("Readme.md")], &tar).unwrap();
         let (o, _) = run_job(Job::Copy(ts), Resolution::Cancel);
         assert!(o.errors.is_empty(), "{:?}", o.errors);
         assert_eq!(zip_read(&tar.join("Readme.md")), vec![b'r'; 5000]);
         let ts = plan_transfer(&[from.join("Readme.md")], &seven).unwrap();
-        let before = fs::read(&seven).unwrap();
         let (o, _) = run_job(Job::Copy(ts), Resolution::Cancel);
-        assert_eq!(o.errors.len(), 1, "{:?}", o.errors);
-        assert_eq!(fs::read(&seven).unwrap(), before);
+        assert!(o.errors.is_empty(), "{:?}", o.errors);
+        assert_eq!(zip_read(&seven.join("Readme.md")), vec![b'r'; 5000]);
         assert!(!staging_left());
     }
 
@@ -2603,16 +2780,21 @@ mod tests {
         let got = fs::metadata(dated.join("sub").join("deep")).unwrap().modified().unwrap();
         assert!(got.duration_since(old).unwrap_or_default() <= Duration::from_secs(2), "{got:?}");
 
-        // 7z can't be changed.
+        // A 7z can be changed too: packing adds a file, and its old entries
+        // are kept; deleting rewrites it without one.
         let seven = tmp.0.join("b.7z");
         let mut w = sevenz_rust2::ArchiveWriter::create(&seven).unwrap();
         w.push_archive_entry(sevenz_rust2::ArchiveEntry::new_file("x.txt"), Some(&b"x"[..])).unwrap();
         w.finish().unwrap();
         let ts = plan_transfer(&[target.join("a.txt")], &seven).unwrap();
         let (o, _) = run_job(Job::Copy(ts), Resolution::Cancel);
-        assert_eq!(o.errors.len(), 1);
+        assert!(o.errors.is_empty(), "{:?}", o.errors);
+        assert_eq!(zip_read(&seven.join("a.txt")), b"aaa");
+        assert_eq!(zip_read(&seven.join("x.txt")), b"x");
         let (o, _) = run_job(Job::Delete { paths: vec![seven.join("x.txt")], to_trash: false }, Resolution::Cancel);
-        assert_eq!(o.errors.len(), 1);
+        assert!(o.errors.is_empty(), "{:?}", o.errors);
+        assert_eq!(entry_stamp(&seven.join("x.txt")).unwrap(), None);
+        assert_eq!(zip_read(&seven.join("a.txt")), b"aaa");
     }
 
     #[test]

@@ -3,9 +3,9 @@
 //! Paths stay plain `PathBuf`s. A path that runs through an archive file
 //! (`C:\x\a.zip\sub\f.txt`) is served by that archive's [`Vfs`]; anything
 //! else is the local file system ([`LocalFs`]). Archives can be listed,
-//! walked and read (copy out, view); zips, tars and plain gz files can also
-//! be changed (see `zip_edit`, `tar_edit`, `gz_edit`, driven by the jobs in
-//! `ops`), the others are read-only.
+//! walked and read (copy out, view); zips, 7z archives, tars and plain gz
+//! files can also be changed (see `zip_edit`, `sevenz_edit`, `tar_edit`,
+//! `gz_edit`, driven by the jobs in `ops`), rar is read-only.
 //! Supported: zip (`.zip`, `.jar`) via the `zip` crate, 7z via
 //! `sevenz-rust2`, tar (`.tar`, `.tar.gz`/`.tgz`, `.tar.bz2`/`.tbz2`) via
 //! `tar` + `flate2`/`bzip2`, a single gzipped file (`.gz`), and rar (rar4,
@@ -163,7 +163,7 @@ pub(crate) enum Format {
 impl Format {
     /// Archives of this format can be changed (rewritten).
     pub(crate) fn writable(self) -> bool {
-        matches!(self, Format::Zip | Format::Tar | Format::TarGz | Format::TarBz2 | Format::Gz)
+        matches!(self, Format::Zip | Format::SevenZ | Format::Tar | Format::TarGz | Format::TarBz2 | Format::Gz)
     }
 }
 
@@ -317,7 +317,7 @@ pub fn in_archive(path: &Path) -> bool {
 }
 
 /// For an archive or a path inside one: whether the archive can be changed
-/// (zip, tar and gz yes, 7z and rar no). One inside another archive can be
+/// (zip, 7z, tar and gz yes, rar no). One inside another archive can be
 /// changed if that one can (it's rewritten and then put back). `None` for
 /// local paths.
 pub fn archive_writable(path: &Path) -> Option<bool> {
@@ -741,7 +741,7 @@ fn read_zip_index(file: &Path) -> io::Result<Vec<Raw>> {
 
 /// Opens the 7z `file` (stored at `disk`) with its password, if one was
 /// given.
-fn open_7z(file: &Path, disk: &Path) -> io::Result<(sevenz_rust2::Archive, sevenz_rust2::Password)> {
+pub(crate) fn open_7z(file: &Path, disk: &Path) -> io::Result<(sevenz_rust2::Archive, sevenz_rust2::Password)> {
     let password = password_for(file).map_or_else(sevenz_rust2::Password::empty, |p| p.as_str().into());
     match sevenz_rust2::Archive::open_with_password(disk, &password) {
         Ok(archive) => Ok((archive, password)),
@@ -749,7 +749,7 @@ fn open_7z(file: &Path, disk: &Path) -> io::Result<(sevenz_rust2::Archive, seven
     }
 }
 
-fn sevenz_err(file: &Path, e: sevenz_rust2::Error) -> io::Error {
+pub(crate) fn sevenz_err(file: &Path, e: sevenz_rust2::Error) -> io::Error {
     match e {
         sevenz_rust2::Error::PasswordRequired | sevenz_rust2::Error::MaybeBadPassword(_) => password_error(file),
         e => io_err(e),

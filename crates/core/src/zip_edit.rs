@@ -5,6 +5,7 @@
 //! archive is untouched; dropping an uncommitted edit removes the temp file.
 
 use crate::gz_edit::GzEdit;
+use crate::sevenz_edit::SevenZEdit;
 use crate::tar_edit::TarEdit;
 use crate::vfs::{self, clean_parts, Format};
 use chrono::{DateTime, Datelike, Local, Timelike};
@@ -195,29 +196,32 @@ fn options(modified: Option<SystemTime>, size: u64) -> SimpleFileOptions {
     opts
 }
 
-/// A zip, tar or gz archive being rewritten (see [`ZipEdit`], [`TarEdit`],
-/// [`GzEdit`]).
+/// A zip, 7z, tar or gz archive being rewritten (see [`ZipEdit`],
+/// [`SevenZEdit`], [`TarEdit`], [`GzEdit`]).
 pub(crate) enum Rewrite {
     Zip(Box<ZipEdit>),
+    SevenZ(Box<SevenZEdit>),
     Tar(Box<TarEdit>),
     Gz(Box<GzEdit>),
 }
 
 impl Rewrite {
-    /// Starts rewriting `archive`, which must be a zip, a tar (plain, gz or
-    /// bz2) or a plain gz on disk; it may not exist yet.
+    /// Starts rewriting `archive`, which must be a zip, a 7z, a tar (plain,
+    /// gz or bz2) or a plain gz on disk; it may not exist yet.
     pub fn begin(archive: &Path) -> io::Result<Rewrite> {
         match archive.file_name().and_then(vfs::format_of) {
             Some(Format::Zip) => Ok(Rewrite::Zip(Box::new(ZipEdit::begin(archive)?))),
+            Some(Format::SevenZ) => Ok(Rewrite::SevenZ(Box::new(SevenZEdit::begin(archive)?))),
             Some(f @ (Format::Tar | Format::TarGz | Format::TarBz2)) => Ok(Rewrite::Tar(Box::new(TarEdit::begin(archive, f)?))),
             Some(Format::Gz) => Ok(Rewrite::Gz(Box::new(GzEdit::begin(archive)?))),
-            _ => Err(io::Error::other("Only zip, tar and gz archives can be changed")),
+            _ => Err(io::Error::other("Only zip, 7z, tar and gz archives can be changed")),
         }
     }
 
     pub fn copy_existing(&mut self, edits: &Edits, alive: &mut dyn FnMut() -> bool) -> io::Result<bool> {
         match self {
             Rewrite::Zip(e) => e.copy_existing(edits, alive),
+            Rewrite::SevenZ(e) => e.copy_existing(edits, alive),
             Rewrite::Tar(e) => e.copy_existing(edits, alive),
             Rewrite::Gz(e) => e.copy_existing(edits, alive),
         }
@@ -226,6 +230,7 @@ impl Rewrite {
     pub fn add_dir(&mut self, inner: &str, modified: Option<SystemTime>) -> io::Result<()> {
         match self {
             Rewrite::Zip(e) => e.add_dir(inner, modified),
+            Rewrite::SevenZ(e) => e.add_dir(inner, modified),
             Rewrite::Tar(e) => e.add_dir(inner, modified),
             Rewrite::Gz(e) => e.add_dir(inner, modified),
         }
@@ -234,6 +239,7 @@ impl Rewrite {
     pub fn start_file(&mut self, inner: &str, modified: Option<SystemTime>, size: u64) -> io::Result<()> {
         match self {
             Rewrite::Zip(e) => e.start_file(inner, modified, size),
+            Rewrite::SevenZ(e) => e.start_file(inner, modified),
             Rewrite::Tar(e) => e.start_file(inner, modified),
             Rewrite::Gz(e) => e.start_file(inner, modified),
         }
@@ -242,6 +248,7 @@ impl Rewrite {
     pub fn output(&mut self) -> &mut dyn Write {
         match self {
             Rewrite::Zip(e) => e.output(),
+            Rewrite::SevenZ(e) => e.output(),
             Rewrite::Tar(e) => e.output(),
             Rewrite::Gz(e) => e.output(),
         }
@@ -250,6 +257,7 @@ impl Rewrite {
     pub fn abort_file(&mut self) -> io::Result<()> {
         match self {
             Rewrite::Zip(e) => e.abort_file(),
+            Rewrite::SevenZ(e) => e.abort_file(),
             Rewrite::Tar(e) => e.abort_file(),
             Rewrite::Gz(e) => e.abort_file(),
         }
@@ -258,6 +266,7 @@ impl Rewrite {
     pub fn commit(self) -> io::Result<()> {
         match self {
             Rewrite::Zip(e) => (*e).commit(),
+            Rewrite::SevenZ(e) => (*e).commit(),
             Rewrite::Tar(e) => (*e).commit(),
             Rewrite::Gz(e) => (*e).commit(),
         }
