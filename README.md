@@ -13,7 +13,7 @@ with a modern, minimalist look. Written in Rust with [iced](https://iced.rs).
 - Folder history (Alt+Left/Right, Alt+Down list) and a hotlist of favourite folders (Ctrl+D)
 - Folder sizes (Space on a folder), compare folders (Shift+F2)
 - Folders are watched and refresh by themselves; tabs and folders are restored on start
-- Drive bar with free space (middle-click opens a new tab, right-click the shell menu, updates when drives come and go), Enter on a disk image (.iso, .img, .vhd, .vhdx) mounts it and opens the new drive, path bar with autocomplete
+- Drive bar with free space (middle-click opens a new tab, right-click the shell menu, updates when drives come and go), Enter on a disk image (.iso, .img, .vhd, .vhdx) mounts it and opens the new drive, path bar with autocomplete (expands %VAR% and ~)
 
 **File operations**
 - Copy, move, delete, recycle bin and new folder run as background jobs, several at once, with progress, speed, pause and cancel

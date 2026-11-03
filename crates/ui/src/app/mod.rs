@@ -1212,7 +1212,7 @@ impl App {
         ("Mouse wheel", "Scroll the view (the cursor stays)"),
         ("Double-click the empty tab bar", "New tab"),
         ("Mouse back / forward", "Previous / next folder"),
-        ("Click the path bar", "Edit the path: Tab completes, Up/Down pick a suggestion, Enter goes, Esc cancels"),
+        ("Click the path bar", "Edit the path (%VAR% and ~ expand): Tab completes, Up/Down pick a suggestion, Enter goes, Esc cancels"),
         ("Click a drive", "Change drive"),
         ("Tab bar: click, middle-click", "Switch tab, close tab"),
     ];
@@ -3306,9 +3306,27 @@ fn launch(path: &Path) -> io::Result<String> {
     })
 }
 
-/// Turns what the user typed in the path bar into a path: `~` is the home
-/// folder, `D:` the root of D:, relative paths start at `base`.
+/// Value of an environment variable, looked up ignoring case.
+fn env_var_any_case(name: &str) -> Option<String> {
+    if let Some(value) = std::env::var_os(name) {
+        return Some(value.to_string_lossy().into_owned());
+    }
+    std::env::vars_os()
+        .find(|(key, _)| key.to_string_lossy().eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.to_string_lossy().into_owned())
+}
+
+/// Turns what the user typed in the path bar into a path: `%NAME%` is an
+/// environment variable, `~` the home folder, `D:` the root of D:, relative
+/// paths start at `base`.
 fn resolve_typed_path(raw: &str, base: &Path) -> PathBuf {
+    let expanded;
+    let raw = if raw.contains('%') && !remote::is_remote(Path::new(raw)) {
+        expanded = rc_core::fs::expand_env(raw, env_var_any_case);
+        expanded.as_str()
+    } else {
+        raw
+    };
     let mut path = match raw.strip_prefix('~') {
         Some(rest) => rc_platform::home_dir()
             .map(|h| h.join(rest.trim_start_matches(['/', '\\'])))

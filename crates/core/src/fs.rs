@@ -97,6 +97,36 @@ pub fn dir_size(path: &Path, cancel: &AtomicBool) -> u64 {
     total
 }
 
+/// Expands Windows-style `%NAME%` variables in `text` using `lookup`
+/// (which should ignore the case of the name, as Windows does). Unknown
+/// variables, a lone `%` and `%%` stay as typed, like in cmd.
+pub fn expand_env(text: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find('%') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        if let Some(rest_after) = after.strip_prefix('%') {
+            out.push_str("%%");
+            rest = rest_after;
+            continue;
+        }
+        let name_end = after.find(['%', '/', '\\']).filter(|&i| after[i..].starts_with('%'));
+        match name_end.and_then(|i| lookup(&after[..i]).map(|v| (i, v))) {
+            Some((i, value)) => {
+                out.push_str(&value);
+                rest = &after[i + 1..];
+            }
+            None => {
+                out.push('%');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,5 +141,35 @@ mod tests {
         assert_eq!(dir_size(&root, &AtomicBool::new(false)), 60);
         assert_eq!(dir_size(&root, &AtomicBool::new(true)), 0);
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn fake_env(name: &str) -> Option<String> {
+        match name.to_ascii_lowercase().as_str() {
+            "temp" => Some("C:\\Users\\me\\Temp".into()),
+            "appdata" => Some("C:\\Users\\me\\AppData\\Roaming".into()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn expands_variables() {
+        assert_eq!(expand_env("%temp%", fake_env), "C:\\Users\\me\\Temp");
+        assert_eq!(expand_env("%TEMP%\\sub", fake_env), "C:\\Users\\me\\Temp\\sub");
+        assert_eq!(
+            expand_env("%appdata%\\a\\%temp%", fake_env),
+            "C:\\Users\\me\\AppData\\Roaming\\a\\C:\\Users\\me\\Temp"
+        );
+        assert_eq!(expand_env("plain\\path", fake_env), "plain\\path");
+    }
+
+    #[test]
+    fn leaves_unknown_and_odd_percents() {
+        assert_eq!(expand_env("%nope%\\x", fake_env), "%nope%\\x");
+        assert_eq!(expand_env("100%", fake_env), "100%");
+        assert_eq!(expand_env("%", fake_env), "%");
+        assert_eq!(expand_env("a%%b", fake_env), "a%%b");
+        assert_eq!(expand_env("%%temp%", fake_env), "%%temp%");
+        assert_eq!(expand_env("%a\\b%temp%", fake_env), "%a\\bC:\\Users\\me\\Temp");
+        assert_eq!(expand_env("50% of %temp%", fake_env), "50% of C:\\Users\\me\\Temp");
     }
 }
