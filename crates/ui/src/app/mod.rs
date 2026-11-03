@@ -363,7 +363,7 @@ pub enum Message {
     RightPress(usize, usize),
     RightClickBackground(usize),
     ClickBackground(usize),
-    ContextDone(usize, Result<MenuAction, String>),
+    ContextDone(usize, Result<MenuAction, String>, Option<PathBuf>),
     Hover(usize, usize),
     HoverEnd(usize),
     MouseMoved(Point),
@@ -761,7 +761,7 @@ impl App {
                 self.active = side;
                 return self.context_menu(side, true);
             }
-            Message::ContextDone(side, result) => match result {
+            Message::ContextDone(side, result, made) => match result {
                 Ok(MenuAction::Nothing) => {}
                 Ok(MenuAction::Rename) => {
                     self.active = side;
@@ -772,6 +772,14 @@ impl App {
                     return self.run(Command::Delete);
                 }
                 Ok(MenuAction::Invoked(_verb)) => {
+                    // "New > Folder" made "New folder" without asking: take
+                    // it back (it is empty and was just created) and ask for
+                    // the name like F7 does.
+                    if made.is_some_and(|dir| std::fs::remove_dir(dir).is_ok()) {
+                        self.active = side;
+                        self.reload_panels();
+                        return self.run(Command::MakeDir);
+                    }
                     // Verbs that finish later (paste, extract, ...) are
                     // picked up by the folder watcher.
                     self.reload_panels();
@@ -2370,15 +2378,28 @@ impl App {
         // Items in archives: the menu acts on temp copies.
         let Some((folder, items)) = self.shell_items_extracted(side, items) else { return Task::none() };
         let extended = self.modifiers.shift();
+        let before = if background { subfolders(&folder) } else { Default::default() };
 
         window::get_oldest()
             .and_then(move |id| {
-                let (folder, items) = (folder.clone(), items.clone());
+                let (folder, items, before) = (folder.clone(), items.clone(), before.clone());
                 window::run_with_handle(id, move |handle| {
-                    rc_platform::show_context_menu(native_handle(&handle), &folder, &items, extended)
+                    let result = rc_platform::show_context_menu(native_handle(&handle), &folder, &items, extended);
+                    // A folder the menu created in the background (New > Folder).
+                    let made = match (&result, items.is_empty()) {
+                        (Ok(MenuAction::Invoked(_)), true) => {
+                            let new: Vec<_> = subfolders(&folder).difference(&before).cloned().collect();
+                            match new.as_slice() {
+                                [one] => Some(folder.join(one)),
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    };
+                    (result, made)
                 })
             })
-            .map(move |result| Message::ContextDone(side, result))
+            .map(move |(result, made)| Message::ContextDone(side, result, made))
     }
 
     /// The shell menu of a drive root (right-click on a drive button): the
@@ -2397,7 +2418,7 @@ impl App {
                     rc_platform::show_context_menu(native_handle(&handle), &folder, &items, extended)
                 })
             })
-            .map(move |result| Message::ContextDone(side, result))
+            .map(move |result| Message::ContextDone(side, result, None))
     }
 
     // ---- jobs -------------------------------------------------------------
@@ -3001,6 +3022,12 @@ impl App {
         self.disk.borrow_mut().insert(root, (Instant::now(), space));
         space
     }
+}
+
+/// Names of the folders directly inside `dir`.
+fn subfolders(dir: &Path) -> std::collections::HashSet<std::ffi::OsString> {
+    let Ok(rd) = std::fs::read_dir(dir) else { return Default::default() };
+    rd.flatten().filter(|e| e.file_type().is_ok_and(|t| t.is_dir())).map(|e| e.file_name()).collect()
 }
 
 fn is_modifier_key(key: Named) -> bool {
