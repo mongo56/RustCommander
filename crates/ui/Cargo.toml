@@ -16,6 +16,11 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 toml_edit = "0.22"
 unicode-segmentation = "1"
+# Update check (GitHub releases API) and download; rustls with the ring
+# provider like the FTPS code, webpki roots.
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+serde_json = "1"
+sha2 = "0.11"
 
 [build-dependencies]
 png = "0.17"

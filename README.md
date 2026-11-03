@@ -44,6 +44,7 @@ with a modern, minimalist look. Written in Rust with [iced](https://iced.rs).
 - F10 settings view (general, key bindings, colours) that keeps your comments in the file
 - F1 help, Ctrl+Space command palette, built-in themes (Dark, Light, Nord, Gruvbox)
 - Every action is a `cm_*` command, so any key can be bound to any command
+- Check for updates (command palette): finds a newer release on GitHub, downloads the installer and updates in place; optionally at startup (`check_updates_at_startup`)
 
 ## Key bindings
 

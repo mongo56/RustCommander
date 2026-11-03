@@ -29,6 +29,9 @@ pub struct Config {
     /// The hotlist tree: a button left of the left panel's drive buttons
     /// (and Ctrl+Shift+D) swap that panel's files for the hotlist as a tree.
     pub hotlist_tree: bool,
+    /// Look for a newer release on GitHub at startup (in the background;
+    /// a newer one is offered in the status line).
+    pub check_updates_at_startup: bool,
     /// Edge of the thumbnail view's pictures in pixels (Ctrl+Shift+F5);
     /// 0 = the default, see [`Config::thumbnail_size`].
     pub thumbnail_size: u32,
@@ -322,6 +325,11 @@ fn template(editor: &str, compare: CompareState) -> String {
          # picked in it open in the right panel.\n\
          hotlist_tree = false\n\
          \n\
+         # Look for a newer RustCommander release on GitHub at startup (in the\n\
+         # background; a newer one is offered in the status line). The command\n\
+         # palette's Check for updates (cm_CheckForUpdates) looks any time.\n\
+         check_updates_at_startup = false\n\
+         \n\
          # Size of the pictures in the thumbnail view (Ctrl+Shift+F5), in pixels\n\
          # (32-512).\n\
          thumbnail_size = 128\n\
@@ -399,6 +407,9 @@ mod tests {
         assert!(!parse(&template("", CompareState::default())).unwrap().show_fkeys);
         assert!(!parse(&template("", CompareState::default())).unwrap().hotlist_tree);
         assert!(parse(&apply(&out, &[Edit::Flag("hotlist_tree", true)]).unwrap()).unwrap().hotlist_tree);
+        assert!(!parse(&template("", CompareState::default())).unwrap().check_updates_at_startup);
+        let on = apply(&out, &[Edit::Flag("check_updates_at_startup", true)]).unwrap();
+        assert!(parse(&on).unwrap().check_updates_at_startup);
         assert_eq!(config.keys["Ctrl+Shift+F5"], "cm_RenMov");
         assert_eq!(config.colors["Accent"], "#00ff00");
         assert_eq!(config.colors["bg"], "#000000");

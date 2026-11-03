@@ -98,6 +98,8 @@ pub enum Command {
     CommandPalette,
     /// Searchable list of keys and features (F1).
     Help,
+    /// Look for a newer release on GitHub; download and install it.
+    CheckForUpdates,
     Quit,
 }
 
@@ -169,6 +171,7 @@ impl Command {
             Configuration => "cm_Configuration",
             CommandPalette => "cm_CommandPalette",
             Help => "cm_HelpIndex",
+            CheckForUpdates => "cm_CheckForUpdates",
             Quit => "cm_Exit",
         }
     }
@@ -241,6 +244,7 @@ impl Command {
             Configuration => "Settings: preferences, key bindings, colour themes",
             CommandPalette => "Command palette: find a command by name, id or key and run it",
             Help => "This help: all keys and features",
+            CheckForUpdates => "Check for updates: look for a newer release on GitHub, download and install it",
             Quit => "Exit",
         }
     }
@@ -293,6 +297,7 @@ impl Command {
             CopyToClipboard => "ClipCopy",
             CutToClipboard => "ClipCut",
             PasteFromClipboard => "Paste",
+            CheckForUpdates => "Update",
             _ => {
                 let id = self.id();
                 id.strip_prefix("cm_").unwrap_or(id)
@@ -371,6 +376,7 @@ impl Command {
             Configuration,
             CommandPalette,
             Help,
+            CheckForUpdates,
             Quit,
         ]
     };

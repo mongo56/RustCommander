@@ -13,6 +13,7 @@ mod find_files;
 mod multi_rename;
 mod settings;
 mod thumbs;
+mod update;
 mod viewer;
 
 use crate::keymap;
@@ -193,6 +194,11 @@ pub struct App {
     placement: Option<rc_platform::Placement>,
     /// Files from zips open in the editor (F4), put back on save.
     archive_edits: archive_edit::ArchiveEdits,
+    /// A newer release found by the startup check: the status-line notice
+    /// (shown when there's no other status; a click opens the dialog).
+    update_notice: Option<(String, crate::update::Release)>,
+    /// Version the user chose to skip in the update dialog (session).
+    skipped_update: Option<String>,
 }
 
 /// A navigation whose target folder is being listed in the background.
@@ -250,6 +256,8 @@ enum Dialog {
     Compare { opts: CompareOptions },
     /// Remove a hotlist group with entries (Del in the hotlist tree).
     RemoveGroup { path: Vec<usize>, name: String, count: usize },
+    /// Check for updates: result, offer, download progress.
+    Update(update::UpdateDialog),
 }
 
 /// The path bar of one side being edited, with folder suggestions.
@@ -452,6 +460,7 @@ pub enum Message {
     Find(find_files::FindMsg),
     Connect(connect::ConnectMsg),
     Settings(settings::SettingsMsg),
+    Update(update::UpdateMsg),
     /// Background listing for a pending navigation: (side, seq, listing).
     Navigated(usize, u64, Listing),
     /// A file inside an archive was extracted to a temp copy to be opened.
@@ -556,6 +565,8 @@ impl App {
             config_stamp: None,
             placement: session.as_ref().and_then(|s| s.window).map(Into::into),
             archive_edits: archive_edit::ArchiveEdits::default(),
+            update_notice: None,
+            skipped_update: session.as_ref().and_then(|s| s.skipped_update.clone()),
         };
         app.refresh_config();
         app.tree_fix_cursor();
@@ -572,7 +583,8 @@ impl App {
             Some(p) if hidden_until_placed(&session) => restore_window(p),
             _ => Task::none(),
         };
-        (app, show)
+        let check = app.startup_update_check();
+        (app, Task::batch([show, check]))
     }
 
     pub fn theme(&self) -> Theme {
@@ -1138,6 +1150,7 @@ impl App {
             Message::Find(msg) => return self.find_update(msg),
             Message::Connect(msg) => return self.connect_update(msg),
             Message::Settings(msg) => return self.settings_update(msg),
+            Message::Update(msg) => return self.update_msg(msg),
             Message::ArchiveEdit(msg) => return self.archive_edit_update(msg),
             Message::Navigated(side, seq, result) => {
                 let current = self.sides[side].current;
@@ -1289,6 +1302,12 @@ impl App {
                 _ => self.hotlist_key(named, text.as_deref(), mods),
             };
             return Task::batch([task, self.popup_snap()]);
+        }
+        if let Some(Dialog::Update(_)) = self.dialog {
+            if named.is_some_and(is_modifier_key) || captured {
+                return Task::none();
+            }
+            return self.update_key(named, mods.shift());
         }
         if let Some(Dialog::Compare { opts }) = &mut self.dialog {
             let option = match text.as_deref().map(str::to_ascii_lowercase).as_deref() {
@@ -1483,6 +1502,7 @@ impl App {
             Connect => return self.open_connect(),
             Disconnect => return self.disconnect(),
             Help => return self.open_help(),
+            CheckForUpdates => return self.check_for_updates(),
             Configuration => return self.open_settings(),
             CommandPalette => return self.open_palette(),
             Edit => {
@@ -2207,6 +2227,8 @@ impl App {
                 return self.palette_pick(selected);
             }
             Dialog::RemoveGroup { path, .. } => self.tree_remove_now(&path),
+            // Its buttons send their own messages.
+            Dialog::Update(d) => self.dialog = Some(Dialog::Update(d)),
             Dialog::Compare { opts } => {
                 let changed = self.compare_opts != opts;
                 self.compare_opts = opts;
@@ -2940,6 +2962,7 @@ impl App {
             hotlist_tree: self.tree.shown,
             compare: self.compare_unsaved,
             recent_commands: self.recent_commands.iter().map(|c| c.id().to_owned()).collect(),
+            skipped_update: self.skipped_update.clone(),
             split: self.split,
             columns: self.columns,
             window: self.placement.map(Into::into),

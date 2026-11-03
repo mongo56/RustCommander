@@ -10,6 +10,9 @@
 ; to keep them (default: keep), uninstalling asks whether to remove them
 ; (default: keep). Silent runs always keep them unless /DELETESETTINGS is
 ; given. /SETTINGSDIR=<path> points that logic at another folder (testing).
+;
+; /RESTARTAPP (with /SILENT, used by the app's update command) starts
+; RustCommander when the installation is done.
 
 #ifndef AppVersion
   #define AppVersion "0.0.0"
@@ -76,6 +79,9 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopico
 
 [Run]
 Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent
+; The app's update command runs the installer with /SP- /SILENT /RESTARTAPP:
+; start the new version afterwards, as the user (not elevated).
+Filename: "{app}\{#AppExe}"; Flags: nowait runasoriginaluser skipifnotsilent; Check: HasSwitch('/RESTARTAPP')
 
 [Code]
 var

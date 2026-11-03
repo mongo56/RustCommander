@@ -91,6 +91,45 @@ pub fn spawn_detached(program: &str, args: &[std::ffi::OsString], dir: &Path) ->
     std::process::Command::new(program).args(args).current_dir(dir).spawn()
 }
 
+/// Starts the program `path` with the command line `args` through the
+/// shell, so a program that needs administrator rights gets the UAC prompt
+/// (a plain `CreateProcess` fails for those). Doesn't wait for it.
+pub fn run_program(path: &Path, args: &str) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        use windows::core::{HSTRING, PCWSTR};
+        use windows::Win32::UI::Shell::ShellExecuteW;
+        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+        win::allow_foreground();
+        let (file, params) = (HSTRING::from(path.as_os_str()), HSTRING::from(args));
+        let dir = path.parent().map(|d| HSTRING::from(d.as_os_str()));
+        // SAFETY: all strings live until the call returns.
+        let result = unsafe {
+            ShellExecuteW(
+                None,
+                &HSTRING::from("open"),
+                &file,
+                &params,
+                dir.as_ref().map_or(PCWSTR::null(), |d| PCWSTR(d.as_ptr())),
+                SW_SHOWNORMAL,
+            )
+        };
+        // Values above 32 mean success; below are old-style error codes.
+        match result.0 as isize {
+            n if n > 32 => Ok(()),
+            5 => Err(io::Error::new(io::ErrorKind::PermissionDenied, "access denied or cancelled")),
+            2 | 3 => Err(io::Error::new(io::ErrorKind::NotFound, "program not found")),
+            n => Err(io::Error::other(format!("ShellExecute failed ({n})"))),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let dir = path.parent().unwrap_or(Path::new("."));
+        let args: Vec<std::ffi::OsString> = args.split_whitespace().map(Into::into).collect();
+        std::process::Command::new(path).args(args).current_dir(dir).spawn().map(drop)
+    }
+}
+
 /// True for files that start a program rather than open a document.
 pub fn is_executable(path: &Path) -> bool {
     let ext = path

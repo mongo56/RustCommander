@@ -693,6 +693,7 @@ impl App {
             Dialog::History { selected } => return self.history_view(*selected),
             Dialog::Palette(palette) => return self.palette_view(palette),
             Dialog::Compare { opts } => return compare_view(opts, self.dialog_focus.unwrap_or(1)),
+            Dialog::Update(d) => return self.update_view(d),
             _ => {}
         }
         let input_field = |value: &'a str| {
@@ -769,7 +770,7 @@ impl App {
                 None,
                 "Remove",
             ),
-            Dialog::Hotlist(_) | Dialog::History { .. } | Dialog::Palette(_) | Dialog::Compare { .. } => {
+            Dialog::Hotlist(_) | Dialog::History { .. } | Dialog::Palette(_) | Dialog::Compare { .. } | Dialog::Update(_) => {
                 unreachable!("drawn above")
             }
         };
@@ -991,7 +992,8 @@ impl App {
                 format!("{}…", cut.trim_end())
             }
         };
-        let status = match &self.status {
+        let line = self.status_line();
+        let status = match &line {
             Some((msg, tone)) => text(ellipsize(&msg.replace('\n', " "))).size(12).color(match tone {
                 Tone::Info => theme::c().text,
                 Tone::Success => theme::c().success,
@@ -1003,7 +1005,8 @@ impl App {
         if !self.config.show_fkeys {
             // Just a status line with a quiet hint on the right.
             let hint = text(hint).size(12).color(theme::c().muted).wrapping(Wrapping::None);
-            return container(row![container(status.wrapping(Wrapping::None)).clip(true), Space::with_width(Length::Fill), hint].spacing(16))
+            let status = self.status_clickable(container(status.wrapping(Wrapping::None)).clip(true).into());
+            return container(row![status, Space::with_width(Length::Fill), hint].spacing(16))
                 .padding([3, 10])
                 .width(Length::Fill)
                 .clip(true)
@@ -1025,7 +1028,7 @@ impl App {
         .spacing(6);
 
         column![
-            container(status.wrapping(Wrapping::None)).padding([3, 10]).clip(true),
+            self.status_clickable(container(status.wrapping(Wrapping::None)).padding([3, 10]).clip(true).into()),
             container(fkeys).padding(Padding { top: 0.0, right: 8.0, bottom: 8.0, left: 8.0 }),
         ]
         .into()
@@ -1064,7 +1067,7 @@ pub(super) fn elide_left(s: &str, max_chars: usize) -> String {
     format!("…{tail}")
 }
 
-fn dialog_button(label: &str, message: Message, primary: bool, focused: bool) -> Element<'_, Message> {
+pub(super) fn dialog_button(label: &str, message: Message, primary: bool, focused: bool) -> Element<'_, Message> {
     let b = button(text(label).size(13)).on_press(message).padding([6, 14]);
     if focused {
         b.style(theme::focused(primary)).into()

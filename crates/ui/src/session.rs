@@ -41,6 +41,10 @@ pub struct Session {
     /// most recent first.
     #[serde(default)]
     pub recent_commands: Vec<String>,
+    /// Release version skipped in the update dialog: the startup check
+    /// doesn't offer it again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skipped_update: Option<String>,
     /// Editor setting from older versions; read once to seed `config.toml`.
     #[serde(default, skip_serializing)]
     pub editor: String,
@@ -190,6 +194,7 @@ mod tests {
             window: Some(WindowState { left: -8, top: 0, right: 1200, bottom: 800, maximized: true }),
             compare: Some(CompareState { by_content: true, ignore_date: false, subfolders: true }),
             recent_commands: vec!["cm_MkDir".into(), "cm_Copy".into()],
+            skipped_update: Some("0.9.1".into()),
             split: 0.3,
             columns: [45.0, 95.0, 150.0],
             editor: r#""my editor.exe" -n %1"#.into(),
@@ -202,6 +207,7 @@ mod tests {
         assert_eq!(back.hotlist, session.hotlist);
         assert!(back.hotlist_tree);
         assert_eq!(back.recent_commands, session.recent_commands);
+        assert_eq!(back.skipped_update.as_deref(), Some("0.9.1"));
         // Compare options not yet moved to config.toml are kept...
         assert_eq!(back.compare, session.compare);
         // ...and dropped once they were.

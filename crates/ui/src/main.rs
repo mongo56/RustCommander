@@ -15,6 +15,7 @@ mod select_range;
 mod session;
 mod sites;
 mod theme;
+mod update;
 mod watch;
 
 /// "0.1.0" — the version from Cargo.toml.
