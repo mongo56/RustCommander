@@ -842,7 +842,7 @@ impl App {
                         row![
                             label("Hotlist tree"),
                             switch(self.config.hotlist_tree, SettingsMsg::HotlistTree(!self.config.hotlist_tree)),
-                            hint("A button left of the left panel's drives (Ctrl+Shift+D) shows the hotlist there as a tree".into()),
+                            hint("A button left of the left panel's drives (Ctrl+Shift+D) shows the hotlist as a tree left of the panels".into()),
                         ]
                         .spacing(8)
                         .align_y(Alignment::Center)

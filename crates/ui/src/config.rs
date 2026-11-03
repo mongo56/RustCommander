@@ -27,7 +27,7 @@ pub struct Config {
     /// one-line hint instead.
     pub show_fkeys: bool,
     /// The hotlist tree: a button left of the left panel's drive buttons
-    /// (and Ctrl+Shift+D) swap that panel's files for the hotlist as a tree.
+    /// (and Ctrl+Shift+D) show / hide the hotlist as a tree left of the panels.
     pub hotlist_tree: bool,
     /// Look for a newer release on GitHub at startup (in the background;
     /// a newer one is offered in the status line).
@@ -321,8 +321,8 @@ fn template(editor: &str, compare: CompareState) -> String {
          show_fkeys = false\n\
          \n\
          # Hotlist tree: a button left of the left panel's drive buttons (and\n\
-         # Ctrl+Shift+D) shows the hotlist (Ctrl+D) there as a folder tree; folders\n\
-         # picked in it open in the right panel.\n\
+         # Ctrl+Shift+D) shows the hotlist (Ctrl+D) as a folder tree left of the\n\
+         # panels; folders picked in it open in the last active panel.\n\
          hotlist_tree = false\n\
          \n\
          # Look for a newer RustCommander release on GitHub at startup (in the\n\

@@ -270,7 +270,7 @@ impl App {
                 }
                 let side = c.side;
                 self.connect_close();
-                self.active = side;
+                self.focus_panel(side);
                 self.status = Some((format!("Connected to {} (Ctrl+Shift+F disconnects)", site.address()), Tone::Success));
                 self.start_nav(side, Nav::to(path))
             }

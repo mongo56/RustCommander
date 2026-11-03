@@ -180,7 +180,7 @@ impl App {
     pub(super) fn sync_grids(&mut self) {
         let size = self.thumb_size() as f32;
         let bar = if self.config.show_fkeys { 0.0 } else { FKEYS_H };
-        let estimate = ((self.window_width - SPLIT_W - self.left_width()).min(self.left_width()) - scrollbar::WIDTH, self.window_height - CHROME_H + bar);
+        let estimate = (self.panel_width(1).min(self.panel_width(0)) - scrollbar::WIDTH, self.window_height - CHROME_H + bar);
         for side in 0..2 {
             let (w, h) = match self.thumbs.area[side].get() {
                 (w, h) if w > 0.0 && h > 0.0 => (w, h),

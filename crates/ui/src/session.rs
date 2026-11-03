@@ -19,10 +19,13 @@ pub struct Session {
     /// list of paths, which still loads (a folder is a plain path).
     #[serde(default)]
     pub hotlist: Vec<HotItem>,
-    /// The left panel shows the hotlist tree instead of its files (when
-    /// the `hotlist_tree` setting is on).
+    /// The hotlist tree is shown left of the panels (when the
+    /// `hotlist_tree` setting is on).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub hotlist_tree: bool,
+    /// Width of the hotlist tree; older files lack it.
+    #[serde(default = "default_tree_width")]
+    pub tree_width: f32,
     /// Window position and maximised state (Windows).
     #[serde(default)]
     pub window: Option<WindowState>,
@@ -52,6 +55,13 @@ pub struct Session {
 
 fn default_split() -> f32 {
     0.5
+}
+
+/// Default width of the hotlist tree.
+pub const DEFAULT_TREE_WIDTH: f32 = 260.0;
+
+fn default_tree_width() -> f32 {
+    DEFAULT_TREE_WIDTH
 }
 
 /// Default widths of the Ext / Size / Modified columns.
@@ -191,6 +201,7 @@ mod tests {
                 HotItem::Menu { name: "Empty".into(), expanded: false, items: vec![] },
             ],
             hotlist_tree: true,
+            tree_width: 310.0,
             window: Some(WindowState { left: -8, top: 0, right: 1200, bottom: 800, maximized: true }),
             compare: Some(CompareState { by_content: true, ignore_date: false, subfolders: true }),
             recent_commands: vec!["cm_MkDir".into(), "cm_Copy".into()],
@@ -206,6 +217,7 @@ mod tests {
         assert_eq!(back.columns, [45.0, 95.0, 150.0]);
         assert_eq!(back.hotlist, session.hotlist);
         assert!(back.hotlist_tree);
+        assert_eq!(back.tree_width, 310.0);
         assert_eq!(back.recent_commands, session.recent_commands);
         assert_eq!(back.skipped_update.as_deref(), Some("0.9.1"));
         // Compare options not yet moved to config.toml are kept...
@@ -244,6 +256,7 @@ mod tests {
         assert_eq!(session.hotlist, folders);
         assert_eq!(session.split, 0.5);
         assert!(!session.hotlist_tree);
+        assert_eq!(session.tree_width, DEFAULT_TREE_WIDTH);
         assert_eq!(session.columns, DEFAULT_COLUMNS);
         // Saved again, plain folders keep the old form.
         let saved = toml::to_string_pretty(&session).unwrap();

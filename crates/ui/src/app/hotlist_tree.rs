@@ -1,7 +1,9 @@
-//! The hotlist tree: the left panel showing the directory hotlist (Ctrl+D)
-//! as a folder tree with its groups (setting `hotlist_tree`; the button left
-//! of the drive buttons or Ctrl+Shift+D swap it with the panel's files, which
-//! are kept meanwhile). Folders picked in it open in the right panel. It
+//! The hotlist tree: the directory hotlist (Ctrl+D) as a folder tree with
+//! its groups, in a column left of both panels (setting `hotlist_tree`; the
+//! button left of the left panel's drive buttons or Ctrl+Shift+D show and
+//! hide it; its divider resizes it). It has a keyboard focus of its own
+//! (`HotTree::focused`, Tab cycles tree, left, right); folders picked in it
+//! open in the last active panel, and other commands act on that panel. It
 //! edits the same list as Ctrl+D (`App::hotlist`), saved at once.
 
 use super::*;
@@ -27,8 +29,18 @@ fn name_input_id() -> text_input::Id {
 /// Tree state; the entries themselves are `App::hotlist`.
 #[derive(Debug, Default)]
 pub(super) struct HotTree {
-    /// Shown instead of the left panel's files (saved with the session).
+    /// Shown left of the panels (saved with the session).
     pub shown: bool,
+    /// Width as set with the divider (saved; `App::tree_width` keeps it
+    /// within the window).
+    pub width: f32,
+    /// Has the keyboard focus; `App::active` is then the last active
+    /// panel, which commands other than the tree's own act on.
+    pub focused: bool,
+    /// The divider right of it is dragged; when it was last pressed
+    /// (double click: default width).
+    resizing: bool,
+    resize_click: Option<Instant>,
     /// Path of the entry with the cursor (see [`hotlist::get`]).
     pub cursor: Vec<usize>,
     /// First row drawn; `detached` while the wheel or scrollbar moved it
@@ -50,8 +62,8 @@ pub(super) struct HotTree {
 }
 
 impl HotTree {
-    pub fn new(shown: bool) -> Self {
-        Self { shown, ..Self::default() }
+    pub fn new(shown: bool, width: f32) -> Self {
+        Self { shown, width, ..Self::default() }
     }
 }
 
@@ -95,6 +107,8 @@ enum Action {
 pub enum TreeMsg {
     /// The button left of the drive buttons.
     Toggle,
+    /// Press on the divider right of the tree.
+    ResizePress,
     Press(Vec<usize>),
     Middle(Vec<usize>),
     /// Right press on an entry, or on the empty part of the list.
@@ -134,69 +148,58 @@ enum Mark {
     End,
 }
 
-/// How a command behaves while the tree has the focus.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum InTree {
-    /// Runs as usual (not tied to a panel).
-    Run,
-    /// Acts on the right panel, which gets the focus.
-    OnRight,
-    /// Needs files to act on.
-    No,
-}
-
-pub(super) fn in_tree(cmd: Command) -> InTree {
-    use Command::*;
-    match cmd {
-        SwitchPanel | HotlistTree | Help | Configuration | CommandPalette | EditConfig | Quit => InTree::Run,
-        Hotlist | DirHistory | HistoryBack | HistoryForward | FindFiles | Connect | Disconnect | Terminal | NewTab
-        | CloseTab | NextTab | PrevTab | Refresh | ToggleHidden | Thumbnails | PasteFromClipboard | GoParent | GoRoot
-        | SortBy(_) => InTree::OnRight,
-        _ => InTree::No,
-    }
+/// Commands (not handled by `tree_key`) that, run while the tree has the
+/// focus, move the focus to the last active panel: they need typing there.
+/// All others act on that panel and leave the focus in the tree.
+pub(super) fn takes_focus(cmd: Command) -> bool {
+    matches!(cmd, Command::QuickFilter | Command::Rename)
 }
 
 impl App {
     /// Keys of `tree_key`, for the F1 help. Keep in sync.
     pub(super) const TREE_KEYS: &'static [(&'static str, &'static str)] = &[
-        ("Ctrl+Shift+D, button left of the drives", "Show the hotlist tree in the left panel / its files again (setting \"Hotlist tree\", F10)"),
+        ("Ctrl+Shift+D, button left of the drives", "Show / hide the hotlist tree left of the panels (setting \"Hotlist tree\", F10)"),
+        ("Drag its right edge", "Resize the tree (double-click: default width)"),
+        ("Tab, Shift+Tab", "Focus tree, left panel, right panel in turn"),
         ("Up, Down, PgUp, PgDn, Home, End", "Move the cursor; letters jump to the next entry starting with them"),
-        ("Enter, click", "Open the folder in the right panel (the tree keeps the focus) / open or close the group"),
-        ("Shift+Enter, middle-click", "Open the folder in a new tab of the right panel"),
+        ("Enter, click", "Open the folder in the last active panel (the tree keeps the focus) / open or close the group"),
+        ("Shift+Enter, middle-click", "Open the folder in a new tab of the last active panel"),
         ("Right / Left", "Open the group (then to its first entry) / close it, or go to the group holding the entry"),
         ("Space", "Open or close the group"),
         ("F7 (new folder key)", "New group after the cursor: type its name, Enter"),
         ("F2", "Rename the group"),
-        ("+", "Add the right panel's folder (into the group, or after the entry)"),
+        ("+", "Add the last active panel's folder (into the group, or after the entry)"),
         ("Del", "Remove the entry (asks first for a group with entries)"),
         ("Ctrl+Up, Ctrl+Down", "Move the entry up / down"),
         ("Ctrl+Right / Ctrl+Left", "Move the entry into the group above it / out of its group"),
-        ("Drag", "Move entries and groups, also into and out of groups"),
+        ("Drag", "Move entries and groups, also into and out of groups; a folder dropped on a panel opens there"),
         ("Drag folders from a panel", "Add them to the hotlist where dropped (Explorer drops: at the end)"),
-        ("Right-click", "Menu: open in a new tab, new group, rename, add the right panel's folder, remove"),
-        ("Tab", "Switch to the right panel; commands that need files work there"),
+        ("Right-click", "Menu: open in a new tab, new group, rename, add the last active panel's folder, remove"),
+        ("Other keys", "Commands act on the last active panel as if it had the focus (Ctrl+S, Shift+F6 move the focus there)"),
     ];
 
-    /// The tree is drawn instead of the left panel's files.
+    /// The tree is drawn left of the panels.
     pub(super) fn tree_visible(&self) -> bool {
         self.config.hotlist_tree && self.tree.shown
     }
 
     /// The tree has the keyboard focus.
     pub(super) fn tree_focused(&self) -> bool {
-        self.active == 0 && self.tree_visible()
+        self.tree.focused && self.tree_visible()
     }
 
     pub(super) fn tree_dragging(&self) -> bool {
         self.tree.press.as_ref().is_some_and(|p| p.active)
     }
 
-    /// Mouse moves matter: an entry is pressed (a drag may start).
+    /// Mouse moves matter: an entry is pressed (a drag may start), or the
+    /// divider is dragged.
     pub(super) fn tree_tracks_mouse(&self) -> bool {
-        self.tree.press.is_some()
+        self.tree.press.is_some() || self.tree.resizing
     }
 
-    /// Ctrl+Shift+D / the button: tree or files in the left panel.
+    /// Ctrl+Shift+D / the button: show or hide the tree (hiding it gives
+    /// the focus back to the last active panel).
     pub(super) fn toggle_tree(&mut self) -> Task<Message> {
         if !self.config.hotlist_tree {
             self.status = Some(("Turn on \"Hotlist tree\" in the settings (F10) first".into(), Tone::Info));
@@ -208,10 +211,11 @@ impl App {
         t.menu = None;
         t.press = None;
         t.over = None;
+        t.resizing = false;
+        t.focused = t.shown;
         if t.shown {
-            self.active = 0;
-            // Start on the right panel's folder if it is in the list.
-            if let Some((mut at, i)) = hotlist::find(&self.hotlist, &self.panel(1).path) {
+            // Start on the active panel's folder if it is in the list.
+            if let Some((mut at, i)) = hotlist::find(&self.hotlist, &self.panel(self.active).path) {
                 at.push(i);
                 if hotlist::rows(&self.hotlist).iter().any(|r| r.path == at) {
                     self.tree.cursor = at;
@@ -220,6 +224,7 @@ impl App {
             self.tree_fix_cursor();
             self.tree.detached = false;
         }
+        self.sync_grids();
         self.save_session();
         Task::none()
     }
@@ -318,7 +323,7 @@ impl App {
     /// New group after `target` (or at the end), then its name is typed.
     fn tree_new_group(&mut self, target: Option<Vec<usize>>) -> Task<Message> {
         self.leave_edits();
-        self.active = 0;
+        self.tree.focused = true;
         let (at, index) = match target.as_deref().and_then(|p| p.split_last()) {
             Some((&last, at)) => (at.to_vec(), last + 1),
             None => (Vec::new(), self.hotlist.len()),
@@ -330,7 +335,7 @@ impl App {
         self.tree_start_naming(path, true)
     }
 
-    /// Where `+` / "Add the right panel's folder" put it: into a group,
+    /// Where `+` / "Add the current folder" put it: into a group,
     /// after a folder, or at the end.
     fn tree_add_spot(&self, target: Option<&[usize]>) -> (Vec<usize>, usize) {
         match target.and_then(|p| Some((p, hotlist::get(&self.hotlist, p)?))) {
@@ -391,20 +396,19 @@ impl App {
     fn tree_add_current(&mut self, target: Option<Vec<usize>>) {
         self.leave_edits();
         let (at, index) = self.tree_add_spot(target.as_deref());
-        let dir = self.panel(1).path.clone();
+        let dir = self.panel(self.active).path.clone();
         self.tree_add_folders(vec![dir], &at, index);
     }
 
-    /// Opens the folder at `path` in the right panel (or a new tab there);
-    /// the tree keeps the focus. A group opens or closes instead.
+    /// Opens the folder at `path` in the last active panel (or a new tab
+    /// there); the focus stays where it is. A group opens or closes instead.
     fn tree_open(&mut self, path: &[usize], new_tab: bool) -> Task<Message> {
         match hotlist::get(&self.hotlist, path) {
             Some(HotItem::Folder(dir)) => {
                 let dir = dir.clone();
                 self.tree_set_cursor(path.to_vec());
-                let task = if new_tab { self.open_tab(1, dir, true) } else { self.start_nav(1, Nav::to(dir)) };
-                self.active = 0;
-                task
+                let side = self.active;
+                if new_tab { self.open_tab(side, dir, true) } else { self.start_nav(side, Nav::to(dir)) }
             }
             Some(HotItem::Menu { .. }) if !new_tab => {
                 self.tree_toggle_group(path, None);
@@ -662,15 +666,37 @@ impl App {
         }
     }
 
-    /// The spot an entry being dragged would move to (`None`: into itself).
+    /// The spot an entry being dragged would move to (`None`: into itself,
+    /// or not over the list).
     fn tree_move_spot(&self, rows: &[TreeRow]) -> Option<Spot> {
         let press = self.tree.press.as_ref().filter(|p| p.active)?;
+        self.tree.over?;
         let spot = self.tree_spot(rows);
         (!spot.at.starts_with(&press.path)).then_some(spot)
     }
 
-    /// The left button went up: a click on an entry, or the end of a drag.
+    /// The panel a folder dragged out of the tree would open in.
+    pub(super) fn tree_drop_side(&self) -> Option<usize> {
+        let press = self.tree.press.as_ref().filter(|p| p.active)?;
+        let folder = matches!(hotlist::get(&self.hotlist, &press.path), Some(HotItem::Folder(_)));
+        (folder && self.tree.over.is_none() && !self.tree_under_mouse()).then(|| self.side_under_mouse())
+    }
+
+    /// The left button went up: a click on an entry, the end of a drag, or
+    /// of resizing.
     pub(super) fn tree_release(&mut self) -> Task<Message> {
+        if std::mem::take(&mut self.tree.resizing) {
+            self.save_session();
+        }
+        // A folder dragged onto a panel opens there, which gets the focus.
+        if let Some(side) = self.tree_drop_side() {
+            let press = self.tree.press.take();
+            if let Some(HotItem::Folder(dir)) = press.and_then(|p| hotlist::get(&self.hotlist, &p.path)) {
+                let dir = dir.clone();
+                self.focus_panel(side);
+                return self.start_nav(side, Nav::to(dir));
+            }
+        }
         let Some(press) = self.tree.press.take() else { return Task::none() };
         if !press.active {
             self.tree.over = None;
@@ -701,8 +727,15 @@ impl App {
     }
 
     /// Mouse moved with an entry pressed: past the threshold it is dragged.
+    /// Or the divider is dragged: resize.
     pub(super) fn tree_mouse_moved(&mut self) {
         let mouse = self.mouse;
+        if self.tree.resizing {
+            self.tree.width = mouse.x - SPLIT_W / 2.0;
+            self.tree.width = self.tree_width();
+            self.sync_grids();
+            return;
+        }
         if let Some(p) = self.tree.press.as_mut().filter(|p| !p.active) {
             let start = *p.start.get_or_insert(mouse);
             if mouse.distance(start) >= DRAG_THRESHOLD {
@@ -717,7 +750,7 @@ impl App {
         let rows = hotlist::rows(&self.hotlist);
         let spot = self.tree_spot(&rows);
         self.tree.over = None;
-        self.active = 0;
+        self.tree.focused = true;
         self.tree_add_folders(dirs, &spot.at, spot.index);
         Task::none()
     }
@@ -735,7 +768,7 @@ impl App {
     /// Files dropped from other apps on the tree: folders go at the end.
     pub(super) fn tree_drop_external(&mut self, sources: Vec<PathBuf>) -> Task<Message> {
         let dirs: Vec<PathBuf> = sources.into_iter().filter(|p| p.is_dir()).collect();
-        self.active = 0;
+        self.tree.focused = true;
         let n = self.hotlist.len();
         self.tree_add_folders(dirs, &[], n);
         Task::none()
@@ -750,13 +783,17 @@ impl App {
         };
         if let Some(press) = self.tree.press.as_ref().filter(|p| p.active) {
             let what = hotlist::get(&self.hotlist, &press.path).map(HotItem::label).unwrap_or_default();
+            if let Some(side) = self.tree_drop_side() {
+                return Some(format!("Open {what} in the {} panel", if side == 0 { "left" } else { "right" }));
+            }
             return Some(match self.tree_move_spot(&rows) {
                 Some(spot) => format!("Move {what}{}", into(&spot)),
-                None => "Not into itself".to_owned(),
+                None if self.tree.over.is_some() => "Not into itself".to_owned(),
+                None => format!("Move {what}"),
             });
         }
         let drag = self.drag.as_ref().filter(|d| d.active)?;
-        if !self.tree_visible() || self.side_under_mouse() != 0 {
+        if !self.tree_under_mouse() {
             return None;
         }
         let dirs = self.dragged_folders(drag.side, &drag.sources);
@@ -771,10 +808,23 @@ impl App {
     pub(super) fn tree_update(&mut self, msg: TreeMsg) -> Task<Message> {
         match msg {
             TreeMsg::Toggle => return self.toggle_tree(),
+            TreeMsg::ResizePress => {
+                let now = Instant::now();
+                if matches!(self.tree.resize_click, Some(t) if now - t < DOUBLE_CLICK) {
+                    self.tree.resize_click = None;
+                    self.tree.resizing = false;
+                    self.tree.width = crate::session::DEFAULT_TREE_WIDTH;
+                    self.sync_grids();
+                    self.save_session();
+                } else {
+                    self.tree.resize_click = Some(now);
+                    self.tree.resizing = true;
+                }
+            }
             TreeMsg::Press(path) => {
                 self.leave_edits();
                 self.tree.menu = None;
-                self.active = 0;
+                self.tree.focused = true;
                 if hotlist::get(&self.hotlist, &path).is_some() {
                     self.tree.cursor = path.clone();
                     self.tree.press = Some(Press { path, start: None, active: false });
@@ -783,12 +833,12 @@ impl App {
             TreeMsg::Middle(path) => {
                 self.leave_edits();
                 self.tree.menu = None;
-                self.active = 0;
+                self.tree.focused = true;
                 return self.tree_open(&path, true);
             }
             TreeMsg::Right(target) => {
                 self.leave_edits();
-                self.active = 0;
+                self.tree.focused = true;
                 if let Some(p) = &target {
                     self.tree_set_cursor(p.clone());
                 }
@@ -811,7 +861,7 @@ impl App {
             TreeMsg::Background => {
                 self.leave_edits();
                 self.tree.menu = None;
-                self.active = 0;
+                self.tree.focused = true;
             }
             TreeMsg::Over(y) => self.tree.over = Some(y),
             TreeMsg::Out => self.tree.over = None,
@@ -838,7 +888,7 @@ impl App {
                 return self.tree_new_group(target);
             }
             TreeMsg::AddCurrent => {
-                self.active = 0;
+                self.tree.focused = true;
                 let target = (!self.tree.cursor.is_empty()).then(|| self.tree.cursor.clone());
                 self.tree_add_current(target);
             }
@@ -865,7 +915,7 @@ impl App {
         let color = if on { theme::c().accent } else { theme::c().muted };
         let icon = image(self.glyph(Glyph::Tree, color)).width(ICON).height(ICON);
         let keys = keymap::Keymap::keys_for(&self.keymap.bindings(), Command::HotlistTree).join(", ");
-        let tip = if on { "Show the folder" } else { "Show the hotlist tree" };
+        let tip = if on { "Hide the hotlist tree" } else { "Show the hotlist tree" };
         let tip = if keys.is_empty() { tip.to_owned() } else { format!("{tip} ({keys})") };
         tooltip(
             button(icon).on_press(Message::Tree(TreeMsg::Toggle)).padding([2, 6]).style(theme::drive(on)),
@@ -876,13 +926,12 @@ impl App {
         .into()
     }
 
-    /// The left side while it shows the tree: a title in place of the
-    /// tabs, a bar with the toggle and actions in place of the drives, the
-    /// tree, a hint line.
+    /// The tree column: a title level with the tabs, a bar with actions
+    /// level with the drives, the tree, a hint line.
     pub(super) fn tree_side_view(&self) -> Element<'_, Message> {
         let c = theme::c();
         let focused = self.tree_focused();
-        let file_drop = self.dragging() && self.side_under_mouse() == 0;
+        let file_drop = self.dragging() && self.tree_under_mouse();
         let strip = if file_drop || self.tree_dragging() {
             c.success
         } else if focused {
@@ -921,9 +970,8 @@ impl App {
         };
         let bar = container(
             row![
-                self.tree_button(),
                 action("+ Group", TreeMsg::NewGroup),
-                action("+ Right panel's folder", TreeMsg::AddCurrent),
+                action("+ Current folder", TreeMsg::AddCurrent),
                 Space::with_width(Length::Fill),
             ]
             .spacing(2)
@@ -939,7 +987,17 @@ impl App {
         } else if self.tree_dragging() {
             "Drop between entries or on a group \u{b7} Esc cancel"
         } else {
-            "Enter open \u{b7} Shift+Enter new tab \u{b7} F7 group \u{b7} F2 rename \u{b7} Del remove \u{b7} drag to move"
+            // As much as fits on one line.
+            let room = ((self.tree_width() - 20.0) / 5.5) as usize;
+            [
+                "Enter open \u{b7} Shift+Enter new tab \u{b7} F7 group \u{b7} F2 rename \u{b7} Del remove \u{b7} drag to move",
+                "Enter open \u{b7} Shift+Enter new tab \u{b7} F7 group \u{b7} F2 rename \u{b7} Del remove",
+                "Enter open \u{b7} F7 group \u{b7} F2 rename \u{b7} Del remove",
+                "Enter open \u{b7} F7 group \u{b7} Del remove",
+            ]
+            .into_iter()
+            .find(|h| h.chars().count() <= room)
+            .unwrap_or("F1 help")
         };
         let footer = container(text(hint).size(11).color(c.muted).wrapping(Wrapping::None))
             .padding([4, 10])
@@ -965,7 +1023,7 @@ impl App {
             container(
                 column![
                     text("No favourite folders yet").size(14).color(c.text),
-                    text("Drag folders here from the right panel, press + to add the right panel's folder, or F7 for a group.")
+                    text("Drag folders here from a panel, press + to add the current folder, or F7 for a group.")
                         .size(12)
                         .color(c.muted),
                 ]
@@ -1059,10 +1117,10 @@ impl App {
                     Some(icon) => Element::from(image(icon).width(ICON).height(ICON)),
                     None => Space::new(ICON, ICON).into(),
                 });
-                let here = self.panel(1).path == *dir;
+                let here = self.sides.iter().any(|s| s.tabs[s.current].path == *dir);
                 let color = if here { c.selected } else { c.dir };
                 let parent = dir.parent().map(rc_core::remote::display).unwrap_or_default();
-                let room = (self.left_width() / 7.0) as usize;
+                let room = (self.tree_width() / 7.0) as usize;
                 let label = item.label();
                 let detail = super::view::elide_left(&parent, room.saturating_sub(label.chars().count() + r.depth * 2 + 6).max(8));
                 content = content
@@ -1113,12 +1171,13 @@ impl App {
         let c = theme::c();
         let actions = self.tree_actions(menu.target.as_deref());
         let item = menu.target.as_deref().and_then(|p| hotlist::get(&self.hotlist, p));
-        let right = HotItem::Folder(self.panel(1).path.clone()).label();
+        let current = HotItem::Folder(self.panel(self.active).path.clone()).label();
+        let panel = if self.active == 0 { "left panel" } else { "right panel" };
         let mut list = Column::new().spacing(1);
         let mut height = 10.0;
         for (i, &action) in actions.iter().enumerate() {
             let (label, key) = match action {
-                Action::Open => ("Open in the right panel".to_owned(), "Enter"),
+                Action::Open => (format!("Open in the {panel}"), "Enter"),
                 Action::OpenNewTab => ("Open in a new tab".to_owned(), "Shift+Enter"),
                 Action::Expand => {
                     let open = matches!(item, Some(HotItem::Menu { expanded: true, .. }));
@@ -1127,8 +1186,8 @@ impl App {
                 Action::Rename => ("Rename group".to_owned(), "F2"),
                 Action::NewGroup => ("New group".to_owned(), "F7"),
                 Action::AddCurrent => match item {
-                    Some(HotItem::Menu { .. }) => (format!("Add \"{right}\" (right panel) here"), "+"),
-                    _ => (format!("Add \"{right}\" (right panel)"), "+"),
+                    Some(HotItem::Menu { .. }) => (format!("Add \"{current}\" ({panel}) here"), "+"),
+                    _ => (format!("Add \"{current}\" ({panel})"), "+"),
                 },
                 Action::Remove => match item {
                     Some(HotItem::Menu { .. }) => ("Remove group".to_owned(), "Del"),
@@ -1264,10 +1323,11 @@ mod tests {
     }
 
     #[test]
-    fn panel_commands_are_kept_from_the_tree() {
-        assert_eq!(in_tree(Command::SwitchPanel), InTree::Run);
-        assert_eq!(in_tree(Command::Copy), InTree::No);
-        assert_eq!(in_tree(Command::Delete), InTree::No);
-        assert_eq!(in_tree(Command::NewTab), InTree::OnRight);
+    fn typing_commands_take_the_focus_from_the_tree() {
+        assert!(takes_focus(Command::QuickFilter));
+        assert!(takes_focus(Command::Rename));
+        assert!(!takes_focus(Command::Copy));
+        assert!(!takes_focus(Command::NewTab));
+        assert!(!takes_focus(Command::SwitchPanel));
     }
 }

@@ -44,11 +44,16 @@ impl Columns {
 
 impl App {
     pub fn view(&self) -> Element<'_, Message> {
-        let panels = row![
-            container(self.side_view(0)).width(Length::Fixed(self.left_width())),
-            self.divider(),
-            self.side_view(1)
-        ].height(Length::Fill);
+        let mut panels = Row::new().height(Length::Fill);
+        if self.tree_visible() {
+            panels = panels
+                .push(container(self.tree_side_view()).width(Length::Fixed(self.tree_width())))
+                .push(self.split_line(Message::Tree(hotlist_tree::TreeMsg::ResizePress)));
+        }
+        let panels = panels
+            .push(container(self.side_view(0)).width(Length::Fixed(self.left_width())))
+            .push(self.divider())
+            .push(self.side_view(1));
 
         let base: Element<'_, Message> = if let Some(h) = &self.help {
             self.help_view(h)
@@ -87,34 +92,52 @@ impl App {
         base
     }
 
+    /// Width of the hotlist tree when shown: as set, kept narrow enough
+    /// to leave both panels room.
+    pub(super) fn tree_width(&self) -> f32 {
+        let max = (self.window_width - 2.0 * SPLIT_W - 2.0 * MIN_PANEL).max(MIN_TREE);
+        self.tree.width.clamp(MIN_TREE, max).round()
+    }
+
+    /// Window x where the panels start (right of the hotlist tree and its
+    /// divider when shown).
+    pub(super) fn panels_x(&self) -> f32 {
+        if self.tree_visible() { self.tree_width() + SPLIT_W } else { 0.0 }
+    }
+
     /// Width of the left panel: the split share, kept within bounds so
     /// neither panel gets too narrow.
     pub(super) fn left_width(&self) -> f32 {
-        let room = (self.window_width - SPLIT_W).max(1.0);
+        let room = (self.window_width - self.panels_x() - SPLIT_W).max(1.0);
         let min = MIN_PANEL.min(room / 2.0);
         (room * self.split).clamp(min, room - min).round()
     }
 
     /// Window x of the middle of the divider.
     pub(super) fn split_x(&self) -> f32 {
-        self.left_width() + SPLIT_W / 2.0
+        self.panels_x() + self.left_width() + SPLIT_W / 2.0
     }
 
-    fn panel_width(&self, side: usize) -> f32 {
+    pub(super) fn panel_width(&self, side: usize) -> f32 {
         let left = self.left_width();
-        if side == 0 { left } else { (self.window_width - SPLIT_W - left).max(1.0) }
+        if side == 0 { left } else { (self.window_width - self.panels_x() - SPLIT_W - left).max(1.0) }
     }
 
     /// Draggable divider between the panels (double click: back to equal, see
     /// `Message::SplitPress`).
     fn divider(&self) -> Element<'_, Message> {
+        self.split_line(Message::SplitPress)
+    }
+
+    /// A divider line that resizes what is left of it when dragged.
+    fn split_line(&self, press: Message) -> Element<'_, Message> {
         let line = row![
             Space::new(Length::Fixed(2.0), Length::Fill),
             container(Space::new(Length::Fixed(1.0), Length::Fill)).style(filled(theme::c().border)),
             Space::new(Length::Fixed(2.0), Length::Fill),
         ];
         mouse_area(line)
-            .on_press(Message::SplitPress)
+            .on_press(press)
             .interaction(mouse::Interaction::ResizingHorizontally)
             .into()
     }
@@ -184,15 +207,13 @@ impl App {
     }
 
     fn side_view(&self, side: usize) -> Element<'_, Message> {
-        if side == 0 && self.tree_visible() {
-            return self.tree_side_view();
-        }
         let panel = self.panel(side);
-        let active = side == self.active;
+        let active = self.panel_focused(side);
         let drop_here = self
             .drag
             .as_ref()
-            .is_some_and(|d| d.active && self.side_under_mouse() == side && self.drop_target(d).is_some());
+            .is_some_and(|d| d.active && self.side_under_mouse() == side && self.drop_target(d).is_some())
+            || self.tree_drop_side() == Some(side);
 
         // Thin strip marks the active panel (green while it's a drop target).
         let strip = if drop_here {
@@ -315,7 +336,7 @@ impl App {
     /// Current path; click to edit it.
     fn path_bar(&self, side: usize) -> Element<'_, Message> {
         let panel = self.panel(side);
-        let active = side == self.active;
+        let active = self.panel_focused(side);
 
         let content: Element<'_, Message> = match &self.path_edit {
             Some(edit) if edit.side == side => text_input("Path", &edit.text)

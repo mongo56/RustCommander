@@ -228,7 +228,7 @@ impl App {
         let focus = hit.path.file_name().map(|n| n.to_string_lossy().into_owned());
         let side = f.side;
         self.close_find();
-        self.active = side;
+        self.focus_panel(side);
         self.start_nav(side, Nav::To { path: folder, focus })
     }
 
@@ -243,7 +243,7 @@ impl App {
         f.stop();
         let (side, hits, cursor) = (f.side, f.results.clone(), f.cursor);
         self.close_find();
-        self.active = side;
+        self.focus_panel(side);
         self.nav[side] = None;
         let panel = self.panel_mut(side);
         // The cursor goes to the hit that was under it in the list.
