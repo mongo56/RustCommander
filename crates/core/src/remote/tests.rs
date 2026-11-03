@@ -25,12 +25,27 @@ impl Drop for TempDir {
     }
 }
 
-/// The settings folder (known_hosts) shared by all tests of this process.
-fn settings() -> PathBuf {
+/// The settings folder (known_hosts) shared by all tests of this process. Like
+/// [`TempDir`] it cleans up: the guard deletes the folder once the last test
+/// that asked for it is done (its `Drop` runs even when a test panics).
+static SETTINGS_USERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+struct Settings(PathBuf);
+
+impl Drop for Settings {
+    fn drop(&mut self) {
+        if SETTINGS_USERS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+}
+
+fn settings() -> Settings {
     let dir = std::env::temp_dir().join(format!("rc-remote-settings-{}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
     set_settings_dir(dir.clone());
-    dir
+    SETTINGS_USERS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    Settings(dir)
 }
 
 fn free_port() -> u16 {
@@ -509,7 +524,7 @@ fn sftp_login(port: u16, password: &str) -> Login {
 
 #[test]
 fn sftp_against_local_server() {
-    settings();
+    let _settings = settings();
     let disk = TempDir::new("sftp-server");
     let port = start_sftp(disk.0.clone(), 1);
     let login = sftp_login(port, sftp_server::PASSWORD);
@@ -535,7 +550,7 @@ fn sftp_refuses_a_changed_host_key() {
     let port = start_sftp(disk.0.clone(), 2);
     // Trust another key for this server.
     let other = sftp_server::host_key(3).public_key().to_openssh().unwrap();
-    let mut known = fs::OpenOptions::new().create(true).append(true).open(settings.join("known_hosts")).unwrap();
+    let mut known = fs::OpenOptions::new().create(true).append(true).open(settings.0.join("known_hosts")).unwrap();
     writeln!(known, "127.0.0.1:{port} {other}").unwrap();
     let e = connect(sftp_login(port, sftp_server::PASSWORD), "").unwrap_err().to_string();
     assert!(e.contains(HOST_KEY_CHANGED), "{e}");
