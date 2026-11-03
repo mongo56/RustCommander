@@ -7,6 +7,7 @@ mod connect;
 mod file_diff;
 mod help;
 mod hotlist;
+mod hotlist_tree;
 mod palette;
 mod find_files;
 mod multi_rename;
@@ -88,6 +89,8 @@ pub struct App {
     conflict_focus: Option<usize>,
     /// Favourite folders (Ctrl+D), saved with the session.
     hotlist: Vec<crate::hotlist::HotItem>,
+    /// The left panel as the hotlist tree (setting `hotlist_tree`).
+    tree: hotlist_tree::HotTree,
     /// Commands last run from the command palette, most recent first
     /// (saved with the session).
     recent_commands: Vec<Command>,
@@ -245,6 +248,8 @@ enum Dialog {
     Palette(palette::Palette),
     /// Compare-folders options; Enter compares with them.
     Compare { opts: CompareOptions },
+    /// Remove a hotlist group with entries (Del in the hotlist tree).
+    RemoveGroup { path: Vec<usize>, name: String, count: usize },
 }
 
 /// The path bar of one side being edited, with folder suggestions.
@@ -412,6 +417,8 @@ pub enum Message {
     /// Open hotlist entry `i` in a new tab (Shift+Enter / middle-click).
     HotlistNewTab(usize),
     HotlistBack,
+    /// The hotlist tree in the left panel.
+    Tree(hotlist_tree::TreeMsg),
     HistoryPick(usize),
     /// Run the palette's `n`th shown command (a click).
     PalettePick(usize),
@@ -497,6 +504,7 @@ impl App {
             dialog_focus: None,
             conflict_focus: None,
             hotlist: session.as_ref().map(|s| s.hotlist.clone()).unwrap_or_default(),
+            tree: hotlist_tree::HotTree::new(session.as_ref().is_some_and(|s| s.hotlist_tree)),
             recent_commands: session
                 .as_ref()
                 .map(|s| s.recent_commands.iter().filter_map(|id| Command::from_id(id)).collect())
@@ -550,6 +558,7 @@ impl App {
             archive_edits: archive_edit::ArchiveEdits::default(),
         };
         app.refresh_config();
+        app.tree_fix_cursor();
         // First start: hidden files as configured.
         if session.is_none() && app.config.show_hidden {
             for side in &mut app.sides {
@@ -610,7 +619,12 @@ impl App {
         // Mouse moves re-render the window, so only listen while a drag may
         // be starting or in progress, or the viewer shows a document (mouse
         // selection).
-        if self.drag.is_some() || self.split_drag || self.column_drag.is_some() || self.viewer_tracks_mouse() {
+        if self.drag.is_some()
+            || self.split_drag
+            || self.column_drag.is_some()
+            || self.viewer_tracks_mouse()
+            || self.tree_tracks_mouse()
+        {
             subs.push(event::listen_with(|event, _status, _window| match event {
                 Event::Mouse(mouse::Event::CursorMoved { position }) => Some(Message::MouseMoved(position)),
                 _ => None,
@@ -801,6 +815,7 @@ impl App {
                     self.sync_grids();
                 }
                 self.column_dragged(position.x);
+                self.tree_mouse_moved();
                 let pan = self.viewer_mouse_moved();
                 return Task::batch([pan, self.update_drag()]);
             }
@@ -832,6 +847,9 @@ impl App {
                 self.column_drag = None;
                 if !right {
                     self.viewer_release();
+                    if self.tree_tracks_mouse() {
+                        return self.tree_release();
+                    }
                 }
                 return self.finish_drag(right);
             }
@@ -894,6 +912,9 @@ impl App {
                 let sources = std::mem::take(&mut self.dropped);
                 self.status = None;
                 let side = position.map(|(x, _)| usize::from(x >= self.split_x())).unwrap_or(self.active);
+                if side == 0 && self.tree_visible() {
+                    return self.tree_drop_external(sources);
+                }
                 self.active = side;
                 let target = self.panel(side).path.clone();
                 return self.open_transfer(false, sources, &target);
@@ -1051,6 +1072,7 @@ impl App {
             Message::HotlistPick(i) => return self.hotlist_pick(i),
             Message::HotlistNewTab(i) => return self.hotlist_new_tab(i),
             Message::HotlistBack => self.hotlist_back(),
+            Message::Tree(msg) => return self.tree_update(msg),
             Message::HistoryPick(i) => return self.history_pick(i),
             Message::PalettePick(i) => return self.palette_pick(i),
             Message::Job(id, event) => return self.on_job_event(id, event),
@@ -1282,7 +1304,8 @@ impl App {
         }
         if self.dialog.is_some() {
             // Dialogs with a text box keep Left/Right for its cursor.
-            let has_input = !matches!(self.dialog, Some(Dialog::Delete { .. } | Dialog::Compare { .. }));
+            let has_input =
+                !matches!(self.dialog, Some(Dialog::Delete { .. } | Dialog::Compare { .. } | Dialog::RemoveGroup { .. }));
             let back = match named {
                 Some(Named::Tab) => Some(mods.shift()),
                 Some(Named::ArrowLeft) if !has_input => Some(true),
@@ -1298,6 +1321,9 @@ impl App {
                 return self.dialog_enter();
             }
             return Task::none();
+        }
+        if let Some(task) = self.tree_modal_key(named) {
+            return task;
         }
         if let Some(rename) = &mut self.rename {
             if escape {
@@ -1320,6 +1346,10 @@ impl App {
             self.drag = None;
             return Task::none();
         }
+        if escape && self.tree_tracks_mouse() {
+            self.tree_cancel_drag();
+            return Task::none();
+        }
         if captured {
             return Task::none();
         }
@@ -1328,6 +1358,18 @@ impl App {
         // letter) must not end a quick search or trigger anything.
         if named.is_some_and(is_modifier_key) {
             return Task::none();
+        }
+
+        // The hotlist tree has keys of its own; others run on the right panel
+        // or not at all (`run`).
+        if self.tree_focused() {
+            if let Some(task) = self.tree_key(&key, named, mods, text.as_deref()) {
+                return task;
+            }
+            return match self.keymap.command(&key, mods) {
+                Some(cmd) => self.run(cmd),
+                None => Task::none(),
+            };
         }
 
         // Quick search: plain typing jumps to matching names.
@@ -1395,6 +1437,17 @@ impl App {
         use Command::*;
         self.status = None;
         self.quick_search = None;
+        if self.tree_focused() {
+            match hotlist_tree::in_tree(cmd) {
+                hotlist_tree::InTree::Run => {}
+                hotlist_tree::InTree::OnRight => self.active = 1,
+                hotlist_tree::InTree::No => {
+                    let msg = format!("\"{}\" needs files: Tab switches to the right panel", cmd.description());
+                    self.status = Some((msg, Tone::Info));
+                    return Task::none();
+                }
+            }
+        }
         let rows = self.page_rows();
         let page = rows.saturating_sub(1).max(1) as isize;
         let active = self.active;
@@ -1488,6 +1541,7 @@ impl App {
                 self.open_hotlist();
                 return self.popup_snap();
             }
+            HotlistTree => return self.toggle_tree(),
             DirHistory => {
                 self.open_history();
                 return self.popup_snap();
@@ -1682,6 +1736,7 @@ impl App {
         if self.rename.is_some() {
             self.commit_rename();
         }
+        self.tree_leave_naming();
     }
 
     // ---- tabs -------------------------------------------------------------
@@ -2151,6 +2206,7 @@ impl App {
                 self.dialog = Some(Dialog::Palette(palette));
                 return self.palette_pick(selected);
             }
+            Dialog::RemoveGroup { path, .. } => self.tree_remove_now(&path),
             Dialog::Compare { opts } => {
                 let changed = self.compare_opts != opts;
                 self.compare_opts = opts;
@@ -2222,6 +2278,9 @@ impl App {
                 return self.context_menu(drag.side, on_parent);
             }
             return Task::none();
+        }
+        if self.tree_visible() && self.side_under_mouse() == 0 {
+            return self.tree_drop_files(drag.side, &drag.sources);
         }
         let Some(target) = self.drop_target(&drag) else { return Task::none() };
         self.active = drag.side;
@@ -2310,6 +2369,9 @@ impl App {
     /// valid target" (e.g. back onto the same panel).
     fn drop_target(&self, drag: &Drag) -> Option<PathBuf> {
         let side = self.side_under_mouse();
+        if side == 0 && self.tree_visible() {
+            return None;
+        }
         let panel = self.panel(side);
         if let Some((hover_side, index)) = self.hover {
             if hover_side == side {
@@ -2875,6 +2937,7 @@ impl App {
             left: side(&self.sides[0]),
             right: side(&self.sides[1]),
             hotlist: self.hotlist.clone(),
+            hotlist_tree: self.tree.shown,
             compare: self.compare_unsaved,
             recent_commands: self.recent_commands.iter().map(|c| c.id().to_owned()).collect(),
             split: self.split,

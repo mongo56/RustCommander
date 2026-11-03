@@ -26,6 +26,9 @@ pub enum Command {
     DirHistory,
     /// Directory hotlist popup (Ctrl+D).
     Hotlist,
+    /// The left panel as the hotlist tree, or back to its files
+    /// (Ctrl+Shift+D; needs the `hotlist_tree` setting).
+    HotlistTree,
     SwitchPanel,
     /// Toggle selection on the cursor entry, optionally moving down.
     ToggleSelect { advance: bool },
@@ -119,6 +122,7 @@ impl Command {
             HistoryForward => "cm_NextDir",
             DirHistory => "cm_DirectoryHistory",
             Hotlist => "cm_DirectoryHotlist",
+            HotlistTree => "cm_HotlistTree",
             SwitchPanel => "cm_FocusSwap",
             ToggleSelect { advance: true } => "cm_Select",
             ToggleSelect { advance: false } => "cm_SelectNoMove",
@@ -190,6 +194,7 @@ impl Command {
             HistoryForward => "Forward to the next folder",
             DirHistory => "Folder history list: jump back or forward to any folder visited in this tab",
             Hotlist => "Directory hotlist: favourite folders, with submenus",
+            HotlistTree => "Hotlist tree: show the hotlist as a folder tree in the left panel, or its files again",
             SwitchPanel => "Switch to the other panel",
             ToggleSelect { advance: true } => "Select / deselect the entry and move down",
             ToggleSelect { advance: false } => "Select / deselect the entry",
@@ -267,6 +272,7 @@ impl Command {
             NewTab => "NewTab",
             CloseTab => "CloseTab",
             Hotlist => "Hotlist",
+            HotlistTree => "Tree",
             Connect => "Connect",
             Disconnect => "Disconn",
             SelectAll => "SelAll",
@@ -318,6 +324,7 @@ impl Command {
             HistoryForward,
             DirHistory,
             Hotlist,
+            HotlistTree,
             SwitchPanel,
             ToggleSelect { advance: true },
             ToggleSelect { advance: false },

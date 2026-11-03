@@ -78,6 +78,9 @@ impl App {
         if let Some(card) = modal {
             return stack![base, opaque(center(card).style(theme::backdrop))].into();
         }
+        if let Some(menu) = self.tree_menu_view() {
+            return stack![base, menu].into();
+        }
         if let Some(label) = self.drag_label() {
             return stack![base, label].into();
         }
@@ -159,15 +162,20 @@ impl App {
 
     /// Floating "Copy 3 items → target" label next to the mouse.
     fn drag_label(&self) -> Option<Element<'_, Message>> {
-        let drag = self.drag.as_ref().filter(|d| d.active)?;
-        let verb = if self.modifiers.shift() { "Move" } else { "Copy" };
-        let what = describe(&drag.sources);
-        let label = match self.drop_target(drag) {
-            Some(target) => {
-                let name = target.file_name().map(|n| n.to_string_lossy().into_owned());
-                format!("{verb} {what} → {}", name.unwrap_or_else(|| target.display().to_string()))
+        let label = match self.tree_drag_text() {
+            Some(label) => label,
+            None => {
+                let drag = self.drag.as_ref().filter(|d| d.active)?;
+                let verb = if self.modifiers.shift() { "Move" } else { "Copy" };
+                let what = describe(&drag.sources);
+                match self.drop_target(drag) {
+                    Some(target) => {
+                        let name = target.file_name().map(|n| n.to_string_lossy().into_owned());
+                        format!("{verb} {what} → {}", name.unwrap_or_else(|| target.display().to_string()))
+                    }
+                    None => format!("{verb} {what}"),
+                }
             }
-            None => format!("{verb} {what}"),
         };
         let tag = container(text(label).size(12)).padding([4, 8]).style(theme::drag_label);
         // Drawn at the cursor iced hands to `draw`, so it keeps up with the
@@ -176,6 +184,9 @@ impl App {
     }
 
     fn side_view(&self, side: usize) -> Element<'_, Message> {
+        if side == 0 && self.tree_visible() {
+            return self.tree_side_view();
+        }
         let panel = self.panel(side);
         let active = side == self.active;
         let drop_here = self
@@ -253,7 +264,8 @@ impl App {
     /// One button per drive, plus free space on the current one.
     fn drive_bar(&self, side: usize) -> Element<'_, Message> {
         let panel = self.panel(side);
-        let buttons = Row::with_children(self.drives.iter().map(|drive| {
+        let toggle = (side == 0 && self.config.hotlist_tree).then(|| self.tree_button());
+        let buttons = Row::with_children(toggle.into_iter().chain(self.drives.iter().map(|drive| {
             let current = panel.path.starts_with(drive.as_str());
             let letter = drive.trim_end_matches(['\\', '/', ':']).to_string();
             let letter = if letter.is_empty() { drive.clone() } else { letter.to_lowercase() };
@@ -271,7 +283,7 @@ impl App {
             .on_middle_press(Message::DriveMiddle(side, drive.clone()))
             .on_right_press(Message::DriveRight(side, drive.clone()))
             .into()
-        }))
+        })))
         .spacing(2);
 
         let width = self.panel_width(side);
@@ -748,6 +760,15 @@ impl App {
                 None,
                 "Delete",
             ),
+            Dialog::RemoveGroup { name, count, .. } => (
+                "Remove group".into(),
+                format!(
+                    "Remove the group \"{name}\" and the {} in it from the hotlist? The folders themselves stay.",
+                    if *count == 1 { "entry".to_owned() } else { format!("{count} entries") }
+                ),
+                None,
+                "Remove",
+            ),
             Dialog::Hotlist(_) | Dialog::History { .. } | Dialog::Palette(_) | Dialog::Compare { .. } => {
                 unreachable!("drawn above")
             }
@@ -823,7 +844,7 @@ impl App {
                     let color = if path == here { theme::c().selected } else { theme::c().text };
                     self.popup_row(i, Some(path), name, color, path.display().to_string())
                 }
-                HotItem::Menu { name, items } => {
+                HotItem::Menu { name, items, .. } => {
                     let name = match &menu.naming {
                         Some(typed) if menu.renaming && i == selected => format!("{typed}_"),
                         _ => format!("{name}  \u{203a}"),
@@ -859,7 +880,7 @@ impl App {
         let mut title = String::from("Hotlist");
         let mut level = self.hotlist.as_slice();
         for &i in &menu.at {
-            if let Some(HotItem::Menu { name, items }) = level.get(i) {
+            if let Some(HotItem::Menu { name, items, .. }) = level.get(i) {
                 title.push_str(&format!(" \u{203a} {name}"));
                 level = items;
             }
@@ -1034,7 +1055,7 @@ pub(super) fn elide_end(s: &str, max_chars: usize) -> String {
     format!("{head}…")
 }
 
-fn elide_left(s: &str, max_chars: usize) -> String {
+pub(super) fn elide_left(s: &str, max_chars: usize) -> String {
     let count = s.chars().count();
     if count <= max_chars {
         return s.to_string();

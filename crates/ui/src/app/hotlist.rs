@@ -98,7 +98,7 @@ impl App {
                                 *old = name;
                             }
                         } else {
-                            items.insert(i.min(items.len()), HotItem::Menu { name, items: Vec::new() });
+                            items.insert(i.min(items.len()), HotItem::Menu { name, expanded: false, items: Vec::new() });
                         }
                         self.save_session();
                     }

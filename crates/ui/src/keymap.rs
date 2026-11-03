@@ -424,6 +424,7 @@ const DEFAULTS: &[(&str, Command)] = {
         ("ctrl+shift+f2", CompareDirsOptions),
         ("ctrl+shift+f5", Thumbnails),
         ("ctrl+shift+f", Disconnect),
+        ("ctrl+shift+d", HotlistTree),
     ]
 };
 

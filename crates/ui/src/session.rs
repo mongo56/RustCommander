@@ -19,6 +19,10 @@ pub struct Session {
     /// list of paths, which still loads (a folder is a plain path).
     #[serde(default)]
     pub hotlist: Vec<HotItem>,
+    /// The left panel shows the hotlist tree instead of its files (when
+    /// the `hotlist_tree` setting is on).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hotlist_tree: bool,
     /// Window position and maximised state (Windows).
     #[serde(default)]
     pub window: Option<WindowState>,
@@ -179,9 +183,10 @@ mod tests {
             right: SideState::default(),
             hotlist: vec![
                 HotItem::Folder(dir.clone()),
-                HotItem::Menu { name: "Work".into(), items: vec![HotItem::Folder(dir.join("x"))] },
-                HotItem::Menu { name: "Empty".into(), items: vec![] },
+                HotItem::Menu { name: "Work".into(), expanded: true, items: vec![HotItem::Folder(dir.join("x"))] },
+                HotItem::Menu { name: "Empty".into(), expanded: false, items: vec![] },
             ],
+            hotlist_tree: true,
             window: Some(WindowState { left: -8, top: 0, right: 1200, bottom: 800, maximized: true }),
             compare: Some(CompareState { by_content: true, ignore_date: false, subfolders: true }),
             recent_commands: vec!["cm_MkDir".into(), "cm_Copy".into()],
@@ -195,6 +200,7 @@ mod tests {
         assert_eq!(back.split, 0.3);
         assert_eq!(back.columns, [45.0, 95.0, 150.0]);
         assert_eq!(back.hotlist, session.hotlist);
+        assert!(back.hotlist_tree);
         assert_eq!(back.recent_commands, session.recent_commands);
         // Compare options not yet moved to config.toml are kept...
         assert_eq!(back.compare, session.compare);
@@ -231,6 +237,7 @@ mod tests {
         let folders = [r"C:\Users", r"D:\Work"].map(|p| HotItem::Folder(PathBuf::from(p)));
         assert_eq!(session.hotlist, folders);
         assert_eq!(session.split, 0.5);
+        assert!(!session.hotlist_tree);
         assert_eq!(session.columns, DEFAULT_COLUMNS);
         // Saved again, plain folders keep the old form.
         let saved = toml::to_string_pretty(&session).unwrap();

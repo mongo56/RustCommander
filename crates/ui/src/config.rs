@@ -26,6 +26,9 @@ pub struct Config {
     /// The function-key bar (F1-F10 buttons) under the panels; off = a
     /// one-line hint instead.
     pub show_fkeys: bool,
+    /// The hotlist tree: a button left of the left panel's drive buttons
+    /// (and Ctrl+Shift+D) swap that panel's files for the hotlist as a tree.
+    pub hotlist_tree: bool,
     /// Edge of the thumbnail view's pictures in pixels (Ctrl+Shift+F5);
     /// 0 = the default, see [`Config::thumbnail_size`].
     pub thumbnail_size: u32,
@@ -314,6 +317,11 @@ fn template(editor: &str, compare: CompareState) -> String {
          # one-line hint (F1 help, command palette, F10 settings).\n\
          show_fkeys = false\n\
          \n\
+         # Hotlist tree: a button left of the left panel's drive buttons (and\n\
+         # Ctrl+Shift+D) shows the hotlist (Ctrl+D) there as a folder tree; folders\n\
+         # picked in it open in the right panel.\n\
+         hotlist_tree = false\n\
+         \n\
          # Size of the pictures in the thumbnail view (Ctrl+Shift+F5), in pixels\n\
          # (32-512).\n\
          thumbnail_size = 128\n\
@@ -389,6 +397,8 @@ mod tests {
         assert_eq!(config.theme, "light");
         assert!(config.show_hidden && config.show_fkeys);
         assert!(!parse(&template("", CompareState::default())).unwrap().show_fkeys);
+        assert!(!parse(&template("", CompareState::default())).unwrap().hotlist_tree);
+        assert!(parse(&apply(&out, &[Edit::Flag("hotlist_tree", true)]).unwrap()).unwrap().hotlist_tree);
         assert_eq!(config.keys["Ctrl+Shift+F5"], "cm_RenMov");
         assert_eq!(config.colors["Accent"], "#00ff00");
         assert_eq!(config.colors["bg"], "#000000");

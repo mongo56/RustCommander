@@ -64,14 +64,15 @@ impl Page {
 }
 
 /// Rows of the General page.
-const GENERAL_ROWS: usize = 8;
+const GENERAL_ROWS: usize = 9;
 const ROW_EDITOR: usize = 0;
 const ROW_TERMINAL: usize = 1;
 const ROW_HIDDEN: usize = 2;
 const ROW_FKEYS: usize = 3;
-/// Compare options 0..3 (`toggle_compare_option`) are rows 4..7.
-const ROW_COMPARE: usize = 4;
-const ROW_CONFIG: usize = 7;
+const ROW_TREE: usize = 4;
+/// Compare options 0..3 (`toggle_compare_option`) are rows 5..8.
+const ROW_COMPARE: usize = 5;
+const ROW_CONFIG: usize = 8;
 
 #[derive(Debug, Clone)]
 pub enum SettingsMsg {
@@ -92,6 +93,7 @@ pub enum SettingsMsg {
     Terminal(String),
     ShowHidden(bool),
     ShowFkeys(bool),
+    HotlistTree(bool),
     /// Toggle compare option 0..3.
     Compare(u8),
     EditConfig,
@@ -296,6 +298,7 @@ impl App {
                 }
                 ROW_HIDDEN => self.settings_update(SettingsMsg::ShowHidden(!self.config.show_hidden)),
                 ROW_FKEYS => self.settings_update(SettingsMsg::ShowFkeys(!self.config.show_fkeys)),
+                ROW_TREE => self.settings_update(SettingsMsg::HotlistTree(!self.config.hotlist_tree)),
                 ROW_CONFIG => self.settings_update(SettingsMsg::EditConfig),
                 _ => self.settings_update(SettingsMsg::Compare((row - ROW_COMPARE) as u8)),
             },
@@ -424,6 +427,11 @@ impl App {
                 s.row[0] = ROW_FKEYS;
                 let state = if on { "shown" } else { "hidden" };
                 self.settings_write(&[Edit::Flag("show_fkeys", on)], format!("Function-key bar {state}"));
+            }
+            SettingsMsg::HotlistTree(on) => {
+                s.row[0] = ROW_TREE;
+                let state = if on { "on: the button left of the left panel's drives shows it" } else { "off" };
+                self.settings_write(&[Edit::Flag("hotlist_tree", on)], format!("Hotlist tree {state}"));
             }
             SettingsMsg::Compare(i) => {
                 s.row[0] = ROW_COMPARE + i as usize;
@@ -814,6 +822,17 @@ impl App {
                             label("Function-key bar"),
                             switch(self.config.show_fkeys, SettingsMsg::ShowFkeys(!self.config.show_fkeys)),
                             hint("Buttons F1-F10 under the panels; off = a one-line hint".into()),
+                        ]
+                        .spacing(8)
+                        .align_y(Alignment::Center)
+                        .into()
+                    ),
+                    line(
+                        ROW_TREE,
+                        row![
+                            label("Hotlist tree"),
+                            switch(self.config.hotlist_tree, SettingsMsg::HotlistTree(!self.config.hotlist_tree)),
+                            hint("A button left of the left panel's drives (Ctrl+Shift+D) shows the hotlist there as a tree".into()),
                         ]
                         .spacing(8)
                         .align_y(Alignment::Center)
