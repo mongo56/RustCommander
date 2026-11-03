@@ -29,6 +29,9 @@ pub enum Command {
     /// Show / hide the hotlist tree left of the panels
     /// (Ctrl+Shift+D; needs the `hotlist_tree` setting).
     HotlistTree,
+    /// With the hotlist tree shown: hide / show the left panel, leaving
+    /// the tree and the right panel.
+    HotlistTreeHideLeft,
     SwitchPanel,
     /// Toggle selection on the cursor entry, optionally moving down.
     ToggleSelect { advance: bool },
@@ -125,6 +128,7 @@ impl Command {
             DirHistory => "cm_DirectoryHistory",
             Hotlist => "cm_DirectoryHotlist",
             HotlistTree => "cm_HotlistTree",
+            HotlistTreeHideLeft => "cm_HotlistTreeHideLeft",
             SwitchPanel => "cm_FocusSwap",
             ToggleSelect { advance: true } => "cm_Select",
             ToggleSelect { advance: false } => "cm_SelectNoMove",
@@ -198,6 +202,7 @@ impl Command {
             DirHistory => "Folder history list: jump back or forward to any folder visited in this tab",
             Hotlist => "Directory hotlist: favourite folders, with submenus",
             HotlistTree => "Hotlist tree: show or hide the hotlist as a folder tree left of the panels",
+            HotlistTreeHideLeft => "Hotlist tree: hide or show the left panel while the tree is shown",
             SwitchPanel => "Switch to the other panel",
             ToggleSelect { advance: true } => "Select / deselect the entry and move down",
             ToggleSelect { advance: false } => "Select / deselect the entry",
@@ -277,6 +282,7 @@ impl Command {
             CloseTab => "CloseTab",
             Hotlist => "Hotlist",
             HotlistTree => "Tree",
+            HotlistTreeHideLeft => "HideLeft",
             Connect => "Connect",
             Disconnect => "Disconn",
             SelectAll => "SelAll",
@@ -330,6 +336,7 @@ impl Command {
             DirHistory,
             Hotlist,
             HotlistTree,
+            HotlistTreeHideLeft,
             SwitchPanel,
             ToggleSelect { advance: true },
             ToggleSelect { advance: false },

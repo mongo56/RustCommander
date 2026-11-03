@@ -50,10 +50,10 @@ impl App {
                 .push(container(self.tree_side_view()).width(Length::Fixed(self.tree_width())))
                 .push(self.split_line(Message::Tree(hotlist_tree::TreeMsg::ResizePress)));
         }
-        let panels = panels
-            .push(container(self.side_view(0)).width(Length::Fixed(self.left_width())))
-            .push(self.divider())
-            .push(self.side_view(1));
+        if !self.left_hidden() {
+            panels = panels.push(container(self.side_view(0)).width(Length::Fixed(self.left_width()))).push(self.divider());
+        }
+        let panels = panels.push(self.side_view(1));
 
         let base: Element<'_, Message> = if let Some(h) = &self.help {
             self.help_view(h)
@@ -108,6 +108,9 @@ impl App {
     /// Width of the left panel: the split share, kept within bounds so
     /// neither panel gets too narrow.
     pub(super) fn left_width(&self) -> f32 {
+        if self.left_hidden() {
+            return 0.0;
+        }
         let room = (self.window_width - self.panels_x() - SPLIT_W).max(1.0);
         let min = MIN_PANEL.min(room / 2.0);
         (room * self.split).clamp(min, room - min).round()
@@ -115,12 +118,13 @@ impl App {
 
     /// Window x of the middle of the divider.
     pub(super) fn split_x(&self) -> f32 {
-        self.panels_x() + self.left_width() + SPLIT_W / 2.0
+        if self.left_hidden() { self.panels_x() } else { self.panels_x() + self.left_width() + SPLIT_W / 2.0 }
     }
 
     pub(super) fn panel_width(&self, side: usize) -> f32 {
         let left = self.left_width();
-        if side == 0 { left } else { (self.window_width - self.panels_x() - SPLIT_W - left).max(1.0) }
+        let split = if self.left_hidden() { 0.0 } else { SPLIT_W };
+        if side == 0 { left } else { (self.window_width - self.panels_x() - split - left).max(1.0) }
     }
 
     /// Draggable divider between the panels (double click: back to equal, see
@@ -285,7 +289,8 @@ impl App {
     /// One button per drive, plus free space on the current one.
     fn drive_bar(&self, side: usize) -> Element<'_, Message> {
         let panel = self.panel(side);
-        let toggle = (side == 0 && self.config.hotlist_tree).then(|| self.tree_button());
+        let toggle_side = usize::from(self.left_hidden());
+        let toggle = (side == toggle_side && self.config.hotlist_tree).then(|| self.tree_button());
         let buttons = Row::with_children(toggle.into_iter().chain(self.drives.iter().map(|drive| {
             let current = panel.path.starts_with(drive.as_str());
             let letter = drive.trim_end_matches(['\\', '/', ':']).to_string();

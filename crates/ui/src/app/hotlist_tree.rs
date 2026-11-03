@@ -34,6 +34,8 @@ pub(super) struct HotTree {
     /// Width as set with the divider (saved; `App::tree_width` keeps it
     /// within the window).
     pub width: f32,
+    /// The left panel is hidden while the tree is shown (saved).
+    pub hide_left: bool,
     /// Has the keyboard focus; `App::active` is then the last active
     /// panel, which commands other than the tree's own act on.
     pub focused: bool,
@@ -62,8 +64,8 @@ pub(super) struct HotTree {
 }
 
 impl HotTree {
-    pub fn new(shown: bool, width: f32) -> Self {
-        Self { shown, width, ..Self::default() }
+    pub fn new(shown: bool, width: f32, hide_left: bool) -> Self {
+        Self { shown, width, hide_left, ..Self::default() }
     }
 }
 
@@ -107,6 +109,8 @@ enum Action {
 pub enum TreeMsg {
     /// The button left of the drive buttons.
     Toggle,
+    /// The "hide / show left panel" button in the tree's title.
+    ToggleLeft,
     /// Press on the divider right of the tree.
     ResizePress,
     Press(Vec<usize>),
@@ -183,6 +187,11 @@ impl App {
         self.config.hotlist_tree && self.tree.shown
     }
 
+    /// The left panel is hidden (tree shown with "hide left panel" on).
+    pub(super) fn left_hidden(&self) -> bool {
+        self.tree.hide_left && self.tree_visible()
+    }
+
     /// The tree has the keyboard focus.
     pub(super) fn tree_focused(&self) -> bool {
         self.tree.focused && self.tree_visible()
@@ -223,6 +232,24 @@ impl App {
             }
             self.tree_fix_cursor();
             self.tree.detached = false;
+        }
+        self.sync_grids();
+        self.save_session();
+        Task::none()
+    }
+
+    /// Hide or show the left panel (needs the tree shown); hiding it makes
+    /// the right panel the active one.
+    pub(super) fn toggle_hide_left(&mut self) -> Task<Message> {
+        if !self.tree_visible() {
+            self.status = Some(("Show the hotlist tree first (Ctrl+Shift+D)".into(), Tone::Info));
+            return Task::none();
+        }
+        self.leave_edits();
+        self.tree.hide_left = !self.tree.hide_left;
+        self.tree.menu = None;
+        if self.tree.hide_left {
+            self.active = 1;
         }
         self.sync_grids();
         self.save_session();
@@ -812,6 +839,7 @@ impl App {
     pub(super) fn tree_update(&mut self, msg: TreeMsg) -> Task<Message> {
         match msg {
             TreeMsg::Toggle => return self.toggle_tree(),
+            TreeMsg::ToggleLeft => return self.toggle_hide_left(),
             TreeMsg::ResizePress => {
                 let now = Instant::now();
                 if matches!(self.tree.resize_click, Some(t) if now - t < DOUBLE_CLICK) {
@@ -930,6 +958,24 @@ impl App {
         .into()
     }
 
+    /// Small button in the tree's title: hide or show the left panel.
+    fn hide_left_button(&self) -> Element<'_, Message> {
+        let hidden = self.tree.hide_left;
+        let keys = keymap::Keymap::keys_for(&self.keymap.bindings(), Command::HotlistTreeHideLeft).join(", ");
+        let tip = if hidden { "Show the left panel" } else { "Hide the left panel" };
+        let tip = if keys.is_empty() { tip.to_owned() } else { format!("{tip} ({keys})") };
+        tooltip(
+            button(text(if hidden { "Show left" } else { "Hide left" }).size(11).wrapping(Wrapping::None))
+                .on_press(Message::Tree(TreeMsg::ToggleLeft))
+                .padding([1, 6])
+                .style(theme::drive(hidden)),
+            container(text(tip).size(12)).padding([3, 8]).style(theme::drag_label),
+            tooltip::Position::Bottom,
+        )
+        .gap(4)
+        .into()
+    }
+
     /// The tree column: a title level with the tabs, a bar with actions
     /// level with the drives, the tree, a hint line.
     pub(super) fn tree_side_view(&self) -> Element<'_, Message> {
@@ -950,6 +996,7 @@ impl App {
             row![
                 button(text("Hotlist").size(12).wrapping(Wrapping::None)).padding([3, 10]).style(theme::tab(true)),
                 Space::with_width(Length::Fill),
+                self.hide_left_button(),
                 text(match folders {
                     1 => "1 folder".to_owned(),
                     n => format!("{n} folders"),

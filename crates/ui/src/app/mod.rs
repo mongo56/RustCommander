@@ -513,7 +513,7 @@ impl App {
                 restore(session.as_ref().map(|s| &s.left), left),
                 restore(session.as_ref().map(|s| &s.right), right),
             ],
-            active: session.as_ref().map_or(0, |s| s.active.min(1)),
+            active: session.as_ref().map_or(0, |s| if s.hide_left && s.hotlist_tree { 1 } else { s.active.min(1) }),
             drives: rc_platform::roots(),
             status: None,
             window_width: width,
@@ -527,6 +527,7 @@ impl App {
             tree: hotlist_tree::HotTree::new(
                 session.as_ref().is_some_and(|s| s.hotlist_tree),
                 session.as_ref().map_or(session::DEFAULT_TREE_WIDTH, |s| s.tree_width),
+                session.as_ref().is_some_and(|s| s.hide_left),
             ),
             recent_commands: session
                 .as_ref()
@@ -1492,6 +1493,10 @@ impl App {
         let page = rows.saturating_sub(1).max(1) as isize;
         let active = self.active;
         let other = 1 - active;
+        if self.left_hidden() && matches!(cmd, CompareDirs | CompareDirsOptions | CompareFiles | SyncOtherPanel) {
+            self.status = Some(("The left panel is hidden: show it first (Show left button / command)".into(), Tone::Info));
+            return Task::none();
+        }
 
         // In archives: zips, tars and gz files can be changed (as jobs), others can't; nothing can
         // be edited in place. `bool` = allowed in a zip or tar.
@@ -1583,6 +1588,7 @@ impl App {
                 return self.popup_snap();
             }
             HotlistTree => return self.toggle_tree(),
+            HotlistTreeHideLeft => return self.toggle_hide_left(),
             DirHistory => {
                 self.open_history();
                 return self.popup_snap();
@@ -2429,7 +2435,7 @@ impl App {
 
     /// Gives panel `side` the focus (taking it from the hotlist tree).
     pub(super) fn focus_panel(&mut self, side: usize) {
-        self.active = side;
+        self.active = if self.left_hidden() { 1 } else { side };
         self.tree.focused = false;
     }
 
@@ -2438,6 +2444,15 @@ impl App {
     fn switch_focus(&mut self) {
         if !self.tree_visible() {
             self.focus_panel(1 - self.active);
+            return;
+        }
+        if self.left_hidden() {
+            // Only tree and right panel.
+            if self.tree_focused() {
+                self.focus_panel(1);
+            } else {
+                self.tree.focused = true;
+            }
             return;
         }
         // 0 = tree, 1 = left, 2 = right.
@@ -3023,6 +3038,7 @@ impl App {
             right: side(&self.sides[1]),
             hotlist: self.hotlist.clone(),
             hotlist_tree: self.tree.shown,
+            hide_left: self.tree.hide_left,
             tree_width: self.tree.width,
             compare: self.compare_unsaved,
             recent_commands: self.recent_commands.iter().map(|c| c.id().to_owned()).collect(),

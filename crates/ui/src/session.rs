@@ -23,6 +23,9 @@ pub struct Session {
     /// `hotlist_tree` setting is on).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub hotlist_tree: bool,
+    /// The left panel is hidden while the tree is shown.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hide_left: bool,
     /// Width of the hotlist tree; older files lack it.
     #[serde(default = "default_tree_width")]
     pub tree_width: f32,
@@ -201,6 +204,7 @@ mod tests {
                 HotItem::Menu { name: "Empty".into(), expanded: false, items: vec![] },
             ],
             hotlist_tree: true,
+            hide_left: true,
             tree_width: 310.0,
             window: Some(WindowState { left: -8, top: 0, right: 1200, bottom: 800, maximized: true }),
             compare: Some(CompareState { by_content: true, ignore_date: false, subfolders: true }),
@@ -217,6 +221,7 @@ mod tests {
         assert_eq!(back.columns, [45.0, 95.0, 150.0]);
         assert_eq!(back.hotlist, session.hotlist);
         assert!(back.hotlist_tree);
+        assert!(back.hide_left);
         assert_eq!(back.tree_width, 310.0);
         assert_eq!(back.recent_commands, session.recent_commands);
         assert_eq!(back.skipped_update.as_deref(), Some("0.9.1"));
@@ -256,6 +261,7 @@ mod tests {
         assert_eq!(session.hotlist, folders);
         assert_eq!(session.split, 0.5);
         assert!(!session.hotlist_tree);
+        assert!(!session.hide_left);
         assert_eq!(session.tree_width, DEFAULT_TREE_WIDTH);
         assert_eq!(session.columns, DEFAULT_COLUMNS);
         // Saved again, plain folders keep the old form.
