@@ -4223,7 +4223,7 @@ dependencies = [
 
 [[package]]
 name = "rc-core"
-version = "0.5.10"
+version = "0.5.11"
 dependencies = [
  "bzip2",
  "chrono",
@@ -4249,7 +4249,7 @@ dependencies = [
 
 [[package]]
 name = "rc-platform"
-version = "0.5.10"
+version = "0.5.11"
 dependencies = [
  "open",
  "windows 0.62.2",
@@ -4550,7 +4550,7 @@ dependencies = [
 
 [[package]]
 name = "rustcommander"
-version = "0.5.10"
+version = "0.5.11"
 dependencies = [
  "iced",
  "image",
