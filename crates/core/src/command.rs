@@ -107,9 +107,9 @@ commands! {
             "Compare folders with options (by content, ignore dates, subfolders)", "CmpDirs";
         /// Side-by-side diff of two files (Alt+F2).
         CompareFiles => "cm_CompareFilesByContent", "Compare two files by content, side by side", "CmpFiles";
-        /// Find files by name and contents (Alt+F7).
+        /// Find files by name and contents (Ctrl+F).
         FindFiles => "cm_SearchFor", "Find files by name and contents", "Find";
-        /// Saved server connections; connect one in this panel (Ctrl+F).
+        /// Saved server connections; connect one in this panel (Ctrl+F7).
         Connect => "cm_FtpConnect",
             "Connect to a server (SFTP, FTP, FTPS): saved connections, new, edit, delete", "Connect";
         /// Close the connection of the panel's server (Ctrl+Shift+F).

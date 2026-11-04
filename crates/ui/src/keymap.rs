@@ -400,14 +400,14 @@ const DEFAULTS: &[(&str, Command)] = {
         ("shift+f5", Copy),
         ("ctrl+f6", SortBy(SortKey::Size)),
         ("shift+f6", Rename),
-        ("alt+f7", FindFiles),
+        ("ctrl+f7", Connect),
         ("shift+f8", DeletePermanent),
         ("alt+f9", Unpack),
         ("ctrl+f9", Terminal),
         ("ctrl+a", SelectAll),
         ("ctrl+c", CopyToClipboard),
         ("ctrl+d", Hotlist),
-        ("ctrl+f", Connect),
+        ("ctrl+f", FindFiles),
         ("ctrl+h", ToggleHidden),
         ("ctrl+m", MultiRename),
         ("alt+o", SyncOtherPanel),
@@ -529,7 +529,7 @@ mod tests {
             ("shift+f6", Some(Rename)),
             ("ctrl+f6", Some(SortBy(SortKey::Size))),
             ("f7", Some(MakeDir)),
-            ("alt+f7", Some(FindFiles)),
+            ("ctrl+f7", Some(Connect)),
             ("f8", Some(Delete)),
             ("shift+f8", Some(DeletePermanent)),
             ("delete", Some(Delete)),
@@ -558,7 +558,7 @@ mod tests {
             ("insert", Some(ToggleSelect { advance: true })),
             ("ctrl+space", Some(CommandPalette)),
             ("escape", Some(DeselectAll)),
-            ("ctrl+f", Some(Connect)),
+            ("ctrl+f", Some(FindFiles)),
             ("ctrl+shift+f", Some(Disconnect)),
             ("ctrl+a", Some(SelectAll)),
             ("ctrl+q", Some(Quit)),
@@ -685,11 +685,11 @@ mod tests {
         // Only Ctrl+K makes folders now: no modifier variant of F7 is left.
         assert_eq!(Keymap::keys_for(&bindings, Command::MakeDir), ["Ctrl+K"]);
         let f7 = Key::Named(Named::F7);
-        for m in [Modifiers::CTRL, Modifiers::SHIFT, Modifiers::CTRL | Modifiers::SHIFT, Modifiers::LOGO] {
+        for m in [Modifiers::ALT, Modifiers::SHIFT, Modifiers::CTRL | Modifiers::SHIFT, Modifiers::LOGO] {
             assert_eq!(map.command(&f7, m), None, "{m:?}");
         }
-        // Alt+F7 is its own default and still finds files.
-        assert_eq!(map.command(&f7, Modifiers::ALT), Some(Command::FindFiles));
+        // Ctrl+F7 is its own default and still connects.
+        assert_eq!(map.command(&f7, Modifiers::CTRL), Some(Command::Connect));
         assert!(Keymap::keys_for(&bindings, Command::Copy).starts_with(&["F5", "F7"]));
         assert!(map.is_changed(Command::MakeDir) && map.is_changed(Command::Copy));
         assert!(!map.is_changed(Command::Move));
@@ -748,7 +748,8 @@ mod tests {
         let f7 = Key::Named(Named::F7);
         assert_eq!(map.command(&f7, Modifiers::empty()), Some(Command::Copy));
         assert_eq!(map.command(&f7, Modifiers::CTRL | Modifiers::SHIFT), Some(Command::MakeDir));
-        assert_eq!(map.command(&f7, Modifiers::CTRL), None);
+        assert_eq!(map.command(&f7, Modifiers::CTRL), Some(Command::Connect), "its own default");
+        assert_eq!(map.command(&f7, Modifiers::ALT), None);
         assert_eq!(map.command(&f7, Modifiers::SHIFT), None);
         assert_eq!(map.command(&Key::Named(Named::Delete), Modifiers::empty()), None);
         assert_eq!(map.command(&Key::Named(Named::Delete), Modifiers::SHIFT), Some(Command::DeletePermanent));

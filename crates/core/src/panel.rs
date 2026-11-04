@@ -83,7 +83,7 @@ pub struct Panel {
     /// Folder sizes computed on request (Space), by name; `None` while
     /// counting. Kept across refreshes, cleared on navigation.
     dir_sizes: HashMap<String, Option<u64>>,
-    /// Search results fed into the panel (Alt+F7, TC's "feed to listbox"):
+    /// Search results fed into the panel (Ctrl+F, TC's "feed to listbox"):
     /// what was searched for. `entries` then hold the hits, named by their
     /// path relative to `path` (the search root); refreshes re-check them
     /// on disk instead of listing the folder, and any navigation ends it.

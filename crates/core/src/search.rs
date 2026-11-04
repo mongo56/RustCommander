@@ -1,4 +1,4 @@
-//! Find files (Alt+F7, TC's `cm_SearchFor`): walks a folder tree matching
+//! Find files (Ctrl+F, TC's `cm_SearchFor`): walks a folder tree matching
 //! names against masks or a regex, optionally keeping only files whose
 //! contents contain a text (plain or regex). Runs on the caller's thread
 //! (the UI uses a worker), reporting hits in batches and stopping when the

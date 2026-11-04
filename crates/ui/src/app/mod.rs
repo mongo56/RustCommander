@@ -183,11 +183,11 @@ pub struct App {
     /// network folders); see `start_nav`.
     nav: [Option<PendingNav>; 2],
     /// The full-window tool covering the panels while open: viewer (F3),
-    /// multi-rename (Ctrl+M), compare files (Alt+F2), find files (Alt+F7),
-    /// connect (Ctrl+F), help (F1), settings (F10) or a built-in terminal
+    /// multi-rename (Ctrl+M), compare files (Alt+F2), find files (Ctrl+F),
+    /// connect (Ctrl+F7), help (F1), settings (F10) or a built-in terminal
     /// (F9). See `screen.rs`.
     screen: Option<Screen>,
-    /// The closed find tool (fields and results), kept for the next Alt+F7.
+    /// The closed find tool (fields and results), kept for the next Ctrl+F.
     find_last: Option<find_files::FindFiles>,
     /// Built-in terminals (F9), running whether shown or not; `Screen::Term`
     /// names the one shown.
@@ -1303,7 +1303,7 @@ impl App {
         ("Right-click a drive", "Windows menu for the drive"),
         ("Enter on a .iso, .img, .vhd, .vhdx", "Mount the disk image (Windows' Mount) and open the new drive"),
         ("Enter / Ctrl+PgDn on a .zip, .7z, .rar, .tar, .tar.gz, .gz, ...", "Browse the archive like a folder: view, copy out, Enter opens a temp copy; in a zip, 7z, tar or gz also copy/move in (also from other archives), F7, F2, F8 (rar is read-only)"),
-        ("Ctrl+F, then Enter", "Connect to an SFTP/FTP/FTPS server: browse, F3 view, F5/F6 download and upload, F7, F2, F8 work there; Ctrl+Shift+F disconnects"),
+        ("Ctrl+F7, then Enter", "Connect to an SFTP/FTP/FTPS server: browse, F3 view, F5/F6 download and upload, F7, F2, F8 work there; Ctrl+Shift+F disconnects"),
         ("Right-click", "Explorer context menu"),
         ("Drag and drop", "Copy (Shift = move) between panels and other apps; right drag = drop menu"),
         ("Mouse wheel", "Scroll the view (the cursor stays)"),

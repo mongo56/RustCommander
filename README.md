@@ -19,7 +19,7 @@ with a modern, minimalist look. Written in Rust with [iced](https://iced.rs).
 - Copy, move, delete, recycle bin and new folder run as background jobs, several at once, with progress, speed, pause and cancel
 - Overwrite prompts (overwrite, all, older, skip, skip all); symlinks and junctions are copied as links
 - Inline rename (F2) and multi-rename with masks and live preview (Ctrl+M)
-- Find files (Alt+F7) by name, mask or regex and by content, also inside archives
+- Find files (Ctrl+F) by name, mask or regex and by content, also inside archives
 - Compare files side by side (Alt+F2)
 
 **Viewer (F3)**
@@ -31,7 +31,7 @@ with a modern, minimalist look. Written in Rust with [iced](https://iced.rs).
 - Add, change and delete files inside zip, 7z, tar and gz archives
 
 **Remote (SFTP, FTP, FTPS)**
-- Servers appear as folders (Ctrl+F connect, Ctrl+Shift+F disconnect)
+- Servers appear as folders (Ctrl+F7 connect, Ctrl+Shift+F disconnect)
 - Saved connections; passwords are kept in the Windows Credential Manager; SSH host keys are checked and remembered
 
 **Shell integration (Windows)**
@@ -78,9 +78,9 @@ with a modern, minimalist look. Written in Rust with [iced](https://iced.rs).
 | Shift+F2 | Compare folders |
 | Alt+F2 | Compare files |
 | Alt+F5 / Alt+F9 | Pack / unpack |
-| Alt+F7 | Find files |
+| Ctrl+F | Find files |
 | Ctrl+M | Multi-rename |
-| Ctrl+F / Ctrl+Shift+F | Connect to / disconnect from a server |
+| Ctrl+F7 / Ctrl+Shift+F | Connect to / disconnect from a server |
 | Ctrl+Space | Command palette |
 | Ctrl+, | Edit config.toml |
 | Alt+F4 / Ctrl+Q | Quit |

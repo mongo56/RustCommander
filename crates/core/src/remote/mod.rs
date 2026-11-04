@@ -354,7 +354,7 @@ fn connection(path: &Path) -> io::Result<Arc<Connection>> {
     let (key, _) = split(path).ok_or_else(|| io::Error::other("Not a remote path"))?;
     let all = CONNECTIONS.lock().unwrap_or_else(|e| e.into_inner());
     all.iter().find(|c| c.key.eq_ignore_ascii_case(&key)).cloned().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::NotConnected, format!("Not connected to {key} (Ctrl+F connects)"))
+        io::Error::new(io::ErrorKind::NotConnected, format!("Not connected to {key} (Ctrl+F7 connects)"))
     })
 }
 

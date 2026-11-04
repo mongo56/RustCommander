@@ -1,11 +1,11 @@
-//! Find files (Alt+F7, TC's `cm_SearchFor`): fills the window while open.
+//! Find files (Ctrl+F, TC's `cm_SearchFor`): fills the window while open.
 //! Name masks or a regex, optionally a text the files must contain (plain
 //! or regex, match case), in a folder and its subfolders. The search runs
 //! on a worker thread (`rc_core::search::search`) and hits appear as they
 //! are found; Esc stops it. Go to a hit (Enter in the list, double-click,
 //! Ctrl+G) to show it in its folder, or feed all hits to the panel
 //! (Ctrl+L, TC's "feed to listbox": `Panel::show_results`). Closing keeps
-//! the fields and the last results for the next Alt+F7.
+//! the fields and the last results for the next Ctrl+F.
 
 use super::*;
 use crate::theme::filled;

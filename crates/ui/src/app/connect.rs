@@ -1,4 +1,4 @@
-//! Connect to a server (Ctrl+F, TC's `cm_FtpConnect`): fills the window
+//! Connect to a server (Ctrl+F7, TC's `cm_FtpConnect`): fills the window
 //! while open. Lists the saved connections (`crate::sites`); N/Ins adds
 //! one, E/F4 edits, Del twice deletes, Enter connects in the panel the tool
 //! was opened from. Logging in runs on a worker thread
@@ -185,7 +185,7 @@ impl App {
     pub(super) fn disconnect(&mut self) -> Task<Message> {
         let path = self.panel(self.active).path.clone();
         let Some((key, _)) = remote::split(&path) else {
-            self.info("The panel doesn't show a server (Ctrl+F connects)");
+            self.info("The panel doesn't show a server (Ctrl+F7 connects)");
             return Task::none();
         };
         remote::disconnect(&path);
