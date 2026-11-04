@@ -92,6 +92,13 @@ pub enum SettingsMsg {
     Detected(Vec<rc_platform::FoundEditor>),
     /// Use the detected editor with this index.
     UseEditor(usize),
+    /// Installed terminals found in the background.
+    DetectedTerminals(Vec<rc_platform::FoundTerminal>),
+    /// Use the detected terminal with this index.
+    UseTerminal(usize),
+    /// Open the file dialog for the terminal program.
+    BrowseTerminal,
+    PickedTerminal(Option<std::path::PathBuf>),
     Terminal(String),
     ShowHidden(bool),
     ShowFkeys(bool),
@@ -165,6 +172,8 @@ pub(super) struct Settings {
     editors: Vec<rc_platform::FoundEditor>,
     /// The terminal command being typed.
     terminal: String,
+    /// Installed terminals found on this machine (filled in the background).
+    terminals: Vec<rc_platform::FoundTerminal>,
     /// The colours being typed, by `theme::NAMES` index.
     hex: Vec<String>,
     capture: Option<Capture>,
@@ -189,6 +198,7 @@ impl App {
             editor: self.config.editor.clone(),
             editors: Vec::new(),
             terminal: self.config.terminal.clone(),
+            terminals: Vec::new(),
             hex: current_hex(),
             capture: None,
             picker: None,
@@ -198,6 +208,9 @@ impl App {
         Task::batch([
             scrollable::snap_to(list_id(), RelativeOffset::START),
             off_thread(rc_platform::detect_editors, |found| Message::Settings(SettingsMsg::Detected(found))),
+            off_thread(rc_platform::detect_terminals, |found| {
+                Message::Settings(SettingsMsg::DetectedTerminals(found))
+            }),
         ])
     }
 
@@ -229,6 +242,16 @@ impl App {
         if let Some(s) = &mut self.settings {
             s.row[0] = ROW_EDITOR;
             s.editor = text;
+        }
+        self.settings_save_editor();
+        Task::none()
+    }
+
+    /// Makes `command` the terminal command line and saves.
+    fn settings_use_terminal(&mut self, command: String) -> Task<Message> {
+        if let Some(s) = &mut self.settings {
+            s.row[0] = ROW_TERMINAL;
+            s.terminal = command;
         }
         self.settings_save_editor();
         Task::none()
@@ -482,6 +505,24 @@ impl App {
                 if let Some(found) = s.editors.get(i) {
                     let path = found.path.clone();
                     return self.settings_use_editor(&path);
+                }
+            }
+            SettingsMsg::DetectedTerminals(found) => s.terminals = found,
+            SettingsMsg::UseTerminal(i) => {
+                if let Some(found) = s.terminals.get(i) {
+                    let command = found.command();
+                    return self.settings_use_terminal(command);
+                }
+            }
+            SettingsMsg::BrowseTerminal => {
+                s.row[0] = ROW_TERMINAL;
+                return off_thread(rc_platform::pick_program, |p| Message::Settings(SettingsMsg::PickedTerminal(p)));
+            }
+            SettingsMsg::PickedTerminal(path) => {
+                if let Some(path) = path {
+                    let text = path.display().to_string();
+                    let text = if text.contains(' ') { format!("\"{text}\"") } else { text };
+                    return self.settings_use_terminal(text);
                 }
             }
             SettingsMsg::EditConfig => {
@@ -789,6 +830,25 @@ impl App {
                     .on_press(msg(SettingsMsg::Browse))
                     .padding([3, 12])
                     .style(theme::fkey);
+                let browse_terminal = button(text("Browse...").size(13))
+                    .on_press(msg(SettingsMsg::BrowseTerminal))
+                    .padding([3, 12])
+                    .style(theme::fkey);
+                let detected_terminals: Element<'a, Message> = if s.terminals.is_empty() {
+                    hint("Looking for installed terminals...".into()).into()
+                } else {
+                    let current = s.terminal.trim();
+                    let buttons = s.terminals.iter().enumerate().map(|(i, t)| {
+                        let on = current == t.command();
+                        Element::from(
+                            button(text(t.name.as_str()).size(13))
+                                .on_press(msg(SettingsMsg::UseTerminal(i)))
+                                .padding([3, 12])
+                                .style(theme::drive(on)),
+                        )
+                    });
+                    Row::with_children(buttons).spacing(6).wrap().into()
+                };
                 let detected: Element<'a, Message> = if s.editors.is_empty() {
                     hint("Looking for installed editors...".into()).into()
                 } else {
@@ -824,10 +884,11 @@ impl App {
                     row![label("Installed editors"), detected].spacing(8).padding([3, 14]),
                     line(
                         ROW_TERMINAL,
-                        row![label("Terminal for F9"), terminal].spacing(8).align_y(Alignment::Center).into()
+                        row![label("Terminal for F9"), terminal, browse_terminal].spacing(8).align_y(Alignment::Center).into()
                     ),
                     container(hint("Starts in the panel's folder; %1 is that folder (optional). Enter saves.".into()))
                         .padding([0, 14 + LABEL_W as u16 + 8]),
+                    row![label("Installed terminals"), detected_terminals].spacing(8).padding([3, 14]),
                     line(
                         ROW_HIDDEN,
                         row![

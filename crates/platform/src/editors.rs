@@ -67,7 +67,7 @@ fn same_file(a: &Path, b: &Path) -> bool {
 }
 
 /// `root\folder`, where a `*` ending a component matches by prefix.
-fn expand(root: &Path, folder: &str) -> Vec<PathBuf> {
+pub(crate) fn expand(root: &Path, folder: &str) -> Vec<PathBuf> {
     let mut dirs = vec![root.to_path_buf()];
     for part in folder.split('\\') {
         let mut next = Vec::new();
@@ -88,13 +88,13 @@ fn expand(root: &Path, folder: &str) -> Vec<PathBuf> {
     dirs
 }
 
-fn on_path(exe: &str) -> Option<PathBuf> {
+pub(crate) fn on_path(exe: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path).map(|d| d.join(exe)).find(|p| p.is_file())
 }
 
 #[cfg(windows)]
-fn app_path(exe: &str) -> Option<PathBuf> {
+pub(crate) fn app_path(exe: &str) -> Option<PathBuf> {
     use windows::core::PCWSTR;
     use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ};
     let key: Vec<u16> =
@@ -128,7 +128,7 @@ fn app_path(exe: &str) -> Option<PathBuf> {
 }
 
 #[cfg(not(windows))]
-fn app_path(_exe: &str) -> Option<PathBuf> {
+pub(crate) fn app_path(_exe: &str) -> Option<PathBuf> {
     None
 }
 

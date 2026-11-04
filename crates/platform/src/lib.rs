@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 
 pub mod credentials;
 mod editors;
+mod terminals;
 pub use editors::{detect_editors, pick_program, FoundEditor};
+pub use terminals::{detect_terminals, FoundTerminal};
 #[cfg(windows)]
 mod clipboard_win;
 #[cfg(windows)]
