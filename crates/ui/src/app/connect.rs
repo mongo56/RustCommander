@@ -185,7 +185,7 @@ impl App {
     pub(super) fn disconnect(&mut self) -> Task<Message> {
         let path = self.panel(self.active).path.clone();
         let Some((key, _)) = remote::split(&path) else {
-            self.status = Some(("The panel doesn't show a server (Ctrl+F connects)".into(), Tone::Info));
+            self.info("The panel doesn't show a server (Ctrl+F connects)");
             return Task::none();
         };
         remote::disconnect(&path);
@@ -200,7 +200,7 @@ impl App {
             let target = local.or_else(rc_platform::home_dir).unwrap_or_else(|| PathBuf::from("C:\\"));
             tasks.push(self.start_nav(side, Nav::to(target)));
         }
-        self.status = Some((format!("Disconnected from {key}"), Tone::Info));
+        self.info(format!("Disconnected from {key}"));
         Task::batch(tasks)
     }
 
@@ -271,7 +271,7 @@ impl App {
                 let side = c.side;
                 self.connect_close();
                 self.focus_panel(side);
-                self.status = Some((format!("Connected to {} (Ctrl+Shift+F disconnects)", site.address()), Tone::Success));
+                self.success(format!("Connected to {} (Ctrl+Shift+F disconnects)", site.address()));
                 self.start_nav(side, Nav::to(path))
             }
             Err(e) if e.contains(remote::HOST_KEY_UNKNOWN) => {

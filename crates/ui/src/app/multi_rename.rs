@@ -157,7 +157,7 @@ impl App {
         let side = self.active;
         let panel = self.panel(side);
         if panel.results().is_some() {
-            self.status = Some(("Multi-rename doesn't work on search results yet".into(), Tone::Info));
+            self.info("Multi-rename doesn't work on search results yet");
             return Task::none();
         }
         let entries: Vec<Entry> = panel.targets().into_iter().cloned().collect();

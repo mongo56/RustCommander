@@ -185,13 +185,13 @@ impl App {
                 // Dropping a download's stage cancels it.
                 self.dialog = None;
                 if action == Action::CancelDownload {
-                    self.status = Some(("Update download cancelled".into(), Tone::Info));
+                    self.info("Update download cancelled");
                 }
             }
             Action::Skip => {
                 if let Stage::Available { release, .. } = &d.stage {
                     let version = release.version.to_string();
-                    self.status = Some((format!("Version {version} skipped; Check for updates still offers it"), Tone::Info));
+                    self.info(format!("Version {version} skipped; Check for updates still offers it"));
                     self.skipped_update = Some(version);
                     self.update_notice = None;
                     self.dialog = None;
@@ -266,7 +266,7 @@ impl App {
             Ok(Some(path)) => match rc_platform::run_program(&path, up::INSTALLER_ARGS) {
                 Ok(()) => {
                     self.dialog = None;
-                    self.status = Some(("Installing the update\u{2026}".into(), Tone::Success));
+                    self.success("Installing the update\u{2026}");
                     return self.quit();
                 }
                 Err(e) => d.stage = Stage::Failed(format!("Can't start the installer: {e}")),

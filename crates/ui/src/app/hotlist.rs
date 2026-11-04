@@ -212,7 +212,7 @@ impl App {
         } else {
             format!("Removed {} from the hotlist", here.display())
         };
-        self.status = Some((msg, Tone::Info));
+        self.info(msg);
         self.save_session();
         Task::none()
     }

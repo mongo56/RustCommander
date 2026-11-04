@@ -211,7 +211,7 @@ impl App {
     /// the focus back to the last active panel).
     pub(super) fn toggle_tree(&mut self) -> Task<Message> {
         if !self.config.hotlist_tree {
-            self.status = Some(("Turn on \"Hotlist tree\" in the settings (F10) first".into(), Tone::Info));
+            self.info("Turn on \"Hotlist tree\" in the settings (F10) first");
             return Task::none();
         }
         self.leave_edits();
@@ -242,7 +242,7 @@ impl App {
     /// the right panel the active one.
     pub(super) fn toggle_hide_left(&mut self) -> Task<Message> {
         if !self.tree_visible() {
-            self.status = Some(("Show the hotlist tree first (Ctrl+Shift+D)".into(), Tone::Info));
+            self.info("Show the hotlist tree first (Ctrl+Shift+D)");
             return Task::none();
         }
         self.leave_edits();
@@ -383,7 +383,7 @@ impl App {
     /// already in that menu; the cursor goes to the last one.
     fn tree_add_folders(&mut self, dirs: Vec<PathBuf>, at: &[usize], index: usize) {
         if dirs.is_empty() {
-            self.status = Some(("Only folders go into the hotlist".into(), Tone::Info));
+            self.info("Only folders go into the hotlist");
             return;
         }
         let Some(menu) = hotlist::menu_at(&self.hotlist, at) else { return };
@@ -413,7 +413,7 @@ impl App {
         if let Some(path) = last {
             self.tree_set_cursor(path);
         }
-        self.status = Some((msg, Tone::Success));
+        self.success(msg);
         self.save_session();
     }
 
@@ -478,7 +478,7 @@ impl App {
             HotItem::Folder { path, .. } => path.display().to_string(),
             HotItem::Menu { name, .. } => format!("the group \"{name}\""),
         };
-        self.status = Some((format!("Removed {what} from the hotlist"), Tone::Info));
+        self.info(format!("Removed {what} from the hotlist"));
         self.tree.cursor = path.to_vec();
         self.tree_fix_cursor();
         self.save_session();

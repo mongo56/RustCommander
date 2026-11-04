@@ -253,7 +253,7 @@ impl App {
             panel.focus(&name);
         }
         panel.ensure_visible(rows);
-        self.status = Some(("Search results in the panel; Backspace or .. returns to the folder".into(), Tone::Info));
+        self.info("Search results in the panel; Backspace or .. returns to the folder");
         Task::none()
     }
 

@@ -501,6 +501,17 @@ pub enum Message {
 }
 
 impl App {
+    /// Set the status line (shown in the panel header) with the given tone.
+    pub fn info(&mut self, text: impl Into<String>) {
+        self.status = Some((text.into(), Tone::Info));
+    }
+    pub fn success(&mut self, text: impl Into<String>) {
+        self.status = Some((text.into(), Tone::Success));
+    }
+    pub fn error(&mut self, text: impl Into<String>) {
+        self.status = Some((text.into(), Tone::Error));
+    }
+
     pub fn new(session: Option<Session>) -> (Self, Task<Message>) {
         let home = rc_platform::home_dir();
         let left = std::env::current_dir().ok().or_else(|| home.clone());
@@ -836,7 +847,7 @@ impl App {
                     // picked up by the folder watcher.
                     self.reload_panels();
                 }
-                Err(e) => self.status = Some((e, Tone::Error)),
+                Err(e) => self.error(e),
             },
             Message::Hover(side, index) => self.hover = Some((side, index)),
             Message::HoverEnd(side) => {
@@ -919,12 +930,12 @@ impl App {
                             DragOutcome::Linked => "Linked",
                             _ => "Copied",
                         };
-                        self.status = Some((format!("{verb} to another app"), Tone::Success));
+                        self.success(format!("{verb} to another app"));
                         if outcome == DragOutcome::Moved {
                             self.panel_mut(side).deselect_all();
                         }
                     }
-                    Err(e) => self.status = Some((e, Tone::Error)),
+                    Err(e) => self.error(e),
                 }
             }
             Message::DropMenuDone(side, result) => {
@@ -932,7 +943,7 @@ impl App {
                 match result {
                     Ok(DragOutcome::Moved) => self.panel_mut(side).deselect_all(),
                     Ok(_) => {}
-                    Err(e) => self.status = Some((e, Tone::Error)),
+                    Err(e) => self.error(e),
                 }
             }
             Message::Hovered => {
@@ -1070,7 +1081,7 @@ impl App {
                         Some(diff) if self.panel(0).path == left && self.panel(1).path == right => {
                             self.apply_compare(diff)
                         }
-                        _ => self.status = Some(("Compare cancelled".into(), Tone::Info)),
+                        _ => self.info("Compare cancelled"),
                     }
                 }
             }
@@ -1186,13 +1197,13 @@ impl App {
                 Ok(new) => {
                     self.drives = rc_platform::roots();
                     if let Some(drive) = new {
-                        self.status = Some((format!("Mounted as {drive}"), Tone::Success));
+                        self.success(format!("Mounted as {drive}"));
                         return self.start_nav(active, Nav::to(PathBuf::from(drive)));
                     }
                     // No new drive letter: already mounted, or still coming.
-                    self.status = Some(("Mounted (no new drive letter appeared)".to_string(), Tone::Info));
+                    self.info("Mounted (no new drive letter appeared)");
                 }
-                Err(e) => self.status = Some((e, Tone::Error)),
+                Err(e) => self.error(e),
             },
             Message::ViewerLoaded(seq, result) => return self.viewer_loaded(seq, result),
             Message::ViewerFound(seq, result, cancel) => self.viewer_found(seq, result, &cancel),
@@ -1423,7 +1434,7 @@ impl App {
         }
         if escape && self.nav[self.active].is_some() {
             self.nav[self.active] = None;
-            self.status = Some(("Cancelled".into(), Tone::Info));
+            self.info("Cancelled");
             return Task::none();
         }
         if escape && self.drag.as_ref().is_some_and(|d| d.active) {
@@ -1531,7 +1542,7 @@ impl App {
         let active = self.active;
         let other = 1 - active;
         if self.left_hidden() && matches!(cmd, CompareDirs | CompareDirsOptions | CompareFiles | SyncOtherPanel) {
-            self.status = Some(("The left panel is hidden: show it first (Show left button / command)".into(), Tone::Info));
+            self.info("The left panel is hidden: show it first (Show left button / command)");
             return Task::none();
         }
 
@@ -1580,7 +1591,7 @@ impl App {
             }
             EditConfig => {
                 if let Err(e) = crate::config::create_if_missing("", Some(self.compare_opts.into())) {
-                    self.status = Some((format!("Can't create config.toml: {e}"), Tone::Error));
+                    self.error(format!("Can't create config.toml: {e}"));
                 } else if let Some(path) = crate::config::file() {
                     self.edit_file(&path, "config.toml");
                 }
@@ -1700,7 +1711,7 @@ impl App {
                 let panel = self.panel_mut(active);
                 panel.show_hidden = !panel.show_hidden;
                 let state = if panel.show_hidden { "shown" } else { "hidden" };
-                self.status = Some((format!("Hidden files {state}"), Tone::Info));
+                self.info(format!("Hidden files {state}"));
                 let path = self.panel(active).path.clone();
                 return self.list_in_background(path);
             }
@@ -1726,7 +1737,7 @@ impl App {
         if cmd == DeselectAll {
             if let Some((cancel, ..)) = self.comparing.take() {
                 cancel.store(true, Ordering::Relaxed);
-                self.status = Some(("Compare cancelled".into(), Tone::Info));
+                self.info("Compare cancelled");
             }
             self.cancel_counts();
         }
@@ -1748,7 +1759,7 @@ impl App {
                 }
                 // Plain file: open with the default app.
                 match launch(&path) {
-                    Ok(msg) => self.status = Some((msg, Tone::Success)),
+                    Ok(msg) => self.success(msg),
                     Err(e) => self.report(Err(e)),
                 }
                 return Task::none();
@@ -1836,7 +1847,7 @@ impl App {
                     let s = &mut self.sides[side];
                     s.tabs.insert(s.current + 1, panel);
                 }
-                Err(e) => self.status = Some((e.to_string(), Tone::Error)),
+                Err(e) => self.error(e.to_string()),
             }
             return Task::none();
         }
@@ -2122,7 +2133,7 @@ impl App {
             return Task::none();
         }
         if let Some(msg) = archive_transfer_problem(is_move, &sources, target) {
-            self.status = Some((msg.into(), Tone::Info));
+            self.info(msg);
             return Task::none();
         }
         let mut input = remote::display(target);
@@ -2160,7 +2171,7 @@ impl App {
             Dialog::Transfer { is_move, sources, base, input } => {
                 let target = resolve_typed_path(input.trim(), &base);
                 if let Some(msg) = archive_transfer_problem(is_move, &sources, &target) {
-                    self.status = Some((msg.into(), Tone::Info));
+                    self.info(msg);
                     return Task::none();
                 }
                 match ops::plan_transfer(&sources, &target) {
@@ -2174,7 +2185,7 @@ impl App {
                         let job = if is_move { Job::Move(transfers) } else { Job::Copy(transfers) };
                         return self.start_job(job, title);
                     }
-                    Err(msg) => self.status = Some((msg, Tone::Error)),
+                    Err(msg) => self.error(msg),
                 }
             }
             Dialog::MakeDir { input } => {
@@ -2216,7 +2227,7 @@ impl App {
                         .map_or(Ok(()), std::fs::create_dir_all)
                         .and_then(|_| std::fs::File::create_new(&path).map(drop));
                     if let Err(e) = made {
-                        self.status = Some((format!("Can't create {name}: {e}"), Tone::Error));
+                        self.error(format!("Can't create {name}: {e}"));
                         return Task::none();
                     }
                     let panel = self.panel_mut(self.active);
@@ -2236,7 +2247,7 @@ impl App {
                     archive.set_file_name(name);
                 }
                 if archive.is_dir() || vfs::in_archive(archive.parent().unwrap_or(&archive)) {
-                    self.status = Some((format!("Can't pack into {}", archive.display()), Tone::Error));
+                    self.error(format!("Can't pack into {}", archive.display()));
                     return Task::none();
                 }
                 let title = format!("Packing {} → {}", describe(&sources), archive.display());
@@ -2252,7 +2263,7 @@ impl App {
             Dialog::Unpack { archives, base, input } => {
                 let target = resolve_typed_path(input.trim().trim_matches('"'), &base);
                 if vfs::in_archive(&target) {
-                    self.status = Some(("Can't unpack into an archive".into(), Tone::Info));
+                    self.info("Can't unpack into an archive");
                     return Task::none();
                 }
                 let title = format!("Unpacking {} → {}", describe(&archives), target.display());
@@ -2260,17 +2271,17 @@ impl App {
             }
             Dialog::Password { archive, input, retry } => match vfs::try_password(&archive, &input) {
                 Ok(true) => {
-                    self.status = Some(("Password accepted".into(), Tone::Success));
+                    self.success("Password accepted");
                     if let Some(side) = retry {
                         return self.start_nav(side, Nav::to(archive));
                     }
                 }
                 Ok(false) => {
-                    self.status = Some(("Wrong password".into(), Tone::Error));
+                    self.error("Wrong password");
                     self.dialog = Some(Dialog::Password { archive, input: String::new(), retry });
                     return text_input::focus(dialog_input_id());
                 }
-                Err(e) => self.status = Some((format!("Can't open the archive: {e}"), Tone::Error)),
+                Err(e) => self.error(format!("Can't open the archive: {e}")),
             },
             Dialog::Delete { paths, to_trash } => {
                 // No recycle bin inside archives.
@@ -2307,7 +2318,7 @@ impl App {
                 self.compare_opts = opts;
                 if changed {
                     if let Err(e) = self.save_compare() {
-                        self.status = Some((format!("Compare options not saved: {e}"), Tone::Error));
+                        self.error(format!("Compare options not saved: {e}"));
                     }
                 }
                 return self.compare_dirs();
@@ -2413,7 +2424,7 @@ impl App {
         }
         if items.iter().any(|p| vfs::is_virtual(p)) {
             if cut {
-                self.status = Some(("Can't cut files in an archive or on a server: move them with F6".into(), Tone::Info));
+                self.info("Can't cut files in an archive or on a server: move them with F6");
                 return Task::none();
             }
             match self.shell_items_extracted(side, items) {
@@ -2436,7 +2447,7 @@ impl App {
     /// clipboard into the active panel, through the usual transfer dialog.
     fn paste_files(&mut self) -> Task<Message> {
         let Some((sources, cut)) = rc_platform::clipboard_files() else {
-            self.status = Some(("No files on the clipboard".into(), Tone::Info));
+            self.info("No files on the clipboard");
             return Task::none();
         };
         let target = self.panel(self.active).path.clone();
@@ -2547,7 +2558,7 @@ impl App {
         }
         // Downloading here would block the window.
         if items.iter().any(|p| remote::is_remote(p)) {
-            self.status = Some(("Not for files on a server: copy them to a local folder first (F5)".into(), Tone::Info));
+            self.info("Not for files on a server: copy them to a local folder first (F5)");
             return None;
         }
         match vfs::extract_temp_all(&items) {
@@ -2556,7 +2567,7 @@ impl App {
                 Some((folder, local))
             }
             Err(e) => {
-                self.status = Some((format!("Can't extract from the archive: {e}"), Tone::Error));
+                self.error(format!("Can't extract from the archive: {e}"));
                 None
             }
         }
@@ -2566,11 +2577,11 @@ impl App {
 
     fn context_menu(&mut self, side: usize, background: bool) -> Task<Message> {
         if background && remote::is_remote(&self.panel(side).path) {
-            self.status = Some(("No context menu on a server".into(), Tone::Info));
+            self.info("No context menu on a server");
             return Task::none();
         }
         if background && vfs::in_archive(&self.panel(side).path) {
-            self.status = Some(("No context menu for the archive's folders; right-click a file".into(), Tone::Info));
+            self.info("No context menu for the archive's folders; right-click a file");
             return Task::none();
         }
         let items = if background { Vec::new() } else { self.target_paths(side) };
@@ -2695,7 +2706,7 @@ impl App {
     fn refuse_in_archive(&mut self, side: usize, what: &str, zip_ok: bool) -> bool {
         if remote::is_remote(&self.panel(side).path) {
             if !zip_ok {
-                self.status = Some((format!("Can't {what} on a server: copy the files to a local folder first"), Tone::Info));
+                self.info(format!("Can't {what} on a server: copy the files to a local folder first"));
             }
             return !zip_ok;
         }
@@ -2707,7 +2718,7 @@ impl App {
             true => format!("Read-only archive (only zip, 7z, tar and gz archives can be changed): can't {what} here"),
             false => format!("Can't {what} inside archives"),
         };
-        self.status = Some((msg, Tone::Info));
+        self.info(msg);
         true
     }
 
@@ -2725,7 +2736,7 @@ impl App {
             return Task::none();
         }
         if sources.iter().any(|p| vfs::is_virtual(p)) {
-            self.status = Some(("Can't pack files inside archives or on servers: copy them out first".into(), Tone::Info));
+            self.info("Can't pack files inside archives or on servers: copy them out first");
             return Task::none();
         }
         let target = self.panel(1 - self.active).path.clone();
@@ -2751,16 +2762,16 @@ impl App {
             .map(|e| e.path.clone())
             .collect();
         if archives.is_empty() {
-            self.status = Some(("Select archives (zip, 7z, rar, tar, ...) to unpack".into(), Tone::Info));
+            self.info("Select archives (zip, 7z, rar, tar, ...) to unpack");
             return Task::none();
         }
         if archives.iter().any(|a| remote::is_remote(a)) {
-            self.status = Some(("Can't unpack on a server: copy the archive to a local folder first".into(), Tone::Info));
+            self.info("Can't unpack on a server: copy the archive to a local folder first");
             return Task::none();
         }
         let target = self.panel(1 - self.active).path.clone();
         if vfs::in_archive(&target) {
-            self.status = Some(("Can't unpack into an archive or onto a server".into(), Tone::Info));
+            self.info("Can't unpack into an archive or onto a server");
             return Task::none();
         }
         let mut input = target.display().to_string();
@@ -2803,7 +2814,7 @@ impl App {
                     let task = self.start_nav(side, nav);
                     self.deferred.push(task);
                 }
-                None => self.status = Some((error, Tone::Error)),
+                None => self.error(error),
             }
             return;
         }
@@ -2813,7 +2824,7 @@ impl App {
             Some(p) => {
                 let _ = panel.navigate(p, None);
             }
-            None => self.status = Some((error, Tone::Error)),
+            None => self.error(error),
         }
     }
 
@@ -2822,11 +2833,11 @@ impl App {
     /// options that read the disk it runs on a worker (Esc cancels).
     fn compare_dirs(&mut self) -> Task<Message> {
         if (0..2).any(|side| self.panel(side).results().is_some()) {
-            self.status = Some(("Can't compare search results".into(), Tone::Info));
+            self.info("Can't compare search results");
             return Task::none();
         }
         if self.panel(0).path == self.panel(1).path {
-            self.status = Some(("Both panels show the same folder".into(), Tone::Info));
+            self.info("Both panels show the same folder");
             return Task::none();
         }
         if let Some((cancel, ..)) = self.comparing.take() {
@@ -2835,7 +2846,7 @@ impl App {
         let opts = CompareOptions { show_hidden: self.panel(0).show_hidden && self.panel(1).show_hidden, ..self.compare_opts };
         if opts.reads_disk() && (0..2).any(|side| vfs::in_archive(&self.panel(side).path)) {
             let msg = "Compare by content or with subfolders doesn't work in archives yet";
-            self.status = Some((msg.into(), Tone::Info));
+            self.info(msg);
             return Task::none();
         }
         if !opts.reads_disk() {
@@ -2847,7 +2858,7 @@ impl App {
         let (left, right) = (self.panel(0).entries.clone(), self.panel(1).entries.clone());
         let cancel = Arc::new(AtomicBool::new(false));
         self.comparing = Some((cancel.clone(), self.panel(0).path.clone(), self.panel(1).path.clone()));
-        self.status = Some(("Comparing\u{2026} (Esc cancels)".into(), Tone::Info));
+        self.info("Comparing\u{2026} (Esc cancels)");
         let (tx, rx) = iced::futures::channel::oneshot::channel();
         std::thread::spawn(move || {
             let diff = rc_core::compare::compare_with(&left, &right, opts, &cancel);
@@ -3012,7 +3023,7 @@ impl App {
                 match self.panel(side).nav_target(&nav) {
                     Some(target) => self.ask_password(target, Some(side)),
                     None => {
-                        self.status = Some((e, Tone::Error));
+                        self.error(e);
                         Task::none()
                     }
                 }
@@ -3020,7 +3031,7 @@ impl App {
             // A vanished history folder: try the one before it.
             Err(_) if self.panel_mut(side).forget_target(&nav) => self.start_nav(side, nav),
             Err(e) => {
-                self.status = Some((e, Tone::Error));
+                self.error(e);
                 Task::none()
             }
         }
@@ -3098,9 +3109,9 @@ impl App {
         let first = self.config_stamp.is_none();
         self.config_stamp = Some(stamp);
         match self.apply_config() {
-            Ok(()) if !first => self.status = Some(("Settings reloaded".into(), Tone::Info)),
+            Ok(()) if !first => self.info("Settings reloaded"),
             Ok(()) => {}
-            Err(e) => self.status = Some((format!("Bad config: {e}"), Tone::Error)),
+            Err(e) => self.error(format!("Bad config: {e}")),
         }
     }
 
@@ -3191,7 +3202,7 @@ impl App {
 
     fn report(&mut self, result: io::Result<()>) {
         if let Err(e) = result {
-            self.status = Some((e.to_string(), Tone::Error));
+            self.error(e.to_string());
         }
     }
 

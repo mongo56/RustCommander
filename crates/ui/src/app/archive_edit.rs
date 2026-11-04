@@ -95,7 +95,7 @@ impl App {
             }
             return Task::none();
         }
-        self.status = Some((format!("Extracting {}…", name_of(&entry)), Tone::Info));
+        self.info(format!("Extracting {}…", name_of(&entry)));
         Task::perform(
             async move {
                 let (tx, rx) = iced::futures::channel::oneshot::channel();
@@ -125,18 +125,18 @@ impl App {
     pub(super) fn new_in_archive(&mut self, entry: PathBuf, name: &str) -> Task<Message> {
         if vfs::archive_writable(&entry) != Some(true) {
             let msg = "Read-only archive (only zip, 7z, tar and gz archives can be changed): can't create files here";
-            self.status = Some((msg.into(), Tone::Info));
+            self.info(msg);
             return Task::none();
         }
         match vfs::open(&entry).and_then(|v| v.stat(&entry)) {
             Ok(Some(e)) if e.is_dir() => {
-                self.status = Some((format!("Can't create {name}: a folder with this name exists"), Tone::Error));
+                self.error(format!("Can't create {name}: a folder with this name exists"));
                 return Task::none();
             }
             Ok(Some(_)) => return self.edit_in_archive(entry),
             Ok(None) => {}
             Err(e) => {
-                self.status = Some((format!("Can't create {name}: {e}"), Tone::Error));
+                self.error(format!("Can't create {name}: {e}"));
                 return Task::none();
             }
         }
@@ -147,7 +147,7 @@ impl App {
         let made = std::fs::create_dir_all(&stage).and_then(|_| std::fs::File::create(&src).map(drop));
         if let Err(e) = made {
             let _ = std::fs::remove_dir_all(&stage);
-            self.status = Some((format!("Can't create {name}: {e}"), Tone::Error));
+            self.error(format!("Can't create {name}: {e}"));
             return Task::none();
         }
         let first = Path::new(name).components().next().map(|c| c.as_os_str().to_string_lossy().into_owned());
@@ -166,7 +166,7 @@ impl App {
                 let (copy, stamp) = match result {
                     Ok(r) => r,
                     Err(e) => {
-                        self.status = Some((e, Tone::Error));
+                        self.error(e);
                         return Task::none();
                     }
                 };
@@ -210,11 +210,11 @@ impl App {
         self.refresh_config();
         match crate::editor::launch(&self.config.editor, copy) {
             Ok(child) => {
-                self.status = Some((note.to_owned(), Tone::Success));
+                self.success(note.to_owned());
                 Ok(child)
             }
             Err(e) => {
-                self.status = Some((format!("Can't start the editor: {e}"), Tone::Error));
+                self.error(format!("Can't start the editor: {e}"));
                 Err(())
             }
         }
@@ -278,7 +278,7 @@ impl App {
                         true => "the editor was closed",
                         false => "the archive isn't open any more",
                     };
-                    self.status = Some((format!("Stopped watching {} ({why})", name_of(&edit.entry)), Tone::Info));
+                    self.info(format!("Stopped watching {} ({why})", name_of(&edit.entry)));
                 }
                 continue;
             }
@@ -308,15 +308,15 @@ impl App {
         edit.failed = !outcome.errors.is_empty() || outcome.cancelled;
         if let Some((_, err)) = outcome.errors.first() {
             let msg = format!("{name} not saved into {archive}: {err}. Your edited copy: {}", edit.copy.display());
-            self.status = Some((msg, Tone::Error));
+            self.error(msg);
         } else if outcome.cancelled {
-            self.status = Some((format!("{name} not saved into {archive}: cancelled"), Tone::Info));
+            self.info(format!("{name} not saved into {archive}: cancelled"));
         } else {
             match ops::entry_stamp(&edit.entry) {
                 Ok(stamp) => edit.stamp = stamp,
                 Err(e) => eprintln!("can't read {}: {e}", edit.entry.display()),
             }
-            self.status = Some((format!("Saved {name} into {archive}"), Tone::Success));
+            self.success(format!("Saved {name} into {archive}"));
         }
         Task::none()
     }

@@ -90,7 +90,7 @@ impl App {
         let paths = match self.diff_pair() {
             Ok(p) => p,
             Err(e) => {
-                self.status = Some((e, Tone::Error));
+                self.error(e);
                 return Task::none();
             }
         };
