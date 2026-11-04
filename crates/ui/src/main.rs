@@ -85,7 +85,7 @@ fn main() -> iced::Result {
     }
     // iced tries the listed backends in order: the first is the one used.
     let software = std::env::var("ICED_BACKEND").is_ok_and(|v| v.split(',').find(|b| !b.is_empty()) == Some("tiny-skia"));
-    theme::set_shadows(!software);
+    theme::set_software(software);
     // Temp copies of files in archives or on servers left by earlier runs.
     std::thread::spawn(|| rc_core::vfs::clean_temp(rc_core::vfs::TEMP_MAX_AGE));
     startup::mark("config ready");

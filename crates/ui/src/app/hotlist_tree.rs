@@ -221,6 +221,7 @@ impl App {
         t.press = None;
         t.over = None;
         t.resizing = false;
+        self.split_ghost = None;
         t.focused = t.shown;
         if t.shown {
             // Start on the active panel's folder if it is in the list.
@@ -717,6 +718,11 @@ impl App {
     /// of resizing.
     pub(super) fn tree_release(&mut self) -> Task<Message> {
         if std::mem::take(&mut self.tree.resizing) {
+            if self.split_ghost.take().is_some() {
+                self.tree.width = self.mouse.x - SPLIT_W / 2.0;
+                self.tree.width = self.tree_width();
+                self.sync_grids();
+            }
             self.save_session();
         }
         // A folder dragged onto a panel opens there, which gets the focus.
@@ -762,9 +768,15 @@ impl App {
     pub(super) fn tree_mouse_moved(&mut self) {
         let mouse = self.mouse;
         if self.tree.resizing {
+            let old = self.tree.width;
             self.tree.width = mouse.x - SPLIT_W / 2.0;
             self.tree.width = self.tree_width();
-            self.sync_grids();
+            if theme::software() {
+                self.split_ghost = Some(self.tree.width + SPLIT_W / 2.0);
+                self.tree.width = old;
+            } else {
+                self.sync_grids();
+            }
             return;
         }
         if let Some(p) = self.tree.press.as_mut().filter(|p| !p.active) {

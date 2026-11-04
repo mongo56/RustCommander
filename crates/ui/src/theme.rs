@@ -344,18 +344,24 @@ pub fn focused(primary_button: bool) -> impl Fn(&Theme, button::Status) -> butto
     }
 }
 
-/// Whether box shadows are drawn; `main` turns them off for the software
-/// renderer. iced_tiny_skia 0.13 redraws only the damaged part of the window
-/// but blends a quad's whole shadow every time, so each redraw inside a
-/// dialog darkened the area around it a little more.
-static SHADOWS: AtomicBool = AtomicBool::new(true);
+/// Whether the software renderer (tiny-skia) draws the window; `main` sets
+/// it. iced_tiny_skia 0.13 redraws only the damaged part of the window, so
+/// with it box shadows are off (it blends a quad's whole shadow every time,
+/// so each redraw inside a dialog darkened the area around it a little
+/// more) and dividers show a line while dragged instead of resizing the
+/// panels (which redraws the whole window) on every mouse move.
+static SOFTWARE: AtomicBool = AtomicBool::new(false);
 
-pub fn set_shadows(on: bool) {
-    SHADOWS.store(on, Ordering::Relaxed);
+pub fn set_software(on: bool) {
+    SOFTWARE.store(on, Ordering::Relaxed);
+}
+
+pub fn software() -> bool {
+    SOFTWARE.load(Ordering::Relaxed)
 }
 
 pub fn dialog(_theme: &Theme) -> container::Style {
-    let shadow = if SHADOWS.load(Ordering::Relaxed) {
+    let shadow = if !software() {
         iced::Shadow { color: Color { a: 0.5, ..Color::BLACK }, offset: iced::Vector::new(0.0, 8.0), blur_radius: 24.0 }
     } else {
         iced::Shadow::default()

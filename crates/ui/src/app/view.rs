@@ -82,6 +82,15 @@ impl App {
             .find_map(|j| j.conflict.as_ref().map(|c| self.conflict_view(j.id, c)))
             .or_else(|| self.dialog.as_ref().map(|d| self.dialog_view(d)));
 
+        // A divider being dragged with the software renderer.
+        let base = match self.split_ghost {
+            Some(x) => {
+                let line = container(Space::new(Length::Fixed(2.0), Length::Fill)).style(filled(theme::c().accent));
+                stack![base, row![Space::new(Length::Fixed((x - 1.0).max(0.0)), Length::Fill), line]].into()
+            }
+            None => base,
+        };
+
         if let Some(card) = modal {
             return stack![base, opaque(center(card).style(theme::backdrop))].into();
         }
@@ -116,6 +125,13 @@ impl App {
         let room = (self.window_width - self.panels_x() - SPLIT_W).max(1.0);
         let min = MIN_PANEL.min(room / 2.0);
         (room * self.split).clamp(min, room - min).round()
+    }
+
+    /// Moves the divider between the panels to window x.
+    pub(super) fn drag_split_to(&mut self, x: f32) {
+        let room = (self.window_width - self.panels_x() - SPLIT_W).max(1.0);
+        self.split = (x - self.panels_x() - SPLIT_W / 2.0) / room;
+        self.split = self.left_width() / room;
     }
 
     /// Window x of the middle of the divider.

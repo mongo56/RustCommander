@@ -138,6 +138,10 @@ pub struct App {
     split_drag: bool,
     /// When the divider was last pressed (double click resets it).
     split_click: Option<Instant>,
+    /// Window x of the line drawn where a dragged divider (panels or
+    /// hotlist tree) would go; with the software renderer the size is
+    /// only applied on release (see `theme::software`).
+    split_ghost: Option<f32>,
     /// Widths of the Ext / Size / Modified columns, shared by all panels.
     columns: [f32; 3],
     /// A column header edge is being dragged.
@@ -582,6 +586,7 @@ impl App {
             split: session.as_ref().map_or(0.5, |s| s.split).clamp(0.0, 1.0),
             split_drag: false,
             split_click: None,
+            split_ghost: None,
             columns: clamp_columns(session.as_ref().map_or(session::DEFAULT_COLUMNS, |s| s.columns)),
             column_drag: None,
             column_click: None,
@@ -872,10 +877,14 @@ impl App {
             Message::MouseMoved(position) => {
                 self.mouse = position;
                 if self.split_drag {
-                    let room = (self.window_width - self.panels_x() - SPLIT_W).max(1.0);
-                    self.split = (position.x - self.panels_x() - SPLIT_W / 2.0) / room;
-                    self.split = self.left_width() / room;
-                    self.sync_grids();
+                    let old = self.split;
+                    self.drag_split_to(position.x);
+                    if theme::software() {
+                        self.split_ghost = Some(self.split_x());
+                        self.split = old;
+                    } else {
+                        self.sync_grids();
+                    }
                 }
                 self.column_dragged(position.x);
                 self.tree_mouse_moved();
@@ -906,7 +915,10 @@ impl App {
                 }
             }
             Message::MouseUp(right) => {
-                self.split_drag = false;
+                if std::mem::take(&mut self.split_drag) && self.split_ghost.take().is_some() {
+                    self.drag_split_to(self.mouse.x);
+                    self.sync_grids();
+                }
                 self.column_drag = None;
                 if !right {
                     self.viewer_release();
