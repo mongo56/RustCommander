@@ -126,7 +126,15 @@ fn forget_step(stack: &mut Vec<Visit>, n: usize) -> bool {
 
 impl Panel {
     pub fn open(path: impl Into<PathBuf>) -> io::Result<Self> {
-        let mut panel = Self {
+        let mut panel = Self::unlisted(path);
+        panel.reload()?;
+        Ok(panel)
+    }
+
+    /// A panel on `path` with no entries yet: nothing is read (the listing
+    /// comes later through [`Panel::apply_listing`]).
+    pub fn unlisted(path: impl Into<PathBuf>) -> Self {
+        Self {
             path: path.into(),
             entries: Vec::new(),
             cursor: 0,
@@ -144,9 +152,7 @@ impl Panel {
             results: None,
             thumbnails: false,
             grid: (1, 1),
-        };
-        panel.reload()?;
-        Ok(panel)
+        }
     }
 
     /// Re-reads the current folder, keeping cursor and selection by name.

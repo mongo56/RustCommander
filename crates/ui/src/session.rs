@@ -137,16 +137,10 @@ impl TabState {
         }
     }
 
-    /// Opens the tab's folder, or its closest existing parent if the folder
-    /// is gone. `None` when nothing on the path exists any more.
-    pub fn open(&self) -> Option<Panel> {
-        // The folder, or the nearest one that still exists (an archive or a
-        // folder in one counts).
-        let mut panel = self
-            .path
-            .ancestors()
-            .filter(|p| p.is_dir() || rc_core::vfs::in_archive(p))
-            .find_map(|p| Panel::open(p).ok())?;
+    /// The tab with its settings but no entries: the folder is read in the
+    /// background at startup (`App::new`), so the window shows at once.
+    pub fn panel(&self) -> Panel {
+        let mut panel = Panel::unlisted(&self.path);
         panel.sort.key = match self.sort.as_str() {
             "ext" => SortKey::Ext,
             "size" => SortKey::Size,
@@ -156,8 +150,7 @@ impl TabState {
         panel.sort.descending = self.descending;
         panel.show_hidden = self.show_hidden;
         panel.thumbnails = self.thumbnails;
-        panel.reload().ok()?;
-        Some(panel)
+        panel
     }
 }
 
@@ -231,7 +224,7 @@ mod tests {
         let moved = toml::to_string_pretty(&Session { compare: None, ..back.clone() }).unwrap();
         assert!(!moved.contains("compare"), "{moved}");
         assert_eq!(toml::from_str::<Session>(&moved).unwrap().compare, None);
-        let panel = back.left.tabs[0].open().unwrap();
+        let panel = back.left.tabs[0].panel();
         assert_eq!(panel.sort.key, SortKey::Size);
         assert!(panel.sort.descending && panel.show_hidden && panel.thumbnails);
         // List-view tabs don't write the switch.
@@ -269,17 +262,5 @@ mod tests {
         assert!(saved.contains("Users"), "{saved}");
         let back: Session = toml::from_str(&saved).unwrap();
         assert_eq!(back.hotlist, folders);
-    }
-
-    #[test]
-    fn missing_folder_falls_back_to_parent() {
-        let tab = TabState {
-            path: std::env::temp_dir().join("rc-no-such-folder").join("deeper"),
-            sort: default_sort(),
-            descending: false,
-            show_hidden: false,
-            thumbnails: false,
-        };
-        assert_eq!(tab.open().unwrap().path, std::env::temp_dir());
     }
 }

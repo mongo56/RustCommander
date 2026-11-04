@@ -254,12 +254,12 @@ impl App {
     }
 
     /// Cached 48 px system icon.
-    fn big_icon(&self, path: &Path, is_dir: bool) -> Option<image::Handle> {
-        let key = rc_platform::icon_key(path, is_dir);
+    fn big_icon(&self, entry: &Entry) -> Option<image::Handle> {
+        let key = super::entry_icon_key(entry);
         if let Some(handle) = self.thumbs.icons.borrow().get(&key) {
             return handle.clone();
         }
-        let handle = rc_platform::large_icon(path, is_dir)
+        let handle = rc_platform::large_icon(&entry.path, entry.is_dir())
             .map(|icon| image::Handle::from_rgba(icon.width, icon.height, icon.rgba));
         self.thumbs.icons.borrow_mut().insert(key, handle.clone());
         handle
@@ -318,7 +318,7 @@ impl App {
         let opacity = if entry.hidden { 0.5_f32 } else { 1.0 };
         let picture: Element<'_, Message> = match thumb {
             Some(handle) => image_widget(handle).content_fit(ContentFit::ScaleDown).opacity(opacity).into(),
-            None => match self.big_icon(&entry.path, entry.is_dir()).or_else(|| self.icon(&entry.path, entry.is_dir())) {
+            None => match self.big_icon(entry).or_else(|| self.entry_icon(entry)) {
                 Some(handle) => image_widget(handle).width(BIG_ICON).height(BIG_ICON).opacity(opacity).into(),
                 None => Space::new(BIG_ICON, BIG_ICON).into(),
             },

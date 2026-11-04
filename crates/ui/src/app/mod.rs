@@ -31,7 +31,7 @@ use rc_core::entry::Entry;
 use rc_core::{remote, vfs, Activated, Command, EntryKind, Nav, Panel, SortKey};
 use rc_platform::{DragOutcome, MenuAction};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Component, Path, PathBuf, MAIN_SEPARATOR};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -166,6 +166,9 @@ pub struct App {
     /// Latest background listing requested per folder (`Message::Listed`).
     listings: HashMap<PathBuf, u64>,
     next_listing: u64,
+    /// Tab folders from the session still being read at startup
+    /// (`Message::Restored`); their path bar says "reading".
+    restoring: HashSet<PathBuf>,
     /// Folder change per side still waiting for its listing (slow or
     /// network folders); see `start_nav`.
     nav: [Option<PendingNav>; 2],
@@ -457,6 +460,10 @@ pub enum Message {
     FsChanged(PathBuf),
     /// A background listing of a folder finished (`u64`: request number).
     Listed(PathBuf, u64, Result<Vec<Entry>, String>),
+    /// A tab folder from the session was read at startup: the folder the
+    /// tabs had, the one found (it or its closest existing parent) and its
+    /// entries.
+    Restored(PathBuf, Result<(PathBuf, Vec<Entry>), String>),
     ViewerLoaded(u64, Result<viewer::Loaded, String>),
     /// Search result in a large file: the window holding the match, the
     /// match, and whether the search wrapped around.
@@ -516,10 +523,13 @@ impl App {
         let home = rc_platform::home_dir();
         let left = std::env::current_dir().ok().or_else(|| home.clone());
         let right = home.clone().or_else(|| left.clone());
+        // Nothing is read here: the tabs start empty and their folders are
+        // listed on worker threads (`restore_tabs`), so the window shows at once.
         let restore = |state: Option<&SideState>, fallback: Option<PathBuf>| {
-            let tabs: Vec<Panel> = state.map(|s| s.tabs.iter().filter_map(TabState::open).collect()).unwrap_or_default();
+            let tabs: Vec<Panel> = state.map(|s| s.tabs.iter().map(TabState::panel).collect()).unwrap_or_default();
             if tabs.is_empty() {
-                Side { tabs: vec![open_panel(fallback)], current: 0 }
+                let path = fallback.unwrap_or_else(|| PathBuf::from(if cfg!(windows) { "C:\\" } else { "/" }));
+                Side { tabs: vec![Panel::unlisted(path)], current: 0 }
             } else {
                 let current = state.map_or(0, |s| s.current).min(tabs.len() - 1);
                 Side { tabs, current }
@@ -533,7 +543,8 @@ impl App {
                 restore(session.as_ref().map(|s| &s.right), right),
             ],
             active: session.as_ref().map_or(0, |s| if s.hide_left && s.hotlist_tree { 1 } else { s.active.min(1) }),
-            drives: rc_platform::roots(),
+            // Filled by `list_drives` on a worker thread.
+            drives: Vec::new(),
             status: None,
             window_width: width,
             window_height: height,
@@ -583,6 +594,7 @@ impl App {
             disk: RefCell::new(HashMap::new()),
             listings: HashMap::new(),
             next_listing: 0,
+            restoring: HashSet::new(),
             nav: [None, None],
             viewer: None,
             multi_rename: None,
@@ -604,22 +616,24 @@ impl App {
             skipped_update: session.as_ref().and_then(|s| s.skipped_update.clone()),
         };
         app.refresh_config();
+        crate::startup::mark("config.toml read");
         app.tree_fix_cursor();
         // First start: hidden files as configured.
         if session.is_none() && app.config.show_hidden {
             for side in &mut app.sides {
                 for tab in &mut side.tabs {
                     tab.show_hidden = true;
-                    let _ = tab.reload();
                 }
             }
         }
+        let tabs = app.restore_tabs();
         let show = match app.placement {
             Some(p) if hidden_until_placed(&session) => restore_window(p),
             _ => Task::none(),
         };
         let check = app.startup_update_check();
-        (app, Task::batch([show, check]))
+        crate::startup::mark("App::new done");
+        (app, Task::batch([show, tabs, list_drives(), check]))
     }
 
     pub fn theme(&self) -> Theme {
@@ -1187,6 +1201,7 @@ impl App {
                 return self.list_in_background(path);
             }
             Message::Listed(path, seq, result) => self.apply_listing(path, seq, result),
+            Message::Restored(path, result) => self.tab_restored(path, result),
             Message::Extracted(result) => {
                 self.status = Some(match result.and_then(|p| launch(&p).map_err(|e| e.to_string())) {
                     Ok(msg) => (msg, Tone::Success),
@@ -3076,6 +3091,58 @@ impl App {
         self.after_change();
     }
 
+    /// Lists every tab's folder on worker threads, the visible tabs first;
+    /// each answer is a `Message::Restored`. Tabs on the same folder share
+    /// one listing.
+    fn restore_tabs(&mut self) -> Task<Message> {
+        let visible = (0..2).map(|side| self.panel(side).path.clone());
+        let all = self.sides.iter().flat_map(|s| s.tabs.iter().map(|t| t.path.clone()));
+        let paths: Vec<PathBuf> = visible.chain(all).collect();
+        let mut tasks = Vec::new();
+        for path in paths {
+            if !self.restoring.insert(path.clone()) {
+                continue;
+            }
+            tasks.push(Task::perform(
+                async move {
+                    let (tx, rx) = iced::futures::channel::oneshot::channel();
+                    let dir = path.clone();
+                    std::thread::spawn(move || {
+                        let _ = tx.send(read_restored(&dir));
+                    });
+                    let result = rx.await.unwrap_or_else(|_| Err("listing thread failed".into()));
+                    (path, result)
+                },
+                |(path, result)| Message::Restored(path, result),
+            ));
+        }
+        Task::batch(tasks)
+    }
+
+    /// Fills the tabs still on `path` (the user may have moved on) with its
+    /// listing; a folder that is gone gives way to its closest parent.
+    fn tab_restored(&mut self, path: PathBuf, result: Result<(PathBuf, Vec<Entry>), String>) {
+        if !self.restoring.remove(&path) {
+            return;
+        }
+        crate::startup::mark(&format!("tab listed: {}", path.display()));
+        match result {
+            Ok((found, entries)) => {
+                for tab in self.sides.iter_mut().flat_map(|s| s.tabs.iter_mut()).filter(|t| t.path == path) {
+                    tab.path = found.clone();
+                    tab.apply_listing(entries.clone());
+                }
+            }
+            Err(e) => self.error(format!("{}: {e}", path.display())),
+        }
+        self.after_change();
+    }
+
+    /// Whether the visible tab of `side` waits for its startup listing.
+    pub(super) fn restoring(&self, side: usize) -> bool {
+        self.restoring.contains(&self.panel(side).path)
+    }
+
     fn session(&self) -> Session {
         let side = |s: &Side| SideState { current: s.current, tabs: s.tabs.iter().map(TabState::from_panel).collect() };
         Session {
@@ -3214,7 +3281,16 @@ impl App {
 
     /// System icon for a path, cached.
     fn icon(&self, path: &Path, is_dir: bool) -> Option<image::Handle> {
-        let key = rc_platform::icon_key(path, is_dir);
+        self.icon_by_key(rc_platform::icon_key(path, is_dir), path, is_dir)
+    }
+
+    /// System icon for a listed entry, cached; a program's own icon is
+    /// read again once the file changes (see [`entry_icon_key`]).
+    pub(super) fn entry_icon(&self, entry: &Entry) -> Option<image::Handle> {
+        self.icon_by_key(entry_icon_key(entry), &entry.path, entry.is_dir())
+    }
+
+    fn icon_by_key(&self, key: String, path: &Path, is_dir: bool) -> Option<image::Handle> {
         if let Some(handle) = self.icons.borrow().get(&key) {
             return handle.clone();
         }
@@ -3496,11 +3572,45 @@ fn summarize(verb: &str, o: &Outcome) -> (String, Tone) {
     }
 }
 
-fn open_panel(path: Option<PathBuf>) -> Panel {
-    path.and_then(|p| Panel::open(p).ok())
-        .or_else(|| rc_platform::home_dir().and_then(|p| Panel::open(p).ok()))
-        .or_else(|| Panel::open(if cfg!(windows) { "C:\\" } else { "/" }).ok())
-        .expect("could not open any starting folder")
+/// Lists a tab folder from the session (worker thread): the folder, or the
+/// closest parent that still exists (an archive or a folder in one counts),
+/// else the home folder, else the root.
+fn read_restored(path: &Path) -> Result<(PathBuf, Vec<Entry>), String> {
+    let root = PathBuf::from(if cfg!(windows) { "C:\\" } else { "/" });
+    path.ancestors()
+        .filter(|p| p.is_dir() || vfs::in_archive(p))
+        .map(Path::to_path_buf)
+        .chain(rc_platform::home_dir())
+        .chain([root])
+        .find_map(|p| vfs::list(&p, true).ok().map(|entries| (p, entries)))
+        .ok_or_else(|| "no folder could be read".into())
+}
+
+/// Icon cache key for a listed entry. Files with their own icon (programs,
+/// shortcuts) are keyed by size and date as well: a file looked at while it
+/// was still being written (a download in progress) shows the generic icon,
+/// and that must not stick once the file is complete.
+pub(super) fn entry_icon_key(entry: &Entry) -> String {
+    let key = rc_platform::icon_key(&entry.path, entry.is_dir());
+    if key.starts_with("file:") {
+        format!("{key}|{}|{}", entry.size, entry.modified.map_or(0, |m| m.timestamp_millis()))
+    } else {
+        key
+    }
+}
+
+/// Reads the drive list on a worker thread (`Message::DrivesChanged`).
+fn list_drives() -> Task<Message> {
+    Task::perform(
+        async {
+            let (tx, rx) = iced::futures::channel::oneshot::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(rc_platform::roots());
+            });
+            rx.await.unwrap_or_default()
+        },
+        Message::DrivesChanged,
+    )
 }
 
 /// Whether `main` creates the window hidden, for [`restore_window`] to move
@@ -3512,7 +3622,10 @@ pub fn hidden_until_placed(session: &Option<Session>) -> bool {
 /// Moves the (hidden) window to its saved place and shows it.
 fn restore_window(p: rc_platform::Placement) -> Task<Message> {
     window::get_oldest().then(move |id| match id {
-        Some(id) => window::run_with_handle(id, move |h| rc_platform::restore_placement(native_handle(&h), &p))
+        Some(id) => window::run_with_handle(id, move |h| {
+                crate::startup::mark("window placed");
+                rc_platform::restore_placement(native_handle(&h), &p)
+            })
             // Let winit know it's visible (and show it if placing failed).
             .chain(window::change_mode(id, window::Mode::Windowed)),
         None => Task::none(),
@@ -3526,5 +3639,17 @@ fn toggle_compare_option(opts: &mut CompareOptions, i: u8) {
         0 => opts.by_content ^= true,
         1 => opts.ignore_date ^= true,
         _ => opts.subfolders ^= true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_folder_falls_back_to_parent() {
+        let gone = std::env::temp_dir().join("rc-no-such-folder").join("deeper");
+        let (found, _) = read_restored(&gone).unwrap();
+        assert_eq!(found, std::env::temp_dir());
     }
 }

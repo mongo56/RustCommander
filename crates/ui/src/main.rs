@@ -14,6 +14,7 @@ mod hotlist;
 mod select_range;
 mod session;
 mod sites;
+mod startup;
 mod theme;
 mod update;
 mod watch;
@@ -52,13 +53,13 @@ fn print_version() {
 }
 
 fn main() -> iced::Result {
+    startup::init();
     if std::env::args().skip(1).any(|a| a == "--version" || a == "-V") {
         print_version();
         return Ok(());
     }
-    // Temp copies of files in archives or on servers left by earlier runs.
-    std::thread::spawn(|| rc_core::vfs::clean_temp(rc_core::vfs::TEMP_MAX_AGE));
     let mut session = session::load();
+    startup::mark("session loaded");
     if let Some(dir) = config::dir() {
         // SFTP host keys are trusted in known_hosts there.
         rc_core::remote::set_settings_dir(dir);
@@ -76,6 +77,15 @@ fn main() -> iced::Result {
             Err(e) => eprintln!("could not move the compare options to config.toml: {e}"),
         }
     }
+    // The renderer is picked when iced starts: set it before that, and
+    // before other threads run. Software unless config.toml says otherwise
+    // (a broken file too); a user-set ICED_BACKEND wins.
+    if std::env::var_os("ICED_BACKEND").is_none() && config::load().map_or(true, |c| c.software_rendering) {
+        std::env::set_var("ICED_BACKEND", "tiny-skia");
+    }
+    // Temp copies of files in archives or on servers left by earlier runs.
+    std::thread::spawn(|| rc_core::vfs::clean_temp(rc_core::vfs::TEMP_MAX_AGE));
+    startup::mark("config ready");
     let size = session.as_ref().map_or(iced::Size::new(1280.0, 800.0), |s| {
         iced::Size::new(s.width.max(400.0), s.height.max(300.0))
     });
@@ -94,5 +104,8 @@ fn main() -> iced::Result {
         // iced's default sans-serif is Fira Sans, which Windows lacks; cosmic-text
         // then fell back to Segoe UI word by word. Name it directly.
         .default_font(iced::Font::with_name("Segoe UI"))
-        .run_with(move || app::App::new(session))
+        .run_with(move || {
+            startup::mark("iced started (window + renderer)");
+            app::App::new(session)
+        })
 }

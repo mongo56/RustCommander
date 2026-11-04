@@ -64,16 +64,17 @@ impl Page {
 }
 
 /// Rows of the General page.
-const GENERAL_ROWS: usize = 10;
+const GENERAL_ROWS: usize = 11;
 const ROW_EDITOR: usize = 0;
 const ROW_TERMINAL: usize = 1;
 const ROW_HIDDEN: usize = 2;
 const ROW_FKEYS: usize = 3;
 const ROW_TREE: usize = 4;
 const ROW_UPDATES: usize = 5;
-/// Compare options 0..3 (`toggle_compare_option`) are rows 6..9.
-const ROW_COMPARE: usize = 6;
-const ROW_CONFIG: usize = 9;
+const ROW_RENDER: usize = 6;
+/// Compare options 0..3 (`toggle_compare_option`) are rows 7..10.
+const ROW_COMPARE: usize = 7;
+const ROW_CONFIG: usize = 10;
 
 #[derive(Debug, Clone)]
 pub enum SettingsMsg {
@@ -96,6 +97,7 @@ pub enum SettingsMsg {
     ShowFkeys(bool),
     HotlistTree(bool),
     CheckUpdates(bool),
+    SoftwareRendering(bool),
     /// Toggle compare option 0..3.
     Compare(u8),
     EditConfig,
@@ -304,6 +306,9 @@ impl App {
                 ROW_UPDATES => {
                     self.settings_update(SettingsMsg::CheckUpdates(!self.config.check_updates_at_startup))
                 }
+                ROW_RENDER => {
+                    self.settings_update(SettingsMsg::SoftwareRendering(!self.config.software_rendering))
+                }
                 ROW_CONFIG => self.settings_update(SettingsMsg::EditConfig),
                 _ => self.settings_update(SettingsMsg::Compare((row - ROW_COMPARE) as u8)),
             },
@@ -442,6 +447,14 @@ impl App {
                 s.row[0] = ROW_UPDATES;
                 let state = if on { "on" } else { "off" };
                 self.settings_write(&[Edit::Flag("check_updates_at_startup", on)], format!("Update check at startup {state}"));
+            }
+            SettingsMsg::SoftwareRendering(on) => {
+                s.row[0] = ROW_RENDER;
+                let state = if on { "on (CPU)" } else { "off (GPU)" };
+                self.settings_write(
+                    &[Edit::Flag("software_rendering", on)],
+                    format!("Software rendering {state} from the next start"),
+                );
             }
             SettingsMsg::Compare(i) => {
                 s.row[0] = ROW_COMPARE + i as usize;
@@ -857,6 +870,20 @@ impl App {
                                 SettingsMsg::CheckUpdates(!self.config.check_updates_at_startup)
                             ),
                             hint("At startup, ask GitHub for a newer release (the command palette's Check for updates looks any time)".into()),
+                        ]
+                        .spacing(8)
+                        .align_y(Alignment::Center)
+                        .into()
+                    ),
+                    line(
+                        ROW_RENDER,
+                        row![
+                            label("Software rendering"),
+                            switch(
+                                self.config.software_rendering,
+                                SettingsMsg::SoftwareRendering(!self.config.software_rendering)
+                            ),
+                            hint("Draw with the CPU instead of the graphics card: starts much faster. Applies at the next start".into()),
                         ]
                         .spacing(8)
                         .align_y(Alignment::Center)

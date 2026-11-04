@@ -44,6 +44,8 @@ impl Columns {
 
 impl App {
     pub fn view(&self) -> Element<'_, Message> {
+        static FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        crate::startup::mark_once(&FIRST, "first view");
         let mut panels = Row::new().height(Length::Fill);
         if self.tree_visible() {
             panels = panels
@@ -359,6 +361,14 @@ impl App {
                         .size(13)
                         .color(theme::c().muted)
                         .wrapping(Wrapping::None),
+                    // Startup: the session's folder is still being read.
+                    None if self.restoring(side) => text(elide_left(
+                        &format!("{}  (reading…)", rc_core::remote::display(&panel.path)),
+                        self.path_chars(side),
+                    ))
+                    .size(13)
+                    .color(theme::c().muted)
+                    .wrapping(Wrapping::None),
                     None => text(elide_left(
                         &match panel.results() {
                             Some(what) => format!("{}  \u{2014} search results: {what}", rc_core::remote::display(&panel.path)),
@@ -594,7 +604,7 @@ impl App {
             EntryKind::File => format::size(entry.size),
         };
 
-        let icon: Element<'_, Message> = match self.icon(&entry.path, entry.is_dir()) {
+        let icon: Element<'_, Message> = match self.entry_icon(entry) {
             Some(handle) => image(handle)
                 .width(ICON)
                 .height(ICON)
