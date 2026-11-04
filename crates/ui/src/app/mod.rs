@@ -150,6 +150,9 @@ pub struct App {
     column_click: Option<(usize, Instant)>,
     /// Row under the mouse while dragging: (side, index).
     hover: Option<(usize, usize)>,
+    /// Wheel movement (in list rows) not yet scrolled: touchpads send small
+    /// pixel deltas that would each round to nothing.
+    wheel_rest: f32,
     modifiers: keyboard::Modifiers,
     /// Whether the window has keyboard focus, as last reported. On Windows,
     /// winit synthesizes key-downs for keys still held when focus arrives and
@@ -592,6 +595,7 @@ impl App {
             column_drag: None,
             column_click: None,
             hover: None,
+            wheel_rest: 0.0,
             modifiers: keyboard::Modifiers::default(),
             focused: true,
             leaked_enter: false,
@@ -1023,10 +1027,18 @@ impl App {
             }
             Message::Wheel(side, lines) => {
                 let rows = self.page_rows();
-                let panel = self.panel_mut(side);
                 // Three lines a notch in the list, one row of thumbnails.
-                let step = if panel.thumbnails { -lines } else { -lines * 3.0 };
-                panel.scroll_by(step.round() as isize, rows);
+                let step = if self.panel(side).thumbnails { -lines } else { -lines * 3.0 };
+                // Keep the fraction, but drop it when the direction flips.
+                if self.wheel_rest * step < 0.0 {
+                    self.wheel_rest = 0.0;
+                }
+                let total = self.wheel_rest + step;
+                let whole = total.trunc();
+                self.wheel_rest = total - whole;
+                if whole != 0.0 {
+                    self.panel_mut(side).scroll_by(whole as isize, rows);
+                }
             }
             Message::ScrollTo(side, start, rows) => self.panel_mut(side).scroll_to(start, rows),
             Message::Drive(side, drive) => {

@@ -2,6 +2,7 @@
 //! the lazily filled icon and disk-space caches.
 
 use super::*;
+use crate::ring::Ring;
 use crate::theme::filled;
 use iced::widget::text::Wrapping;
 use iced::widget::{
@@ -564,7 +565,12 @@ impl App {
             let len = panel.entries.len();
             let start = panel.view_start(rows);
             let end = (start + rows).min(len);
-            let rows_view = container(Column::with_children((start..end).map(|i| self.entry_row(side, i, active))))
+            // Entry `i` goes in slot `i % rows` when the screen is full, so a
+            // scroll step re-shapes only the rows that came into view (see
+            // `ring`); a shorter list is just in order.
+            let slots = end - start;
+            let children = (0..slots).map(|k| self.entry_row(side, start + (k + slots - start % slots) % slots, active)).collect();
+            let rows_view = container(Ring::new(children, ROW_H, start))
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .clip(true);

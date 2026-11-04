@@ -9,6 +9,7 @@ mod terminal;
 mod icon;
 mod icon_art;
 mod keymap;
+mod ring;
 mod scrollbar;
 mod hotlist;
 mod select_range;
