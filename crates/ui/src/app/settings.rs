@@ -915,7 +915,7 @@ impl App {
                     .padding(5)
                     .size(13)
                     .style(theme::input);
-                let shell = text_input(&format!("Empty: {}", crate::config::DEFAULT_BUILTIN_SHELL), &s.shell)
+                let shell = text_input("Empty: PowerShell 7 if installed, else Windows PowerShell", &s.shell)
                     .id(shell_id())
                     .on_input(move |v| msg(SettingsMsg::Shell(v)))
                     .on_submit(msg(SettingsMsg::SaveEditor))

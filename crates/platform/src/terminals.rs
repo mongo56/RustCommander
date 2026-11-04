@@ -48,6 +48,23 @@ const KNOWN: &[(&str, &str, &str, &[&str])] = &[
 /// Looks for the known terminals on PATH, in the registry's App Paths and in
 /// the usual install folders. Touches the disk: call it off the UI thread.
 pub fn detect_terminals() -> Vec<FoundTerminal> {
+    let roots = search_roots();
+    KNOWN.iter().filter_map(|row| find_known(row, &roots)).collect()
+}
+
+/// Installed PowerShell 7 (`pwsh.exe`), found like in `detect_terminals`.
+/// Touches the disk; the result is cached for the life of the process.
+pub fn find_pwsh() -> Option<PathBuf> {
+    static PWSH: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    PWSH.get_or_init(|| {
+        let row = KNOWN.iter().find(|k| k.1 == "pwsh.exe")?;
+        find_known(row, &search_roots()).map(|t| t.path)
+    })
+    .clone()
+}
+
+/// Folders searched for the known terminals.
+fn search_roots() -> Vec<PathBuf> {
     let env = |v: &str| std::env::var_os(v).map(PathBuf::from);
     let local = env("LOCALAPPDATA");
     let mut roots: Vec<PathBuf> =
@@ -61,21 +78,21 @@ pub fn detect_terminals() -> Vec<FoundTerminal> {
         roots.push(sys.join("System32"));
         roots.push(sys.join(r"System32\WindowsPowerShell\v1.0"));
     }
-    let mut found = Vec::new();
-    for (name, exe, args, folders) in KNOWN {
-        let mut candidates: Vec<PathBuf> = Vec::new();
-        candidates.extend(on_path(exe));
-        candidates.extend(app_path(exe));
-        for root in &roots {
-            for folder in *folders {
-                candidates.extend(expand(root, folder).into_iter().map(|d| d.join(exe)));
-            }
-        }
-        if let Some(path) = candidates.into_iter().find(|p| exists(p)) {
-            found.push(FoundTerminal { name: (*name).to_owned(), path, args: (*args).to_owned() });
+    roots
+}
+
+fn find_known(row: &(&str, &str, &str, &[&str]), roots: &[PathBuf]) -> Option<FoundTerminal> {
+    let (name, exe, args, folders) = row;
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    candidates.extend(on_path(exe));
+    candidates.extend(app_path(exe));
+    for root in roots {
+        for folder in *folders {
+            candidates.extend(expand(root, folder).into_iter().map(|d| d.join(exe)));
         }
     }
-    found
+    let path = candidates.into_iter().find(|p| exists(p))?;
+    Some(FoundTerminal { name: (*name).to_owned(), path, args: (*args).to_owned() })
 }
 
 /// Like `is_file`, but also true for app-execution aliases (reparse points

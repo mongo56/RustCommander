@@ -82,10 +82,14 @@ impl Config {
         if self.thumbnail_size == 0 { 128 } else { self.thumbnail_size.clamp(32, 512) }
     }
 
-    /// The built-in terminal's shell command line: `builtin_shell`, or
-    /// `powershell.exe -NoLogo` (elsewhere `$SHELL`, else `/bin/sh`) when empty.
+    /// The built-in terminal's shell command line: `builtin_shell`, or when
+    /// empty `pwsh.exe -NoLogo` if PowerShell 7 is installed, else
+    /// `powershell.exe -NoLogo` (elsewhere `$SHELL`, else `/bin/sh`). The
+    /// PowerShell 7 lookup touches the disk once (cached).
     pub fn builtin_shell(&self) -> String {
-        builtin_shell_or_default(&self.builtin_shell, cfg!(windows), std::env::var("SHELL").ok())
+        let setting = self.builtin_shell.trim();
+        let pwsh = if cfg!(windows) && setting.is_empty() { rc_platform::find_pwsh() } else { None };
+        builtin_shell_or_default(setting, cfg!(windows), std::env::var("SHELL").ok(), pwsh)
     }
 
     /// The theme preset with the `[colors]` overrides on top.
@@ -95,15 +99,28 @@ impl Config {
     }
 }
 
-fn builtin_shell_or_default(setting: &str, windows: bool, shell_env: Option<String>) -> String {
+fn builtin_shell_or_default(
+    setting: &str,
+    windows: bool,
+    shell_env: Option<String>,
+    pwsh: Option<std::path::PathBuf>,
+) -> String {
     match setting.trim() {
-        "" if windows => DEFAULT_BUILTIN_SHELL.to_owned(),
+        "" if windows => match pwsh {
+            Some(path) => {
+                let program = path.display().to_string();
+                let program = if program.contains(' ') { format!("\"{program}\"") } else { program };
+                format!("{program} -NoLogo")
+            }
+            None => DEFAULT_BUILTIN_SHELL.to_owned(),
+        },
         "" => shell_env.filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "/bin/sh".into()),
         s => s.to_owned(),
     }
 }
 
-/// The built-in terminal's shell on Windows when `builtin_shell` is empty.
+/// The built-in terminal's shell on Windows when `builtin_shell` is empty and
+/// PowerShell 7 isn't installed.
 pub const DEFAULT_BUILTIN_SHELL: &str = "powershell.exe -NoLogo";
 
 /// One change to `config.toml`.
@@ -340,7 +357,8 @@ fn template(editor: &str, compare: CompareState) -> String {
          \n\
          # Shell of the built-in terminal (F9; Ctrl+F9 opens the external one above):\n\
          # a program, optionally with arguments; it starts in the active panel's\n\
-         # folder. Empty = powershell.exe -NoLogo (elsewhere $SHELL).\n\
+         # folder. Empty = PowerShell 7 (pwsh.exe -NoLogo) if installed, else\n\
+         # powershell.exe -NoLogo (elsewhere $SHELL).\n\
          # Examples: builtin_shell = 'pwsh.exe -NoLogo', builtin_shell = 'cmd.exe'\n\
          builtin_shell = \"\"\n\
          \n\
@@ -489,11 +507,17 @@ mod tests {
 
     #[test]
     fn builtin_shell_defaults() {
-        assert_eq!(builtin_shell_or_default("", true, None), "powershell.exe -NoLogo");
-        assert_eq!(builtin_shell_or_default("  ", true, Some("/bin/zsh".into())), "powershell.exe -NoLogo");
-        assert_eq!(builtin_shell_or_default("", false, Some("/bin/zsh".into())), "/bin/zsh");
-        assert_eq!(builtin_shell_or_default("", false, None), "/bin/sh");
-        assert_eq!(builtin_shell_or_default(" cmd.exe /k ", true, None), "cmd.exe /k");
+        let pwsh = || Some(std::path::PathBuf::from(r"C:\Program Files\PowerShell\7\pwsh.exe"));
+        let plain = || Some(std::path::PathBuf::from(r"C:\pwsh\pwsh.exe"));
+        assert_eq!(builtin_shell_or_default("", true, None, None), "powershell.exe -NoLogo");
+        assert_eq!(builtin_shell_or_default("  ", true, Some("/bin/zsh".into()), None), "powershell.exe -NoLogo");
+        let quoted = builtin_shell_or_default("", true, None, pwsh());
+        assert_eq!(quoted, r#""C:\Program Files\PowerShell\7\pwsh.exe" -NoLogo"#);
+        assert_eq!(builtin_shell_or_default("", true, None, plain()), r"C:\pwsh\pwsh.exe -NoLogo");
+        assert_eq!(builtin_shell_or_default("cmd.exe", true, None, pwsh()), "cmd.exe");
+        assert_eq!(builtin_shell_or_default("", false, Some("/bin/zsh".into()), pwsh()), "/bin/zsh");
+        assert_eq!(builtin_shell_or_default("", false, None, None), "/bin/sh");
+        assert_eq!(builtin_shell_or_default(" cmd.exe /k ", true, None, None), "cmd.exe /k");
         let config = parse(&template("", CompareState::default())).unwrap();
         assert_eq!(config.builtin_shell, "");
         assert_eq!(parse("builtin_shell = 'pwsh -NoLogo'").unwrap().builtin_shell, "pwsh -NoLogo");
