@@ -1,392 +1,194 @@
 use crate::panel::SortKey;
 
-/// Every user action goes through a `Command`. Key bindings, the function-key
-/// bar, menus and (later) a command palette all map onto these, the same idea
-/// as Total Commander's `cm_*` internal commands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Command {
-    CursorUp,
-    CursorDown,
-    PageUp,
-    PageDown,
-    CursorHome,
-    CursorEnd,
-    /// Previous / next entry in the thumbnail view (Left / Right).
-    CursorLeft,
-    CursorRight,
-    /// Scroll the cursor by n rows (mouse wheel).
-    CursorBy(i32),
-    Open,
-    GoParent,
-    GoRoot,
-    /// Previous / next folder in the panel's history (Alt+Left/Right).
-    HistoryBack,
-    HistoryForward,
-    /// The panel's folder history as a popup list (Alt+Down).
-    DirHistory,
-    /// Directory hotlist popup (Ctrl+D).
-    Hotlist,
-    /// Show / hide the hotlist tree left of the panels
-    /// (Ctrl+Shift+D; needs the `hotlist_tree` setting).
-    HotlistTree,
-    /// With the hotlist tree shown: hide / show the left panel, leaving
-    /// the tree and the right panel.
-    HotlistTreeHideLeft,
-    SwitchPanel,
-    /// Toggle selection on the cursor entry, optionally moving down.
-    ToggleSelect { advance: bool },
-    /// Compute the size of every folder in the panel (Alt+Shift+Enter).
-    CountDirSizes,
-    /// Select the entries that differ from the other panel (Shift+F2).
-    CompareDirs,
-    /// Compare-folders options, then compare (Ctrl+Shift+F2).
-    CompareDirsOptions,
-    /// Side-by-side diff of two files (Alt+F2).
-    CompareFiles,
-    /// Find files by name and contents (Alt+F7).
-    FindFiles,
-    /// Saved server connections; connect one in this panel (Ctrl+F).
-    Connect,
-    /// Close the connection of the panel's server (Ctrl+Shift+F).
-    Disconnect,
-    SelectAll,
-    DeselectAll,
-    Refresh,
-    ToggleHidden,
-    /// Thumbnail view on / off for the tab (Ctrl+Shift+F5).
-    Thumbnails,
-    /// Show only entries matching a typed filter (Ctrl+S).
-    QuickFilter,
-    SortBy(SortKey),
-    /// Make the other panel show the same folder.
-    SyncOtherPanel,
-    View,
-    Edit,
-    /// Ask for a file name, create it if missing and edit it (Shift+F4).
-    EditNew,
-    Copy,
-    Move,
-    /// Put the selected files on the system clipboard (Ctrl+C / Ctrl+X),
-    /// for pasting here or in Explorer.
-    CopyToClipboard,
-    CutToClipboard,
-    /// Copy or move the files on the clipboard into the panel (Ctrl+V).
-    PasteFromClipboard,
-    /// Rename the cursor entry in place (Shift+F6).
-    Rename,
-    /// Rename the selected files by mask (Ctrl+M).
-    MultiRename,
-    MakeDir,
-    /// Pack the selected files into a zip in the other panel (Alt+F5).
-    Pack,
-    /// Unpack the selected archives into the other panel (Alt+F9).
-    Unpack,
-    /// Open a terminal in the active panel's folder (F9).
-    Terminal,
-    /// Delete to the recycle bin.
-    Delete,
-    /// Delete permanently (Shift+F8 / Shift+Del).
-    DeletePermanent,
-    NewTab,
-    CloseTab,
-    NextTab,
-    PrevTab,
-    /// Open the folder under the cursor in a new tab.
-    OpenInNewTab,
-    /// Open `config.toml` in the editor (Ctrl+,).
-    EditConfig,
-    /// Settings view: preferences, key bindings, colours (F10).
-    Configuration,
-    /// Popup to find a command by name, id or key and run it (Ctrl+Space).
-    CommandPalette,
-    /// Searchable list of keys and features (F1).
-    Help,
-    /// Look for a newer release on GitHub; download and install it.
-    CheckForUpdates,
-    Quit,
+/// Builds `enum Command`, `id`, `description`, `short_label` and `ALL` from
+/// one table. Each command is one row: `Variant => "cm_Id", "description",
+/// "Label";`. A variant with data gives its fields after a colon and then
+/// one row per value, written as the fields part of the value:
+/// `SortBy: (SortKey)` then `(SortKey::Name) => ...;`. Rows under
+/// `bindable` are listed in `ALL` in table order; `mouse_only` rows are not.
+macro_rules! commands {
+    (bindable { $($bindable:tt)* } mouse_only { $($mouse:tt)* }) => {
+        commands!(@gen [$($bindable)* $($mouse)*] [$($bindable)*]);
+    };
+    (@gen [
+        $(
+            $(#[$doc:meta])*
+            $v:ident $(: $decl:tt)?
+            $( $(($($targ:tt)*))? $({$($sarg:tt)*})? => $id:literal, $desc:literal, $label:literal; )+
+        )*
+    ] [
+        $(
+            $(#[$bdoc:meta])*
+            $bv:ident $(: $bdecl:tt)?
+            $( $(($($btarg:tt)*))? $({$($bsarg:tt)*})? => $bid:literal, $bdesc:literal, $blabel:literal; )+
+        )*
+    ]) => {
+        /// Every user action goes through a `Command`. Key bindings, the function-key
+        /// bar, menus and the command palette all map onto these, the same idea
+        /// as Total Commander's `cm_*` internal commands.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum Command {
+            $( $(#[$doc])* $v $($decl)?, )*
+        }
+
+        impl Command {
+            /// Stable identifier, used for config files and the command palette.
+            pub fn id(self) -> &'static str {
+                match self {
+                    $($( Command::$v $(($($targ)*))? $({$($sarg)*})? => $id, )+)*
+                }
+            }
+
+            /// What the command does, for the F1 help list and the palette.
+            pub fn description(self) -> &'static str {
+                match self {
+                    $($( Command::$v $(($($targ)*))? $({$($sarg)*})? => $desc, )+)*
+                }
+            }
+
+            /// A one-word label for the function-key bar.
+            pub fn short_label(self) -> &'static str {
+                match self {
+                    $($( Command::$v $(($($targ)*))? $({$($sarg)*})? => $label, )+)*
+                }
+            }
+
+            /// Every command a key can be bound to (all but the mouse-only ones).
+            pub const ALL: &'static [Command] = &[
+                $($( Command::$bv $(($($btarg)*))? $({$($bsarg)*})?, )+)*
+            ];
+        }
+    };
+}
+
+commands! {
+    bindable {
+        CursorUp => "cm_CursorUp", "Cursor up", "CursorUp";
+        CursorDown => "cm_CursorDown", "Cursor down", "CursorDown";
+        PageUp => "cm_PageUp", "Cursor one page up", "PageUp";
+        PageDown => "cm_PageDown", "Cursor one page down", "PageDown";
+        CursorHome => "cm_GoToFirstEntry", "Cursor to the first entry", "GoToFirstEntry";
+        CursorEnd => "cm_GoToLastEntry", "Cursor to the last entry", "GoToLastEntry";
+        /// Previous / next entry in the thumbnail view (Left / Right).
+        CursorLeft => "cm_CursorLeft", "Cursor to the previous entry (thumbnail view)", "CursorLeft";
+        CursorRight => "cm_CursorRight", "Cursor to the next entry (thumbnail view)", "CursorRight";
+        Open => "cm_Return",
+            "Open the folder, archive (zip, 7z, tar, gz: browse like a folder) or file under the cursor", "Open";
+        GoParent => "cm_GoToParent", "Go to the parent folder", "Up";
+        GoRoot => "cm_GoToRoot", "Go to the root of the drive", "Root";
+        /// Previous / next folder in the panel's history (Alt+Left/Right).
+        HistoryBack => "cm_PrevDir", "Back to the previous folder", "PrevDir";
+        HistoryForward => "cm_NextDir", "Forward to the next folder", "NextDir";
+        /// The panel's folder history as a popup list (Alt+Down).
+        DirHistory => "cm_DirectoryHistory",
+            "Folder history list: jump back or forward to any folder visited in this tab", "DirectoryHistory";
+        /// Directory hotlist popup (Ctrl+D).
+        Hotlist => "cm_DirectoryHotlist", "Directory hotlist: favourite folders, with submenus", "Hotlist";
+        /// Show / hide the hotlist tree left of the panels
+        /// (Ctrl+Shift+D; needs the `hotlist_tree` setting).
+        HotlistTree => "cm_HotlistTree",
+            "Hotlist tree: show or hide the hotlist as a folder tree left of the panels", "Tree";
+        /// With the hotlist tree shown: hide / show the left panel, leaving
+        /// the tree and the right panel.
+        HotlistTreeHideLeft => "cm_HotlistTreeHideLeft",
+            "Hotlist tree: hide or show the left panel while the tree is shown", "HideLeft";
+        SwitchPanel => "cm_FocusSwap", "Switch to the other panel", "Switch";
+        /// Toggle selection on the cursor entry, optionally moving down.
+        ToggleSelect: { advance: bool }
+            { advance: true } => "cm_Select", "Select / deselect the entry and move down", "Select";
+            { advance: false } => "cm_SelectNoMove", "Select / deselect the entry", "SelectNoMove";
+        /// Compute the size of every folder in the panel (Alt+Shift+Enter).
+        CountDirSizes => "cm_CountDirContent", "Compute the size of every folder in the panel", "CountDirContent";
+        /// Select the entries that differ from the other panel (Shift+F2).
+        CompareDirs => "cm_CompareDirs",
+            "Compare folders: select the entries that differ from the other panel", "CmpDirs";
+        /// Compare-folders options, then compare (Ctrl+Shift+F2).
+        CompareDirsOptions => "cm_CompareDirsOptions",
+            "Compare folders with options (by content, ignore dates, subfolders)", "CmpDirs";
+        /// Side-by-side diff of two files (Alt+F2).
+        CompareFiles => "cm_CompareFilesByContent", "Compare two files by content, side by side", "CmpFiles";
+        /// Find files by name and contents (Alt+F7).
+        FindFiles => "cm_SearchFor", "Find files by name and contents", "Find";
+        /// Saved server connections; connect one in this panel (Ctrl+F).
+        Connect => "cm_FtpConnect",
+            "Connect to a server (SFTP, FTP, FTPS): saved connections, new, edit, delete", "Connect";
+        /// Close the connection of the panel's server (Ctrl+Shift+F).
+        Disconnect => "cm_FtpDisconnect", "Close the connection of the server shown in the panel", "Disconn";
+        SelectAll => "cm_SelectAll", "Select all entries", "SelAll";
+        DeselectAll => "cm_ClearAll", "Clear the selection", "SelNone";
+        Refresh => "cm_RereadSource", "Reread the folder", "Refresh";
+        ToggleHidden => "cm_SwitchHidSys", "Show / hide hidden and system files", "Hidden";
+        /// Thumbnail view on / off for the tab (Ctrl+Shift+F5).
+        Thumbnails => "cm_SrcThumbs",
+            "Thumbnail view on / off: pictures, videos and documents as a grid of previews", "Thumbs";
+        /// Show only entries matching a typed filter (Ctrl+S).
+        QuickFilter => "cm_QuickFilter", "Quick filter: show only entries matching typed text", "Filter";
+        SortBy: (SortKey)
+            (SortKey::Name) => "cm_SortByName", "Sort by name", "ByName";
+            (SortKey::Ext) => "cm_SortByExt", "Sort by extension", "ByExt";
+            (SortKey::Size) => "cm_SortBySize", "Sort by size", "BySize";
+            (SortKey::Modified) => "cm_SortByDateTime", "Sort by date", "ByDate";
+        /// Make the other panel show the same folder.
+        SyncOtherPanel => "cm_TransferPath", "Show this folder in the other panel too", "TransferPath";
+        View => "cm_View", "View the file (text, hex, images)", "View";
+        Edit => "cm_Edit", "Edit the file in the configured editor", "Edit";
+        /// Ask for a file name, create it if missing and edit it (Shift+F4).
+        EditNew => "cm_EditNewFile", "Create a new file and edit it", "NewFile";
+        Copy => "cm_Copy", "Copy to the other panel", "Copy";
+        Move => "cm_RenMov", "Move / rename to the other panel", "Move";
+        /// Put the selected files on the system clipboard (Ctrl+C / Ctrl+X),
+        /// for pasting here or in Explorer.
+        CopyToClipboard => "cm_CopyToClipboard", "Copy the files to the clipboard", "ClipCopy";
+        CutToClipboard => "cm_CutToClipboard", "Cut the files to the clipboard (paste moves them)", "ClipCut";
+        /// Copy or move the files on the clipboard into the panel (Ctrl+V).
+        PasteFromClipboard => "cm_PasteFromClipboard", "Paste files from the clipboard into this panel", "Paste";
+        /// Rename the cursor entry in place (Shift+F6).
+        Rename => "cm_RenameOnly", "Rename in place", "Rename";
+        /// Rename the selected files by mask (Ctrl+M).
+        MultiRename => "cm_MultiRenameFiles", "Multi-rename the selected files by mask", "MultiRen";
+        MakeDir => "cm_MkDir", "Create a folder", "MkDir";
+        /// Pack the selected files into a zip in the other panel (Alt+F5).
+        Pack => "cm_PackFiles", "Pack the selected files into a zip archive in the other panel", "Pack";
+        /// Unpack the selected archives into the other panel (Alt+F9).
+        Unpack => "cm_UnpackFiles", "Unpack the selected archives (zip, 7z, tar, gz) into the other panel", "Unpack";
+        /// Open a terminal in the active panel's folder (F9).
+        Terminal => "cm_ExecuteDOS", "Open a terminal in this folder (the \"terminal\" setting)", "Term";
+        /// Delete to the recycle bin.
+        Delete => "cm_Delete", "Delete to the recycle bin", "Delete";
+        /// Delete permanently (Shift+F8 / Shift+Del).
+        DeletePermanent => "cm_DeletePermanent", "Delete permanently", "DelPerm";
+        NewTab => "cm_OpenNewTab", "New tab", "NewTab";
+        CloseTab => "cm_CloseCurrentTab", "Close the tab", "CloseTab";
+        NextTab => "cm_SwitchToNextTab", "Next tab", "SwitchToNextTab";
+        PrevTab => "cm_SwitchToPreviousTab", "Previous tab", "SwitchToPreviousTab";
+        /// Open the folder under the cursor in a new tab.
+        OpenInNewTab => "cm_OpenDirInNewTab", "Open the folder under the cursor in a new tab", "OpenDirInNewTab";
+        /// Open `config.toml` in the editor (Ctrl+,).
+        EditConfig => "cm_EditConfig", "Edit config.toml (editor, [keys], [colors])", "Config";
+        /// Settings view: preferences, key bindings, colours (F10).
+        Configuration => "cm_Configuration", "Settings: preferences, key bindings, colour themes", "Settings";
+        /// Popup to find a command by name, id or key and run it (Ctrl+Space).
+        CommandPalette => "cm_CommandPalette",
+            "Command palette: find a command by name, id or key and run it", "Palette";
+        /// Searchable list of keys and features (F1).
+        Help => "cm_HelpIndex", "This help: all keys and features", "Help";
+        /// Look for a newer release on GitHub; download and install it.
+        CheckForUpdates => "cm_CheckForUpdates",
+            "Check for updates: look for a newer release on GitHub, download and install it", "Update";
+        Quit => "cm_Exit", "Exit", "Exit";
+    }
+    mouse_only {
+        /// Scroll the cursor by n rows (mouse wheel).
+        CursorBy: (i32)
+            (_) => "cm_Scroll", "Scroll the cursor (mouse wheel)", "Scroll";
+    }
 }
 
 impl Command {
-    /// Stable identifier, used for config files and the command palette.
-    pub fn id(self) -> &'static str {
-        use Command::*;
-        match self {
-            CursorUp => "cm_CursorUp",
-            CursorDown => "cm_CursorDown",
-            PageUp => "cm_PageUp",
-            PageDown => "cm_PageDown",
-            CursorHome => "cm_GoToFirstEntry",
-            CursorEnd => "cm_GoToLastEntry",
-            CursorLeft => "cm_CursorLeft",
-            CursorRight => "cm_CursorRight",
-            CursorBy(_) => "cm_Scroll",
-            Open => "cm_Return",
-            GoParent => "cm_GoToParent",
-            GoRoot => "cm_GoToRoot",
-            HistoryBack => "cm_PrevDir",
-            HistoryForward => "cm_NextDir",
-            DirHistory => "cm_DirectoryHistory",
-            Hotlist => "cm_DirectoryHotlist",
-            HotlistTree => "cm_HotlistTree",
-            HotlistTreeHideLeft => "cm_HotlistTreeHideLeft",
-            SwitchPanel => "cm_FocusSwap",
-            ToggleSelect { advance: true } => "cm_Select",
-            ToggleSelect { advance: false } => "cm_SelectNoMove",
-            CountDirSizes => "cm_CountDirContent",
-            CompareDirs => "cm_CompareDirs",
-            CompareDirsOptions => "cm_CompareDirsOptions",
-            CompareFiles => "cm_CompareFilesByContent",
-            FindFiles => "cm_SearchFor",
-            Connect => "cm_FtpConnect",
-            Disconnect => "cm_FtpDisconnect",
-            SelectAll => "cm_SelectAll",
-            DeselectAll => "cm_ClearAll",
-            Refresh => "cm_RereadSource",
-            ToggleHidden => "cm_SwitchHidSys",
-            Thumbnails => "cm_SrcThumbs",
-            QuickFilter => "cm_QuickFilter",
-            SortBy(SortKey::Name) => "cm_SortByName",
-            SortBy(SortKey::Ext) => "cm_SortByExt",
-            SortBy(SortKey::Size) => "cm_SortBySize",
-            SortBy(SortKey::Modified) => "cm_SortByDateTime",
-            SyncOtherPanel => "cm_TransferPath",
-            View => "cm_View",
-            Edit => "cm_Edit",
-            EditNew => "cm_EditNewFile",
-            Copy => "cm_Copy",
-            Move => "cm_RenMov",
-            CopyToClipboard => "cm_CopyToClipboard",
-            CutToClipboard => "cm_CutToClipboard",
-            PasteFromClipboard => "cm_PasteFromClipboard",
-            Rename => "cm_RenameOnly",
-            MultiRename => "cm_MultiRenameFiles",
-            MakeDir => "cm_MkDir",
-            Pack => "cm_PackFiles",
-            Unpack => "cm_UnpackFiles",
-            Terminal => "cm_ExecuteDOS",
-            Delete => "cm_Delete",
-            DeletePermanent => "cm_DeletePermanent",
-            NewTab => "cm_OpenNewTab",
-            CloseTab => "cm_CloseCurrentTab",
-            NextTab => "cm_SwitchToNextTab",
-            PrevTab => "cm_SwitchToPreviousTab",
-            OpenInNewTab => "cm_OpenDirInNewTab",
-            EditConfig => "cm_EditConfig",
-            Configuration => "cm_Configuration",
-            CommandPalette => "cm_CommandPalette",
-            Help => "cm_HelpIndex",
-            CheckForUpdates => "cm_CheckForUpdates",
-            Quit => "cm_Exit",
-        }
-    }
-
-    /// What the command does, for the F1 help list. A new command must add
-    /// one here (the match is exhaustive).
-    pub fn description(self) -> &'static str {
-        use Command::*;
-        match self {
-            CursorUp => "Cursor up",
-            CursorDown => "Cursor down",
-            PageUp => "Cursor one page up",
-            PageDown => "Cursor one page down",
-            CursorHome => "Cursor to the first entry",
-            CursorEnd => "Cursor to the last entry",
-            CursorLeft => "Cursor to the previous entry (thumbnail view)",
-            CursorRight => "Cursor to the next entry (thumbnail view)",
-            CursorBy(_) => "Scroll the cursor (mouse wheel)",
-            Open => "Open the folder, archive (zip, 7z, tar, gz: browse like a folder) or file under the cursor",
-            GoParent => "Go to the parent folder",
-            GoRoot => "Go to the root of the drive",
-            HistoryBack => "Back to the previous folder",
-            HistoryForward => "Forward to the next folder",
-            DirHistory => "Folder history list: jump back or forward to any folder visited in this tab",
-            Hotlist => "Directory hotlist: favourite folders, with submenus",
-            HotlistTree => "Hotlist tree: show or hide the hotlist as a folder tree left of the panels",
-            HotlistTreeHideLeft => "Hotlist tree: hide or show the left panel while the tree is shown",
-            SwitchPanel => "Switch to the other panel",
-            ToggleSelect { advance: true } => "Select / deselect the entry and move down",
-            ToggleSelect { advance: false } => "Select / deselect the entry",
-            CountDirSizes => "Compute the size of every folder in the panel",
-            CompareDirs => "Compare folders: select the entries that differ from the other panel",
-            CompareDirsOptions => "Compare folders with options (by content, ignore dates, subfolders)",
-            CompareFiles => "Compare two files by content, side by side",
-            FindFiles => "Find files by name and contents",
-            Connect => "Connect to a server (SFTP, FTP, FTPS): saved connections, new, edit, delete",
-            Disconnect => "Close the connection of the server shown in the panel",
-            SelectAll => "Select all entries",
-            DeselectAll => "Clear the selection",
-            Refresh => "Reread the folder",
-            ToggleHidden => "Show / hide hidden and system files",
-            Thumbnails => "Thumbnail view on / off: pictures, videos and documents as a grid of previews",
-            QuickFilter => "Quick filter: show only entries matching typed text",
-            SortBy(SortKey::Name) => "Sort by name",
-            SortBy(SortKey::Ext) => "Sort by extension",
-            SortBy(SortKey::Size) => "Sort by size",
-            SortBy(SortKey::Modified) => "Sort by date",
-            SyncOtherPanel => "Show this folder in the other panel too",
-            View => "View the file (text, hex, images)",
-            Edit => "Edit the file in the configured editor",
-            EditNew => "Create a new file and edit it",
-            Copy => "Copy to the other panel",
-            Move => "Move / rename to the other panel",
-            CopyToClipboard => "Copy the files to the clipboard",
-            CutToClipboard => "Cut the files to the clipboard (paste moves them)",
-            PasteFromClipboard => "Paste files from the clipboard into this panel",
-            Rename => "Rename in place",
-            MultiRename => "Multi-rename the selected files by mask",
-            MakeDir => "Create a folder",
-            Pack => "Pack the selected files into a zip archive in the other panel",
-            Unpack => "Unpack the selected archives (zip, 7z, tar, gz) into the other panel",
-            Terminal => "Open a terminal in this folder (the \"terminal\" setting)",
-            Delete => "Delete to the recycle bin",
-            DeletePermanent => "Delete permanently",
-            NewTab => "New tab",
-            CloseTab => "Close the tab",
-            NextTab => "Next tab",
-            PrevTab => "Previous tab",
-            OpenInNewTab => "Open the folder under the cursor in a new tab",
-            EditConfig => "Edit config.toml (editor, [keys], [colors])",
-            Configuration => "Settings: preferences, key bindings, colour themes",
-            CommandPalette => "Command palette: find a command by name, id or key and run it",
-            Help => "This help: all keys and features",
-            CheckForUpdates => "Check for updates: look for a newer release on GitHub, download and install it",
-            Quit => "Exit",
-        }
-    }
-
-    /// A one-word label for the function-key bar.
-    pub fn short_label(self) -> &'static str {
-        use Command::*;
-        match self {
-            Help => "Help",
-            Rename => "Rename",
-            View => "View",
-            Edit => "Edit",
-            EditNew => "NewFile",
-            Copy => "Copy",
-            Move => "Move",
-            MakeDir => "MkDir",
-            Delete => "Delete",
-            DeletePermanent => "DelPerm",
-            Terminal => "Term",
-            Configuration => "Settings",
-            Quit => "Exit",
-            Open => "Open",
-            Refresh => "Refresh",
-            Pack => "Pack",
-            Unpack => "Unpack",
-            FindFiles => "Find",
-            MultiRename => "MultiRen",
-            CommandPalette => "Palette",
-            NewTab => "NewTab",
-            CloseTab => "CloseTab",
-            Hotlist => "Hotlist",
-            HotlistTree => "Tree",
-            HotlistTreeHideLeft => "HideLeft",
-            Connect => "Connect",
-            Disconnect => "Disconn",
-            SelectAll => "SelAll",
-            DeselectAll => "SelNone",
-            ToggleHidden => "Hidden",
-            Thumbnails => "Thumbs",
-            QuickFilter => "Filter",
-            CompareDirs | CompareDirsOptions => "CmpDirs",
-            CompareFiles => "CmpFiles",
-            SortBy(SortKey::Name) => "ByName",
-            SortBy(SortKey::Ext) => "ByExt",
-            SortBy(SortKey::Size) => "BySize",
-            SortBy(SortKey::Modified) => "ByDate",
-            SwitchPanel => "Switch",
-            GoParent => "Up",
-            GoRoot => "Root",
-            EditConfig => "Config",
-            CopyToClipboard => "ClipCopy",
-            CutToClipboard => "ClipCut",
-            PasteFromClipboard => "Paste",
-            CheckForUpdates => "Update",
-            _ => {
-                let id = self.id();
-                id.strip_prefix("cm_").unwrap_or(id)
-            }
-        }
-    }
-
     /// The command with this id (case-insensitive), for config files.
     pub fn from_id(id: &str) -> Option<Command> {
         Self::ALL.iter().copied().find(|c| c.id().eq_ignore_ascii_case(id))
     }
-
-    /// Every command a key can be bound to (all but the mouse-only ones).
-    pub const ALL: &'static [Command] = {
-        use Command::*;
-        &[
-            CursorUp,
-            CursorDown,
-            PageUp,
-            PageDown,
-            CursorHome,
-            CursorEnd,
-            CursorLeft,
-            CursorRight,
-            Open,
-            GoParent,
-            GoRoot,
-            HistoryBack,
-            HistoryForward,
-            DirHistory,
-            Hotlist,
-            HotlistTree,
-            HotlistTreeHideLeft,
-            SwitchPanel,
-            ToggleSelect { advance: true },
-            ToggleSelect { advance: false },
-            CountDirSizes,
-            CompareDirs,
-            CompareDirsOptions,
-            CompareFiles,
-            FindFiles,
-            Connect,
-            Disconnect,
-            SelectAll,
-            DeselectAll,
-            Refresh,
-            ToggleHidden,
-            Thumbnails,
-            QuickFilter,
-            SortBy(SortKey::Name),
-            SortBy(SortKey::Ext),
-            SortBy(SortKey::Size),
-            SortBy(SortKey::Modified),
-            SyncOtherPanel,
-            View,
-            Edit,
-            EditNew,
-            Copy,
-            Move,
-            CopyToClipboard,
-            CutToClipboard,
-            PasteFromClipboard,
-            Rename,
-            MultiRename,
-            MakeDir,
-            Pack,
-            Unpack,
-            Terminal,
-            Delete,
-            DeletePermanent,
-            NewTab,
-            CloseTab,
-            NextTab,
-            PrevTab,
-            OpenInNewTab,
-            EditConfig,
-            Configuration,
-            CommandPalette,
-            Help,
-            CheckForUpdates,
-            Quit,
-        ]
-    };
 }
 
 #[cfg(test)]
