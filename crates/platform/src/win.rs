@@ -447,6 +447,40 @@ pub fn drop_menu(window: isize, folder: &Path, items: &[PathBuf], target: &Path)
     }
 }
 
+/// The app's own right-drop menu at the cursor. Escape or a click outside is
+/// `Cancel`.
+pub fn drop_choice(window: isize) -> Result<crate::DropChoice, String> {
+    use crate::DropChoice;
+    use windows::Win32::UI::WindowsAndMessaging::{AppendMenuW, MF_SEPARATOR, MF_STRING};
+    const COPY: usize = 1;
+    const MOVE: usize = 2;
+    const MORE: usize = 3;
+    const CANCEL: usize = 4;
+    let hwnd = HWND(window as *mut c_void);
+    unsafe {
+        let hmenu = CreatePopupMenu().map_err(|e| e.message())?;
+        let add = |id: usize, text: &str| {
+            let text: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+            let _ = AppendMenuW(hmenu, MF_STRING, id, PCWSTR(text.as_ptr()));
+        };
+        add(COPY, "&Copy here");
+        add(MOVE, "&Move here");
+        let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR::null());
+        add(MORE, "M&ore options\u{2026}");
+        add(CANCEL, "Cancel");
+        let mut pt = POINT::default();
+        let _ = GetCursorPos(&mut pt);
+        let picked = TrackPopupMenuEx(hmenu, (TPM_RETURNCMD | TPM_RIGHTBUTTON).0, pt.x, pt.y, hwnd, None);
+        let _ = DestroyMenu(hmenu);
+        Ok(match picked.0 as usize {
+            COPY => DropChoice::Copy,
+            MOVE => DropChoice::Move,
+            MORE => DropChoice::More,
+            _ => DropChoice::Cancel,
+        })
+    }
+}
+
 fn outcome(effect: DROPEFFECT) -> DragOutcome {
     if effect.0 & DROPEFFECT_MOVE.0 != 0 {
         DragOutcome::Moved

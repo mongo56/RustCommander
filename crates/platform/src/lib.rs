@@ -318,6 +318,30 @@ pub fn drop_menu(window: isize, folder: &Path, items: &[PathBuf], target: &Path)
     }
 }
 
+/// What the user picked in the small menu shown after a right-button drop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropChoice {
+    Copy,
+    Move,
+    /// Fall back to the OS drop menu (handlers such as archive extraction).
+    More,
+    Cancel,
+}
+
+/// Our own right-drop menu (Copy here / Move here / More options / Cancel)
+/// at the cursor. Blocks until the menu closes.
+pub fn drop_choice(window: isize) -> Result<DropChoice, String> {
+    #[cfg(windows)]
+    {
+        win::drop_choice(window)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = window;
+        Ok(DropChoice::More)
+    }
+}
+
 /// Mouse position relative to the window's client area, in logical
 /// (DPI-independent) pixels.
 pub fn cursor_in_window(window: isize) -> Option<(f32, f32)> {

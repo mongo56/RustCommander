@@ -343,6 +343,18 @@ fn clamp_columns(widths: [f32; 3]) -> [f32; 3] {
     out
 }
 
+/// A right-button drop waiting for the user's choice. `sources` go through
+/// the Copy/Move dialog; `folder` + `items` are the shell's data object for
+/// "More options".
+#[derive(Debug, Clone)]
+pub struct RightDrop {
+    side: usize,
+    sources: Vec<PathBuf>,
+    folder: PathBuf,
+    items: Vec<PathBuf>,
+    target: PathBuf,
+}
+
 struct Drag {
     side: usize,
     /// Where the drag started; set by the first mouse move after the press.
@@ -406,6 +418,8 @@ pub enum Message {
     /// Files put on the system clipboard: how many, and whether cut.
     ClipboardSet(Result<usize, String>, bool),
     DropMenuDone(usize, Result<DragOutcome, String>),
+    /// Our right-drop menu closed: the pending drop and the choice.
+    RightDropPicked(Box<RightDrop>, Result<rc_platform::DropChoice, String>),
     FileDropped(PathBuf),
     DropPosition(Option<(f32, f32)>),
     /// Files from another app hovered over our window (once per file); the
@@ -952,6 +966,18 @@ impl App {
                     Err(e) => self.error(e),
                 }
             }
+            Message::RightDropPicked(drop, choice) => {
+                let drop = *drop;
+                match choice {
+                    Ok(rc_platform::DropChoice::Copy) => return self.open_transfer(false, drop.sources, &drop.target),
+                    Ok(rc_platform::DropChoice::Move) => return self.open_transfer(true, drop.sources, &drop.target),
+                    Ok(rc_platform::DropChoice::More) => {
+                        return self.drop_menu(drop.side, drop.folder, drop.items, drop.target);
+                    }
+                    Ok(rc_platform::DropChoice::Cancel) => {}
+                    Err(e) => self.error(e),
+                }
+            }
             Message::Hovered => {
                 // One hover event arrives per file; the button is still held
                 // while hovering, so any of them reads it. No drop has
@@ -984,8 +1010,8 @@ impl App {
                 let side = position.map(|(x, _)| usize::from(x >= self.split_x())).unwrap_or(self.active);
                 self.focus_panel(side);
                 let target = self.panel(side).path.clone();
-                // A right drag from outside lands the shell's drop menu, like
-                // an internal one; archives and servers can't take it, so
+                // A right drag from outside lands our drop menu, like an
+                // internal one; archives and servers can't take it, so
                 // those keep the Copy dialog.
                 let usable = !vfs::in_archive(&target) && !remote::is_remote(&target);
                 if drop_right && usable {
@@ -993,9 +1019,9 @@ impl App {
                     // the Public Desktop); the shell's data object takes one
                     // folder, so only the sources under the first one go.
                     if let Some(folder) = sources.first().and_then(|p| p.parent()).map(Path::to_path_buf) {
-                        let mut items = sources;
+                        let mut items = sources.clone();
                         items.retain(|p| p.parent() == Some(folder.as_path()));
-                        return self.drop_menu(side, folder, items, target);
+                        return self.right_drop(RightDrop { side, sources, folder, items, target });
                     }
                 }
                 return self.open_transfer(false, sources, &target);
@@ -2376,13 +2402,21 @@ impl App {
         // The shell's drop menu can't take files inside archives.
         let in_archive = vfs::in_archive(&self.panel(drag.side).path) || vfs::in_archive(&target);
         if drag.right && !in_archive {
-            let (folder, items) = self.shell_items(drag.side, drag.sources);
-            return self.drop_menu(drag.side, folder, items, target);
+            let (folder, items) = self.shell_items(drag.side, drag.sources.clone());
+            return self.right_drop(RightDrop { side: drag.side, sources: drag.sources, folder, items, target });
         }
         self.open_transfer(self.modifiers.shift(), drag.sources, &target)
     }
 
-    /// Right-button drop: let the shell show its drop menu for the target
+    /// Right-button drop: our own small menu (Copy here / Move here / More
+    /// options / Cancel). Copy and Move use the app's transfer dialog and job.
+    fn right_drop(&self, drop: RightDrop) -> Task<Message> {
+        window::get_oldest()
+            .and_then(|id| window::run_with_handle(id, |handle| rc_platform::drop_choice(native_handle(&handle))))
+            .map(move |choice| Message::RightDropPicked(Box::new(drop.clone()), choice))
+    }
+
+    /// "More options": let the shell show its drop menu for the target
     /// folder. `(folder, items)` is the drop's data object: from inside our
     /// window `shell_items` picks it; an outside drop hands over its own.
     fn drop_menu(&self, side: usize, folder: PathBuf, items: Vec<PathBuf>, target: PathBuf) -> Task<Message> {
