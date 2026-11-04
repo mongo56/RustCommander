@@ -846,6 +846,13 @@ impl App {
                 None,
                 "Delete",
             ),
+            Dialog::CloseTerm { program, .. } => (
+                "Close terminal".into(),
+                format!("{program} is still running in this terminal. Close the terminal anyway?"),
+                None,
+                "Close",
+            ),
+            Dialog::QuitTerms => ("Quit".into(), self.quit_text(), None, "Quit"),
             Dialog::RemoveGroup { name, count, .. } => (
                 "Remove group".into(),
                 format!(

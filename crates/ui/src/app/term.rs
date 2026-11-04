@@ -16,6 +16,8 @@ use crate::theme::filled;
 use alacritty_terminal::event::{Event as TermEvent, EventListener, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg, State};
 use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::index::{Column as GridColumn, Line, Point as GridPoint, Side};
+use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::color::Colors as TermColors;
@@ -80,7 +82,7 @@ fn cell_w() -> f32 {
 
 /// Columns and lines that fit in an area of `size` pixels (the grid widget).
 fn grid_size(size: Size) -> (usize, usize) {
-    let cols = ((size.width - 2.0 * PAD) / cell_w()).floor().max(2.0) as usize;
+    let cols = ((size.width - 2.0 * PAD - crate::scrollbar::WIDTH) / cell_w()).floor().max(2.0) as usize;
     let lines = ((size.height - 2.0 * PAD) / CELL_H).floor().max(1.0) as usize;
     (cols.min(u16::MAX as usize), lines.min(u16::MAX as usize))
 }
@@ -108,6 +110,28 @@ pub enum TermMsg {
     Close(u64),
     /// What `poll_info` found out about terminal `id`'s shell (sent on change).
     Info(u64, ShellInfo),
+    /// The mouse in terminal `id`'s grid.
+    Mouse(u64, Mouse),
+    /// The scrollbar of terminal `id` was moved: the history line at the top.
+    ScrollTo(u64, f32),
+    /// The clipboard text to paste into terminal `id` (`None`: no text).
+    Paste(u64, Option<String>),
+}
+
+/// What the mouse did in the grid; cells are viewport positions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mouse {
+    /// Left press: `clicks` 1 (character selection), 2 (word) or 3 (line);
+    /// `right`: the press was on the right half of the cell.
+    Down { line: u16, col: u16, right: bool, clicks: u8 },
+    /// Moved with the left button down.
+    Drag { line: u16, col: u16, right: bool },
+    /// Left button released.
+    Up,
+    /// Wheel: lines, positive scrolls back into the history.
+    Wheel(i32),
+    /// Right press: copy the selection, or paste.
+    Context,
 }
 
 /// A terminal shell's folder (`None`: not known, keep the last one) and the
@@ -240,8 +264,96 @@ impl TermSession {
             if term.grid().display_offset() != 0 {
                 term.scroll_display(Scroll::Bottom);
             }
+            // Typing ends a selection, like in Windows Terminal.
+            term.selection = None;
         }
         let _ = self.chan.send(Msg::Input(bytes.into()));
+    }
+
+    /// The selected text, if any is selected.
+    fn selected_text(&self) -> Option<String> {
+        let term = self.term.lock();
+        if term.selection.as_ref().is_none_or(Selection::is_empty) {
+            return None;
+        }
+        term.selection_to_string().filter(|s| !s.is_empty())
+    }
+
+    /// Scrolls the view and redraws it.
+    fn scroll(&mut self, scroll: Scroll) {
+        self.term.lock().scroll_display(scroll);
+        self.refresh();
+    }
+
+    /// Pastes `text` as the program wants it (see `paste_bytes`).
+    fn paste(&self, text: &str) {
+        let bracketed = self.term.lock().mode().contains(TermMode::BRACKETED_PASTE);
+        self.write(paste_bytes(text, bracketed));
+    }
+
+    /// Applies a mouse action on the grid; returns the text to copy (right
+    /// click on a selection).
+    fn mouse(&mut self, mouse: Mouse) -> Option<String> {
+        let mut copy = None;
+        {
+            let mut term = self.term.lock();
+            let offset = term.grid().display_offset();
+            let cols = term.columns().max(1);
+            let point = |line: u16, col: u16| {
+                GridPoint::new(Line(line as i32 - offset as i32), GridColumn((col as usize).min(cols - 1)))
+            };
+            let side = |right: bool| if right { Side::Right } else { Side::Left };
+            match mouse {
+                Mouse::Down { line, col, right, clicks } => {
+                    let ty = match clicks {
+                        1 => SelectionType::Simple,
+                        2 => SelectionType::Semantic,
+                        _ => SelectionType::Lines,
+                    };
+                    term.selection = Some(Selection::new(ty, point(line, col), side(right)));
+                }
+                Mouse::Drag { line, col, right } => {
+                    let to = point(line, col);
+                    if let Some(selection) = &mut term.selection {
+                        selection.update(to, side(right));
+                    }
+                }
+                Mouse::Up => {
+                    if term.selection.as_ref().is_some_and(Selection::is_empty) {
+                        term.selection = None;
+                    }
+                }
+                Mouse::Wheel(lines) => {
+                    let mode = *term.mode();
+                    if !mode.contains(TermMode::ALT_SCREEN) {
+                        term.scroll_display(Scroll::Delta(lines));
+                    } else if mode.contains(TermMode::ALTERNATE_SCROLL) {
+                        drop(term);
+                        self.write_raw(wheel_arrows(mode.contains(TermMode::APP_CURSOR), lines));
+                        self.refresh();
+                        return None;
+                    }
+                }
+                Mouse::Context => {
+                    drop(term);
+                    copy = self.selected_text();
+                    if copy.is_some() {
+                        self.term.lock().selection = None;
+                    }
+                    self.refresh();
+                    return copy;
+                }
+            }
+        }
+        self.refresh();
+        copy
+    }
+
+    /// Sends `bytes` without touching the view or the selection.
+    fn write_raw(&self, bytes: Vec<u8>) {
+        if !bytes.is_empty() {
+            let _ = self.chan.send(Msg::Input(bytes.into()));
+        }
     }
 
     /// Resizes the grid and the ConPTY when the size changed.
@@ -271,6 +383,11 @@ impl TermSession {
 
     fn app_cursor(&self) -> bool {
         self.term.lock().mode().contains(TermMode::APP_CURSOR)
+    }
+
+    /// A full-screen program (alternate screen) runs.
+    fn alt_screen(&self) -> bool {
+        self.term.lock().mode().contains(TermMode::ALT_SCREEN)
     }
 }
 
@@ -621,6 +738,11 @@ struct Frame {
     fills: Vec<(u16, u16, u16, Color)>,
     runs: Vec<Run>,
     cursor: Option<Cursor>,
+    /// Selected cells: (line, column, cells), drawn over the text.
+    selection: Vec<(u16, u16, u16)>,
+    /// Lines of history, and how many the view is scrolled back.
+    history: usize,
+    offset: usize,
 }
 
 /// Text of one style on one line, starting at a cell.
@@ -669,6 +791,29 @@ fn simple_char(c: char) -> bool {
     matches!(c as u32, 0x20..=0x7e | 0xa0..=0x24f | 0x370..=0x4ff | 0x2010..=0x2027 | 0x2500..=0x259f)
 }
 
+/// The cells of the viewport inside `range`, a run per line.
+fn selection_cells(range: &SelectionRange, offset: usize, cols: usize, lines: usize) -> Vec<(u16, u16, u16)> {
+    let mut cells = Vec::new();
+    for view in 0..lines {
+        let line = Line(view as i32 - offset as i32);
+        if line < range.start.line || line > range.end.line {
+            continue;
+        }
+        let (from, to) = if range.is_block {
+            (range.start.column.0, range.end.column.0)
+        } else {
+            (
+                if line == range.start.line { range.start.column.0 } else { 0 },
+                if line == range.end.line { range.end.column.0 } else { cols.saturating_sub(1) },
+            )
+        };
+        if to >= from {
+            cells.push((view as u16, from as u16, (to - from + 1) as u16));
+        }
+    }
+    cells
+}
+
 impl Frame {
     fn build(term: &Term<Proxy>, pal: &Palette) -> Frame {
         let content = term.renderable_content();
@@ -678,6 +823,12 @@ impl Frame {
             cols: term.columns(),
             lines: term.screen_lines(),
             bg: pal.resolve(AnsiColor::Named(NamedColor::Background), overrides),
+            selection: content
+                .selection
+                .map(|r| selection_cells(&r, content.display_offset, term.columns(), term.screen_lines()))
+                .unwrap_or_default(),
+            history: term.history_size(),
+            offset: content.display_offset,
             ..Frame::default()
         };
         let cursor_point = content.cursor.point;
@@ -843,7 +994,42 @@ fn cell_rect(origin: Point, line: u16, col: u16, cells: u16) -> Rectangle {
     Rectangle { x: x0, y: origin.y + line as f32 * CELL_H, width: x1 - x0, height: CELL_H }
 }
 
+/// Mouse state of the grid widget.
+#[derive(Debug, Default)]
+struct GridState {
+    /// The left button is down (a selection is being dragged).
+    dragging: bool,
+    /// The last drag position sent, to send changes only.
+    last: Option<(u16, u16, bool)>,
+    /// The last left press: when, where, and in a row how many.
+    click: Option<(Instant, u16, u16, u8)>,
+    /// Pixels of wheel movement not yet worth a line.
+    wheel: f32,
+}
+
+/// Longest time between presses of a double or triple click.
+const MULTI_CLICK: Duration = Duration::from_millis(500);
+
+/// The cell under `at` (relative to the widget): line, column, right half.
+/// Outside the grid it is the nearest cell.
+fn cell_at(at: Point, cols: usize, lines: usize) -> (u16, u16, bool) {
+    let (x, y) = (at.x - PAD, at.y - PAD);
+    let col = (x / cell_w()).floor();
+    let right = col >= cols as f32 || (x / cell_w()).fract() >= 0.5;
+    let col = col.clamp(0.0, cols.saturating_sub(1) as f32) as u16;
+    let line = (y / CELL_H).floor().clamp(0.0, lines.saturating_sub(1) as f32) as u16;
+    (line, col, right && x >= 0.0)
+}
+
 impl Widget<Message, Theme, iced::Renderer> for Grid<'_> {
+    fn tag(&self) -> iced::advanced::widget::tree::Tag {
+        iced::advanced::widget::tree::Tag::of::<GridState>()
+    }
+
+    fn state(&self) -> iced::advanced::widget::tree::State {
+        iced::advanced::widget::tree::State::new(GridState::default())
+    }
+
     fn size(&self) -> Size<Length> {
         Size::new(Length::Fill, Length::Fill)
     }
@@ -852,12 +1038,23 @@ impl Widget<Message, Theme, iced::Renderer> for Grid<'_> {
         layout::atomic(limits, Length::Fill, Length::Fill)
     }
 
+    fn mouse_interaction(
+        &self,
+        _tree: &Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        _viewport: &Rectangle,
+        _renderer: &iced::Renderer,
+    ) -> mouse::Interaction {
+        if cursor.is_over(layout.bounds()) { mouse::Interaction::Text } else { mouse::Interaction::None }
+    }
+
     fn on_event(
         &mut self,
-        _tree: &mut Tree,
+        tree: &mut Tree,
         event: Event,
         layout: Layout<'_>,
-        _cursor: mouse::Cursor,
+        cursor: mouse::Cursor,
         _renderer: &iced::Renderer,
         _clipboard: &mut dyn Clipboard,
         shell: &mut IcedShell<'_, Message>,
@@ -869,8 +1066,64 @@ impl Widget<Message, Theme, iced::Renderer> for Grid<'_> {
             if (cols, lines) != (self.frame.cols, self.frame.lines) {
                 shell.publish(Message::Term(TermMsg::Resize(self.id, cols, lines)));
             }
+            return event::Status::Ignored;
         }
-        event::Status::Ignored
+        let state = tree.state.downcast_mut::<GridState>();
+        let bounds = layout.bounds();
+        let (cols, lines) = (self.frame.cols, self.frame.lines);
+        let mut send = |m: Mouse| shell.publish(Message::Term(TermMsg::Mouse(self.id, m)));
+        match event {
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+                let Some(at) = cursor.position_in(bounds) else { return event::Status::Ignored };
+                let (line, col, right) = cell_at(at, cols, lines);
+                let now = Instant::now();
+                let clicks = match state.click {
+                    Some((when, l, c, n)) if (l, c) == (line, col) && now.duration_since(when) < MULTI_CLICK => {
+                        n % 3 + 1
+                    }
+                    _ => 1,
+                };
+                state.click = Some((now, line, col, clicks));
+                state.dragging = true;
+                state.last = Some((line, col, right));
+                send(Mouse::Down { line, col, right, clicks });
+                event::Status::Captured
+            }
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) if cursor.is_over(bounds) => {
+                send(Mouse::Context);
+                event::Status::Captured
+            }
+            Event::Mouse(mouse::Event::CursorMoved { position }) if state.dragging => {
+                let at = Point::new(position.x - bounds.x, position.y - bounds.y);
+                let (line, col, right) = cell_at(at, cols, lines);
+                if state.last != Some((line, col, right)) {
+                    state.last = Some((line, col, right));
+                    send(Mouse::Drag { line, col, right });
+                }
+                event::Status::Captured
+            }
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) if state.dragging => {
+                state.dragging = false;
+                send(Mouse::Up);
+                event::Status::Captured
+            }
+            Event::Mouse(mouse::Event::WheelScrolled { delta }) if cursor.is_over(bounds) => {
+                let lines = match delta {
+                    mouse::ScrollDelta::Lines { y, .. } => (y * 3.0).round() as i32,
+                    mouse::ScrollDelta::Pixels { y, .. } => {
+                        state.wheel += y / CELL_H;
+                        let whole = state.wheel.trunc();
+                        state.wheel -= whole;
+                        whole as i32
+                    }
+                };
+                if lines != 0 {
+                    send(Mouse::Wheel(lines));
+                }
+                event::Status::Captured
+            }
+            _ => event::Status::Ignored,
+        }
     }
 
     fn draw(
@@ -893,6 +1146,12 @@ impl Widget<Message, Theme, iced::Renderer> for Grid<'_> {
         for run in &f.runs {
             self.draw_run(renderer, run, origin, bounds);
         }
+        if !f.selection.is_empty() {
+            let color = Color { a: 0.4, ..theme::c().accent };
+            for &(line, col, cells) in &f.selection {
+                fill(renderer, cell_rect(origin, line, col, cells), color);
+            }
+        }
         let Some(c) = &f.cursor else { return };
         let r = cell_rect(origin, c.line, c.col, c.cells);
         match c.shape {
@@ -914,6 +1173,48 @@ impl Widget<Message, Theme, iced::Renderer> for Grid<'_> {
                 Background::Color(Color::TRANSPARENT),
             ),
         }
+    }
+}
+
+/// What pasting `text` sends: line breaks as Enter (`\r`); in bracketed
+/// paste mode (the program asked for it) wrapped in `ESC [ 200 ~` ..
+/// `ESC [ 201 ~`, with ESC characters dropped so the text can't end the
+/// bracket itself.
+fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
+    let text = text.replace("\r\n", "\r").replace('\n', "\r");
+    if !bracketed {
+        return text.into_bytes();
+    }
+    let mut bytes = b"\x1b[200~".to_vec();
+    bytes.extend(text.replace('\x1b', "").into_bytes());
+    bytes.extend(b"\x1b[201~");
+    bytes
+}
+
+/// The arrow keys the wheel sends on the alternate screen (programs like
+/// `less`, which don't scroll a history): Up for positive `lines`.
+fn wheel_arrows(app_cursor: bool, lines: i32) -> Vec<u8> {
+    let key = match (lines > 0, app_cursor) {
+        (true, true) => "\x1bOA",
+        (true, false) => "\x1b[A",
+        (false, true) => "\x1bOB",
+        (false, false) => "\x1b[B",
+    };
+    key.repeat(lines.unsigned_abs() as usize).into_bytes()
+}
+
+/// Whether closing a terminal asks first: a program other than the idle
+/// shell runs in it.
+fn close_needs_confirm(program: Option<&str>) -> bool {
+    program.is_some()
+}
+
+/// The question at quit, if terminals are still running.
+fn quit_question(count: usize) -> Option<String> {
+    match count {
+        0 => None,
+        1 => Some("1 terminal is still running. Quit anyway?".to_owned()),
+        n => Some(format!("{n} terminals are still running. Quit anyway?")),
     }
 }
 
@@ -1018,6 +1319,11 @@ impl App {
         ("Ctrl+Shift+Down/Up (cm_NextTerminal, cm_PrevTerminal)", "Next/previous entry of the sidebar: Files, terminal 1, 2, ..."),
         ("Ctrl+Shift+T (cm_NewTerminal)", "Another terminal in the active panel's folder (the + of the sidebar)"),
         ("Ctrl+Shift+W (cm_CloseTerminal)", "End the shown terminal and close it (middle-click or x on its sidebar entry too)"),
+        ("cm_TerminalFolderToPanel (no key by default)", "Active panel goes to the terminal's current folder and Files is shown"),
+        ("Ctrl+Shift+C or Ctrl+Insert", "Copy the selected text (select with the mouse: drag, double-click a word, triple-click a line)"),
+        ("Right-click", "Copies the selection and clears it; with no selection pastes the clipboard"),
+        ("Ctrl+Shift+V or Shift+Insert", "Paste the clipboard (bracketed when the program asks for it)"),
+        ("Mouse wheel, Shift+PgUp/PgDn, Shift+Home/End", "Scroll the history (full-screen programs get arrow keys from the wheel); typing jumps back to the bottom"),
         ("Every other key", "Goes to the shell (Esc, Tab, Ctrl+C, arrows, F1-F12, ...)"),
         ("exit", "Ends the shell and closes the terminal"),
     ];
@@ -1147,6 +1453,54 @@ impl App {
     /// `CloseTerminal`: ends the shown terminal.
     pub(super) fn close_shown_term(&mut self) {
         if let Some(&id) = self.screen.term() {
+            self.request_close_term(id);
+        }
+    }
+
+    /// Closes terminal `id`, asking first when a program runs in it (not
+    /// for the idle shell).
+    fn request_close_term(&mut self, id: u64) {
+        let Some(program) = self.term(id).map(|t| t.program.clone()) else { return };
+        if close_needs_confirm(program.as_deref()) {
+            self.dialog_focus = None;
+            self.dialog = Some(Dialog::CloseTerm { id, program: program.unwrap_or_default() });
+        } else {
+            self.close_term(id);
+        }
+    }
+
+    /// The window is closing (or Quit): asks first while terminals run.
+    pub(super) fn request_quit(&mut self) -> Task<Message> {
+        let asking = matches!(self.dialog, Some(Dialog::QuitTerms));
+        if quit_question(self.terms.len()).is_some() && !asking {
+            self.dialog_focus = None;
+            self.dialog = Some(Dialog::QuitTerms);
+            return Task::none();
+        }
+        self.quit()
+    }
+
+    /// `TerminalFolderToPanel`: the active panel goes to the folder of the
+    /// shown (or last used) terminal; back to the panels.
+    pub(super) fn term_folder_to_panel(&mut self) -> Task<Message> {
+        let id = self.screen.term().copied().or(self.term_last);
+        let Some(dir) = id.and_then(|id| self.term(id)).map(|t| t.dir.clone()) else {
+            self.info("No built-in terminal is open");
+            return Task::none();
+        };
+        self.hide_term();
+        let side = self.active;
+        self.start_nav_to(side, Nav::to(dir), true)
+    }
+
+    /// The text of the quit question (for the dialog).
+    pub(super) fn quit_text(&self) -> String {
+        quit_question(self.terms.len()).unwrap_or_else(|| "Quit?".to_owned())
+    }
+
+    /// The dialog's OK: ends terminal `id` (if it still exists).
+    pub(super) fn close_term_now(&mut self, id: u64) {
+        if self.term(id).is_some() {
             self.close_term(id);
         }
     }
@@ -1190,7 +1544,31 @@ impl App {
             }
             TermMsg::Show(None) => self.hide_term(),
             TermMsg::New => return self.new_term(),
-            TermMsg::Close(id) => self.close_term(id),
+            TermMsg::Close(id) => self.request_close_term(id),
+            TermMsg::Mouse(id, mouse) => {
+                let Some(t) = self.term_mut(id) else { return Task::none() };
+                if let Some(text) = t.mouse(mouse) {
+                    return iced::clipboard::write(text);
+                }
+                if mouse == Mouse::Context && t.selected_text().is_none() {
+                    return iced::clipboard::read().map(move |text| Message::Term(TermMsg::Paste(id, text)));
+                }
+            }
+            TermMsg::ScrollTo(id, top) => {
+                if let Some(t) = self.term_mut(id) {
+                    let history = t.frame.history;
+                    let offset = history.saturating_sub(top.round().max(0.0) as usize);
+                    let delta = offset as i32 - t.frame.offset as i32;
+                    if delta != 0 {
+                        t.scroll(Scroll::Delta(delta));
+                    }
+                }
+            }
+            TermMsg::Paste(id, text) => {
+                if let (Some(t), Some(text)) = (self.term(id), text.filter(|t| !t.is_empty())) {
+                    t.paste(&text);
+                }
+            }
             TermMsg::Info(id, info) => {
                 if let Some(t) = self.term_mut(id) {
                     if let Some(dir) = info.dir {
@@ -1272,9 +1650,42 @@ impl App {
             Command::NextTerminal,
             Command::PrevTerminal,
             Command::CloseTerminal,
+            Command::TerminalFolderToPanel,
         ];
         if let Some(cmd) = self.keymap.command(key, mods).filter(|c| reserved.contains(c)) {
             return self.run(cmd);
+        }
+        let Some(t) = self.term(id) else { return Task::none() };
+        let named = match key {
+            keyboard::Key::Named(n) => Some(*n),
+            _ => None,
+        };
+        let letter = |l: &str| matches!(key, keyboard::Key::Character(c) if c.eq_ignore_ascii_case(l));
+        let (ctrl, alt, shift) = (mods.control(), mods.alt(), mods.shift());
+        // Keys the terminal keeps for itself (TERM_KEYS): copy, paste, scrolling.
+        if (ctrl && shift && !alt && letter("c")) || (ctrl && !shift && !alt && named == Some(Named::Insert)) {
+            return match t.selected_text() {
+                Some(text) => iced::clipboard::write(text),
+                None => Task::none(),
+            };
+        }
+        if (ctrl && shift && !alt && letter("v")) || (shift && !ctrl && !alt && named == Some(Named::Insert)) {
+            return iced::clipboard::read().map(move |text| Message::Term(TermMsg::Paste(id, text)));
+        }
+        if shift && !ctrl && !alt && !t.alt_screen() {
+            let scroll = match named {
+                Some(Named::PageUp) => Some(Scroll::PageUp),
+                Some(Named::PageDown) => Some(Scroll::PageDown),
+                Some(Named::Home) => Some(Scroll::Top),
+                Some(Named::End) => Some(Scroll::Bottom),
+                _ => None,
+            };
+            if let Some(scroll) = scroll {
+                if let Some(t) = self.term_mut(id) {
+                    t.scroll(scroll);
+                }
+                return Task::none();
+            }
         }
         let Some(t) = self.term(id) else { return Task::none() };
         if let Some(bytes) = key_bytes(key, mods, text, t.app_cursor()) {
@@ -1303,6 +1714,15 @@ impl App {
         .padding([3, 10])
         .height(Length::Fixed(FOOTER_H));
         let grid = Element::new(Grid { id, frame: &t.frame, focused: self.focused });
+        // The bar's position is the history line at the top of the view.
+        let (history, offset, lines) = (t.frame.history, t.frame.offset, t.frame.lines);
+        let grid = crate::scrollbar::attach(
+            grid,
+            history.saturating_sub(offset) as f32,
+            lines as f32,
+            (history + lines) as f32,
+            move |top| Message::Term(TermMsg::ScrollTo(id, top)),
+        );
         container(column![grid, footer])
             .width(Length::Fill)
             .height(Length::Fill)
@@ -1396,6 +1816,91 @@ mod tests {
 
     fn ch(c: &str, m: M, text: Option<&str>) -> Option<Vec<u8>> {
         key_bytes(&Key::Character(c.into()), m, text, false)
+    }
+
+    fn small_term(cols: usize, lines: usize, input: &str) -> Term<Proxy> {
+        let (tx, _rx) = std_mpsc::channel();
+        let proxy = Proxy { tx, wakeup: Arc::new(AtomicBool::new(false)) };
+        let mut term = Term::new(TermConfig::default(), &TermSize::new(cols, lines), proxy);
+        let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
+        parser.advance(&mut term, input.as_bytes());
+        term
+    }
+
+    #[test]
+    fn paste_without_bracketed_mode() {
+        assert_eq!(paste_bytes("a\r\nb\nc\rd", false), b"a\rb\rc\rd");
+        assert_eq!(paste_bytes("x\x1by", false), b"x\x1by");
+    }
+
+    #[test]
+    fn paste_in_bracketed_mode() {
+        assert_eq!(paste_bytes("ls\r\npwd", true), b"\x1b[200~ls\rpwd\x1b[201~");
+        // An ESC can't end the bracket early.
+        assert_eq!(paste_bytes("a\x1b[201~b", true), b"\x1b[200~a[201~b\x1b[201~");
+    }
+
+    #[test]
+    fn wheel_in_full_screen_programs_sends_arrows() {
+        assert_eq!(wheel_arrows(false, 3), b"\x1b[A\x1b[A\x1b[A");
+        assert_eq!(wheel_arrows(true, -2), b"\x1bOB\x1bOB");
+    }
+
+    #[test]
+    fn selection_text_and_cells() {
+        let mut term = small_term(20, 3, "hello world\r\nsecond line");
+        let at = |line, col| GridPoint::new(Line(line), GridColumn(col));
+        let mut selection = Selection::new(SelectionType::Simple, at(0, 6), Side::Left);
+        selection.update(at(0, 10), Side::Right);
+        term.selection = Some(selection);
+        assert_eq!(term.selection_to_string().as_deref(), Some("world"));
+        let range = term.selection.as_ref().and_then(|s| s.to_range(&term)).unwrap();
+        assert_eq!(selection_cells(&range, 0, 20, 3), vec![(0, 6, 5)]);
+        // A word (double-click) and a line (triple-click).
+        term.selection = Some(Selection::new(SelectionType::Semantic, at(0, 7), Side::Left));
+        assert_eq!(term.selection_to_string().as_deref(), Some("world"));
+        term.selection = Some(Selection::new(SelectionType::Lines, at(1, 3), Side::Left));
+        assert_eq!(term.selection_to_string().as_deref(), Some("second line\n"));
+        // A click without a drag selects nothing.
+        let click = Selection::new(SelectionType::Simple, at(0, 2), Side::Left);
+        assert!(click.is_empty());
+    }
+
+    #[test]
+    fn multi_line_selection_cells() {
+        let range = SelectionRange::new(GridPoint::new(Line(0), GridColumn(5)), GridPoint::new(Line(2), GridColumn(3)), false);
+        assert_eq!(selection_cells(&range, 0, 10, 4), vec![(0, 5, 5), (1, 0, 10), (2, 0, 4)]);
+        // Scrolled back by one line, everything moves down.
+        assert_eq!(selection_cells(&range, 1, 10, 4), vec![(1, 5, 5), (2, 0, 10), (3, 0, 4)]);
+    }
+
+    #[test]
+    fn bracketed_paste_mode_is_tracked() {
+        let mut term = small_term(10, 2, "");
+        assert!(!term.mode().contains(TermMode::BRACKETED_PASTE));
+        let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
+        parser.advance(&mut term, b"\x1b[?2004h");
+        assert!(term.mode().contains(TermMode::BRACKETED_PASTE));
+    }
+
+    #[test]
+    fn closing_asks_only_while_a_program_runs() {
+        assert!(!close_needs_confirm(None));
+        assert!(close_needs_confirm(Some("ping")));
+        assert_eq!(quit_question(0), None);
+        assert_eq!(quit_question(1).as_deref(), Some("1 terminal is still running. Quit anyway?"));
+        assert_eq!(quit_question(3).as_deref(), Some("3 terminals are still running. Quit anyway?"));
+    }
+
+    #[test]
+    fn cells_under_the_mouse() {
+        let cw = cell_w();
+        let at = |x: f32, y: f32| cell_at(Point::new(PAD + x * cw, PAD + y * CELL_H), 10, 5);
+        assert_eq!(at(0.2, 0.5), (0, 0, false));
+        assert_eq!(at(3.7, 2.5), (2, 3, true));
+        // Outside: the nearest cell.
+        assert_eq!(at(-4.0, -2.0), (0, 0, false));
+        assert_eq!(at(40.0, 40.0), (4, 9, true));
     }
 
     #[test]

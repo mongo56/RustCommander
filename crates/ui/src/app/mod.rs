@@ -281,6 +281,10 @@ enum Dialog {
     HotEdit { path: Vec<usize>, dir: String, name: String, comment: String, back: Option<(Vec<usize>, usize)>, field: u8 },
     /// Check for updates: result, offer, download progress.
     Update(update::UpdateDialog),
+    /// Closing terminal `id` while `program` runs in it.
+    CloseTerm { id: u64, program: String },
+    /// Quitting while terminals run.
+    QuitTerms,
 }
 
 /// The path bar of one side being edited, with folder suggestions.
@@ -1086,7 +1090,7 @@ impl App {
                 self.focus_panel(side);
                 self.panel_mut(side).sort_by(key);
             }
-            Message::CloseRequested => return self.quit(),
+            Message::CloseRequested => return self.request_quit(),
             Message::Quit(placement) => {
                 if placement.is_some() {
                     self.placement = placement;
@@ -1374,7 +1378,8 @@ impl App {
             }
             return Task::none();
         }
-        if self.screen.is_some() {
+        // (A dialog over a terminal gets the keys itself.)
+        if self.screen.is_some() && !(self.dialog.is_some() && self.screen.term().is_some()) {
             if named.is_some_and(is_modifier_key) {
                 return Task::none();
             }
@@ -1429,7 +1434,13 @@ impl App {
         if self.dialog.is_some() {
             // Dialogs with a text box keep Left/Right for its cursor.
             let has_input =
-                !matches!(self.dialog, Some(Dialog::Delete { .. } | Dialog::Compare { .. } | Dialog::RemoveGroup { .. }));
+                !matches!(self.dialog, Some(
+                    Dialog::Delete { .. }
+                        | Dialog::Compare { .. }
+                        | Dialog::RemoveGroup { .. }
+                        | Dialog::CloseTerm { .. }
+                        | Dialog::QuitTerms
+                ));
             if let (Some(Named::Tab), Some(Dialog::HotEdit { field, .. })) = (named, &mut self.dialog) {
                 // Tab flips between the name and comment boxes.
                 *field = 1 - *field;
@@ -1603,7 +1614,7 @@ impl App {
 
         // Commands that touch more than the active panel or open dialogs.
         match cmd {
-            Quit => return self.quit(),
+            Quit => return self.request_quit(),
             View => return self.open_viewer(),
             MultiRename => return self.open_multi_rename(),
             CompareFiles => return self.open_file_diff(),
@@ -1673,6 +1684,7 @@ impl App {
                 self.close_shown_term();
                 return Task::none();
             }
+            TerminalFolderToPanel => return self.term_folder_to_panel(),
             Terminal => {
                 self.open_terminal();
                 return Task::none();
@@ -2348,6 +2360,8 @@ impl App {
                 return self.palette_pick(selected);
             }
             Dialog::RemoveGroup { path, .. } => self.tree_remove_now(&path),
+            Dialog::CloseTerm { id, .. } => self.close_term_now(id),
+            Dialog::QuitTerms => return self.quit(),
             Dialog::HotEdit { path, name, comment, back, .. } => {
                 if let Some(item) = crate::hotlist::get_mut(&mut self.hotlist, &path) {
                     item.set_note(&name, &comment);

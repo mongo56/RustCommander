@@ -167,6 +167,8 @@ commands! {
         PrevTerminal => "cm_PrevTerminal", "Show the previous entry of the terminal sidebar", "PrevTerm";
         /// End the shown built-in terminal and close it (Ctrl+Shift+W).
         CloseTerminal => "cm_CloseTerminal", "End the shown built-in terminal and close it", "CloseTerm";
+        /// Show the folder the shown (or last used) built-in terminal is in in the active panel and return to the panels.
+        TerminalFolderToPanel => "cm_TerminalFolderToPanel", "Go to the built-in terminal's current folder in the active panel", "TermDir";
         /// Open an external terminal in the active panel's folder (Ctrl+F9).
         Terminal => "cm_ExecuteTerm", "Open an external terminal in this folder (the \"terminal\" setting)", "Term";
         /// Delete to the recycle bin.
