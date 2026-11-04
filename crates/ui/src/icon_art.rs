@@ -1,7 +1,8 @@
 //! The application icon artwork, drawn in code so no image asset is needed:
-//! a rounded square in Gruvbox dark colours made of two file panels (the
-//! left one with a yellow cursor bar) split by a thin gap. Plain Rust with no dependencies: `build.rs` includes this
-//! file too, to embed the same icon in the Windows executable.
+//! a dark rounded square in Gruvbox colours holding two file panels (the
+//! left one with a yellow cursor bar). Plain Rust with no dependencies:
+//! `build.rs` includes this file too, to embed the same icon in the Windows
+//! executable.
 
 /// Samples per pixel along each axis (anti-aliasing).
 const SS: u32 = 4;
@@ -70,7 +71,7 @@ fn sample(x: f32, y: f32, framed: bool) -> Option<[f32; 3]> {
 
 /// The icon at `size` × `size` pixels, RGBA, anti-aliased.
 pub fn rgba(size: u32) -> Vec<u8> {
-    render(size, false)
+    render(size, true)
 }
 
 fn render(size: u32, framed: bool) -> Vec<u8> {
