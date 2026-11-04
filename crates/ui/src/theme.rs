@@ -3,6 +3,7 @@
 
 use iced::widget::{button, container, progress_bar, text_input};
 use iced::{Background, Border, Color, Theme};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::RwLock;
 
 const fn rgb(hex: u32) -> Color {
@@ -343,15 +344,26 @@ pub fn focused(primary_button: bool) -> impl Fn(&Theme, button::Status) -> butto
     }
 }
 
+/// Whether box shadows are drawn; `main` turns them off for the software
+/// renderer. iced_tiny_skia 0.13 redraws only the damaged part of the window
+/// but blends a quad's whole shadow every time, so each redraw inside a
+/// dialog darkened the area around it a little more.
+static SHADOWS: AtomicBool = AtomicBool::new(true);
+
+pub fn set_shadows(on: bool) {
+    SHADOWS.store(on, Ordering::Relaxed);
+}
+
 pub fn dialog(_theme: &Theme) -> container::Style {
+    let shadow = if SHADOWS.load(Ordering::Relaxed) {
+        iced::Shadow { color: Color { a: 0.5, ..Color::BLACK }, offset: iced::Vector::new(0.0, 8.0), blur_radius: 24.0 }
+    } else {
+        iced::Shadow::default()
+    };
     container::Style {
         background: Some(Background::Color(c().header)),
         border: Border { color: c().border, width: 1.0, radius: 8.0.into() },
-        shadow: iced::Shadow {
-            color: Color { a: 0.5, ..Color::BLACK },
-            offset: iced::Vector::new(0.0, 8.0),
-            blur_radius: 24.0,
-        },
+        shadow,
         ..container::Style::default()
     }
 }

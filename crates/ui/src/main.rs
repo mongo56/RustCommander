@@ -83,6 +83,9 @@ fn main() -> iced::Result {
     if std::env::var_os("ICED_BACKEND").is_none() && config::load().map_or(true, |c| c.software_rendering) {
         std::env::set_var("ICED_BACKEND", "tiny-skia");
     }
+    // iced tries the listed backends in order: the first is the one used.
+    let software = std::env::var("ICED_BACKEND").is_ok_and(|v| v.split(',').find(|b| !b.is_empty()) == Some("tiny-skia"));
+    theme::set_shadows(!software);
     // Temp copies of files in archives or on servers left by earlier runs.
     std::thread::spawn(|| rc_core::vfs::clean_temp(rc_core::vfs::TEMP_MAX_AGE));
     startup::mark("config ready");
