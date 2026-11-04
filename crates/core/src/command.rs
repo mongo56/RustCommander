@@ -158,7 +158,7 @@ commands! {
         /// the one key the terminal doesn't pass on to the shell.
         ToggleTerminal => "cm_ToggleTerminal", "Switch between the panels and the built-in terminal (it keeps running)", "Switch";
         /// Open an external terminal in the active panel's folder (Ctrl+F9).
-        Terminal => "cm_ExecuteDOS", "Open an external terminal in this folder (the \"terminal\" setting)", "Term";
+        Terminal => "cm_ExecuteTerm", "Open an external terminal in this folder (the \"terminal\" setting)", "Term";
         /// Delete to the recycle bin.
         Delete => "cm_Delete", "Delete to the recycle bin", "Delete";
         /// Delete permanently (Shift+F8 / Shift+Del).
@@ -190,10 +190,18 @@ commands! {
     }
 }
 
+/// Ids that were renamed: old config files may still use them, so `from_id` accepts them.
+/// Saving writes the new id (`Command::id`). Keep this table small; add a row only on a rename.
+const OLD_IDS: &[(&str, Command)] = &[("cm_ExecuteDOS", Command::Terminal)];
+
 impl Command {
-    /// The command with this id (case-insensitive), for config files.
+    /// The command with this id (case-insensitive), for config files. Also accepts old ids (`OLD_IDS`).
     pub fn from_id(id: &str) -> Option<Command> {
-        Self::ALL.iter().copied().find(|c| c.id().eq_ignore_ascii_case(id))
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|c| c.id().eq_ignore_ascii_case(id))
+            .or_else(|| OLD_IDS.iter().find(|(old, _)| old.eq_ignore_ascii_case(id)).map(|&(_, c)| c))
     }
 }
 
@@ -209,6 +217,9 @@ mod tests {
         }
         assert_eq!(Command::from_id("CM_COPY"), Some(Command::Copy));
         assert_eq!(Command::from_id("cm_Nope"), None);
+        assert_eq!(Command::from_id("cm_ExecuteTerm"), Some(Command::Terminal));
+        assert_eq!(Command::from_id("cm_executedos"), Some(Command::Terminal));
+        assert_eq!(Command::Terminal.id(), "cm_ExecuteTerm");
         ids.sort_unstable();
         ids.dedup();
         assert_eq!(ids.len(), Command::ALL.len());
