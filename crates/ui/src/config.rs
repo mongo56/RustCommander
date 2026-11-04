@@ -316,7 +316,7 @@ fn template(editor: &str, compare: CompareState) -> String {
     }
     let mut colors = String::new();
     for name in crate::theme::NAMES {
-        let value = crate::theme::DARK.get(name).map(crate::theme::to_hex).unwrap_or_default();
+        let value = crate::theme::GRUVBOX.get(name).map(crate::theme::to_hex).unwrap_or_default();
         colors.push_str(&format!("# {name} = \"{value}\"\n"));
     }
     format!(
@@ -363,7 +363,7 @@ fn template(editor: &str, compare: CompareState) -> String {
          thumbnail_size = 128\n\
          \n\
          # Colour theme: {themes}. [colors] below overrides single colours.\n\
-         theme = \"dark\"\n\
+         theme = \"gruvbox\"\n\
          \n\
          # Compare folders (Shift+F2; Ctrl+Shift+F2 or F10 change these): read the\n\
          # contents of same-size files, ignore dates (mark differing files on both\n\
@@ -384,7 +384,7 @@ fn template(editor: &str, compare: CompareState) -> String {
          # \"Ctrl+K\" = \"cm_MkDir\"\n\
          # \"F8\" = \"\"\n\
          \n\
-         # Colours as \"#rrggbb\"; the values below are the dark theme's.\n\
+         # Colours as \"#rrggbb\"; the values below are the gruvbox theme's.\n\
          [colors]\n\
          {colors}"
     )
@@ -403,7 +403,8 @@ mod tests {
         assert!(config.keys.is_empty() && config.colors.is_empty());
         // The commented-out colour lines are valid settings once uncommented.
         let uncommented = template("", CompareState::default()).replace("\n# bg = ", "\nbg = ");
-        assert_eq!(parse(&uncommented).unwrap().colors["bg"], "#14161a");
+        assert_eq!(parse(&uncommented).unwrap().colors["bg"], "#1d2021");
+        assert_eq!(parse(&uncommented).unwrap().theme, "gruvbox");
     }
 
     #[test]
