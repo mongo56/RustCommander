@@ -1004,8 +1004,12 @@ impl App {
                 let drop_right = self.drop_right;
                 self.drop_right = false;
                 self.status = None;
+                // A drop from another app leaves that app in front, which
+                // can hide our drop menu or Copy dialog: come to the front
+                // first (winit's focus gets past Windows' foreground lock).
+                let focus = window::get_oldest().and_then(window::gain_focus);
                 if position.is_some_and(|(x, _)| self.tree_visible() && x < self.panels_x()) {
-                    return self.tree_drop_external(sources);
+                    return focus.chain(self.tree_drop_external(sources));
                 }
                 let side = position.map(|(x, _)| usize::from(x >= self.split_x())).unwrap_or(self.active);
                 self.focus_panel(side);
@@ -1021,10 +1025,10 @@ impl App {
                     if let Some(folder) = sources.first().and_then(|p| p.parent()).map(Path::to_path_buf) {
                         let mut items = sources.clone();
                         items.retain(|p| p.parent() == Some(folder.as_path()));
-                        return self.right_drop(RightDrop { side, sources, folder, items, target });
+                        return focus.chain(self.right_drop(RightDrop { side, sources, folder, items, target }));
                     }
                 }
-                return self.open_transfer(false, sources, &target);
+                return focus.chain(self.open_transfer(false, sources, &target));
             }
             Message::Wheel(side, lines) => {
                 let rows = self.page_rows();
