@@ -126,6 +126,9 @@ pub struct App {
     drag: Option<Drag>,
     /// Files dropped in from other apps, waiting for the drop position.
     dropped: Vec<PathBuf>,
+    /// Was an outside drag held with the right button? Read during hover: by
+    /// the drop the button is already released.
+    drop_right: bool,
     /// Last known mouse position (window coordinates); tracked while a
     /// mouse button is down.
     mouse: Point,
@@ -401,6 +404,11 @@ pub enum Message {
     DropMenuDone(usize, Result<DragOutcome, String>),
     FileDropped(PathBuf),
     DropPosition(Option<(f32, f32)>),
+    /// Files from another app hovered over our window (once per file); the
+    /// mouse button is still held.
+    Hovered,
+    /// The hovering files left our window: the drag they were part of is over.
+    HoverLeft,
     Wheel(usize, f32),
     /// Scrollbar dragged/clicked: first row to show, rows on screen.
     ScrollTo(usize, usize, usize),
@@ -547,6 +555,7 @@ impl App {
             filter_edit: None,
             drag: None,
             dropped: Vec::new(),
+            drop_right: false,
             mouse: Point::ORIGIN,
             split: session.as_ref().map_or(0.5, |s| s.split).clamp(0.0, 1.0),
             split_drag: false,
@@ -625,6 +634,8 @@ impl App {
                     Some(Message::Run(Command::HistoryForward))
                 }
                 Event::Window(window::Event::FileDropped(path)) => Some(Message::FileDropped(path)),
+                Event::Window(window::Event::FileHovered(_)) => Some(Message::Hovered),
+                Event::Window(window::Event::FilesHoveredLeft) => Some(Message::HoverLeft),
                 _ => None,
             }),
             window::resize_events().map(|(_id, size)| Message::Resized(size)),
@@ -924,6 +935,15 @@ impl App {
                     Err(e) => self.status = Some((e, Tone::Error)),
                 }
             }
+            Message::Hovered => {
+                // One hover event arrives per file; the button is still held
+                // while hovering, so any of them reads it. No drop has
+                // arrived yet, so this is still the drag in progress.
+                if self.dropped.is_empty() {
+                    self.drop_right = rc_platform::right_button_down();
+                }
+            }
+            Message::HoverLeft => self.drop_right = false,
             Message::FileDropped(path) => {
                 self.dropped.push(path);
                 // Several events arrive for one drop; ask for the position once.
@@ -937,6 +957,9 @@ impl App {
             }
             Message::DropPosition(position) => {
                 let sources = std::mem::take(&mut self.dropped);
+                // Take the flag: it belongs to this drop only.
+                let drop_right = self.drop_right;
+                self.drop_right = false;
                 self.status = None;
                 if position.is_some_and(|(x, _)| self.tree_visible() && x < self.panels_x()) {
                     return self.tree_drop_external(sources);
@@ -944,6 +967,20 @@ impl App {
                 let side = position.map(|(x, _)| usize::from(x >= self.split_x())).unwrap_or(self.active);
                 self.focus_panel(side);
                 let target = self.panel(side).path.clone();
+                // A right drag from outside lands the shell's drop menu, like
+                // an internal one; archives and servers can't take it, so
+                // those keep the Copy dialog.
+                let usable = !vfs::in_archive(&target) && !remote::is_remote(&target);
+                if drop_right && usable {
+                    // Desktop drags can mix folders (the user's Desktop and
+                    // the Public Desktop); the shell's data object takes one
+                    // folder, so only the sources under the first one go.
+                    if let Some(folder) = sources.first().and_then(|p| p.parent()).map(Path::to_path_buf) {
+                        let mut items = sources;
+                        items.retain(|p| p.parent() == Some(folder.as_path()));
+                        return self.drop_menu(side, folder, items, target);
+                    }
+                }
                 return self.open_transfer(false, sources, &target);
             }
             Message::Wheel(side, lines) => {
@@ -2345,16 +2382,16 @@ impl App {
         // The shell's drop menu can't take files inside archives.
         let in_archive = vfs::in_archive(&self.panel(drag.side).path) || vfs::in_archive(&target);
         if drag.right && !in_archive {
-            return self.drop_menu(drag, target);
+            let (folder, items) = self.shell_items(drag.side, drag.sources);
+            return self.drop_menu(drag.side, folder, items, target);
         }
         self.open_transfer(self.modifiers.shift(), drag.sources, &target)
     }
 
-    /// Right-button drop inside our window: let the shell show its drop
-    /// menu for the target folder.
-    fn drop_menu(&self, drag: Drag, target: PathBuf) -> Task<Message> {
-        let side = drag.side;
-        let (folder, items) = self.shell_items(side, drag.sources);
+    /// Right-button drop: let the shell show its drop menu for the target
+    /// folder. `(folder, items)` is the drop's data object: from inside our
+    /// window `shell_items` picks it; an outside drop hands over its own.
+    fn drop_menu(&self, side: usize, folder: PathBuf, items: Vec<PathBuf>, target: PathBuf) -> Task<Message> {
         window::get_oldest()
             .and_then(move |id| {
                 let (folder, items, target) = (folder.clone(), items.clone(), target.clone());

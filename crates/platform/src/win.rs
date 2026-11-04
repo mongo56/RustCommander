@@ -472,6 +472,21 @@ pub fn cursor_in_window(window: isize) -> Option<(f32, f32)> {
     }
 }
 
+/// Whether the logical right mouse button is down. `GetAsyncKeyState` reads
+/// physical buttons, so with the left/right buttons swapped we test the
+/// physical left button instead.
+pub fn right_button_down() -> bool {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, VK_RBUTTON};
+    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_SWAPBUTTON};
+    let button = if unsafe { GetSystemMetrics(SM_SWAPBUTTON) } != 0 {
+        VK_LBUTTON.0
+    } else {
+        VK_RBUTTON.0
+    };
+    let state = unsafe { GetAsyncKeyState(button as i32) };
+    state < 0
+}
+
 /// The window's restored ("normal") rectangle and whether it's maximised.
 pub fn window_placement(window: isize) -> Option<crate::Placement> {
     use windows::Win32::UI::WindowsAndMessaging::{

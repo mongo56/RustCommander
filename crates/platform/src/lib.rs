@@ -330,6 +330,18 @@ pub fn cursor_in_window(window: isize) -> Option<(f32, f32)> {
     }
 }
 
+/// Whether the logical right mouse button is down.
+pub fn right_button_down() -> bool {
+    #[cfg(windows)]
+    {
+        win::right_button_down()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 /// A window's restored rectangle (screen pixels, Windows workspace
 /// coordinates) and maximised state, saved between sessions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
