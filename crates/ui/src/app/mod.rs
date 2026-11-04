@@ -472,23 +472,7 @@ pub enum Message {
     /// tabs had, the one found (it or its closest existing parent) and its
     /// entries.
     Restored(PathBuf, Result<(PathBuf, Vec<Entry>), String>),
-    ViewerLoaded(u64, Result<viewer::Loaded, String>),
-    /// Search result in a large file: the window holding the match, the
-    /// match, and whether the search wrapped around.
-    ViewerFound(u64, Result<Option<viewer::Found>, String>, std::sync::Arc<std::sync::atomic::AtomicBool>),
-    ViewerWheel(f32),
-    /// Viewer scrollbar: the row (whole file) or byte (large file) to show at the top.
-    ViewerSeek(f32),
-    /// The zoomed image was scrolled (offset in pixels).
-    ViewerPanned(iced::widget::scrollable::AbsoluteOffset),
-    /// Pointer moved over (or left) the viewer body.
-    ViewerPointer(Option<iced::Point>),
-    /// Wheel anywhere while an image is shown (zooms when Ctrl is held).
-    ViewerZoomWheel(f32),
-    ViewerSearch(String),
-    ViewerFind,
-    /// Left button pressed while the viewer shows a document (starts a selection over the body).
-    ViewerPress,
+    Viewer(viewer::ViewerMsg),
     MultiRename(multi_rename::MrMsg),
     FileDiff(file_diff::DiffMsg),
     Find(find_files::FindMsg),
@@ -681,11 +665,13 @@ impl App {
         // wheel, so listen globally instead of through the body's mouse_area.
         if self.viewer.as_ref().is_some_and(|v| v.is_image()) {
             subs.push(event::listen_with(|event, _status, _window| match event {
-                Event::Mouse(mouse::Event::WheelScrolled { delta }) => Some(Message::ViewerZoomWheel(match delta {
-                    mouse::ScrollDelta::Lines { y, .. } => y,
-                    // Touchpads: ~120 px per notch-equivalent.
-                    mouse::ScrollDelta::Pixels { y, .. } => y / 120.0,
-                })),
+                Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
+                    Some(Message::Viewer(viewer::ViewerMsg::ZoomWheel(match delta {
+                        mouse::ScrollDelta::Lines { y, .. } => y,
+                        // Touchpads: ~120 px per notch-equivalent.
+                        mouse::ScrollDelta::Pixels { y, .. } => y / 120.0,
+                    })))
+                }
                 _ => None,
             }));
         }
@@ -704,11 +690,13 @@ impl App {
             }));
         }
         // Viewer selections start on any left press over the body (seen
-        // through `ViewerPointer`): its `mouse_area` doesn't get presses on
+        // through `ViewerMsg::Pointer`): its `mouse_area` doesn't get presses on
         // highlighted rows, since `rich_text` captures presses on its spans.
         if self.viewer_tracks_mouse() {
             subs.push(event::listen_with(|event, _status, _window| match event {
-                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => Some(Message::ViewerPress),
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+                    Some(Message::Viewer(viewer::ViewerMsg::Press))
+                }
                 _ => None,
             }));
         }
@@ -1245,16 +1233,7 @@ impl App {
                 }
                 Err(e) => self.error(e),
             },
-            Message::ViewerLoaded(seq, result) => return self.viewer_loaded(seq, result),
-            Message::ViewerFound(seq, result, cancel) => self.viewer_found(seq, result, &cancel),
-            Message::ViewerWheel(lines) => self.viewer_wheel(lines),
-            Message::ViewerSeek(at) => self.viewer_seek(at),
-            Message::ViewerPanned(offset) => self.viewer_panned(offset),
-            Message::ViewerPointer(at) => self.viewer_pointer(at),
-            Message::ViewerZoomWheel(lines) => return self.viewer_zoom_wheel(lines),
-            Message::ViewerSearch(text) => self.viewer_search_input(text),
-            Message::ViewerFind => return self.viewer_submit(),
-            Message::ViewerPress => self.viewer_press(),
+            Message::Viewer(msg) => return self.viewer_update(msg),
             Message::MultiRename(msg) => return self.multi_rename_update(msg),
             Message::FileDiff(msg) => return self.file_diff_update(msg),
             Message::Find(msg) => return self.find_update(msg),

@@ -93,6 +93,27 @@ pub enum Loaded {
     Image { handle: image::Handle, width: u32, height: u32 },
 }
 
+#[derive(Debug, Clone)]
+pub enum ViewerMsg {
+    Loaded(u64, Result<Loaded, String>),
+    /// Search result in a large file: the window holding the match, the
+    /// match, and whether the search wrapped around.
+    Found(u64, Result<Option<Found>, String>, Arc<AtomicBool>),
+    Wheel(f32),
+    /// Viewer scrollbar: the row (whole file) or byte (large file) to show at the top.
+    Seek(f32),
+    /// The zoomed image was scrolled (offset in pixels).
+    Panned(AbsoluteOffset),
+    /// Pointer moved over (or left) the viewer body.
+    Pointer(Option<Point>),
+    /// Wheel anywhere while an image is shown (zooms when Ctrl is held).
+    ZoomWheel(f32),
+    Search(String),
+    Find,
+    /// Left button pressed while the viewer shows a document (starts a selection over the body).
+    Press,
+}
+
 #[derive(Debug)]
 enum Content {
     Loading,
@@ -225,7 +246,7 @@ fn load(path: PathBuf, seq: u64) -> Task<Message> {
             });
             rx.await.unwrap_or_else(|_| Err("viewer thread failed".into()))
         },
-        move |result| Message::ViewerLoaded(seq, result),
+        move |result| Message::Viewer(ViewerMsg::Loaded(seq, result)),
     )
 }
 
@@ -250,6 +271,22 @@ fn load_sync(path: &Path) -> Result<Loaded, String> {
 }
 
 impl App {
+    pub(super) fn viewer_update(&mut self, msg: ViewerMsg) -> Task<Message> {
+        match msg {
+            ViewerMsg::Loaded(seq, result) => return self.viewer_loaded(seq, result),
+            ViewerMsg::Found(seq, result, cancel) => self.viewer_found(seq, result, &cancel),
+            ViewerMsg::Wheel(lines) => self.viewer_wheel(lines),
+            ViewerMsg::Seek(at) => self.viewer_seek(at),
+            ViewerMsg::Panned(offset) => self.viewer_panned(offset),
+            ViewerMsg::Pointer(at) => self.viewer_pointer(at),
+            ViewerMsg::ZoomWheel(lines) => return self.viewer_zoom_wheel(lines),
+            ViewerMsg::Search(text) => self.viewer_search_input(text),
+            ViewerMsg::Find => return self.viewer_submit(),
+            ViewerMsg::Press => self.viewer_press(),
+        }
+        Task::none()
+    }
+
     /// Opens the viewer on the cursor file of the active panel.
     pub(super) fn open_viewer(&mut self) -> Task<Message> {
         let side = self.active;
@@ -308,7 +345,7 @@ impl App {
         load(v.path().to_path_buf(), seq)
     }
 
-    pub(super) fn viewer_loaded(&mut self, seq: u64, result: Result<Loaded, String>) -> Task<Message> {
+    fn viewer_loaded(&mut self, seq: u64, result: Result<Loaded, String>) -> Task<Message> {
         let Some(v) = self.viewer.as_mut().filter(|v| v.seq == seq) else { return Task::none() };
         match result {
             Ok(loaded) => {
@@ -481,7 +518,7 @@ impl App {
         }
     }
 
-    pub(super) fn viewer_panned(&mut self, offset: AbsoluteOffset) {
+    fn viewer_panned(&mut self, offset: AbsoluteOffset) {
         // Ctrl+wheel zooms; the image scrollable also scrolls on that wheel
         // event, which `viewer_set_zoom` overrides with its own offset.
         if self.modifiers.control() {
@@ -492,7 +529,7 @@ impl App {
         }
     }
 
-    pub(super) fn viewer_pointer(&mut self, at: Option<Point>) {
+    fn viewer_pointer(&mut self, at: Option<Point>) {
         let Some(v) = &mut self.viewer else { return };
         v.pointer = at;
         if let Some(p) = at.filter(|_| v.selecting) {
@@ -524,7 +561,7 @@ impl App {
         if let Some(last) = v.pan {
             v.pan = Some(mouse);
             // The scrollable clamps, and reports the offset it ends up at
-            // through `ViewerPanned`.
+            // through `ViewerMsg::Panned`.
             let by = AbsoluteOffset { x: last.x - mouse.x, y: last.y - mouse.y };
             return scrollable::scroll_by(image_scroll_id(), by);
         }
@@ -542,7 +579,7 @@ impl App {
     /// Left button pressed (anywhere; acts over the body): starts a
     /// selection there, or with Shift extends the current one; on a zoomed
     /// image, starts panning it.
-    pub(super) fn viewer_press(&mut self) {
+    fn viewer_press(&mut self) {
         let shift = self.modifiers.shift();
         let can_pan = self.viewer_can_pan();
         let view = self.viewer_body_size();
@@ -684,7 +721,7 @@ impl App {
     }
 
     /// Ctrl+wheel over an image: one zoom step per notch, around the pointer.
-    pub(super) fn viewer_zoom_wheel(&mut self, notches: f32) -> Task<Message> {
+    fn viewer_zoom_wheel(&mut self, notches: f32) -> Task<Message> {
         if !self.modifiers.control() || notches == 0.0 {
             return Task::none();
         }
@@ -729,7 +766,7 @@ impl App {
 
     /// Scrollbar: `at` is a row of a whole file, else a byte of the file;
     /// infinite = the end.
-    pub(super) fn viewer_seek(&mut self, at: f32) {
+    fn viewer_seek(&mut self, at: f32) {
         let Some(v) = &mut self.viewer else { return };
         let Some(doc) = v.doc_arc() else { return };
         if at.is_infinite() {
@@ -754,7 +791,7 @@ impl App {
         self.viewer_scroll(0);
     }
 
-    pub(super) fn viewer_wheel(&mut self, lines: f32) {
+    fn viewer_wheel(&mut self, lines: f32) {
         self.viewer_scroll((-lines * 3.0).round() as isize);
     }
 
@@ -858,14 +895,14 @@ impl App {
         v.hit = None;
     }
 
-    pub(super) fn viewer_search_input(&mut self, text: String) {
+    fn viewer_search_input(&mut self, text: String) {
         if let Some(v) = &mut self.viewer {
             v.search = Some(text);
         }
     }
 
     /// Enter in the search box: remember the query, close the box, find.
-    pub(super) fn viewer_submit(&mut self) -> Task<Message> {
+    fn viewer_submit(&mut self) -> Task<Message> {
         if let Some(v) = &mut self.viewer {
             if let Some(q) = v.search.take() {
                 if q != v.query {
@@ -943,12 +980,12 @@ impl App {
                 });
                 rx.await.unwrap_or_else(|_| Err("search thread failed".into()))
             },
-            move |result| Message::ViewerFound(seq, result, token.clone()),
+            move |result| Message::Viewer(ViewerMsg::Found(seq, result, token.clone())),
         )
     }
 
     /// Result of a large-file search; `search` tells it from older ones.
-    pub(super) fn viewer_found(&mut self, seq: u64, result: Result<Option<Found>, String>, search: &Arc<AtomicBool>) {
+    fn viewer_found(&mut self, seq: u64, result: Result<Option<Found>, String>, search: &Arc<AtomicBool>) {
         let dims = (self.viewer_rows(), self.viewer_cols());
         let Some(v) = self.viewer.as_mut().filter(|v| v.seq == seq) else { return };
         if !Arc::ptr_eq(&v.cancel, search) || search.load(Ordering::Relaxed) {
@@ -1049,13 +1086,13 @@ impl App {
             body = body.interaction(mouse::Interaction::Grab);
         }
         let body = body
-            .on_move(|at| Message::ViewerPointer(Some(at)))
-            .on_exit(Message::ViewerPointer(None))
+            .on_move(|at| Message::Viewer(ViewerMsg::Pointer(Some(at))))
+            .on_exit(Message::Viewer(ViewerMsg::Pointer(None)))
             .on_scroll(|delta| {
-                Message::ViewerWheel(match delta {
+                Message::Viewer(ViewerMsg::Wheel(match delta {
                     mouse::ScrollDelta::Lines { y, .. } => y,
                     mouse::ScrollDelta::Pixels { y, .. } => y / LINE_H / 3.0,
-                })
+                }))
             });
 
         let mut page = column![header, body];
@@ -1066,8 +1103,8 @@ impl App {
                         text("Find:").size(13),
                         text_input("text to find", query)
                             .id(search_input_id())
-                            .on_input(Message::ViewerSearch)
-                            .on_submit(Message::ViewerFind)
+                            .on_input(|text| Message::Viewer(ViewerMsg::Search(text)))
+                            .on_submit(Message::Viewer(ViewerMsg::Find))
                             .padding(5)
                             .size(13)
                             .style(theme::input),
@@ -1176,7 +1213,7 @@ impl App {
             // The bar's end is the file's end (the visible bytes are only estimated).
             let end = total - visible;
             scrollbar::attach(lines, offset, visible, total, move |at| {
-                Message::ViewerSeek(if at >= end { f32::INFINITY } else { at })
+                Message::Viewer(ViewerMsg::Seek(if at >= end { f32::INFINITY } else { at }))
             })
         })
         .into()
@@ -1193,7 +1230,7 @@ fn zoomed_image<'a>(handle: &'a image::Handle, w: f32, h: f32, zoom: f32) -> Ele
             .id(image_scroll_id())
             .direction(Direction::Both { vertical: scrollbar::bar(), horizontal: scrollbar::bar() })
             .style(scrollbar::style)
-            .on_scroll(|viewport| Message::ViewerPanned(viewport.absolute_offset()))
+            .on_scroll(|viewport| Message::Viewer(ViewerMsg::Panned(viewport.absolute_offset())))
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
