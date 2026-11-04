@@ -13,6 +13,7 @@ mod screen;
 mod find_files;
 mod multi_rename;
 mod settings;
+mod term;
 mod thumbs;
 mod update;
 mod viewer;
@@ -183,10 +184,15 @@ pub struct App {
     nav: [Option<PendingNav>; 2],
     /// The full-window tool covering the panels while open: viewer (F3),
     /// multi-rename (Ctrl+M), compare files (Alt+F2), find files (Alt+F7),
-    /// connect (Ctrl+F), help (F1) or settings (F10). See `screen.rs`.
+    /// connect (Ctrl+F), help (F1), settings (F10) or a built-in terminal
+    /// (F9). See `screen.rs`.
     screen: Option<Screen>,
     /// The closed find tool (fields and results), kept for the next Alt+F7.
     find_last: Option<find_files::FindFiles>,
+    /// Built-in terminals (F9), running whether shown or not; `Screen::Term`
+    /// names the one shown.
+    terms: Vec<term::TermSession>,
+    next_term_id: u64,
     /// (folder, name): put the cursor on `name` once a background listing
     /// of `folder` arrives (after a job on a server).
     focus_after_listing: Vec<(PathBuf, String)>,
@@ -483,6 +489,7 @@ pub enum Message {
     MultiRename(multi_rename::MrMsg),
     FileDiff(file_diff::DiffMsg),
     Find(find_files::FindMsg),
+    Term(term::TermMsg),
     Connect(connect::ConnectMsg),
     Settings(settings::SettingsMsg),
     Update(update::UpdateMsg),
@@ -599,6 +606,8 @@ impl App {
             nav: [None, None],
             screen: None,
             find_last: None,
+            terms: Vec::new(),
+            next_term_id: 1,
             focus_after_listing: Vec::new(),
             rename_opts: rc_core::rename::Options::default(),
             rename_undo: Vec::new(),
@@ -711,6 +720,8 @@ impl App {
             dirs.push(config);
         }
         subs.push(watch::folders(dirs).map(Message::FsChanged));
+        // Each built-in terminal's output, shown or not.
+        subs.extend(self.terms.iter().map(term::TermSession::events));
         Subscription::batch(subs)
     }
 
@@ -1074,6 +1085,7 @@ impl App {
                 }
                 self.archive_edits_flush();
                 self.save_session();
+                self.close_terms();
                 return iced::exit();
             }
             // Minimising reports a zero size; keep the last real one.
@@ -1254,6 +1266,7 @@ impl App {
             Message::MultiRename(msg) => return self.multi_rename_update(msg),
             Message::FileDiff(msg) => return self.file_diff_update(msg),
             Message::Find(msg) => return self.find_update(msg),
+            Message::Term(msg) => return self.term_update(msg),
             Message::Connect(msg) => return self.connect_update(msg),
             Message::Settings(msg) => return self.settings_update(msg),
             Message::Update(msg) => return self.update_msg(msg),
@@ -1372,6 +1385,7 @@ impl App {
                 // typed letters arrive here.
                 Some(Screen::Viewer(_)) if captured && !escape => Task::none(),
                 Some(Screen::Viewer(_)) => self.viewer_key(&key, mods),
+                Some(Screen::Term(_)) => self.term_key(&key, mods, text.as_deref()),
                 None => Task::none(),
             };
         }
@@ -1640,6 +1654,8 @@ impl App {
             MakeDir => return self.open_dialog(Dialog::MakeDir { input: String::new() }),
             Pack => return self.open_pack(),
             Unpack => return self.open_unpack(),
+            InternalTerminal => return self.open_term(),
+            ToggleTerminal => return self.toggle_term(),
             Terminal => {
                 self.open_terminal();
                 return Task::none();
@@ -3220,7 +3236,7 @@ impl App {
         });
     }
 
-    /// F9: a terminal in the active panel's folder (the nearest real one
+    /// Ctrl+F9: an external terminal in the active panel's folder (the nearest real one
     /// above an archive or server location).
     fn open_terminal(&mut self) {
         self.refresh_config();

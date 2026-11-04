@@ -151,8 +151,14 @@ commands! {
         Pack => "cm_PackFiles", "Pack the selected files into a zip archive in the other panel", "Pack";
         /// Unpack the selected archives into the other panel (Alt+F9).
         Unpack => "cm_UnpackFiles", "Unpack the selected archives (zip, 7z, tar, gz) into the other panel", "Unpack";
-        /// Open a terminal in the active panel's folder (F9).
-        Terminal => "cm_ExecuteDOS", "Open a terminal in this folder (the \"terminal\" setting)", "Term";
+        /// Open the built-in terminal in the active panel's folder (F9), or
+        /// show the one already running.
+        InternalTerminal => "cm_InternalTerminal", "Open a built-in terminal in this folder (the \"builtin_shell\" setting)", "Term";
+        /// Switch between the panels and the built-in terminal (Ctrl+Shift+F9);
+        /// the one key the terminal doesn't pass on to the shell.
+        ToggleTerminal => "cm_ToggleTerminal", "Switch between the panels and the built-in terminal (it keeps running)", "Switch";
+        /// Open an external terminal in the active panel's folder (Ctrl+F9).
+        Terminal => "cm_ExecuteDOS", "Open an external terminal in this folder (the \"terminal\" setting)", "Term";
         /// Delete to the recycle bin.
         Delete => "cm_Delete", "Delete to the recycle bin", "Delete";
         /// Delete permanently (Shift+F8 / Shift+Del).

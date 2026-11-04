@@ -27,6 +27,10 @@ fn terminal_id() -> text_input::Id {
     text_input::Id::new("settings-terminal")
 }
 
+fn shell_id() -> text_input::Id {
+    text_input::Id::new("settings-shell")
+}
+
 fn editor_id() -> text_input::Id {
     text_input::Id::new("settings-editor")
 }
@@ -64,17 +68,23 @@ impl Page {
 }
 
 /// Rows of the General page.
-const GENERAL_ROWS: usize = 11;
+const GENERAL_ROWS: usize = 12;
 const ROW_EDITOR: usize = 0;
 const ROW_TERMINAL: usize = 1;
-const ROW_HIDDEN: usize = 2;
-const ROW_FKEYS: usize = 3;
-const ROW_TREE: usize = 4;
-const ROW_UPDATES: usize = 5;
-const ROW_RENDER: usize = 6;
-/// Compare options 0..3 (`toggle_compare_option`) are rows 7..10.
-const ROW_COMPARE: usize = 7;
-const ROW_CONFIG: usize = 10;
+const ROW_SHELL: usize = 2;
+const ROW_HIDDEN: usize = 3;
+const ROW_FKEYS: usize = 4;
+const ROW_TREE: usize = 5;
+const ROW_UPDATES: usize = 6;
+const ROW_RENDER: usize = 7;
+/// Compare options 0..3 (`toggle_compare_option`) are rows 8..11.
+const ROW_COMPARE: usize = 8;
+const ROW_CONFIG: usize = 11;
+
+/// General rows that are text boxes (Enter there saves instead of toggling).
+fn text_row(row: usize) -> bool {
+    matches!(row, ROW_EDITOR | ROW_TERMINAL | ROW_SHELL)
+}
 
 #[derive(Debug, Clone)]
 pub enum SettingsMsg {
@@ -100,6 +110,8 @@ pub enum SettingsMsg {
     BrowseTerminal,
     PickedTerminal(Option<std::path::PathBuf>),
     Terminal(String),
+    /// The built-in terminal's shell command being typed.
+    Shell(String),
     ShowHidden(bool),
     ShowFkeys(bool),
     HotlistTree(bool),
@@ -174,6 +186,8 @@ pub(super) struct Settings {
     terminal: String,
     /// Installed terminals found on this machine (filled in the background).
     terminals: Vec<rc_platform::FoundTerminal>,
+    /// The built-in terminal's shell command being typed.
+    shell: String,
     /// The colours being typed, by `theme::NAMES` index.
     hex: Vec<String>,
     capture: Option<Capture>,
@@ -199,6 +213,7 @@ impl App {
             editors: Vec::new(),
             terminal: self.config.terminal.clone(),
             terminals: Vec::new(),
+            shell: self.config.builtin_shell.clone(),
             hex: current_hex(),
             capture: None,
             picker: None,
@@ -257,7 +272,7 @@ impl App {
         Task::none()
     }
 
-    /// Saves changed editor / terminal commands (on Enter, leaving the page, closing).
+    /// Saves changed editor / terminal / shell commands (on Enter, leaving the page, closing).
     fn settings_save_editor(&mut self) {
         let Some(s) = self.screen.settings() else { return };
         if s.editor != self.config.editor {
@@ -268,6 +283,11 @@ impl App {
         if s.terminal != self.config.terminal {
             let terminal = s.terminal.trim().to_owned();
             self.settings_write(&[Edit::Text("terminal", terminal)], "Terminal saved".into());
+        }
+        let Some(s) = self.screen.settings() else { return };
+        if s.shell != self.config.builtin_shell {
+            let shell = s.shell.trim().to_owned();
+            self.settings_write(&[Edit::Text("builtin_shell", shell)], "Built-in terminal shell saved".into());
         }
     }
 
@@ -325,6 +345,7 @@ impl App {
                 ROW_TERMINAL => {
                     Task::batch([text_input::focus(terminal_id()), text_input::move_cursor_to_end(terminal_id())])
                 }
+                ROW_SHELL => Task::batch([text_input::focus(shell_id()), text_input::move_cursor_to_end(shell_id())]),
                 ROW_HIDDEN => self.settings_update(SettingsMsg::ShowHidden(!self.config.show_hidden)),
                 ROW_FKEYS => self.settings_update(SettingsMsg::ShowFkeys(!self.config.show_fkeys)),
                 ROW_TREE => self.settings_update(SettingsMsg::HotlistTree(!self.config.hotlist_tree)),
@@ -432,15 +453,16 @@ impl App {
                 }
                 // A second click on a row acts like Enter (toggles a switch,
                 // waits for a key, picks the next theme).
-                if again && !(s.page == Page::General && matches!(i, ROW_EDITOR | ROW_TERMINAL)) && !(s.page == Page::Colors && i > 0) {
+                if again && !(s.page == Page::General && text_row(i)) && !(s.page == Page::Colors && i > 0) {
                     return self.settings_activate();
                 }
-                if s.page == Page::General && !matches!(i, ROW_EDITOR | ROW_TERMINAL) {
+                if s.page == Page::General && !text_row(i) {
                     self.settings_save_editor();
                 }
             }
             SettingsMsg::Editor(value) => s.editor = value,
             SettingsMsg::Terminal(value) => s.terminal = value,
+            SettingsMsg::Shell(value) => s.shell = value,
             SettingsMsg::SaveEditor => {
                 self.settings_save_editor();
                 return blur();
@@ -764,7 +786,7 @@ impl App {
             },
         }
         s.reset_all = false;
-        if page == Page::General && matches!(row, ROW_EDITOR | ROW_TERMINAL) {
+        if page == Page::General && text_row(row) {
             self.settings_save_editor();
         }
         Task::batch([blur(), self.settings_snap()])
@@ -828,6 +850,13 @@ impl App {
                     .padding(5)
                     .size(13)
                     .style(theme::input);
+                let shell = text_input(&format!("Empty: {}", crate::config::DEFAULT_BUILTIN_SHELL), &s.shell)
+                    .id(shell_id())
+                    .on_input(move |v| msg(SettingsMsg::Shell(v)))
+                    .on_submit(msg(SettingsMsg::SaveEditor))
+                    .padding(5)
+                    .size(13)
+                    .style(theme::input);
                 let browse = button(text("Browse...").size(13))
                     .on_press(msg(SettingsMsg::Browse))
                     .padding([3, 12])
@@ -886,11 +915,20 @@ impl App {
                     row![label("Installed editors"), detected].spacing(8).padding([3, 14]),
                     line(
                         ROW_TERMINAL,
-                        row![label("Terminal for F9"), terminal, browse_terminal].spacing(8).align_y(Alignment::Center).into()
+                        row![label("External terminal (Ctrl+F9)"), terminal, browse_terminal]
+                            .spacing(8)
+                            .align_y(Alignment::Center)
+                            .into()
                     ),
                     container(hint("Starts in the panel's folder; %1 is that folder (optional). Enter saves.".into()))
                         .padding([0, 14 + LABEL_W as u16 + 8]),
                     row![label("Installed terminals"), detected_terminals].spacing(8).padding([3, 14]),
+                    line(
+                        ROW_SHELL,
+                        row![label("Built-in terminal shell (F9)"), shell].spacing(8).align_y(Alignment::Center).into()
+                    ),
+                    container(hint("A program and arguments, started in the panel's folder; for new terminals. Enter saves.".into()))
+                        .padding([0, 14 + LABEL_W as u16 + 8]),
                     line(
                         ROW_HIDDEN,
                         row![

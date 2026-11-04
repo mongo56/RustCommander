@@ -21,6 +21,12 @@ unicode-segmentation = "1"
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 serde_json = "1"
 sha2 = "0.11"
+# Built-in terminal (F9): VT parser, grid and ConPTY I/O thread; we draw the grid.
+alacritty_terminal = "=0.26.0"
+
+[target.'cfg(windows)'.dependencies]
+# SetDllDirectoryW for the built-in terminal (same version as alacritty_terminal's).
+windows-sys = { version = "0.59", features = ["Win32_System_LibraryLoader"] }
 
 [build-dependencies]
 png = "0.17"

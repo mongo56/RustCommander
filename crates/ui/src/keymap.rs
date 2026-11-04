@@ -366,7 +366,7 @@ const DEFAULTS: &[(&str, Command)] = {
         ("f6", Move),
         ("f7", MakeDir),
         ("f8", Delete),
-        ("f9", Terminal),
+        ("f9", InternalTerminal),
         ("f10", Configuration),
         // Shift+cursor keys move and extend the selection from the anchor
         // (`App::run` checks the Shift state).
@@ -403,6 +403,7 @@ const DEFAULTS: &[(&str, Command)] = {
         ("alt+f7", FindFiles),
         ("shift+f8", DeletePermanent),
         ("alt+f9", Unpack),
+        ("ctrl+f9", Terminal),
         ("ctrl+a", SelectAll),
         ("ctrl+c", CopyToClipboard),
         ("ctrl+d", Hotlist),
@@ -423,6 +424,7 @@ const DEFAULTS: &[(&str, Command)] = {
         ("ctrl+shift+tab", PrevTab),
         ("ctrl+shift+f2", CompareDirsOptions),
         ("ctrl+shift+f5", Thumbnails),
+        ("ctrl+shift+f9", ToggleTerminal),
         ("ctrl+shift+f", Disconnect),
         ("ctrl+shift+d", HotlistTree),
     ]
@@ -532,7 +534,10 @@ mod tests {
             ("shift+f8", Some(DeletePermanent)),
             ("delete", Some(Delete)),
             ("shift+delete", Some(DeletePermanent)),
-            ("f9", Some(Terminal)),
+            ("f9", Some(InternalTerminal)),
+            ("ctrl+f9", Some(Terminal)),
+            ("ctrl+shift+f9", Some(ToggleTerminal)),
+            ("shift+f9", None),
             ("alt+f9", Some(Unpack)),
             ("f10", Some(Configuration)),
             ("enter", Some(Open)),

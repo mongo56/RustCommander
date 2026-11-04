@@ -14,10 +14,14 @@ pub struct Config {
     /// Editor for F4: a program, optionally with arguments; `%1` stands for
     /// the file (appended when missing). Empty = the platform default.
     pub editor: String,
-    /// Terminal for F9: a program, optionally with arguments; `%1` stands
-    /// for the folder (optional: it is the working directory anyway).
+    /// External terminal for Ctrl+F9: a program, optionally with arguments;
+    /// `%1` stands for the folder (optional: it is the working directory anyway).
     /// Empty = Windows Terminal / PowerShell, else $TERMINAL.
     pub terminal: String,
+    /// Shell of the built-in terminal (F9): a program, optionally with
+    /// arguments, started in the active panel's folder. Empty = see
+    /// [`Config::builtin_shell`].
+    pub builtin_shell: String,
     /// Colour theme: a `theme::PRESETS` id; empty = dark.
     pub theme: String,
     /// Hidden files shown at the first start (no session yet); the
@@ -64,6 +68,7 @@ impl Default for Config {
         Self {
             editor: String::new(),
             terminal: String::new(),
+            builtin_shell: String::new(),
             theme: String::new(),
             show_hidden: false,
             show_fkeys: false,
@@ -97,6 +102,12 @@ impl Config {
         if self.thumbnail_size == 0 { 128 } else { self.thumbnail_size.clamp(32, 512) }
     }
 
+    /// The built-in terminal's shell command line: `builtin_shell`, or
+    /// `powershell.exe -NoLogo` (elsewhere `$SHELL`, else `/bin/sh`) when empty.
+    pub fn builtin_shell(&self) -> String {
+        builtin_shell_or_default(&self.builtin_shell, cfg!(windows), std::env::var("SHELL").ok())
+    }
+
     /// The theme preset with the `[colors]` overrides on top.
     pub fn colors(&self) -> Result<crate::theme::Colors, String> {
         let preset = crate::theme::preset(&self.theme).ok_or_else(|| format!("unknown theme \"{}\"", self.theme))?;
@@ -104,10 +115,21 @@ impl Config {
     }
 }
 
+fn builtin_shell_or_default(setting: &str, windows: bool, shell_env: Option<String>) -> String {
+    match setting.trim() {
+        "" if windows => DEFAULT_BUILTIN_SHELL.to_owned(),
+        "" => shell_env.filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "/bin/sh".into()),
+        s => s.to_owned(),
+    }
+}
+
+/// The built-in terminal's shell on Windows when `builtin_shell` is empty.
+pub const DEFAULT_BUILTIN_SHELL: &str = "powershell.exe -NoLogo";
+
 /// One change to `config.toml`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Edit {
-    /// A top-level text setting (`editor`, `terminal`, `theme`).
+    /// A top-level text setting (`editor`, `terminal`, `builtin_shell`, `theme`).
     Text(&'static str, String),
     /// A top-level switch (`show_hidden`).
     Flag(&'static str, bool),
@@ -330,11 +352,17 @@ fn template(editor: &str, compare: CompareState) -> String {
          # Example: editor = '\"C:\\Program Files\\Notepad++\\notepad++.exe\" -multiInst %1'\n\
          editor = {editor}\n\
          \n\
-         # Terminal for F9: a program, optionally with arguments; it starts in the\n\
-         # active panel's folder. %1 stands for that folder (optional).\n\
+         # External terminal for Ctrl+F9: a program, optionally with arguments; it\n\
+         # starts in the active panel's folder. %1 stands for that folder (optional).\n\
          # Empty = Windows Terminal if installed, else PowerShell; elsewhere $TERMINAL\n\
          # or x-terminal-emulator. Example: terminal = 'wt.exe -d %1'\n\
          terminal = \"\"\n\
+         \n\
+         # Shell of the built-in terminal (F9; Ctrl+F9 opens the external one above):\n\
+         # a program, optionally with arguments; it starts in the active panel's\n\
+         # folder. Empty = powershell.exe -NoLogo (elsewhere $SHELL).\n\
+         # Examples: builtin_shell = 'pwsh.exe -NoLogo', builtin_shell = 'cmd.exe'\n\
+         builtin_shell = \"\"\n\
          \n\
          # Show hidden files at the first start (Ctrl+H toggles them per tab).\n\
          show_hidden = false\n\
@@ -474,7 +502,20 @@ mod tests {
     #[test]
     fn missing_keys_default_and_typos_fail() {
         assert_eq!(parse("").unwrap().editor, "");
+        assert_eq!(parse("").unwrap().builtin_shell, "");
         assert!(parse("editor = ").is_err());
+    }
+
+    #[test]
+    fn builtin_shell_defaults() {
+        assert_eq!(builtin_shell_or_default("", true, None), "powershell.exe -NoLogo");
+        assert_eq!(builtin_shell_or_default("  ", true, Some("/bin/zsh".into())), "powershell.exe -NoLogo");
+        assert_eq!(builtin_shell_or_default("", false, Some("/bin/zsh".into())), "/bin/zsh");
+        assert_eq!(builtin_shell_or_default("", false, None), "/bin/sh");
+        assert_eq!(builtin_shell_or_default(" cmd.exe /k ", true, None), "cmd.exe /k");
+        let config = parse(&template("", CompareState::default())).unwrap();
+        assert_eq!(config.builtin_shell, "");
+        assert_eq!(parse("builtin_shell = 'pwsh -NoLogo'").unwrap().builtin_shell, "pwsh -NoLogo");
     }
 
     const OLD: CompareState = CompareState { by_content: true, ignore_date: false, subfolders: true };

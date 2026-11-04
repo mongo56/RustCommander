@@ -66,6 +66,7 @@ impl App {
             Some(Screen::FileDiff(d)) => self.file_diff_view(d),
             Some(Screen::MultiRename(mr)) => self.multi_rename_view(mr),
             Some(Screen::Viewer(v)) => self.viewer_view(v),
+            Some(Screen::Term(id)) => self.term_view(*id),
             None => container(column![panels, hline(), self.jobs_view(), self.bottom_bar()])
                 .width(Length::Fill)
                 .height(Length::Fill)

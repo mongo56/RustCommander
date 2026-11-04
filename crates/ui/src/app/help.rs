@@ -101,6 +101,7 @@ pub(super) fn sections(keymap: &keymap::Keymap) -> Vec<Section> {
         fixed("Compare files (Alt+F2)", App::DIFF_KEYS),
         fixed("Find files (Alt+F7)", App::FIND_KEYS),
         fixed("Connect to server (Ctrl+F)", App::CONNECT_KEYS),
+        fixed("Built-in terminal (F9)", App::TERM_KEYS),
         fixed("Settings (F10)", App::SETTINGS_KEYS),
     ]
 }

@@ -51,7 +51,7 @@ pub(crate) fn command_line(command: &str, path: &Path, append: bool) -> Option<(
 }
 
 /// Splits on whitespace outside double quotes; quotes are removed.
-fn split(command: &str) -> Vec<String> {
+pub(crate) fn split(command: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut word = String::new();
     let (mut quoted, mut started) = (false, false);

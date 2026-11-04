@@ -1,6 +1,7 @@
-//! Terminal for F9, opened in the active panel's folder. The command line
-//! comes from `terminal` in `config.toml`, e.g. `wt -d %1`; `%1` stands for
-//! the folder (it is always the working directory, so `%1` is optional).
+//! External terminal for Ctrl+F9 (F9 is the built-in one, `app/term.rs`),
+//! opened in the active panel's folder. The command line comes from
+//! `terminal` in `config.toml`, e.g. `wt -d %1`; `%1` stands for the folder
+//! (it is always the working directory, so `%1` is optional).
 
 use std::io;
 use std::path::Path;

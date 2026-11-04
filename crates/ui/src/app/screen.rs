@@ -7,6 +7,8 @@
 
 use super::{connect, file_diff, find_files, help, multi_rename, settings, viewer};
 
+/// `Term` names the built-in terminal shown (`App::terms` holds them all,
+/// shown or not).
 pub(super) enum Screen {
     Help(help::Help),
     Settings(Box<settings::Settings>),
@@ -15,6 +17,7 @@ pub(super) enum Screen {
     MultiRename(Box<multi_rename::MultiRename>),
     FileDiff(Box<file_diff::FileDiff>),
     Viewer(Box<viewer::Viewer>),
+    Term(u64),
 }
 
 /// Typed access to the open tool, on the `App::screen` field itself (not on
@@ -37,6 +40,7 @@ pub(super) trait ScreenSlot {
     fn viewer(&self) -> Option<&viewer::Viewer>;
     fn viewer_mut(&mut self) -> Option<&mut viewer::Viewer>;
     fn take_viewer(&mut self) -> Option<viewer::Viewer>;
+    fn term(&self) -> Option<&u64>;
 }
 
 macro_rules! get {
@@ -93,4 +97,5 @@ impl ScreenSlot for Option<Screen> {
     get!(viewer, Viewer, viewer::Viewer);
     get_mut!(viewer_mut, Viewer, viewer::Viewer);
     take!(take_viewer, Viewer, viewer::Viewer);
+    get!(term, Term, u64);
 }
