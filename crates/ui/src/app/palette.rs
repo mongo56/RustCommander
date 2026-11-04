@@ -48,7 +48,7 @@ fn word_start(hay: &str, i: usize) -> bool {
 /// How well one lower-case query word matches a command (lower is better),
 /// `None` if it doesn't: 0 = a whole key (`f7`) or the start of the
 /// description or id, 1 = the start of a word in them, 2 = anywhere.
-fn word_score(word: &str, cmd: Command, keys: &str) -> Option<u32> {
+pub(super) fn word_score(word: &str, cmd: Command, keys: &str) -> Option<u32> {
     let id = cmd.id().strip_prefix("cm_").unwrap_or(cmd.id());
     let texts = [cmd.description(), id, keys];
     if keys.split(", ").any(|k| k.eq_ignore_ascii_case(word)) {

@@ -35,8 +35,35 @@ fn editor_id() -> text_input::Id {
     text_input::Id::new("settings-editor")
 }
 
+fn filter_id() -> text_input::Id {
+    text_input::Id::new("settings-filter")
+}
+
 fn hex_id(i: usize) -> text_input::Id {
     text_input::Id::new(format!("settings-hex-{i}"))
+}
+
+/// The commands the key bindings page lists: those matching the words typed in
+/// the filter box (in the description, the id or the keys, like the command
+/// palette; every word must match), in the usual order. Empty on other pages.
+fn shown_commands(keymap: &keymap::Keymap, s: &Settings) -> Vec<Command> {
+    if s.page != Page::Keys {
+        return Vec::new();
+    }
+    filter_commands(&s.filter, &keymap.bindings())
+}
+
+/// `Command::ALL` narrowed to the commands matching `query` (all when it has no words).
+fn filter_commands(query: &str, bindings: &[(String, Command)]) -> Vec<Command> {
+    let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+    Command::ALL
+        .iter()
+        .copied()
+        .filter(|&cmd| {
+            let keys = keymap::Keymap::keys_for(bindings, cmd).join(", ");
+            words.iter().all(|w| palette::word_score(w, cmd, &keys).is_some())
+        })
+        .collect()
 }
 
 /// Focusing an id no widget has takes the focus from every text box.
@@ -112,6 +139,8 @@ pub enum SettingsMsg {
     Terminal(String),
     /// The built-in terminal's shell command being typed.
     Shell(String),
+    /// The key bindings filter being typed.
+    Filter(String),
     ShowHidden(bool),
     ShowFkeys(bool),
     HotlistTree(bool),
@@ -190,6 +219,8 @@ pub(super) struct Settings {
     shell: String,
     /// The colours being typed, by `theme::NAMES` index.
     hex: Vec<String>,
+    /// The key bindings filter (not saved).
+    filter: String,
     capture: Option<Capture>,
     picker: Option<Picker>,
     /// Ctrl+R pressed once on the keys page (twice resets every key).
@@ -215,6 +246,7 @@ impl App {
             terminals: Vec::new(),
             shell: self.config.builtin_shell.clone(),
             hex: current_hex(),
+            filter: String::new(),
             capture: None,
             picker: None,
             reset_all: false,
@@ -229,10 +261,11 @@ impl App {
         ])
     }
 
-    fn rows_of(page: Page) -> usize {
+    /// Rows of `page`; `shown` is the number of key bindings the filter lets through.
+    fn rows_of(page: Page, shown: usize) -> usize {
         match page {
             Page::General => GENERAL_ROWS,
-            Page::Keys => Command::ALL.len(),
+            Page::Keys => shown,
             // The theme row, then the colours.
             Page::Colors => 1 + theme::NAMES.len(),
         }
@@ -319,7 +352,7 @@ impl App {
     /// Keeps the selected row in view.
     fn settings_snap(&self) -> Task<Message> {
         let Some(s) = self.screen.settings() else { return Task::none() };
-        let rows = Self::rows_of(s.page);
+        let rows = Self::rows_of(s.page, shown_commands(&self.keymap, s).len());
         let y = if rows > 1 { s.row[s.page.index()] as f32 / (rows - 1) as f32 } else { 0.0 };
         scrollable::snap_to(list_id(), RelativeOffset { x: 0.0, y })
     }
@@ -439,12 +472,13 @@ impl App {
         if !matches!(msg, SettingsMsg::ResetAllKeys) {
             s.reset_all = false;
         }
-        // The command selected on the keys page.
-        let selected = Command::ALL.get(s.row[Page::Keys.index()]).copied();
+        // The commands the keys page lists and the selected one.
+        let shown = shown_commands(&self.keymap, s);
+        let selected = shown.get(s.row[Page::Keys.index()]).copied();
         match msg {
             SettingsMsg::Page(page) => return self.settings_page(page),
             SettingsMsg::Click(i) => {
-                let i = i.min(Self::rows_of(s.page) - 1);
+                let i = i.min(Self::rows_of(s.page, shown.len()).saturating_sub(1));
                 let again = s.row[s.page.index()] == i;
                 s.row[s.page.index()] = i;
                 if s.capture.is_some() {
@@ -463,6 +497,12 @@ impl App {
             SettingsMsg::Editor(value) => s.editor = value,
             SettingsMsg::Terminal(value) => s.terminal = value,
             SettingsMsg::Shell(value) => s.shell = value,
+            SettingsMsg::Filter(value) => {
+                s.filter = value;
+                s.row[Page::Keys.index()] = 0;
+                s.note = None;
+                return scrollable::snap_to(list_id(), RelativeOffset::START);
+            }
             SettingsMsg::SaveEditor => {
                 self.settings_save_editor();
                 return blur();
@@ -569,6 +609,8 @@ impl App {
                 s.capture = Some(Capture { cmd, add, taken: None });
                 let what = if add { "to add" } else { "for" };
                 s.note = Some((format!("Press the key combination {what} \"{}\" (Esc cancels)", cmd.description()), Tone::Info));
+                // The filter box may have the focus: it must not take the key.
+                return blur();
             }
             SettingsMsg::Confirm => {
                 if let Some((name, _)) = s.capture.as_ref().and_then(|c| c.taken.clone()) {
@@ -701,6 +743,7 @@ impl App {
         ("Tab, Shift+Tab, Ctrl+Tab", "Next / previous page: General, Key bindings, Colours"),
         ("Up, Down, PgUp, PgDn, Home, End", "Pick a row"),
         ("Enter, Space, click twice", "Change the row: edit the text, flip the switch, next theme"),
+        ("Ctrl+F, / (key bindings)", "Type in the filter box: words of the description, id or key (F7); Esc clears it"),
         ("Enter (key bindings)", "Press a key combination for the command (replaces its keys)"),
         ("Ins, A (key bindings)", "Add one more key combination"),
         ("Enter (a key that's taken)", "Take the key from the other command"),
@@ -734,19 +777,33 @@ impl App {
             self.settings_capture_key(named, key, mods);
             return Task::none();
         }
-        // Keys a text box used (typing, Enter, Esc leaving it).
+        // Keys a text box used (typing, Enter, Esc leaving it). On the keys
+        // page the filter box is the only one: its Esc clears the text first,
+        // and Enter (the box has no submit) binds the selected command's key.
         if captured {
+            if s.page == Page::Keys {
+                match named {
+                    Some(Named::Escape) if !s.filter.is_empty() => {
+                        s.filter.clear();
+                        s.row[Page::Keys.index()] = 0;
+                        // The box lost the focus with the Esc: it keeps it while it has text to clear.
+                        return Task::batch([text_input::focus(filter_id()), scrollable::snap_to(list_id(), RelativeOffset::START)]);
+                    }
+                    Some(Named::Enter) => return self.settings_activate(),
+                    _ => {}
+                }
+            }
             return Task::none();
         }
         let page = s.page;
-        let rows = Self::rows_of(page);
+        let rows = Self::rows_of(page, shown_commands(&self.keymap, s).len());
         let row = s.row[page.index()];
         let ch = match key {
             keyboard::Key::Character(c) if !mods.alt() && !mods.logo() => Some(c.to_ascii_lowercase()),
             _ => None,
         };
         let go = |s: &mut Settings, to: isize| {
-            s.row[page.index()] = to.clamp(0, rows as isize - 1) as usize;
+            s.row[page.index()] = to.clamp(0, (rows as isize - 1).max(0)) as usize;
         };
         let page_rows = ((self.window_height - 160.0) / ROW_H).max(1.0) as isize;
         match named {
@@ -765,7 +822,9 @@ impl App {
             Some(Named::PageUp) => go(s, row as isize - page_rows),
             Some(Named::Home) => go(s, 0),
             Some(Named::End) => go(s, rows as isize),
-            Some(Named::Enter | Named::Space) if !mods.control() => return self.settings_activate(),
+            Some(Named::Enter | Named::Space) if !mods.control() && !(page == Page::Keys && rows == 0) => {
+                return self.settings_activate();
+            }
             Some(Named::ArrowLeft | Named::ArrowRight) if page == Page::Colors && row == 0 => {
                 let n = theme::PRESETS.len();
                 let i = theme::PRESETS.iter().position(|p| theme::preset(&self.config.theme).is_some_and(|q| q.id == p.id));
@@ -779,6 +838,9 @@ impl App {
                 return self.settings_update(SettingsMsg::ResetColor(row - 1));
             }
             _ => match (page, ch.as_deref(), mods.control()) {
+                (Page::Keys, Some("f"), true) | (Page::Keys, Some("/"), false) => {
+                    return Task::batch([text_input::focus(filter_id()), text_input::select_all(filter_id())]);
+                }
                 (Page::Keys, Some("a"), false) => return self.settings_update(SettingsMsg::Capture { add: true }),
                 (Page::Keys, Some("r"), false) => return self.settings_update(SettingsMsg::ResetKey),
                 (Page::Keys, Some("r"), true) => return self.settings_update(SettingsMsg::ResetAllKeys),
@@ -789,7 +851,9 @@ impl App {
         if page == Page::General && text_row(row) {
             self.settings_save_editor();
         }
-        Task::batch([blur(), self.settings_snap()])
+        // The filter box keeps the focus while the list is moved.
+        let leave = if page == Page::Keys { Task::none() } else { blur() };
+        Task::batch([leave, self.settings_snap()])
     }
 
     pub(super) fn settings_view<'a>(&'a self, s: &'a Settings) -> Element<'a, Message> {
@@ -816,6 +880,7 @@ impl App {
         .style(filled(colors.header));
 
         let selected = s.row[s.page.index()];
+        let shown = shown_commands(&self.keymap, s);
         // One clickable row; the selected one is highlighted.
         let line = move |i: usize, content: Element<'a, Message>| -> Element<'a, Message> {
             let bg = if i == selected {
@@ -1015,7 +1080,7 @@ impl App {
             Page::Keys => {
                 let bindings = self.keymap.bindings();
                 let capturing = s.capture.as_ref().map(|c| c.cmd);
-                let rows = Command::ALL.iter().enumerate().map(|(i, &cmd)| {
+                let rows = shown.iter().enumerate().map(|(i, &cmd)| {
                     let keys = keymap::Keymap::keys_for(&bindings, cmd).join(", ");
                     let (keys, color) = match capturing {
                         Some(c) if c == cmd => ("Press a key...".to_owned(), colors.accent),
@@ -1037,7 +1102,11 @@ impl App {
                         .into(),
                     )
                 });
-                Column::with_children(rows).into()
+                if shown.is_empty() {
+                    container(text("No command matches").size(13).color(colors.muted)).padding([8, 14]).into()
+                } else {
+                    Column::with_children(rows).into()
+                }
             }
             Page::Colors => {
                 let current = theme::preset(&self.config.theme);
@@ -1111,7 +1180,21 @@ impl App {
                 list.into()
             }
         };
-        let body = container(scrollbar::thin(body).id(list_id()).height(Length::Fill))
+        let list: Element<'a, Message> = scrollbar::thin(body).id(list_id()).height(Length::Fill).into();
+        let body: Element<'a, Message> = if s.page == Page::Keys {
+            let filter = text_input("Filter: words of the description, id or key (Ctrl+F or /)", &s.filter)
+                .id(filter_id())
+                .on_input(move |v| msg(SettingsMsg::Filter(v)))
+                .padding(5)
+                .size(13)
+                .style(theme::input);
+            let count = format!("{} of {}", shown.len(), Command::ALL.len());
+            let bar = row![filter, text(count).size(12).color(colors.muted)].spacing(10).align_y(Alignment::Center);
+            column![container(bar).padding([6, 14]).style(filled(colors.header)), list].into()
+        } else {
+            list
+        };
+        let body = container(body)
             .width(Length::Fill)
             .height(Length::Fill)
             .style(filled(colors.panel));
@@ -1128,7 +1211,7 @@ impl App {
             None => (
                 match s.page {
                     Page::General => "Tab next page \u{b7} Up/Down pick \u{b7} Enter/Space change \u{b7} Esc close",
-                    Page::Keys => "Enter set key \u{b7} Ins add key \u{b7} Del remove keys \u{b7} R default \u{b7} Ctrl+R all defaults \u{b7} Esc close",
+                    Page::Keys => "Ctrl+F or / filter \u{b7} Enter set key \u{b7} Ins add key \u{b7} Del remove keys \u{b7} R default \u{b7} Ctrl+R all defaults \u{b7} Esc close",
                     Page::Colors => "Left/Right theme \u{b7} Enter edit colour \u{b7} Del theme's colour \u{b7} Tab next page \u{b7} Esc close",
                 }
                 .to_owned(),
@@ -1223,4 +1306,34 @@ fn off_thread<T: Send + 'static>(work: fn() -> T, done: fn(T) -> Message) -> Tas
         },
         move |r| r.map_or(Message::Settings(SettingsMsg::Nothing), done),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn found(query: &str) -> Vec<Command> {
+        filter_commands(query, &keymap::Keymap::default().bindings())
+    }
+
+    #[test]
+    fn empty_filter_lists_every_command_in_order() {
+        assert_eq!(found(""), Command::ALL.to_vec());
+        assert_eq!(found("  "), Command::ALL.to_vec());
+    }
+
+    #[test]
+    fn filter_matches_description_id_and_keys() {
+        let terminal = found("terminal");
+        assert!(terminal.len() >= 2, "{terminal:?}");
+        let f7 = found("f7");
+        assert!(f7.contains(&Command::MakeDir));
+        assert!(f7.len() < Command::ALL.len());
+        assert!(found("MKDIR").contains(&Command::MakeDir));
+        assert!(found("new tab").contains(&Command::NewTab));
+        assert!(found("zzzz").is_empty());
+        // The usual order is kept.
+        let at = |c: Command| Command::ALL.iter().position(|&x| x == c);
+        assert!(found("copy").windows(2).all(|w| at(w[0]) < at(w[1])));
+    }
 }
