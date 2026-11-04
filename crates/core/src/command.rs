@@ -157,6 +157,16 @@ commands! {
         /// Switch between the panels and the built-in terminal (Ctrl+Shift+F9);
         /// the one key the terminal doesn't pass on to the shell.
         ToggleTerminal => "cm_ToggleTerminal", "Switch between the panels and the built-in terminal (it keeps running)", "Switch";
+        /// Open another built-in terminal in the active panel's folder (the
+        /// "+" of the sidebar; Ctrl+Shift+T).
+        NewTerminal => "cm_NewTerminal", "Open another built-in terminal in this folder", "NewTerm";
+        /// Next entry of the terminal sidebar: Files, terminal 1, 2, ... and
+        /// round again (Ctrl+Shift+Down).
+        NextTerminal => "cm_NextTerminal", "Show the next entry of the terminal sidebar (Files, terminal 1, 2, ...)", "NextTerm";
+        /// Previous entry of the terminal sidebar (Ctrl+Shift+Up).
+        PrevTerminal => "cm_PrevTerminal", "Show the previous entry of the terminal sidebar", "PrevTerm";
+        /// End the shown built-in terminal and close it (Ctrl+Shift+W).
+        CloseTerminal => "cm_CloseTerminal", "End the shown built-in terminal and close it", "CloseTerm";
         /// Open an external terminal in the active panel's folder (Ctrl+F9).
         Terminal => "cm_ExecuteTerm", "Open an external terminal in this folder (the \"terminal\" setting)", "Term";
         /// Delete to the recycle bin.

@@ -74,6 +74,12 @@ impl App {
                 .into(),
         };
 
+        let base: Element<'_, Message> = if self.term_side_w() > 0.0 {
+            row![base, self.term_side_view()].into()
+        } else {
+            base
+        };
+
         let modal = self
             .jobs
             .iter()
@@ -104,7 +110,7 @@ impl App {
     /// Width of the hotlist tree when shown: as set, kept narrow enough
     /// to leave both panels room.
     pub(super) fn tree_width(&self) -> f32 {
-        let max = (self.window_width - 2.0 * SPLIT_W - 2.0 * MIN_PANEL).max(MIN_TREE);
+        let max = (self.area_width() - 2.0 * SPLIT_W - 2.0 * MIN_PANEL).max(MIN_TREE);
         self.tree.width.clamp(MIN_TREE, max).round()
     }
 
@@ -120,14 +126,14 @@ impl App {
         if self.left_hidden() {
             return 0.0;
         }
-        let room = (self.window_width - self.panels_x() - SPLIT_W).max(1.0);
+        let room = (self.area_width() - self.panels_x() - SPLIT_W).max(1.0);
         let min = MIN_PANEL.min(room / 2.0);
         (room * self.split).clamp(min, room - min).round()
     }
 
     /// Moves the divider between the panels to window x.
     pub(super) fn drag_split_to(&mut self, x: f32) {
-        let room = (self.window_width - self.panels_x() - SPLIT_W).max(1.0);
+        let room = (self.area_width() - self.panels_x() - SPLIT_W).max(1.0);
         self.split = (x - self.panels_x() - SPLIT_W / 2.0) / room;
         self.split = self.left_width() / room;
     }
@@ -140,7 +146,7 @@ impl App {
     pub(super) fn panel_width(&self, side: usize) -> f32 {
         let left = self.left_width();
         let split = if self.left_hidden() { 0.0 } else { SPLIT_W };
-        if side == 0 { left } else { (self.window_width - self.panels_x() - split - left).max(1.0) }
+        if side == 0 { left } else { (self.area_width() - self.panels_x() - split - left).max(1.0) }
     }
 
     /// Draggable divider between the panels (double click: back to equal, see

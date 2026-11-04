@@ -30,7 +30,7 @@ use iced::advanced::{renderer, Clipboard, Renderer as _, Shell as IcedShell};
 use iced::alignment;
 use iced::font::{Style as FontStyle, Weight};
 use iced::widget::text::{LineHeight, Shaping, Wrapping};
-use iced::widget::{column, container, row, text, Space};
+use iced::widget::{button, column, container, mouse_area, row, text, tooltip, Column, Row, Space};
 use iced::{Background, Color, Element, Font, Length, Pixels, Rectangle};
 use std::sync::mpsc as std_mpsc;
 use std::sync::Mutex;
@@ -41,8 +41,14 @@ const FONT_SIZE: f32 = 14.0;
 const CELL_H: f32 = 18.0;
 /// Space around the grid.
 const PAD: f32 = 6.0;
-/// Height of the line under the grid (title, how to get back).
+/// Height of the line under the grid (how to switch, how to get back).
 const FOOTER_H: f32 = 22.0;
+/// Width of the sidebar (Files, the terminals, +) incl. its separator line.
+const SIDE_W: f32 = 160.0;
+/// Characters a sidebar entry's label is cut to (it is clipped too).
+const LABEL_CHARS: usize = 18;
+/// How often `poll_info` looks at the shells.
+const POLL: Duration = Duration::from_secs(1);
 /// Scrollback lines kept per terminal.
 const HISTORY: usize = 10_000;
 /// Redraws happen at most this often (output arriving faster is coalesced).
@@ -94,6 +100,22 @@ pub enum TermMsg {
     Event(u64, TermEvent),
     /// The grid widget of terminal `id` has room for (columns, lines).
     Resize(u64, usize, usize),
+    /// Sidebar: show terminal `id`, or Files for `None`.
+    Show(Option<u64>),
+    /// Sidebar: "+".
+    New,
+    /// Sidebar: close terminal `id`.
+    Close(u64),
+    /// What `poll_info` found out about terminal `id`'s shell (sent on change).
+    Info(u64, ShellInfo),
+}
+
+/// A terminal shell's folder (`None`: not known, keep the last one) and the
+/// program it runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellInfo {
+    dir: Option<PathBuf>,
+    program: Option<String>,
 }
 
 /// Forwards the I/O thread's events into a channel the subscription reads.
@@ -127,12 +149,14 @@ pub(super) struct TermSession {
     /// Shown: while hidden, output doesn't wake the UI (the frame is rebuilt
     /// when it is shown again).
     visible: Arc<AtomicBool>,
-    /// Window title the shell set (OSC 0/2), else the folder.
-    pub(super) title: String,
-    /// Folder the shell started in.
+    /// Window title a program set (OSC 0/2), when it says more than an exe
+    /// path (`meaningful_title`); shown in the sidebar entry's tooltip.
+    osc_title: Option<String>,
+    /// Folder the shell is in: where it started, then what `poll_info` finds.
     pub(super) dir: PathBuf,
-    /// Process id of the shell (Windows; read by the tests for now).
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Exe name (no `.exe`) of the program the shell runs, if any (polled).
+    program: Option<String>,
+    /// Process id of the shell (Windows).
     pub(super) pid: Option<u32>,
     /// Exit code once the shell has exited.
     exit_code: Option<i32>,
@@ -181,8 +205,9 @@ impl TermSession {
             events: Arc::new(Mutex::new(Some(rx))),
             wakeup,
             visible: Arc::new(AtomicBool::new(true)),
-            title: folder_title(dir),
+            osc_title: None,
             dir: dir.to_owned(),
+            program: None,
             pid,
             exit_code: None,
             frame: Frame::default(),
@@ -331,6 +356,165 @@ fn safe_dll_search() {
 
 fn folder_title(dir: &Path) -> String {
     dir.file_name().map_or_else(|| dir.display().to_string(), |n| n.to_string_lossy().into_owned())
+}
+
+/// A sidebar entry: the folder's name, then the program the shell runs
+/// (`Documents · ping`), in at most `max` characters. The folder is cut
+/// first, so the program stays readable.
+fn term_label(dir: &Path, program: Option<&str>, max: usize) -> String {
+    let folder = folder_title(dir);
+    match program {
+        None => cut(&folder, max),
+        Some(program) => {
+            let program = cut(program, (max / 2).max(4));
+            let room = max.saturating_sub(program.chars().count() + 3).max(4);
+            format!("{} \u{b7} {program}", cut(&folder, room))
+        }
+    }
+}
+
+/// `s` in at most `max` characters, with an ellipsis when cut.
+fn cut(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_owned();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('\u{2026}');
+    out
+}
+
+/// Whether a title a program set says something: not empty and not an exe
+/// path (what cmd and PowerShell set: `C:\...\powershell.exe`, or cmd's
+/// `C:\WINDOWS\system32\cmd.exe - ping`).
+fn meaningful_title(title: &str) -> bool {
+    let t = title.trim();
+    !t.is_empty() && !t.to_ascii_lowercase().contains(".exe")
+}
+
+/// The footer's tip for switching terminals, from the keys of the
+/// previous/next/new terminal commands (`Ctrl+Shift+Up/Down: switch
+/// terminals · Ctrl+Shift+T: new terminal`).
+fn switch_tip(prev: Option<String>, next: Option<String>, new: Option<String>) -> String {
+    let switch = match (prev, next) {
+        (Some(prev), Some(next)) => {
+            // Shared modifiers once: Ctrl+Shift+Up/Down.
+            let keys = match (prev.rsplit_once('+'), next.rsplit_once('+')) {
+                (Some((a, up)), Some((b, down))) if a == b => format!("{a}+{up}/{down}"),
+                _ => format!("{prev} / {next}"),
+            };
+            Some(format!("{keys}: switch terminals"))
+        }
+        (Some(key), None) => Some(format!("{key}: previous terminal")),
+        (None, Some(key)) => Some(format!("{key}: next terminal")),
+        (None, None) => None,
+    };
+    let new = new.map(|key| format!("{key}: new terminal"));
+    match (switch, new) {
+        (Some(s), Some(n)) => format!("{s} \u{b7} {n}"),
+        (Some(s), None) => s,
+        (None, Some(n)) => format!("Sidebar: switch terminals \u{b7} {n}"),
+        (None, None) => "The sidebar on the right switches terminals".to_owned(),
+    }
+}
+
+/// The folder a shell's default prompt shows, from the text of the line up
+/// to the cursor: `PS C:\Users>` (PowerShell) or `C:\Users>` (cmd).
+/// PowerShell doesn't change its process's current folder on `cd`, so this
+/// is how its folder is known.
+fn parse_prompt(line: &str) -> Option<PathBuf> {
+    let s = line.trim_end().strip_suffix('>')?.trim_end_matches('>');
+    let s = s.strip_prefix("PS ").unwrap_or(s).trim();
+    // PowerShell shows UNC folders with the provider's name.
+    let s = s.strip_prefix(r"Microsoft.PowerShell.Core\FileSystem::").unwrap_or(s);
+    let b = s.as_bytes();
+    let drive = b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\';
+    let unc = s.len() > 2 && s.starts_with(r"\\");
+    (drive || unc).then(|| PathBuf::from(s))
+}
+
+/// `parse_prompt` of the cursor's line (with the lines it wrapped from).
+fn prompt_dir(term: &Term<Proxy>) -> Option<PathBuf> {
+    use alacritty_terminal::index::{Column as Col, Line};
+    let grid = term.grid();
+    let cols = grid.columns();
+    let text = |line: Line, end: usize| -> String {
+        let row = &grid[line];
+        (0..end.min(cols))
+            .map(|c| &row[Col(c)])
+            .filter(|cell| !cell.flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER))
+            .map(|cell| cell.c)
+            .collect()
+    };
+    let cursor = grid.cursor.point;
+    let mut line = cursor.line;
+    let mut s = text(line, cursor.column.0);
+    for _ in 0..8 {
+        let prev: Line = line - 1;
+        if prev < grid.topmost_line() || cols == 0 || !grid[prev][Col(cols - 1)].flags.contains(Flags::WRAPLINE) {
+            break;
+        }
+        s.insert_str(0, &text(prev, cols));
+        line = prev;
+    }
+    parse_prompt(&s)
+}
+
+/// Looks at every terminal's shell once per `POLL` (off the UI thread): the
+/// folder it is in and the program it runs, sent as `TermMsg::Info` when
+/// they change. Restarts when the set of terminals changes; none while no
+/// terminal runs.
+pub(super) fn poll_info(terms: &[TermSession]) -> Option<Subscription<Message>> {
+    let shells: Vec<Polled> =
+        terms.iter().filter_map(|t| Some((t.id, t.pid?, t.term.clone(), t.dir.clone()))).collect();
+    if shells.is_empty() {
+        return None;
+    }
+    let key: Vec<(u64, u32)> = shells.iter().map(|s| (s.0, s.1)).collect();
+    Some(Subscription::run_with_id(
+        ("terminal-info", key),
+        iced::stream::channel(8, move |output| async move {
+            std::thread::spawn(move || poll(shells, output));
+            std::future::pending::<()>().await
+        }),
+    ))
+}
+
+/// A polled shell: terminal id, process id, its grid, last known folder.
+type Polled = (u64, u32, Arc<FairMutex<Term<Proxy>>>, PathBuf);
+
+fn poll(shells: Vec<Polled>, mut output: iced::futures::channel::mpsc::Sender<Message>) {
+    // Per shell: the process's own current folder seen last (a change means
+    // the shell changed it: cmd's `cd`), and what was sent last.
+    let mut seen: Vec<(Option<PathBuf>, ShellInfo)> = shells
+        .iter()
+        .map(|(_, pid, _, dir)| (rc_platform::process_cwd(*pid), ShellInfo { dir: Some(dir.clone()), program: None }))
+        .collect();
+    loop {
+        for ((id, pid, term, _), (peb, sent)) in shells.iter().zip(seen.iter_mut()) {
+            let program = rc_platform::foreground_child(*pid);
+            let mut dir = sent.dir.clone();
+            let now = rc_platform::process_cwd(*pid);
+            if now.is_some() && now != *peb {
+                dir.clone_from(&now);
+                *peb = now;
+            }
+            // At the prompt (nothing running), what it shows wins.
+            if program.is_none() {
+                let shown = prompt_dir(&term.lock());
+                if let Some(shown) = shown.filter(|d| d.is_dir()) {
+                    dir = Some(shown);
+                }
+            }
+            let info = ShellInfo { dir, program };
+            if info != *sent && output.try_send(Message::Term(TermMsg::Info(*id, info.clone()))).is_ok() {
+                *sent = info;
+            }
+        }
+        if output.is_closed() {
+            return;
+        }
+        std::thread::sleep(POLL);
+    }
 }
 
 /// The colours a terminal draws with: 16 ANSI colours (light or dark set,
@@ -831,6 +1015,9 @@ pub(super) fn key_bytes(
 impl App {
     pub(super) const TERM_KEYS: &'static [(&'static str, &'static str)] = &[
         ("Ctrl+Shift+F9 (cm_ToggleTerminal)", "Back to the panels; the terminal keeps running (F9 shows it again)"),
+        ("Ctrl+Shift+Down/Up (cm_NextTerminal, cm_PrevTerminal)", "Next/previous entry of the sidebar: Files, terminal 1, 2, ..."),
+        ("Ctrl+Shift+T (cm_NewTerminal)", "Another terminal in the active panel's folder (the + of the sidebar)"),
+        ("Ctrl+Shift+W (cm_CloseTerminal)", "End the shown terminal and close it (middle-click or x on its sidebar entry too)"),
         ("Every other key", "Goes to the shell (Esc, Tab, Ctrl+C, arrows, F1-F12, ...)"),
         ("exit", "Ends the shell and closes the terminal"),
     ];
@@ -843,15 +1030,34 @@ impl App {
         self.terms.iter_mut().find(|t| t.id == id)
     }
 
-    /// F9: shows the built-in terminal, starting one in the active panel's
-    /// folder if none is running.
+    /// Width taken by the terminal sidebar: only over the panels and the
+    /// terminals, and only while a terminal exists.
+    pub(super) fn term_side_w(&self) -> f32 {
+        if !self.terms.is_empty() && matches!(self.screen, None | Some(Screen::Term(_))) { SIDE_W } else { 0.0 }
+    }
+
+    /// Window width left of the sidebar: what the panels share.
+    pub(super) fn area_width(&self) -> f32 {
+        self.window_width - self.term_side_w()
+    }
+
+    /// F9: shows the terminal used last, starting one in the active panel's
+    /// folder if none is running (`NewTerminal` always starts another).
     pub(super) fn open_term(&mut self) -> Task<Message> {
         self.leave_edits();
-        if let Some(t) = self.terms.first_mut() {
-            t.set_visible(true);
-            self.screen = Some(Screen::Term(t.id));
-            return Task::none();
+        let last = self.term_last.filter(|&id| self.term(id).is_some()).or(self.terms.first().map(|t| t.id));
+        match last {
+            Some(id) => {
+                self.show_term(id);
+                Task::none()
+            }
+            None => self.new_term(),
         }
+    }
+
+    /// Starts a shell in the active panel's folder and shows it.
+    pub(super) fn new_term(&mut self) -> Task<Message> {
+        self.leave_edits();
         self.refresh_config();
         let dir = self.panel(self.active).path.clone();
         if vfs::in_archive(&dir) {
@@ -865,15 +1071,31 @@ impl App {
         }
         let id = self.next_term_id;
         self.next_term_id += 1;
-        let (cols, lines) = grid_size(Size::new(self.window_width, self.window_height - FOOTER_H));
+        let (cols, lines) = grid_size(Size::new(self.window_width - SIDE_W, self.window_height - FOOTER_H));
         match TermSession::spawn(id, &self.config.builtin_shell(), &dir, cols, lines) {
             Ok(session) => {
                 self.terms.push(session);
-                self.screen = Some(Screen::Term(id));
+                self.show_term(id);
             }
             Err(e) => self.error(format!("Can't start the shell \"{}\": {e}", self.config.builtin_shell())),
         }
         Task::none()
+    }
+
+    /// Shows terminal `id` (hiding the one shown).
+    fn show_term(&mut self, id: u64) {
+        if let Some(&shown) = self.screen.term() {
+            if shown != id {
+                if let Some(t) = self.term_mut(shown) {
+                    t.set_visible(false);
+                }
+            }
+        }
+        if let Some(t) = self.term_mut(id) {
+            t.set_visible(true);
+            self.term_last = Some(id);
+            self.screen = Some(Screen::Term(id));
+        }
     }
 
     /// `ToggleTerminal` from the panels: like F9.
@@ -892,7 +1114,58 @@ impl App {
                 t.set_visible(false);
             }
             self.screen = None;
-            self.info("The terminal keeps running: F9 shows it again");
+        }
+    }
+
+    /// Sidebar entries are Files (0) and the terminals (1..); this is the
+    /// shown one.
+    fn side_index(&self) -> usize {
+        match self.screen.term() {
+            Some(&id) => self.terms.iter().position(|t| t.id == id).map_or(0, |i| i + 1),
+            None => 0,
+        }
+    }
+
+    /// Shows entry `index` of the sidebar.
+    fn show_entry(&mut self, index: usize) {
+        match index.checked_sub(1).and_then(|i| self.terms.get(i)).map(|t| t.id) {
+            Some(id) => self.show_term(id),
+            None => self.hide_term(),
+        }
+    }
+
+    /// `NextTerminal` / `PrevTerminal`: around Files and the terminals.
+    pub(super) fn cycle_term(&mut self, delta: isize) {
+        if self.terms.is_empty() || !matches!(self.screen, None | Some(Screen::Term(_))) {
+            return;
+        }
+        self.leave_edits();
+        let next = cycle(self.side_index(), self.terms.len() + 1, delta);
+        self.show_entry(next);
+    }
+
+    /// `CloseTerminal`: ends the shown terminal.
+    pub(super) fn close_shown_term(&mut self) {
+        if let Some(&id) = self.screen.term() {
+            self.close_term(id);
+        }
+    }
+
+    /// Ends terminal `id` (dropping it stops its shell). If it was shown, the
+    /// terminal before it is shown, or Files when it was the first.
+    fn close_term(&mut self, id: u64) {
+        let order: Vec<u64> = self.terms.iter().map(|t| t.id).collect();
+        let was_shown = self.screen.term() == Some(&id);
+        let fallback = fallback_after_close(&order, id);
+        self.terms.retain(|t| t.id != id);
+        if self.term_last == Some(id) {
+            self.term_last = fallback;
+        }
+        if was_shown {
+            self.screen = None;
+            if let Some(next) = fallback {
+                self.show_term(next);
+            }
         }
     }
 
@@ -911,6 +1184,21 @@ impl App {
     pub(super) fn term_update(&mut self, msg: TermMsg) -> Task<Message> {
         let shown = self.screen.term().copied();
         match msg {
+            TermMsg::Show(Some(id)) => {
+                self.leave_edits();
+                self.show_term(id);
+            }
+            TermMsg::Show(None) => self.hide_term(),
+            TermMsg::New => return self.new_term(),
+            TermMsg::Close(id) => self.close_term(id),
+            TermMsg::Info(id, info) => {
+                if let Some(t) = self.term_mut(id) {
+                    if let Some(dir) = info.dir {
+                        t.dir = dir;
+                    }
+                    t.program = info.program;
+                }
+            }
             TermMsg::Resize(id, cols, lines) => {
                 if let Some(t) = self.term_mut(id) {
                     t.resize(cols, lines);
@@ -927,8 +1215,8 @@ impl App {
                             t.refresh();
                         }
                     }
-                    TermEvent::Title(title) => t.title = title,
-                    TermEvent::ResetTitle => t.title = folder_title(&t.dir),
+                    TermEvent::Title(title) => t.osc_title = meaningful_title(&title).then_some(title),
+                    TermEvent::ResetTitle => t.osc_title = None,
                     // Answers to queries (cursor position, device attributes...):
                     // a program waits for them.
                     TermEvent::PtyWrite(text) => {
@@ -950,10 +1238,7 @@ impl App {
                     TermEvent::ChildExit(status) => t.exit_code = status.code(),
                     TermEvent::Exit => {
                         let code = t.exit_code;
-                        self.terms.retain(|t| t.id != id);
-                        if shown == Some(id) {
-                            self.screen = None;
-                        }
+                        self.close_term(id);
                         match code {
                             Some(0) | None => self.info("The terminal's shell has exited"),
                             Some(code) => self.info(format!("The terminal's shell has exited (exit code {code})")),
@@ -971,7 +1256,9 @@ impl App {
         Task::none()
     }
 
-    /// Every key goes to the shell except the `ToggleTerminal` key.
+    /// Every key goes to the shell except the keys of the terminal commands
+    /// (back to the panels, next/previous entry, new, close): what the keymap
+    /// binds them to.
     pub(super) fn term_key(
         &mut self,
         key: &keyboard::Key,
@@ -979,9 +1266,15 @@ impl App {
         text: Option<&str>,
     ) -> Task<Message> {
         let Some(&id) = self.screen.term() else { return Task::none() };
-        if self.keymap.command(key, mods) == Some(Command::ToggleTerminal) {
-            self.hide_term();
-            return Task::none();
+        let reserved = [
+            Command::ToggleTerminal,
+            Command::NewTerminal,
+            Command::NextTerminal,
+            Command::PrevTerminal,
+            Command::CloseTerminal,
+        ];
+        if let Some(cmd) = self.keymap.command(key, mods).filter(|c| reserved.contains(c)) {
+            return self.run(cmd);
         }
         let Some(t) = self.term(id) else { return Task::none() };
         if let Some(bytes) = key_bytes(key, mods, text, t.app_cursor()) {
@@ -999,8 +1292,10 @@ impl App {
             Some(key) => format!("{key}: back to the panels (the terminal keeps running)"),
             None => "Bind cm_ToggleTerminal to a key to get back to the panels".to_owned(),
         };
+        let key = |cmd| keymap::Keymap::keys_for(&bindings, cmd).first().map(|k| k.to_string());
+        let switch = switch_tip(key(Command::PrevTerminal), key(Command::NextTerminal), key(Command::NewTerminal));
         let footer = row![
-            text(t.title.as_str()).size(12).color(colors.muted).wrapping(Wrapping::None),
+            text(switch).size(12).color(colors.muted).wrapping(Wrapping::None),
             Space::with_width(Length::Fill),
             text(back).size(12).color(colors.muted).wrapping(Wrapping::None),
         ]
@@ -1014,6 +1309,79 @@ impl App {
             .style(filled(t.frame.bg))
             .into()
     }
+
+    /// The sidebar on the right: Files, one entry per terminal (middle-click
+    /// or x closes it) and "+".
+    pub(super) fn term_side_view(&self) -> Element<'_, Message> {
+        let c = theme::c();
+        let shown = self.screen.term().copied();
+        let entry = |label: String, tip: Option<String>, current: bool, press: TermMsg, close: Option<u64>| {
+            let name = button(text(label).size(12).wrapping(Wrapping::None))
+                .on_press(Message::Term(press))
+                .width(Length::Fill)
+                .padding([4, 8])
+                .style(theme::drive(current));
+            let mut line = Row::new().align_y(iced::Alignment::Center).push(name);
+            if let Some(id) = close {
+                line = line.push(
+                    button(text("\u{d7}").size(13))
+                        .on_press(Message::Term(TermMsg::Close(id)))
+                        .padding([2, 6])
+                        .style(theme::flat),
+                );
+            }
+            let mut line: Element<'_, Message> = container(line).clip(true).width(Length::Fill).into();
+            if let Some(tip) = tip {
+                line = tooltip(
+                    line,
+                    container(text(tip).size(12)).padding([3, 8]).max_width(420).style(theme::drag_label),
+                    tooltip::Position::Left,
+                )
+                .into();
+            }
+            match close {
+                Some(id) => mouse_area(line).on_middle_press(Message::Term(TermMsg::Close(id))).into(),
+                None => line,
+            }
+        };
+        let mut list = Column::new().spacing(2).width(Length::Fill);
+        list = list.push(entry("Files".to_owned(), None, shown.is_none(), TermMsg::Show(None), None));
+        for t in &self.terms {
+            let label = term_label(&t.dir, t.program.as_deref(), LABEL_CHARS);
+            let mut tip = t.dir.display().to_string();
+            if let Some(program) = &t.program {
+                tip.push_str(&format!("\nRunning: {program}"));
+            }
+            if let Some(title) = &t.osc_title {
+                tip.push_str(&format!("\nTitle: {title}"));
+            }
+            list = list.push(entry(label, Some(tip), shown == Some(t.id), TermMsg::Show(Some(t.id)), Some(t.id)));
+        }
+        list = list.push(
+            button(text("+").size(13))
+                .on_press(Message::Term(TermMsg::New))
+                .width(Length::Fill)
+                .padding([2, 8])
+                .style(theme::drive(false)),
+        );
+        let line = container(Space::new(Length::Fixed(1.0), Length::Fill)).style(filled(c.border));
+        row![line, container(list).padding(4).width(Length::Fill).height(Length::Fill).style(filled(c.bg))]
+            .width(Length::Fixed(SIDE_W))
+            .height(Length::Fill)
+            .into()
+    }
+}
+
+/// Entry `index` of `count` moved by `delta`, around.
+fn cycle(index: usize, count: usize, delta: isize) -> usize {
+    (index as isize + delta).rem_euclid(count.max(1) as isize) as usize
+}
+
+/// The terminal to show when `closed` of `order` ends: the one before it,
+/// or Files (`None`) when it was the first.
+fn fallback_after_close(order: &[u64], closed: u64) -> Option<u64> {
+    let pos = order.iter().position(|&id| id == closed)?;
+    pos.checked_sub(1).map(|i| order[i])
 }
 
 #[cfg(test)]
@@ -1028,6 +1396,26 @@ mod tests {
 
     fn ch(c: &str, m: M, text: Option<&str>) -> Option<Vec<u8>> {
         key_bytes(&Key::Character(c.into()), m, text, false)
+    }
+
+    #[test]
+    fn sidebar_cycles_around_files_and_terminals() {
+        // Files + 2 terminals = 3 entries.
+        assert_eq!(cycle(0, 3, 1), 1);
+        assert_eq!(cycle(2, 3, 1), 0);
+        assert_eq!(cycle(0, 3, -1), 2);
+        assert_eq!(cycle(1, 3, -1), 0);
+        assert_eq!(cycle(0, 1, 1), 0);
+        assert_eq!(cycle(0, 0, -1), 0);
+    }
+
+    #[test]
+    fn closing_falls_back_to_the_entry_before() {
+        assert_eq!(fallback_after_close(&[4, 7, 9], 9), Some(7));
+        assert_eq!(fallback_after_close(&[4, 7, 9], 7), Some(4));
+        assert_eq!(fallback_after_close(&[4, 7, 9], 4), None);
+        assert_eq!(fallback_after_close(&[4], 4), None);
+        assert_eq!(fallback_after_close(&[4], 5), None);
     }
 
     #[test]
@@ -1103,6 +1491,60 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_labels() {
+        let docs = Path::new(r"C:\Users\me\Documents");
+        assert_eq!(term_label(docs, None, 18), "Documents");
+        assert_eq!(term_label(docs, Some("ping"), 18), "Documents \u{b7} ping");
+        assert_eq!(term_label(Path::new(r"C:\"), None, 18), r"C:\");
+        // The folder is cut first, the program keeps its name.
+        let long = Path::new(r"C:\Projects\A very long folder name");
+        assert_eq!(term_label(long, None, 18), "A very long folde\u{2026}");
+        assert_eq!(term_label(long, Some("vim"), 18), "A very long\u{2026} \u{b7} vim");
+        let label = term_label(long, Some("a-very-long-program-name"), 18);
+        assert_eq!(label, "A ver\u{2026} \u{b7} a-very-l\u{2026}");
+        assert!(label.chars().count() <= 18);
+        assert_eq!(cut("abc", 3), "abc");
+        assert_eq!(cut("abcd", 3), "ab\u{2026}");
+    }
+
+    #[test]
+    fn titles_that_are_exe_paths_are_ignored() {
+        assert!(!meaningful_title(r"C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe"));
+        assert!(!meaningful_title(r"C:\WINDOWS\system32\cmd.exe - ping  -n 5 127.0.0.1"));
+        assert!(!meaningful_title(r"Administrator: C:\Program Files\PowerShell\7\pwsh.EXE"));
+        assert!(!meaningful_title("  "));
+        assert!(meaningful_title(r"notes.txt (C:\Users\me) - VIM"));
+    }
+
+    #[test]
+    fn switching_tip() {
+        let s = |k: &str| Some(k.to_owned());
+        assert_eq!(
+            switch_tip(s("Ctrl+Shift+Up"), s("Ctrl+Shift+Down"), s("Ctrl+Shift+T")),
+            "Ctrl+Shift+Up/Down: switch terminals \u{b7} Ctrl+Shift+T: new terminal"
+        );
+        assert_eq!(switch_tip(s("Alt+Up"), s("Ctrl+Down"), None), "Alt+Up / Ctrl+Down: switch terminals");
+        assert_eq!(switch_tip(None, s("F2"), None), "F2: next terminal");
+        assert_eq!(switch_tip(None, None, s("Ctrl+T")), "Sidebar: switch terminals \u{b7} Ctrl+T: new terminal");
+        assert_eq!(switch_tip(None, None, None), "The sidebar on the right switches terminals");
+    }
+
+    #[test]
+    fn prompts() {
+        let p = |s: &str| parse_prompt(s).map(|p| p.display().to_string());
+        assert_eq!(p(r"PS C:\Users\me> ").as_deref(), Some(r"C:\Users\me"));
+        assert_eq!(p(r"PS C:\Users\me>> ").as_deref(), Some(r"C:\Users\me"));
+        assert_eq!(p(r"C:\Users\me>").as_deref(), Some(r"C:\Users\me"));
+        assert_eq!(p(r"C:\>").as_deref(), Some(r"C:\"));
+        assert_eq!(p(r"PS Microsoft.PowerShell.Core\FileSystem::\\srv\share> ").as_deref(), Some(r"\\srv\share"));
+        // Typing after the prompt, other providers, plain output.
+        assert_eq!(p(r"PS C:\Users\me> dir"), None);
+        assert_eq!(p(r"PS HKLM:\Software> "), None);
+        assert_eq!(p("<html>"), None);
+        assert_eq!(p(""), None);
+    }
+
+    #[test]
     fn shell_command_lines() {
         assert_eq!(shell_command("powershell.exe -NoLogo"), Some(("powershell.exe".into(), vec!["-NoLogo".into()])));
         assert_eq!(shell_command("  cmd.exe  "), Some(("cmd.exe".into(), vec![])));
@@ -1112,6 +1554,47 @@ mod tests {
         let quoted = if cfg!(windows) { format!("\"{path}\"") } else { path.to_owned() };
         assert_eq!(program, quoted);
         assert_eq!(args, ["-NoLogo", "-c", "a b"]);
+    }
+
+    /// A real cmd's folder, from its prompt and from its process, after a
+    /// `cd`; and the program it runs.
+    #[cfg(windows)]
+    #[test]
+    fn shell_folder_and_program_are_found() {
+        let dir = std::env::temp_dir().join(format!("rc-term-cwd-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let s = TermSession::spawn(2, "cmd.exe /q /k", &dir, 120, 24).unwrap();
+        let rx = s.events.lock().unwrap().take().unwrap();
+        let same = |a: &Option<PathBuf>, b: &Path| a.as_ref().is_some_and(|a| a.as_os_str().eq_ignore_ascii_case(b));
+        let wait = |what: &dyn Fn() -> bool| {
+            let end = Instant::now() + Duration::from_secs(15);
+            while Instant::now() < end {
+                while rx.recv_timeout(Duration::from_millis(50)).is_ok() {
+                    s.wakeup.store(false, Ordering::Release);
+                }
+                if what() {
+                    return true;
+                }
+            }
+            false
+        };
+        let pid = s.pid.expect("shell pid");
+        assert!(wait(&|| same(&prompt_dir(&s.term.lock()), &dir)), "{:?}", prompt_dir(&s.term.lock()));
+        assert!(same(&rc_platform::process_cwd(pid), &dir), "{:?}", rc_platform::process_cwd(pid));
+        s.write(b"cd sub\r".to_vec());
+        let sub = dir.join("sub");
+        assert!(wait(&|| same(&prompt_dir(&s.term.lock()), &sub)), "{:?}", prompt_dir(&s.term.lock()));
+        assert!(same(&rc_platform::process_cwd(pid), &sub));
+        assert_eq!(rc_platform::foreground_child(pid), None);
+        s.write(b"ping -n 6 127.0.0.1\r".to_vec());
+        assert!(wait(&|| rc_platform::foreground_child(pid).is_some_and(|p| p.eq_ignore_ascii_case("ping"))));
+        drop(rx);
+        drop(s);
+        // The shell may still hold the folder for a moment.
+        let end = Instant::now() + Duration::from_secs(5);
+        while std::fs::remove_dir_all(&dir).is_err() && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     /// Runs a real shell in a temporary folder: output reaches the grid, the

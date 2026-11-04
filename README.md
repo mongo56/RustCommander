@@ -37,7 +37,7 @@ with a modern, minimalist look. Written in Rust with [iced](https://iced.rs).
 **Shell integration (Windows)**
 - System icons and the Explorer context menu (right-click)
 - Drag and drop between the panels and with other apps (both mouse buttons)
-- F4 opens your editor; F9 a built-in terminal (PowerShell in a ConPTY) in the current folder, Ctrl+F9 an external one
+- F4 opens your editor; F9 a built-in terminal (PowerShell in a ConPTY) in the current folder, Ctrl+F9 an external one; with a terminal open a sidebar on the right switches between Files and the terminals
 
 **Configuration and keymap**
 - `config.toml` with editor, terminal, built-in terminal shell, theme, key bindings and colours; changes apply on save
@@ -74,6 +74,7 @@ with a modern, minimalist look. Written in Rust with [iced](https://iced.rs).
 | Shift+F8 / Shift+Del | Delete permanently |
 | F9 / Ctrl+F9 | Built-in terminal / external terminal |
 | Ctrl+Shift+F9 | Back from the built-in terminal to the panels (it keeps running) |
+| Ctrl+Shift+T / Ctrl+Shift+Down, Up / Ctrl+Shift+W | New terminal / next, previous entry of the terminal sidebar / close the shown terminal |
 | F10 | Settings |
 | Shift+F2 | Compare folders |
 | Alt+F2 | Compare files |

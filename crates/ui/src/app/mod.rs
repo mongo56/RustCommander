@@ -193,6 +193,8 @@ pub struct App {
     /// names the one shown.
     terms: Vec<term::TermSession>,
     next_term_id: u64,
+    /// The terminal shown last (F9 shows it again).
+    term_last: Option<u64>,
     /// (folder, name): put the cursor on `name` once a background listing
     /// of `folder` arrives (after a job on a server).
     focus_after_listing: Vec<(PathBuf, String)>,
@@ -608,6 +610,7 @@ impl App {
             find_last: None,
             terms: Vec::new(),
             next_term_id: 1,
+            term_last: None,
             focus_after_listing: Vec::new(),
             rename_opts: rc_core::rename::Options::default(),
             rename_undo: Vec::new(),
@@ -722,6 +725,8 @@ impl App {
         subs.push(watch::folders(dirs).map(Message::FsChanged));
         // Each built-in terminal's output, shown or not.
         subs.extend(self.terms.iter().map(term::TermSession::events));
+        // Their shells' folders and programs, for the sidebar.
+        subs.extend(term::poll_info(&self.terms));
         Subscription::batch(subs)
     }
 
@@ -1021,6 +1026,9 @@ impl App {
                 let focus = window::get_oldest().and_then(window::gain_focus);
                 if position.is_some_and(|(x, _)| self.tree_visible() && x < self.panels_x()) {
                     return focus.chain(self.tree_drop_external(sources));
+                }
+                if position.is_some_and(|(x, _)| self.term_side_w() > 0.0 && x >= self.area_width()) {
+                    return focus;
                 }
                 let side = position.map(|(x, _)| usize::from(x >= self.split_x())).unwrap_or(self.active);
                 self.focus_panel(side);
@@ -1656,6 +1664,15 @@ impl App {
             Unpack => return self.open_unpack(),
             InternalTerminal => return self.open_term(),
             ToggleTerminal => return self.toggle_term(),
+            NewTerminal => return self.new_term(),
+            NextTerminal | PrevTerminal => {
+                self.cycle_term(if cmd == NextTerminal { 1 } else { -1 });
+                return Task::none();
+            }
+            CloseTerminal => {
+                self.close_shown_term();
+                return Task::none();
+            }
             Terminal => {
                 self.open_terminal();
                 return Task::none();
