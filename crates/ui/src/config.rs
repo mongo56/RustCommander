@@ -8,7 +8,7 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct Config {
     /// Editor for F4: a program, optionally with arguments; `%1` stands for
@@ -37,7 +37,7 @@ pub struct Config {
     /// a newer one is offered in the status line).
     pub check_updates_at_startup: bool,
     /// Draw with the CPU (iced's tiny-skia renderer) instead of the GPU
-    /// (wgpu): the window opens much sooner. On unless set to false. Read
+    /// (wgpu): the window opens much sooner. Off unless set to true. Read
     /// once at startup.
     pub software_rendering: bool,
     /// Edge of the thumbnail view's pictures in pixels (Ctrl+Shift+F5);
@@ -61,26 +61,6 @@ pub struct CompareState {
     pub by_content: bool,
     pub ignore_date: bool,
     pub subfolders: bool,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            editor: String::new(),
-            terminal: String::new(),
-            builtin_shell: String::new(),
-            theme: String::new(),
-            show_hidden: false,
-            show_fkeys: false,
-            hotlist_tree: false,
-            check_updates_at_startup: false,
-            software_rendering: true,
-            thumbnail_size: 0,
-            keys: BTreeMap::new(),
-            colors: BTreeMap::new(),
-            compare: None,
-        }
-    }
 }
 
 impl From<CompareState> for rc_core::compare::CompareOptions {
@@ -381,10 +361,11 @@ fn template(editor: &str, compare: CompareState) -> String {
          # palette's Check for updates (cm_CheckForUpdates) looks any time.\n\
          check_updates_at_startup = false\n\
          \n\
-         # Draw with the CPU instead of the graphics card: the window opens much\n\
-         # sooner (no GPU setup). Applies at the next start; the ICED_BACKEND\n\
-         # environment variable (tiny-skia / wgpu) overrides it.\n\
-         software_rendering = true\n\
+         # Draw with the CPU instead of the graphics card: the window opens sooner\n\
+         # (no GPU setup), but scrolling and big folders are slower. Applies at\n\
+         # the next start; the ICED_BACKEND environment variable (tiny-skia /\n\
+         # wgpu) overrides it.\n\
+         software_rendering = false\n\
          \n\
          # Size of the pictures in the thumbnail view (Ctrl+Shift+F5), in pixels\n\
          # (32-512).\n\
@@ -467,10 +448,10 @@ mod tests {
         assert!(!parse(&template("", CompareState::default())).unwrap().check_updates_at_startup);
         let on = apply(&out, &[Edit::Flag("check_updates_at_startup", true)]).unwrap();
         assert!(parse(&on).unwrap().check_updates_at_startup);
-        assert!(parse(&template("", CompareState::default())).unwrap().software_rendering);
-        assert!(parse("").unwrap().software_rendering, "on when the key is missing");
-        let off = apply(&out, &[Edit::Flag("software_rendering", false)]).unwrap();
-        assert!(!parse(&off).unwrap().software_rendering);
+        assert!(!parse(&template("", CompareState::default())).unwrap().software_rendering);
+        assert!(!parse("").unwrap().software_rendering, "off when the key is missing");
+        let on = apply(&out, &[Edit::Flag("software_rendering", true)]).unwrap();
+        assert!(parse(&on).unwrap().software_rendering);
         assert_eq!(config.keys["Ctrl+Shift+F5"], "cm_RenMov");
         assert_eq!(config.colors["Accent"], "#00ff00");
         assert_eq!(config.colors["bg"], "#000000");

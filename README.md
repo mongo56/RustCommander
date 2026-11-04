@@ -45,7 +45,7 @@ with a modern, minimalist look. Written in Rust with [iced](https://iced.rs).
 - F1 help, Ctrl+Space command palette, built-in themes (Dark, Light, Nord, Gruvbox)
 - Every action is a `cm_*` command, so any key can be bound to any command
 - Check for updates (command palette): finds a newer release on GitHub, downloads the installer and updates in place; optionally at startup (`check_updates_at_startup`)
-- Software rendering (`software_rendering`, F10, on by default): draws with the CPU instead of the GPU, so the window opens in about 0.1 s instead of 0.6 s; the panels fill in as their folders are read
+- Software rendering (`software_rendering`, F10, off by default so the GPU draws): draws with the CPU instead, so the window opens in about 0.1 s instead of 0.6 s, but scrolling and big folders are slower; the panels fill in as their folders are read
 
 ## Key bindings
 

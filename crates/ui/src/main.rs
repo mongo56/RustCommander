@@ -79,9 +79,9 @@ fn main() -> iced::Result {
         }
     }
     // The renderer is picked when iced starts: set it before that, and
-    // before other threads run. Software unless config.toml says otherwise
-    // (a broken file too); a user-set ICED_BACKEND wins.
-    if std::env::var_os("ICED_BACKEND").is_none() && config::load().map_or(true, |c| c.software_rendering) {
+    // before other threads run. GPU (wgpu) unless config.toml asks for
+    // software rendering (a missing or broken file means GPU); a user-set ICED_BACKEND wins.
+    if std::env::var_os("ICED_BACKEND").is_none() && config::load().is_ok_and(|c| c.software_rendering) {
         std::env::set_var("ICED_BACKEND", "tiny-skia");
     }
     // iced tries the listed backends in order: the first is the one used.

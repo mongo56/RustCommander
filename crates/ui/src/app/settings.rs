@@ -984,7 +984,7 @@ impl App {
                                 self.config.software_rendering,
                                 SettingsMsg::SoftwareRendering(!self.config.software_rendering)
                             ),
-                            hint("Draw with the CPU instead of the graphics card: starts much faster. Applies at the next start".into()),
+                            hint("Draw with the CPU instead of the graphics card: starts sooner, but scrolling and big folders are slower. Applies at the next start".into()),
                         ]
                         .spacing(8)
                         .align_y(Alignment::Center)
