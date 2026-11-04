@@ -166,13 +166,13 @@ impl App {
         find.side = side;
         find.root = root;
         find.query.hidden = hidden;
-        self.find = Some(find);
+        self.screen = Some(Screen::Find(Box::new(find)));
         Task::batch([text_input::focus(name_input_id()), text_input::select_all(name_input_id())])
     }
 
     /// Closes the tool (stopping its search), keeping it for the next open.
     fn close_find(&mut self) {
-        if let Some(mut f) = self.find.take() {
+        if let Some(mut f) = self.screen.take_find() {
             f.stop();
             self.find_last = Some(f);
         }
@@ -184,7 +184,7 @@ impl App {
 
     fn find_move(&mut self, delta: isize) {
         let rows = self.find_rows();
-        let Some(f) = &mut self.find else { return };
+        let Some(f) = self.screen.find_mut() else { return };
         let max = f.results.len().saturating_sub(1);
         f.cursor = f.cursor.saturating_add_signed(delta).min(max);
         f.top = visible_start(f.top, f.cursor, rows, f.results.len());
@@ -193,7 +193,7 @@ impl App {
     fn start_find(&mut self) -> Task<Message> {
         self.next_listing += 1;
         let seq = self.next_listing;
-        let Some(f) = &mut self.find else { return Task::none() };
+        let Some(f) = self.screen.find_mut() else { return Task::none() };
         f.stop();
         let root = resolve_typed_path(f.root.trim(), &self.sides[f.side].tabs[self.sides[f.side].current].path);
         if !root.is_dir() && !rc_core::vfs::in_archive(&root) {
@@ -222,7 +222,7 @@ impl App {
 
     /// Shows the hit under the cursor in its folder, in the tool's panel.
     fn find_go_to(&mut self) -> Task<Message> {
-        let Some(f) = &self.find else { return Task::none() };
+        let Some(f) = self.screen.find() else { return Task::none() };
         let Some(hit) = f.results.get(f.cursor) else { return Task::none() };
         let Some(folder) = hit.path.parent().map(Path::to_path_buf) else { return Task::none() };
         let focus = hit.path.file_name().map(|n| n.to_string_lossy().into_owned());
@@ -235,7 +235,7 @@ impl App {
     /// Puts all hits into the tool's panel (TC's "feed to listbox").
     fn find_feed(&mut self) -> Task<Message> {
         let rows = self.page_rows();
-        let Some(f) = &mut self.find else { return Task::none() };
+        let Some(f) = self.screen.find_mut() else { return Task::none() };
         let Some((root, label)) = f.searched.clone().filter(|_| !f.results.is_empty()) else {
             f.error = Some("Nothing to feed to the panel".into());
             return Task::none();
@@ -258,7 +258,7 @@ impl App {
     }
 
     pub(super) fn find_update(&mut self, msg: FindMsg) -> Task<Message> {
-        let Some(f) = &mut self.find else { return Task::none() };
+        let Some(f) = self.screen.find_mut() else { return Task::none() };
         match msg {
             FindMsg::Input(field, value) => match field {
                 Field::Root => f.root = value,
@@ -335,7 +335,7 @@ impl App {
         mods: keyboard::Modifiers,
         captured: bool,
     ) -> Task<Message> {
-        let Some(f) = &self.find else { return Task::none() };
+        let Some(f) = self.screen.find() else { return Task::none() };
         let page = self.find_rows().saturating_sub(1).max(1) as isize;
         let msg = match named {
             Some(Named::Escape) if f.running.is_some() => FindMsg::Stop,

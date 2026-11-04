@@ -190,13 +190,13 @@ impl App {
         };
         mr.read_others();
         mr.refresh();
-        self.multi_rename = Some(mr);
+        self.screen = Some(Screen::MultiRename(Box::new(mr)));
         Task::batch([text_input::focus(name_input_id()), text_input::move_cursor_to_end(name_input_id())])
     }
 
     fn close_multi_rename(&mut self) {
         self.sync_rename_panel();
-        if let Some(mr) = self.multi_rename.take() {
+        if let Some(mr) = self.screen.take_multi_rename() {
             self.rename_opts = mr.opts;
             self.rename_undo = mr.undo;
         }
@@ -206,7 +206,7 @@ impl App {
     /// their panel under their current names (if they were selected when it
     /// opened) and puts the cursor on the first.
     fn sync_rename_panel(&mut self) {
-        let Some(mr) = &self.multi_rename else {
+        let Some(mr) = self.screen.multi_rename() else {
             return;
         };
         if self.panel(mr.side).path != mr.dir {
@@ -225,7 +225,7 @@ impl App {
 
     /// Starts editing the new name of row `i` (clamped), focusing its box.
     fn edit_row(&mut self, i: usize, scroll: bool) -> Task<Message> {
-        let Some(mr) = self.multi_rename.as_mut() else {
+        let Some(mr) = self.screen.multi_rename_mut() else {
             return Task::none();
         };
         let n = mr.entries.len().min(MAX_ROWS);
@@ -248,7 +248,7 @@ impl App {
     }
 
     pub(super) fn multi_rename_update(&mut self, msg: MrMsg) -> Task<Message> {
-        let Some(mr) = self.multi_rename.as_mut() else {
+        let Some(mr) = self.screen.multi_rename_mut() else {
             return Task::none();
         };
         match msg {
@@ -354,7 +354,7 @@ impl App {
         mods: keyboard::Modifiers,
         captured: bool,
     ) -> Task<Message> {
-        let editing = self.multi_rename.as_ref().and_then(|mr| mr.editing);
+        let editing = self.screen.multi_rename().and_then(|mr| mr.editing);
         let msg = match named {
             Some(Named::Escape) if editing.is_some() => MrMsg::EditDone,
             Some(Named::ArrowUp) if editing.is_some() => {
@@ -362,7 +362,7 @@ impl App {
             }
             Some(Named::ArrowDown) if editing.is_some() => return self.edit_row(editing.unwrap_or(0) + 1, true),
             Some(Named::F2) => {
-                let last = self.multi_rename.as_ref().map_or(0, |mr| mr.last_edit);
+                let last = self.screen.multi_rename().map_or(0, |mr| mr.last_edit);
                 return self.edit_row(last, true);
             }
             Some(Named::Escape) => MrMsg::Close,
@@ -376,7 +376,7 @@ impl App {
                 if !mods.control() || mods.alt() {
                     return Task::none();
                 }
-                let Some(mr) = &self.multi_rename else {
+                let Some(mr) = self.screen.multi_rename() else {
                     return Task::none();
                 };
                 match c.to_ascii_lowercase().as_str() {

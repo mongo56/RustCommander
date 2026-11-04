@@ -108,10 +108,10 @@ pub(super) fn sections(keymap: &keymap::Keymap) -> Vec<Section> {
 impl App {
     pub(super) fn open_help(&mut self) -> Task<Message> {
         self.leave_edits();
-        self.help = Some(Help {
+        self.screen = Some(Screen::Help(Help {
             query: String::new(),
             sections: sections(&self.keymap),
-        });
+        }));
         scrollable::snap_to(list_id(), RelativeOffset::START)
     }
 
@@ -126,7 +126,7 @@ impl App {
         // The help key (F1 or whatever it is bound to) closes help again.
         let again = (named.is_some() || mods.control() || mods.alt())
             && self.keymap.command(key, mods) == Some(Command::Help);
-        let Some(h) = &mut self.help else {
+        let Some(h) = self.screen.help_mut() else {
             return Task::none();
         };
         let scroll = |y: f32| scrollable::scroll_by(list_id(), AbsoluteOffset { x: 0.0, y });
@@ -136,8 +136,8 @@ impl App {
                 h.query.clear();
                 return top();
             }
-            Some(Named::Escape | Named::F1) => self.help = None,
-            _ if again => self.help = None,
+            Some(Named::Escape | Named::F1) => self.screen = None,
+            _ if again => self.screen = None,
             Some(Named::Backspace) => {
                 h.query.pop();
                 return top();

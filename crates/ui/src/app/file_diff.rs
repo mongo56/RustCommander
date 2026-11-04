@@ -98,7 +98,7 @@ impl App {
         self.next_listing += 1;
         let seq = self.next_listing;
         let cancel = Arc::new(AtomicBool::new(false));
-        self.file_diff = Some(FileDiff {
+        self.screen = Some(Screen::FileDiff(Box::new(FileDiff {
             paths: paths.clone(),
             seq,
             content: Content::Loading,
@@ -106,7 +106,7 @@ impl App {
             left: 0,
             block: None,
             cancel: cancel.clone(),
-        });
+        })));
         let [a, b] = paths;
         Task::perform(
             async move {
@@ -126,7 +126,7 @@ impl App {
     }
 
     pub(super) fn close_file_diff(&mut self) {
-        if let Some(d) = self.file_diff.take() {
+        if let Some(d) = self.screen.take_file_diff() {
             d.cancel.store(true, Ordering::Relaxed);
         }
     }
@@ -134,7 +134,7 @@ impl App {
     pub(super) fn file_diff_update(&mut self, msg: DiffMsg) -> Task<Message> {
         match msg {
             DiffMsg::Done(seq, result) => {
-                let Some(d) = self.file_diff.as_mut().filter(|d| d.seq == seq) else { return Task::none() };
+                let Some(d) = self.screen.file_diff_mut().filter(|d| d.seq == seq) else { return Task::none() };
                 d.content = match result {
                     Ok(o) => Content::Loaded(o),
                     Err(e) => Content::Failed(e),
@@ -144,7 +144,7 @@ impl App {
             }
             DiffMsg::Wheel(lines) => self.diff_scroll((-lines * 3.0).round() as isize),
             DiffMsg::ScrollTo(row) => {
-                let top = self.file_diff.as_ref().map_or(0, |d| d.top);
+                let top = self.screen.file_diff().map_or(0, |d| d.top);
                 self.diff_scroll(row as isize - top as isize);
             }
         }
@@ -162,7 +162,7 @@ impl App {
 
     fn diff_scroll(&mut self, delta: isize) {
         let page = self.diff_rows();
-        let Some(d) = &mut self.file_diff else { return };
+        let Some(d) = self.screen.file_diff_mut() else { return };
         let total = d.outcome().map_or(0, |o| o.rows());
         d.top = d.top.saturating_add_signed(delta).min(total.saturating_sub(page));
         d.block = None;
@@ -171,7 +171,7 @@ impl App {
     /// Moves to the next (or previous) block of differing rows.
     fn diff_jump(&mut self, forward: bool) {
         let page = self.diff_rows();
-        let Some(d) = &mut self.file_diff else { return };
+        let Some(d) = self.screen.file_diff_mut() else { return };
         let Content::Loaded(o) = &d.content else { return };
         let o = o.clone();
         let blocks = o.blocks();
@@ -215,12 +215,12 @@ impl App {
             (Some(Named::Home), _) => self.diff_scroll(isize::MIN / 2),
             (Some(Named::End), _) => self.diff_scroll(isize::MAX / 2),
             (Some(Named::ArrowRight), _) => {
-                if let Some(d) = &mut self.file_diff {
+                if let Some(d) = self.screen.file_diff_mut() {
                     d.left = (d.left + H_STEP).min(20_000);
                 }
             }
             (Some(Named::ArrowLeft), _) => {
-                if let Some(d) = &mut self.file_diff {
+                if let Some(d) = self.screen.file_diff_mut() {
                     d.left = d.left.saturating_sub(H_STEP);
                 }
             }

@@ -192,7 +192,7 @@ impl App {
     pub(super) fn open_settings(&mut self) -> Task<Message> {
         self.leave_edits();
         self.refresh_config();
-        self.settings = Some(Settings {
+        self.screen = Some(Screen::Settings(Box::new(Settings {
             page: Page::General,
             row: [0; 3],
             editor: self.config.editor.clone(),
@@ -204,7 +204,7 @@ impl App {
             picker: None,
             reset_all: false,
             note: None,
-        });
+        })));
         Task::batch([
             scrollable::snap_to(list_id(), RelativeOffset::START),
             off_thread(rc_platform::detect_editors, |found| Message::Settings(SettingsMsg::Detected(found))),
@@ -227,7 +227,7 @@ impl App {
     /// `done` (or the error) in the footer.
     fn settings_write(&mut self, edits: &[Edit], done: String) {
         let result = crate::config::write(edits).and_then(|()| self.reload_config());
-        if let Some(s) = &mut self.settings {
+        if let Some(s) = self.screen.settings_mut() {
             s.note = Some(match result {
                 Ok(()) => (done, Tone::Success),
                 Err(e) => (format!("Not saved: {e}"), Tone::Error),
@@ -239,7 +239,7 @@ impl App {
     fn settings_use_editor(&mut self, path: &std::path::Path) -> Task<Message> {
         let text = path.display().to_string();
         let text = if text.contains(' ') { format!("\"{text}\"") } else { text };
-        if let Some(s) = &mut self.settings {
+        if let Some(s) = self.screen.settings_mut() {
             s.row[0] = ROW_EDITOR;
             s.editor = text;
         }
@@ -249,7 +249,7 @@ impl App {
 
     /// Makes `command` the terminal command line and saves.
     fn settings_use_terminal(&mut self, command: String) -> Task<Message> {
-        if let Some(s) = &mut self.settings {
+        if let Some(s) = self.screen.settings_mut() {
             s.row[0] = ROW_TERMINAL;
             s.terminal = command;
         }
@@ -259,12 +259,12 @@ impl App {
 
     /// Saves changed editor / terminal commands (on Enter, leaving the page, closing).
     fn settings_save_editor(&mut self) {
-        let Some(s) = &self.settings else { return };
+        let Some(s) = self.screen.settings() else { return };
         if s.editor != self.config.editor {
             let editor = s.editor.trim().to_owned();
             self.settings_write(&[Edit::Text("editor", editor)], "Editor saved".into());
         }
-        let Some(s) = &self.settings else { return };
+        let Some(s) = self.screen.settings() else { return };
         if s.terminal != self.config.terminal {
             let terminal = s.terminal.trim().to_owned();
             self.settings_write(&[Edit::Text("terminal", terminal)], "Terminal saved".into());
@@ -273,7 +273,7 @@ impl App {
 
     /// Closes the colour picker; `keep` false puts the old colours back.
     fn picker_close(&mut self, keep: bool) {
-        if let Some(p) = self.settings.as_mut().and_then(|s| s.picker.take()) {
+        if let Some(p) = self.screen.settings_mut().and_then(|s| s.picker.take()) {
             if !keep {
                 theme::set(p.saved);
             }
@@ -282,7 +282,7 @@ impl App {
 
     /// Applies the picker's colour to the running app (not saved).
     fn picker_preview(&mut self) {
-        let Some(p) = self.settings.as_mut().and_then(|s| s.picker.as_mut()) else { return };
+        let Some(p) = self.screen.settings_mut().and_then(|s| s.picker.as_mut()) else { return };
         let color = p.color();
         p.hex = theme::to_hex(color);
         theme::set(p.saved.with_color(theme::NAMES[p.i], color));
@@ -291,12 +291,14 @@ impl App {
     fn settings_close(&mut self) {
         self.picker_close(false);
         self.settings_save_editor();
-        self.settings = None;
+        if matches!(self.screen, Some(Screen::Settings(_))) {
+            self.screen = None;
+        }
     }
 
     /// Keeps the selected row in view.
     fn settings_snap(&self) -> Task<Message> {
-        let Some(s) = &self.settings else { return Task::none() };
+        let Some(s) = self.screen.settings() else { return Task::none() };
         let rows = Self::rows_of(s.page);
         let y = if rows > 1 { s.row[s.page.index()] as f32 / (rows - 1) as f32 } else { 0.0 };
         scrollable::snap_to(list_id(), RelativeOffset { x: 0.0, y })
@@ -305,7 +307,7 @@ impl App {
     fn settings_page(&mut self, page: Page) -> Task<Message> {
         self.picker_close(false);
         self.settings_save_editor();
-        let Some(s) = &mut self.settings else { return Task::none() };
+        let Some(s) = self.screen.settings_mut() else { return Task::none() };
         s.page = page;
         s.capture = None;
         s.reset_all = false;
@@ -315,7 +317,7 @@ impl App {
 
     /// Enter / Space / a click on the selected row.
     fn settings_activate(&mut self) -> Task<Message> {
-        let Some(s) = &self.settings else { return Task::none() };
+        let Some(s) = self.screen.settings() else { return Task::none() };
         let row = s.row[s.page.index()];
         match s.page {
             Page::General => match row {
@@ -347,7 +349,7 @@ impl App {
 
     /// Binds `name` to the command being captured.
     fn settings_bind(&mut self, name: String) {
-        let Some(c) = self.settings.as_mut().and_then(|s| s.capture.take()) else { return };
+        let Some(c) = self.screen.settings_mut().and_then(|s| s.capture.take()) else { return };
         let mut edits = Vec::new();
         if !c.add {
             edits.extend(self.keymap.unbind(c.cmd).into_iter().filter(|(n, _)| *n != name));
@@ -363,7 +365,7 @@ impl App {
 
     /// A key pressed while waiting for a key combination to bind.
     fn settings_capture_key(&mut self, named: Option<Named>, key: &keyboard::Key, mods: keyboard::Modifiers) {
-        let Some(s) = &mut self.settings else { return };
+        let Some(s) = self.screen.settings_mut() else { return };
         let Some(c) = &mut s.capture else { return };
         match named {
             Some(Named::Escape) => {
@@ -412,7 +414,7 @@ impl App {
         if matches!(msg, SettingsMsg::Click(_) | SettingsMsg::Theme(_) | SettingsMsg::ResetColor(_)) {
             self.picker_close(false);
         }
-        let Some(s) = &mut self.settings else { return Task::none() };
+        let Some(s) = self.screen.settings_mut() else { return Task::none() };
         if !matches!(msg, SettingsMsg::ResetAllKeys) {
             s.reset_all = false;
         }
@@ -486,7 +488,7 @@ impl App {
                     Ok(()) => ("Compare options saved".into(), Tone::Success),
                     Err(e) => (format!("Not saved: {e}"), Tone::Error),
                 };
-                if let Some(s) = &mut self.settings {
+                if let Some(s) = self.screen.settings_mut() {
                     s.note = Some(note);
                 }
             }
@@ -536,7 +538,7 @@ impl App {
                     Ok(()) => self.status.clone().unwrap_or(("Editing config.toml".into(), Tone::Success)),
                     Err(e) => (format!("Can't create config.toml: {e}"), Tone::Error),
                 };
-                if let Some(s) = &mut self.settings {
+                if let Some(s) = self.screen.settings_mut() {
                     s.note = Some(note);
                 }
             }
@@ -587,7 +589,7 @@ impl App {
                 s.row[2] = 0;
                 let name = theme::preset(id).map_or(id, |p| p.name);
                 self.settings_write(&[Edit::Text("theme", id.to_owned()), Edit::ClearColors], format!("Theme: {name}"));
-                if let Some(s) = &mut self.settings {
+                if let Some(s) = self.screen.settings_mut() {
                     s.hex = current_hex();
                 }
             }
@@ -608,7 +610,7 @@ impl App {
                 s.row[2] = i + 1;
                 let name = theme::NAMES[i];
                 self.settings_write(&[Edit::Color(name.to_owned(), None)], format!("{name}: the theme's colour"));
-                if let Some(s) = &mut self.settings {
+                if let Some(s) = self.screen.settings_mut() {
                     s.hex = current_hex();
                 }
                 return blur();
@@ -647,7 +649,7 @@ impl App {
                             p.s = sat * 100.0;
                             p.v = v * 100.0;
                             self.picker_preview();
-                            if let Some(p) = self.settings.as_mut().and_then(|s| s.picker.as_mut()) {
+                            if let Some(p) = self.screen.settings_mut().and_then(|s| s.picker.as_mut()) {
                                 p.hex = value;
                             }
                         }
@@ -697,7 +699,7 @@ impl App {
         mods: keyboard::Modifiers,
         captured: bool,
     ) -> Task<Message> {
-        let Some(s) = &mut self.settings else { return Task::none() };
+        let Some(s) = self.screen.settings_mut() else { return Task::none() };
         // The colour picker takes Enter (OK) and Esc (cancel) and nothing else.
         if s.picker.is_some() {
             return match named {

@@ -298,7 +298,7 @@ impl App {
             panel.entries.iter().filter(|e| e.kind == EntryKind::File).map(|e| e.path.clone()).collect();
         let index = files.iter().position(|p| *p == current.path).unwrap_or(0);
         self.leave_edits();
-        self.viewer = Some(Viewer {
+        self.screen = Some(Screen::Viewer(Box::new(Viewer {
             files,
             index,
             side,
@@ -321,14 +321,14 @@ impl App {
             selecting: false,
             pan: None,
             origin: Point::ORIGIN,
-        });
+        })));
         self.viewer_show(index)
     }
 
     fn viewer_show(&mut self, index: usize) -> Task<Message> {
         self.next_listing += 1;
         let seq = self.next_listing;
-        let Some(v) = &mut self.viewer else { return Task::none() };
+        let Some(v) = self.screen.viewer_mut() else { return Task::none() };
         v.cancel_search();
         v.index = index;
         v.seq = seq;
@@ -346,7 +346,7 @@ impl App {
     }
 
     fn viewer_loaded(&mut self, seq: u64, result: Result<Loaded, String>) -> Task<Message> {
-        let Some(v) = self.viewer.as_mut().filter(|v| v.seq == seq) else { return Task::none() };
+        let Some(v) = self.screen.viewer_mut().filter(|v| v.seq == seq) else { return Task::none() };
         match result {
             Ok(loaded) => {
                 if let Loaded::Doc(doc) = &loaded {
@@ -360,7 +360,7 @@ impl App {
     }
 
     pub(super) fn close_viewer(&mut self) {
-        let Some(mut v) = self.viewer.take() else { return };
+        let Some(mut v) = self.screen.take_viewer() else { return };
         v.cancel_search();
         // Leave the panel cursor on the file viewed last.
         let path = v.path();
@@ -375,7 +375,7 @@ impl App {
 
     /// Text rows that fit in the viewer.
     fn viewer_rows(&self) -> usize {
-        let search = if self.viewer.as_ref().is_some_and(|v| v.search.is_some()) { SEARCH_H } else { 0.0 };
+        let search = if self.screen.viewer().is_some_and(|v| v.search.is_some()) { SEARCH_H } else { 0.0 };
         ((self.window_height - VIEWER_CHROME_H - search) / LINE_H).floor().max(1.0) as usize
     }
 
@@ -385,7 +385,7 @@ impl App {
 
     fn viewer_scroll(&mut self, delta: isize) {
         let rows = self.viewer_rows();
-        let Some(v) = &mut self.viewer else { return };
+        let Some(v) = self.screen.viewer_mut() else { return };
         let total = v.doc().map_or(0, |d| d.rows(v.mode));
         let max = total.saturating_sub(if v.wrap { 1 } else { rows });
         v.top = v.top.saturating_add_signed(delta).min(max);
@@ -396,7 +396,7 @@ impl App {
     /// edge, centring it on the top row.
     fn viewer_slide(&mut self) {
         let rows = self.viewer_rows();
-        let Some(v) = &mut self.viewer else { return };
+        let Some(v) = self.screen.viewer_mut() else { return };
         let Some(doc) = v.doc_arc() else { return };
         let margin = rows * 2;
         let near_start = v.top < margin && doc.has_before();
@@ -409,7 +409,7 @@ impl App {
 
     /// Home / End: the first or last rows of the file.
     fn viewer_home_end(&mut self, end: bool) {
-        let Some(v) = &mut self.viewer else { return };
+        let Some(v) = self.screen.viewer_mut() else { return };
         let Some(doc) = v.doc_arc() else { return };
         v.left = 0;
         if end {
@@ -428,7 +428,7 @@ impl App {
 
     /// Furthest `left` that still shows the end of the longest visible line.
     fn viewer_max_left(&self) -> usize {
-        let Some(v) = &self.viewer else { return 0 };
+        let Some(v) = self.screen.viewer() else { return 0 };
         let Some(doc) = v.doc() else { return 0 };
         if v.mode != Mode::Text || v.wrap {
             return 0;
@@ -476,7 +476,7 @@ impl App {
     /// `None` when the key is not one of them, or no image is shown (or
     /// loading).
     fn viewer_image_key(&mut self, named: Option<Named>, typed: Option<&str>) -> Option<Task<Message>> {
-        let v = self.viewer.as_ref()?;
+        let v = self.screen.viewer()?;
         let loading_image = matches!(v.content, Content::Loading) && is_image_name(v.path());
         if !v.is_image() && !loading_image {
             return None;
@@ -498,7 +498,7 @@ impl App {
     /// images; one that doesn't decode opens as text). N/P step through
     /// all files instead.
     fn viewer_step_image(&mut self, step: Step) -> Task<Message> {
-        let Some(v) = &mut self.viewer else { return Task::none() };
+        let Some(v) = self.screen.viewer_mut() else { return Task::none() };
         let (i, n) = (v.index, v.files.len());
         let mut range: Box<dyn Iterator<Item = usize>> = match step {
             Step::Prev => Box::new((0..i).rev()),
@@ -524,13 +524,13 @@ impl App {
         if self.modifiers.control() {
             return;
         }
-        if let Some(v) = &mut self.viewer {
+        if let Some(v) = self.screen.viewer_mut() {
             v.offset = offset;
         }
     }
 
     fn viewer_pointer(&mut self, at: Option<Point>) {
-        let Some(v) = &mut self.viewer else { return };
+        let Some(v) = self.screen.viewer_mut() else { return };
         v.pointer = at;
         if let Some(p) = at.filter(|_| v.selecting) {
             self.viewer_drag_to(p);
@@ -541,12 +541,12 @@ impl App {
     /// document is shown (to learn the body's position for selection drags
     /// past its edges), or a zoomed image (drag panning).
     pub(super) fn viewer_tracks_mouse(&self) -> bool {
-        self.viewer.as_ref().is_some_and(|v| v.doc().is_some() || (v.is_image() && v.zoom.is_some()))
+        self.screen.viewer().is_some_and(|v| v.doc().is_some() || (v.is_image() && v.zoom.is_some()))
     }
 
     /// A zoomed image larger than the view on some axis, so dragging pans it.
     fn viewer_can_pan(&self) -> bool {
-        let Some(v) = &self.viewer else { return false };
+        let Some(v) = self.screen.viewer() else { return false };
         let (Some((w, h)), Some(zoom)) = (v.image_size(), v.zoom) else { return false };
         let view = self.viewer_body_size();
         w as f32 * zoom > view.width || h as f32 * zoom > view.height
@@ -557,7 +557,7 @@ impl App {
     /// selection drag on.
     pub(super) fn viewer_mouse_moved(&mut self) -> Task<Message> {
         let mouse = self.mouse;
-        let Some(v) = &mut self.viewer else { return Task::none() };
+        let Some(v) = self.screen.viewer_mut() else { return Task::none() };
         if let Some(last) = v.pan {
             v.pan = Some(mouse);
             // The scrollable clamps, and reports the offset it ends up at
@@ -584,7 +584,7 @@ impl App {
         let can_pan = self.viewer_can_pan();
         let view = self.viewer_body_size();
         let mouse = self.mouse;
-        let Some(v) = &mut self.viewer else { return };
+        let Some(v) = self.screen.viewer_mut() else { return };
         if v.is_image() {
             // Not over the body, or on its scrollbars.
             let on_image = v.pointer.is_some_and(|p| p.x < view.width - IMAGE_BAR && p.y < view.height - IMAGE_BAR);
@@ -597,7 +597,7 @@ impl App {
         let Some(p) = v.pointer.filter(|p| p.x < self.window_width - TEXT_PAD) else { return };
         let keep = v.sel.filter(|_| shift);
         let Some((part, at)) = self.viewer_pos_at(p, keep.map(|s| s.part)) else { return };
-        let Some(v) = &mut self.viewer else { return };
+        let Some(v) = self.screen.viewer_mut() else { return };
         v.sel = Some(match keep {
             Some(s) => Selection { head: at, ..s },
             None => Selection::new(part, at),
@@ -608,7 +608,7 @@ impl App {
 
     /// Left button released anywhere: the drag ends; a plain click leaves no selection.
     pub(super) fn viewer_release(&mut self) {
-        if let Some(v) = &mut self.viewer {
+        if let Some(v) = self.screen.viewer_mut() {
             v.selecting = false;
             v.pan = None;
             if v.sel.is_some_and(|s| s.is_empty()) {
@@ -621,7 +621,7 @@ impl App {
     /// body it first scrolls a row that way.
     fn viewer_drag_to(&mut self, p: Point) {
         let height = self.viewer_body_size().height;
-        let Some(part) = self.viewer.as_ref().filter(|v| v.selecting).and_then(|v| v.sel).map(|s| s.part) else {
+        let Some(part) = self.screen.viewer().filter(|v| v.selecting).and_then(|v| v.sel).map(|s| s.part) else {
             return;
         };
         if p.y < 0.0 {
@@ -631,7 +631,7 @@ impl App {
         }
         let p = Point::new(p.x, p.y.clamp(0.0, (height - 1.0).max(0.0)));
         let Some((_, at)) = self.viewer_pos_at(p, Some(part)) else { return };
-        if let Some(s) = self.viewer.as_mut().and_then(|v| v.sel.as_mut()) {
+        if let Some(s) = self.screen.viewer_mut().and_then(|v| v.sel.as_mut()) {
             s.head = at;
         }
     }
@@ -639,7 +639,7 @@ impl App {
     /// File offset at body position `p` (and the part of a hex row it is
     /// in, unless `part` fixes it): the character boundary nearest to it.
     fn viewer_pos_at(&self, p: Point, part: Option<Part>) -> Option<(Part, u64)> {
-        let v = self.viewer.as_ref()?;
+        let v = self.screen.viewer()?;
         let doc = v.doc()?;
         let x = (p.x - TEXT_PAD) / char_w();
         let r = (p.y / LINE_H).floor().max(0.0) as usize;
@@ -670,7 +670,7 @@ impl App {
 
     /// Ctrl+A: the whole file (copying takes at most `COPY_LIMIT` of it).
     fn viewer_select_all(&mut self) {
-        let Some(v) = &mut self.viewer else { return };
+        let Some(v) = self.screen.viewer_mut() else { return };
         let Some(size) = v.doc().map(|d| d.size) else { return };
         let part = if v.mode == Mode::Text { Part::Text } else { Part::Hex };
         v.sel = Some(Selection { part, anchor: 0, head: size });
@@ -683,7 +683,7 @@ impl App {
     /// Ctrl+C / Ctrl+Insert: the selection to the clipboard, at most
     /// `COPY_LIMIT` bytes of it (read from the file when outside the window).
     fn viewer_copy(&mut self) -> Task<Message> {
-        let Some(v) = &mut self.viewer else { return Task::none() };
+        let Some(v) = self.screen.viewer_mut() else { return Task::none() };
         let Some(doc) = v.doc_arc() else { return Task::none() };
         let Some(sel) = v.sel.filter(|s| !s.is_empty()) else {
             v.note = Some(("Nothing selected: drag with the mouse or press Ctrl+A".into(), Tone::Info));
@@ -725,7 +725,7 @@ impl App {
         if !self.modifiers.control() || notches == 0.0 {
             return Task::none();
         }
-        let anchor = self.viewer.as_ref().and_then(|v| v.pointer);
+        let anchor = self.screen.viewer().and_then(|v| v.pointer);
         self.viewer_zoom_at(anchor, |z| Some(z * ZOOM_STEP.powf(notches)))
     }
 
@@ -739,12 +739,12 @@ impl App {
     /// coordinates; `None` = the view centre) stays where it is.
     /// No-op unless an image is shown.
     fn viewer_zoom_at(&mut self, anchor: Option<Point>, zoom: impl FnOnce(f32) -> Option<f32>) -> Task<Message> {
-        let Some((w, h)) = self.viewer.as_ref().and_then(Viewer::image_size) else {
+        let Some((w, h)) = self.screen.viewer().and_then(Viewer::image_size) else {
             return Task::none();
         };
         let fit = self.viewer_fit_scale((w, h));
         let view = self.viewer_body_size();
-        let Some(v) = self.viewer.as_mut() else { return Task::none() };
+        let Some(v) = self.screen.viewer_mut() else { return Task::none() };
         let old = v.zoom.unwrap_or(fit);
         // In fit mode nothing is scrolled.
         let offset = if v.zoom.is_some() { v.offset } else { AbsoluteOffset { x: 0.0, y: 0.0 } };
@@ -760,14 +760,14 @@ impl App {
 
     /// Size of the area between the header and the footer / find box.
     fn viewer_body_size(&self) -> Size {
-        let search = if self.viewer.as_ref().is_some_and(|v| v.search.is_some()) { SEARCH_H } else { 0.0 };
+        let search = if self.screen.viewer().is_some_and(|v| v.search.is_some()) { SEARCH_H } else { 0.0 };
         Size::new(self.window_width.max(1.0), (self.window_height - VIEWER_CHROME_H - search).max(1.0))
     }
 
     /// Scrollbar: `at` is a row of a whole file, else a byte of the file;
     /// infinite = the end.
     fn viewer_seek(&mut self, at: f32) {
-        let Some(v) = &mut self.viewer else { return };
+        let Some(v) = self.screen.viewer_mut() else { return };
         let Some(doc) = v.doc_arc() else { return };
         if at.is_infinite() {
             // Like End, keeping the horizontal scroll.
@@ -802,7 +802,7 @@ impl App {
         };
         let rows = self.viewer_rows() as isize;
         let ctrl = mods.control();
-        let Some(v) = &mut self.viewer else { return Task::none() };
+        let Some(v) = self.screen.viewer_mut() else { return Task::none() };
 
         if v.search.is_some() {
             match named {
@@ -833,7 +833,7 @@ impl App {
             return task;
         }
         let max_left = self.viewer_max_left();
-        let Some(v) = &mut self.viewer else { return Task::none() };
+        let Some(v) = self.screen.viewer_mut() else { return Task::none() };
         match (named, typed.as_deref()) {
             // Esc drops a selection before it closes.
             (Some(Named::Escape), _) if v.sel.is_some() => v.sel = None,
@@ -879,7 +879,7 @@ impl App {
     }
 
     fn viewer_mode(&mut self, mode: Mode) {
-        let Some(v) = &mut self.viewer else { return };
+        let Some(v) = self.screen.viewer_mut() else { return };
         let Some(doc) = v.doc() else { return };
         if v.mode == mode {
             return;
@@ -896,14 +896,14 @@ impl App {
     }
 
     fn viewer_search_input(&mut self, text: String) {
-        if let Some(v) = &mut self.viewer {
+        if let Some(v) = self.screen.viewer_mut() {
             v.search = Some(text);
         }
     }
 
     /// Enter in the search box: remember the query, close the box, find.
     fn viewer_submit(&mut self) -> Task<Message> {
-        if let Some(v) = &mut self.viewer {
+        if let Some(v) = self.screen.viewer_mut() {
             if let Some(q) = v.search.take() {
                 if q != v.query {
                     v.hit = None;
@@ -918,7 +918,7 @@ impl App {
     /// around the file once.
     fn viewer_find(&mut self, forward: bool) -> Task<Message> {
         let (rows, cols) = (self.viewer_rows(), self.viewer_cols());
-        let Some(v) = &mut self.viewer else { return Task::none() };
+        let Some(v) = self.screen.viewer_mut() else { return Task::none() };
         if v.query.is_empty() {
             v.search = Some(String::new());
             return text_input::focus(search_input_id());
@@ -951,7 +951,7 @@ impl App {
 
     /// Searches a large file on a worker thread, window by window.
     fn viewer_find_in_file(&mut self, doc: Arc<Document>, forward: bool) -> Task<Message> {
-        let Some(v) = &mut self.viewer else { return Task::none() };
+        let Some(v) = self.screen.viewer_mut() else { return Task::none() };
         let from = match v.hit.filter(|h| h.mode == v.mode) {
             Some(h) => match h.mode {
                 Mode::Text => doc.byte_of(if forward { h.start + 1 } else { h.start }),
@@ -987,7 +987,7 @@ impl App {
     /// Result of a large-file search; `search` tells it from older ones.
     fn viewer_found(&mut self, seq: u64, result: Result<Option<Found>, String>, search: &Arc<AtomicBool>) {
         let dims = (self.viewer_rows(), self.viewer_cols());
-        let Some(v) = self.viewer.as_mut().filter(|v| v.seq == seq) else { return };
+        let Some(v) = self.screen.viewer_mut().filter(|v| v.seq == seq) else { return };
         if !Arc::ptr_eq(&v.cancel, search) || search.load(Ordering::Relaxed) {
             return;
         }
@@ -1004,7 +1004,7 @@ impl App {
 
     /// Scrolls `hit` (in the current document) into view and marks it.
     fn viewer_show_hit(&mut self, hit: Hit, wrapped: bool, (rows, cols): (usize, usize)) {
-        let Some(v) = &mut self.viewer else { return };
+        let Some(v) = self.screen.viewer_mut() else { return };
         let Some(doc) = v.doc_arc() else { return };
         let row = match v.mode {
             Mode::Text => doc.line_of(hit.start),

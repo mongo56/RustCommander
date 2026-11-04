@@ -168,7 +168,7 @@ impl App {
         // Start on the site of the panel's server, if any.
         let here = remote::split(&self.panel(self.active).path).map(|(key, _)| key);
         let selected = here.and_then(|k| sites.iter().position(|s| s.address().eq_ignore_ascii_case(&k))).unwrap_or(0);
-        self.connect = Some(ConnectTool {
+        self.screen = Some(Screen::Connect(Box::new(ConnectTool {
             side: self.active,
             sites,
             selected,
@@ -176,7 +176,7 @@ impl App {
             deleting: None,
             note: None,
             last_click: None,
-        });
+        })));
         Task::none()
     }
 
@@ -205,11 +205,13 @@ impl App {
     }
 
     fn connect_close(&mut self) {
-        self.connect = None;
+        if matches!(self.screen, Some(Screen::Connect(_))) {
+            self.screen = None;
+        }
     }
 
     fn connect_move(&mut self, delta: isize) {
-        let Some(c) = &mut self.connect else { return };
+        let Some(c) = self.screen.connect_mut() else { return };
         c.selected = c.selected.saturating_add_signed(delta).min(c.sites.len().saturating_sub(1));
         c.deleting = None;
     }
@@ -217,7 +219,7 @@ impl App {
     /// Enter on a site: connects with its saved or typed password, or asks
     /// for one first.
     fn connect_selected(&mut self, asked: Option<String>) -> Task<Message> {
-        let Some(c) = &mut self.connect else { return Task::none() };
+        let Some(c) = self.screen.connect_mut() else { return Task::none() };
         let Some(site) = c.sites.get(c.selected).cloned() else { return Task::none() };
         let address = site.address();
         let password = match asked.clone() {
@@ -238,7 +240,7 @@ impl App {
     fn start_connect(&mut self, site: Site, login: Login, typed: bool) -> Task<Message> {
         self.next_listing += 1;
         let seq = self.next_listing;
-        let Some(c) = &mut self.connect else { return Task::none() };
+        let Some(c) = self.screen.connect_mut() else { return Task::none() };
         c.note = Some((format!("Connecting to {}\u{2026} (Esc cancels)", site.address()), Tone::Info));
         c.mode = Mode::Connecting { seq, site: site.clone(), login: login.clone(), typed };
         let folder = site.folder.clone();
@@ -255,7 +257,7 @@ impl App {
     }
 
     fn connect_done(&mut self, seq: u64, result: Result<PathBuf, String>) -> Task<Message> {
-        let Some(c) = &mut self.connect else { return Task::none() };
+        let Some(c) = self.screen.connect_mut() else { return Task::none() };
         let Mode::Connecting { seq: expected, .. } = &c.mode else { return Task::none() };
         if *expected != seq {
             return Task::none();
@@ -296,7 +298,7 @@ impl App {
     }
 
     fn connect_trust(&mut self) -> Task<Message> {
-        let Some(c) = &mut self.connect else { return Task::none() };
+        let Some(c) = self.screen.connect_mut() else { return Task::none() };
         let Mode::Trust { site, login, typed, .. } = std::mem::replace(&mut c.mode, Mode::List) else {
             return Task::none();
         };
@@ -308,7 +310,7 @@ impl App {
     }
 
     fn save_form(&mut self) -> Task<Message> {
-        let Some(c) = &mut self.connect else { return Task::none() };
+        let Some(c) = self.screen.connect_mut() else { return Task::none() };
         let Mode::Edit(f) = &c.mode else { return Task::none() };
         let host = f.host.trim().to_owned();
         if host.is_empty() {
@@ -373,7 +375,7 @@ impl App {
     }
 
     fn delete_site(&mut self) {
-        let Some(c) = &mut self.connect else { return };
+        let Some(c) = self.screen.connect_mut() else { return };
         let Some(site) = c.sites.get(c.selected) else { return };
         if c.deleting != Some(c.selected) {
             c.deleting = Some(c.selected);
@@ -393,7 +395,7 @@ impl App {
     }
 
     pub(super) fn connect_update(&mut self, msg: ConnectMsg) -> Task<Message> {
-        let Some(c) = &mut self.connect else { return Task::none() };
+        let Some(c) = self.screen.connect_mut() else { return Task::none() };
         match msg {
             ConnectMsg::Click(i) => {
                 if !matches!(c.mode, Mode::List) {
@@ -500,7 +502,7 @@ impl App {
         mods: keyboard::Modifiers,
         captured: bool,
     ) -> Task<Message> {
-        let Some(c) = &mut self.connect else { return Task::none() };
+        let Some(c) = self.screen.connect_mut() else { return Task::none() };
         let ch = match key {
             keyboard::Key::Character(s) if !mods.control() && !mods.alt() => Some(s.to_ascii_lowercase()),
             _ => None,

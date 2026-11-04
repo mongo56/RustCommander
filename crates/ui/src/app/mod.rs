@@ -9,6 +9,7 @@ mod help;
 mod hotlist;
 mod hotlist_tree;
 mod palette;
+mod screen;
 mod find_files;
 mod multi_rename;
 mod settings;
@@ -16,6 +17,7 @@ mod thumbs;
 mod update;
 mod viewer;
 
+use self::screen::{Screen, ScreenSlot};
 use crate::keymap;
 use crate::select_range::{self, Part, SelectRange};
 use crate::scrollbar;
@@ -179,24 +181,15 @@ pub struct App {
     /// Folder change per side still waiting for its listing (slow or
     /// network folders); see `start_nav`.
     nav: [Option<PendingNav>; 2],
-    /// Built-in viewer (F3), covering the whole window while open.
-    viewer: Option<viewer::Viewer>,
-    /// Multi-rename tool (Ctrl+M), covering the whole window while open.
-    multi_rename: Option<multi_rename::MultiRename>,
-    /// Compare files by content (Alt+F2), covering the whole window.
-    file_diff: Option<file_diff::FileDiff>,
-    /// Find files (Alt+F7), covering the whole window while open; the
-    /// closed tool is kept (fields and results) for the next Alt+F7.
-    find: Option<find_files::FindFiles>,
+    /// The full-window tool covering the panels while open: viewer (F3),
+    /// multi-rename (Ctrl+M), compare files (Alt+F2), find files (Alt+F7),
+    /// connect (Ctrl+F), help (F1) or settings (F10). See `screen.rs`.
+    screen: Option<Screen>,
+    /// The closed find tool (fields and results), kept for the next Alt+F7.
     find_last: Option<find_files::FindFiles>,
-    /// Connect to a server (Ctrl+F), covering the whole window while open.
-    connect: Option<connect::ConnectTool>,
     /// (folder, name): put the cursor on `name` once a background listing
     /// of `folder` arrives (after a job on a server).
     focus_after_listing: Vec<(PathBuf, String)>,
-    help: Option<help::Help>,
-    /// Settings view (F10), covering the whole window while open.
-    settings: Option<settings::Settings>,
     /// Multi-rename settings, kept between uses.
     rename_opts: rc_core::rename::Options,
     /// `(new, old)` paths of the last multi-rename batch, kept after the
@@ -590,15 +583,9 @@ impl App {
             next_listing: 0,
             restoring: HashSet::new(),
             nav: [None, None],
-            viewer: None,
-            multi_rename: None,
-            file_diff: None,
-            find: None,
+            screen: None,
             find_last: None,
-            connect: None,
             focus_after_listing: Vec::new(),
-            help: None,
-            settings: None,
             rename_opts: rc_core::rename::Options::default(),
             rename_undo: Vec::new(),
             config: crate::config::Config::default(),
@@ -663,7 +650,7 @@ impl App {
         ];
         // Ctrl+wheel zooms images; the zoomed image's scrollable captures the
         // wheel, so listen globally instead of through the body's mouse_area.
-        if self.viewer.as_ref().is_some_and(|v| v.is_image()) {
+        if self.screen.viewer().is_some_and(|v| v.is_image()) {
             subs.push(event::listen_with(|event, _status, _window| match event {
                 Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
                     Some(Message::Viewer(viewer::ViewerMsg::ZoomWheel(match delta {
@@ -1336,50 +1323,27 @@ impl App {
             }
             return Task::none();
         }
-        if self.help.is_some() {
+        if self.screen.is_some() {
             if named.is_some_and(is_modifier_key) {
                 return Task::none();
             }
-            return self.help_key(named, &key, mods, text.as_deref());
-        }
-        if self.settings.is_some() {
-            if named.is_some_and(is_modifier_key) {
-                return Task::none();
-            }
-            return self.settings_key(named, &key, mods, captured);
-        }
-        if self.multi_rename.is_some() {
-            if named.is_some_and(is_modifier_key) {
-                return Task::none();
-            }
-            return self.multi_rename_key(named, &key, mods, captured);
-        }
-        if self.find.is_some() {
-            if named.is_some_and(is_modifier_key) {
-                return Task::none();
-            }
-            return self.find_key(named, &key, mods, captured);
-        }
-        if self.connect.is_some() {
-            if named.is_some_and(is_modifier_key) {
-                return Task::none();
-            }
-            return self.connect_key(named, &key, mods, captured);
-        }
-        if self.file_diff.is_some() {
-            if !named.is_some_and(is_modifier_key) {
-                self.file_diff_key(named, &key, mods);
-            }
-            return Task::none();
-        }
-        if self.viewer.is_some() {
-            // Keys the search box used must not act again: in a fast burst
-            // its submit (closing the box) is handled before the typed
-            // letters arrive here.
-            if named.is_some_and(is_modifier_key) || captured && !escape {
-                return Task::none();
-            }
-            return self.viewer_key(&key, mods);
+            return match self.screen {
+                Some(Screen::Help(_)) => self.help_key(named, &key, mods, text.as_deref()),
+                Some(Screen::Settings(_)) => self.settings_key(named, &key, mods, captured),
+                Some(Screen::MultiRename(_)) => self.multi_rename_key(named, &key, mods, captured),
+                Some(Screen::Find(_)) => self.find_key(named, &key, mods, captured),
+                Some(Screen::Connect(_)) => self.connect_key(named, &key, mods, captured),
+                Some(Screen::FileDiff(_)) => {
+                    self.file_diff_key(named, &key, mods);
+                    Task::none()
+                }
+                // Keys the search box used must not act again: in a fast
+                // burst its submit (closing the box) is handled before the
+                // typed letters arrive here.
+                Some(Screen::Viewer(_)) if captured && !escape => Task::none(),
+                Some(Screen::Viewer(_)) => self.viewer_key(&key, mods),
+                None => Task::none(),
+            };
         }
         if let Some(Dialog::Hotlist(_) | Dialog::History { .. } | Dialog::Palette(_)) = self.dialog {
             if named.is_some_and(is_modifier_key) {

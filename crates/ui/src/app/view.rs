@@ -58,23 +58,19 @@ impl App {
         }
         let panels = panels.push(self.side_view(1));
 
-        let base: Element<'_, Message> = if let Some(h) = &self.help {
-            self.help_view(h)
-        } else if let Some(s) = &self.settings {
-            self.settings_view(s)
-        } else {
-            match (&self.find, &self.multi_rename, &self.viewer, &self.file_diff) {
-                _ if self.connect.is_some() => self.connect_view(self.connect.as_ref().unwrap()),
-                (Some(f), ..) => self.find_view(f),
-                (_, _, _, Some(d)) => self.file_diff_view(d),
-                (_, Some(mr), _, _) => self.multi_rename_view(mr),
-                (_, None, Some(v), None) => self.viewer_view(v),
-                (None, None, None, None) => container(column![panels, hline(), self.jobs_view(), self.bottom_bar()])
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .style(filled(theme::c().bg))
-                    .into(),
-            }
+        let base: Element<'_, Message> = match &self.screen {
+            Some(Screen::Help(h)) => self.help_view(h),
+            Some(Screen::Settings(s)) => self.settings_view(s),
+            Some(Screen::Connect(c)) => self.connect_view(c),
+            Some(Screen::Find(f)) => self.find_view(f),
+            Some(Screen::FileDiff(d)) => self.file_diff_view(d),
+            Some(Screen::MultiRename(mr)) => self.multi_rename_view(mr),
+            Some(Screen::Viewer(v)) => self.viewer_view(v),
+            None => container(column![panels, hline(), self.jobs_view(), self.bottom_bar()])
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .style(filled(theme::c().bg))
+                .into(),
         };
 
         let modal = self
