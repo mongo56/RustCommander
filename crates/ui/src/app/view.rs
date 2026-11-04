@@ -168,36 +168,19 @@ impl App {
     pub(super) fn column_press(&mut self, side: usize, col: usize) {
         let shown = Columns::for_width(self.panel_width(side), &self.columns).shown();
         let visible: Vec<usize> = (0..3).filter(|&i| shown[i]).collect();
-        let Some(pos) = visible.iter().position(|&i| i == col) else { return };
-        let prior = if pos == 0 { None } else { Some(visible[pos - 1]) };
-        self.column_drag = Some(ColumnDrag { side, col, prior, x0: None, start: self.columns });
+        let Some(edge) = visible.iter().position(|&i| i == col) else { return };
+        self.column_drag = Some(ColumnDrag { side, visible, edge, x0: None, start: self.columns });
     }
 
-    /// Mouse moved to window x while an edge is dragged. Dragging right
-    /// moves the edge right: the column on its left grows and the one on
-    /// its right shrinks (the name column on the left takes up the change
-    /// for the first edge).
+    /// Mouse moved to window x while an edge is dragged: the edge follows
+    /// the mouse (see `drag_edge`).
     pub(super) fn column_dragged(&mut self, x: f32) {
         let Some(mut d) = self.column_drag.take() else { return };
         let x0 = *d.x0.get_or_insert(x);
-        let dx = x - x0;
-        let (col, start) = (d.col, d.start);
-        match d.prior {
-            None => {
-                let shown = Columns::for_width(self.panel_width(d.side), &start).shown();
-                let room = Columns::name_room(self.panel_width(d.side), &start, shown) - MIN_NAME;
-                let max = (start[col] + room.max(0.0)).min(MAX_COLUMN).max(MIN_COLUMNS[col]);
-                self.columns[col] = (start[col] - dx).clamp(MIN_COLUMNS[col], max).round();
-            }
-            Some(p) => {
-                let lo = -(start[p] - MIN_COLUMNS[p]).max(0.0);
-                let lo = lo.max(-(MAX_COLUMN - start[col]).max(0.0));
-                let hi = (start[col] - MIN_COLUMNS[col]).max(0.0).min((MAX_COLUMN - start[p]).max(0.0));
-                let dx = dx.clamp(lo, hi).round();
-                self.columns[p] = start[p] + dx;
-                self.columns[col] = start[col] - dx;
-            }
-        }
+        let width = self.panel_width(d.side);
+        let shown = Columns::for_width(width, &d.start).shown();
+        let spare = (Columns::name_room(width, &d.start, shown) - MIN_NAME).max(0.0);
+        self.columns = drag_edge(d.start, &d.visible, d.edge, x - x0, spare);
         self.column_drag = Some(d);
     }
 
@@ -511,7 +494,11 @@ impl App {
                 (true, true) => " ↓",
                 _ => "",
             };
-            let label = text(format!("{label}{arrow}")).size(12).width(Length::Fill);
+            // Right-aligned by the container, not the text: iced_tiny_skia
+            // 0.13 gets the redraw area of right-aligned text wrong, so the
+            // label vanished when hovering recoloured it.
+            let label = text(format!("{label}{arrow}")).size(12);
+            let label = container(label).width(Length::Fill);
             let label = if right { label.align_x(Alignment::End) } else { label };
             button(label)
                 .on_press(Message::Sort(side, key))
@@ -652,7 +639,9 @@ impl App {
             None => content.push(cell(fit(&entry.name), Length::Fill)),
         };
         if cols.size {
-            content = content.push(cell(size, Length::Fixed(self.columns[1])).align_x(Alignment::End));
+            // Aligned by a container (see `column_header`).
+            let size = container(cell(size, Length::Shrink)).width(Length::Fixed(self.columns[1])).align_x(Alignment::End);
+            content = content.push(size);
         }
         if cols.date {
             content = content.push(cell(format::date(&entry.modified), Length::Fixed(self.columns[2])).color(theme::c().muted));
@@ -1203,4 +1192,79 @@ fn compare_view(opts: &CompareOptions, focus: usize) -> Element<'static, Message
     ]
     .spacing(10);
     container(content).padding(16).width(Length::Fixed(520.0)).style(theme::dialog).into()
+}
+
+/// Widths of the fixed columns after the edge in front of `visible[edge]`
+/// moved `dx` from where it was pressed (positive: right), from the widths
+/// `start` it had then. Moving right shrinks the columns right of the edge,
+/// nearest first, each down to its minimum, and the column left of it grows
+/// (the name column for the first edge, or once the fixed one is at
+/// `MAX_COLUMN`). Moving left grows `visible[edge]` and shrinks the columns
+/// left of the edge, nearest first, and then the name column, by at most
+/// `name_spare`. So the name column can be widened past the point where
+/// the extension column is at its minimum, and narrowed again.
+fn drag_edge(start: [f32; 3], visible: &[usize], edge: usize, dx: f32, name_spare: f32) -> [f32; 3] {
+    let mut w = start;
+    let spare = |w: &[f32; 3], c: usize| (w[c] - MIN_COLUMNS[c]).max(0.0);
+    let dx = dx.round();
+    if dx > 0.0 {
+        let mut left = dx;
+        for &c in &visible[edge..] {
+            let take = left.min(spare(&w, c));
+            w[c] -= take;
+            left -= take;
+        }
+        if let Some(&p) = edge.checked_sub(1).and_then(|i| visible.get(i)) {
+            w[p] = (w[p] + dx - left).min(MAX_COLUMN.max(start[p]));
+        }
+    } else if dx < 0.0 {
+        let col = visible[edge];
+        let room: f32 = visible[..edge].iter().map(|&c| spare(&w, c)).sum::<f32>() + name_spare;
+        let mut left = (-dx).min(room).min((MAX_COLUMN - w[col]).max(0.0));
+        w[col] += left;
+        for &c in visible[..edge].iter().rev() {
+            let take = left.min(spare(&w, c));
+            w[c] -= take;
+            left -= take;
+        }
+    }
+    w
+}
+
+#[cfg(test)]
+mod drag_edge_tests {
+    use super::*;
+
+    const ALL: [usize; 3] = [0, 1, 2];
+
+    #[test]
+    fn widening_the_name_column_takes_from_every_column_on_the_right() {
+        let start = [60.0, 80.0, 120.0];
+        // Ext gives 30, size 30, date 50.
+        assert_eq!(drag_edge(start, &ALL, 0, 110.0, 0.0), [30.0, 50.0, 70.0]);
+        // Further than all can give: they stay at their minimum.
+        assert_eq!(drag_edge(start, &ALL, 0, 500.0, 0.0), MIN_COLUMNS);
+    }
+
+    #[test]
+    fn narrowing_the_name_column_is_limited_by_its_spare_room() {
+        let start = [60.0, 80.0, 120.0];
+        assert_eq!(drag_edge(start, &ALL, 0, -40.0, 100.0), [100.0, 80.0, 120.0]);
+        assert_eq!(drag_edge(start, &ALL, 0, -40.0, 25.0), [85.0, 80.0, 120.0]);
+    }
+
+    #[test]
+    fn a_middle_edge_pushes_on_and_then_takes_from_the_name_column() {
+        let start = [60.0, 80.0, 120.0];
+        // Right: size gives 30, then date 20; ext grows by both.
+        assert_eq!(drag_edge(start, &ALL, 1, 50.0, 0.0), [110.0, 50.0, 100.0]);
+        // Left: ext gives 30, then the name column 10.
+        assert_eq!(drag_edge(start, &ALL, 1, -40.0, 50.0), [30.0, 120.0, 120.0]);
+    }
+
+    #[test]
+    fn only_visible_columns_change() {
+        let start = [60.0, 80.0, 120.0];
+        assert_eq!(drag_edge(start, &[0, 1], 0, 100.0, 0.0), [30.0, 50.0, 120.0]);
+    }
 }

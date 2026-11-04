@@ -326,13 +326,14 @@ struct QuickSearch {
 }
 
 #[derive(Debug)]
-/// Dragging the edge in front of a column of the panel header: `prior` is the
-/// fixed column on its left that gives or takes the width (none: the name column does).
+/// Dragging the edge in front of a column of the panel header: `visible`
+/// are the fixed columns shown when it was pressed, left to right, and
+/// `edge` the position of the dragged column in them (see `drag_edge`).
 #[derive(Clone)]
 struct ColumnDrag {
     side: usize,
-    col: usize,
-    prior: Option<usize>,
+    visible: Vec<usize>,
+    edge: usize,
     /// Mouse x at the first move; widths are changed relative to it.
     x0: Option<f32>,
     start: [f32; 3],
