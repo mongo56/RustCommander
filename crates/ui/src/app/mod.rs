@@ -195,6 +195,9 @@ pub struct App {
     screen: Option<Screen>,
     /// The closed find tool (fields and results), kept for the next Ctrl+F.
     find_last: Option<find_files::FindFiles>,
+    /// A shell menu verb that may still create an item (paste, extract):
+    /// the cursor goes to it when the folder watcher's reload shows it.
+    focus_new: Option<FocusNew>,
     /// The closed disk usage tool with its last tree, for reopening the same folder.
     disk_usage_last: Option<disk_usage::DiskUsage>,
     /// Built-in terminals (F9), running whether shown or not; `Screen::Term`
@@ -426,7 +429,7 @@ pub enum Message {
     ClickBackground(usize),
     /// The context menu closed: what was picked, and the folder it made
     /// (New > Folder) or, for the script items, the script.
-    ContextDone(usize, Result<MenuAction, String>, Option<PathBuf>),
+    ContextDone(usize, Result<MenuAction, String>, Option<PathBuf>, Option<MenuSnap>),
     Hover(usize, usize),
     HoverEnd(usize),
     MouseMoved(Point),
@@ -629,6 +632,7 @@ impl App {
             nav: [None, None],
             screen: None,
             find_last: None,
+            focus_new: None,
             disk_usage_last: None,
             terms: Vec::new(),
             next_term_id: 1,
@@ -878,7 +882,7 @@ impl App {
                 self.focus_panel(side);
                 return self.context_menu(side, true);
             }
-            Message::ContextDone(side, result, made) => match result {
+            Message::ContextDone(side, result, made, snap) => match result {
                 Ok(MenuAction::Nothing) => {}
                 Ok(MenuAction::Rename) => {
                     self.focus_panel(side);
@@ -902,7 +906,8 @@ impl App {
                     // "New > Folder" made "New folder" without asking: take
                     // it back (it is empty and was just created) and ask for
                     // the name like F7 does.
-                    if made.as_ref().is_some_and(|p| p.is_dir() && std::fs::remove_dir(p).is_ok()) {
+                    let background = snap.as_ref().is_some_and(|s| s.background);
+                    if background && made.as_ref().is_some_and(|p| p.is_dir() && std::fs::remove_dir(p).is_ok()) {
                         self.focus_panel(side);
                         self.reload_panels();
                         return self.run(Command::MakeDir);
@@ -910,7 +915,7 @@ impl App {
                     // "New > Text Document" etc. made a file with a default
                     // name (it may hold a template, so keep it): put the
                     // cursor on it and rename it inline, like Explorer does.
-                    if let Some(file) = made.filter(|p| p.is_file()) {
+                    if let Some(file) = made.clone().filter(|p| background && p.is_file()) {
                         self.focus_panel(side);
                         self.reload_panels();
                         if self.panel(side).path.as_path() == file.parent().unwrap_or(&file) {
@@ -922,8 +927,24 @@ impl App {
                         }
                         return Task::none();
                     }
+                    // An item menu verb made one item at once (Create
+                    // shortcut, ...): the cursor goes to it, no rename.
+                    if let Some(item) = &made {
+                        self.reload_panels();
+                        let name = item.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                        if self.panel(side).path.as_path() == item.parent().unwrap_or(item) {
+                            self.panel_mut(side).focus(&name);
+                        }
+                        return Task::none();
+                    }
                     // Verbs that finish later (paste, extract, ...) are
-                    // picked up by the folder watcher.
+                    // picked up by the folder watcher; the cursor then goes
+                    // to the one new item (see `apply_listing`).
+                    if let Some(s) = snap {
+                        let cursor = self.panel(side).current().map(|e| e.name.clone());
+                        let deadline = Instant::now() + Duration::from_secs(5);
+                        self.focus_new = Some(FocusNew { side, folder: s.folder, before: s.before, deadline, cursor });
+                    }
                     self.reload_panels();
                 }
                 Err(e) => self.error(e),
@@ -2738,9 +2759,13 @@ impl App {
         };
         let script_path = script.and(items.first().cloned());
         // Items in archives: the menu acts on temp copies.
+        self.focus_new = None;
+        let in_archive = items.iter().any(|p| vfs::is_virtual(p));
         let Some((folder, items)) = self.shell_items_extracted(side, items) else { return Task::none() };
         let extended = self.modifiers.shift();
-        let before = if background { entry_names(&folder) } else { Default::default() };
+        let before = if in_archive { Default::default() } else { entry_names(&folder) };
+        // (Items from an archive are temp copies: nothing to follow there.)
+        let snap = (!in_archive).then(|| MenuSnap { background, folder: folder.clone(), before: before.clone() });
 
         window::get_oldest()
             .and_then(move |id| {
@@ -2748,15 +2773,11 @@ impl App {
                 window::run_with_handle(id, move |handle| {
                     let result =
                         rc_platform::show_context_menu(native_handle(&handle), &folder, &items, extended, script);
-                    // What the menu created in the background (New > Folder,
-                    // New > Text Document, ...).
-                    let made = match (&result, items.is_empty()) {
-                        (Ok(MenuAction::Invoked(_)), true) => {
-                            let new: Vec<_> = entry_names(&folder).difference(&before).cloned().collect();
-                            match new.as_slice() {
-                                [one] => Some(folder.join(one)),
-                                _ => None,
-                            }
+                    // What the menu created at once (New > Folder, New > Text
+                    // Document, Create shortcut, ...).
+                    let made = match (&result, in_archive) {
+                        (Ok(MenuAction::Invoked(_)), false) => {
+                            single_new(&before, &entry_names(&folder)).map(|one| folder.join(one))
                         }
                         _ => None,
                     };
@@ -2765,9 +2786,9 @@ impl App {
             })
             .map(move |(result, made)| match result {
                 Ok(MenuAction::RunInTerminal | MenuAction::RunExternal) => {
-                    Message::ContextDone(side, result, script_path.clone())
+                    Message::ContextDone(side, result, script_path.clone(), None)
                 }
-                _ => Message::ContextDone(side, result, made),
+                _ => Message::ContextDone(side, result, made, snap.clone()),
             })
     }
 
@@ -2787,7 +2808,7 @@ impl App {
                     rc_platform::show_context_menu(native_handle(&handle), &folder, &items, extended, None)
                 })
             })
-            .map(move |result| Message::ContextDone(side, result, None))
+            .map(move |result| Message::ContextDone(side, result, None, None))
     }
 
     // ---- jobs -------------------------------------------------------------
@@ -3222,6 +3243,7 @@ impl App {
             }
         }
         if result.is_ok() {
+            self.focus_new_item(&path);
             let wanted: Vec<String> = self
                 .focus_after_listing
                 .iter()
@@ -3238,6 +3260,33 @@ impl App {
             }
         }
         self.after_change();
+    }
+
+    /// After a reload of `path`: if a shell menu verb was waiting to show
+    /// its new item there, puts the cursor on it (exactly one new item and
+    /// the cursor not moved by the user meanwhile). The wait ends after one
+    /// new item, several, a moved cursor, another folder or the deadline.
+    fn focus_new_item(&mut self, path: &Path) {
+        let Some(wait) = &self.focus_new else { return };
+        let panel = self.panel(wait.side);
+        if panel.path != wait.folder || Instant::now() > wait.deadline {
+            self.focus_new = None;
+            return;
+        }
+        if wait.folder != path {
+            return;
+        }
+        let after: NameSet = panel.entries.iter().filter(|e| e.name != "..").map(|e| e.name.clone().into()).collect();
+        if after.difference(&wait.before).next().is_none() {
+            return; // nothing yet: the verb may still be working
+        }
+        let new = single_new(&wait.before, &after).map(|n| n.to_string_lossy().into_owned());
+        let unmoved = panel.current().map(|e| &e.name) == wait.cursor.as_ref();
+        let side = wait.side;
+        self.focus_new = None;
+        if let (Some(name), true) = (new, unmoved) {
+            self.panel_mut(side).focus(&name);
+        }
     }
 
     /// Lists every tab's folder on worker threads, the visible tabs first;
@@ -3484,11 +3533,40 @@ fn remote_space(path: &Path) -> Task<Message> {
     )
 }
 
-/// Names of the folders directly inside `dir`.
+type NameSet = std::collections::HashSet<std::ffi::OsString>;
+
 /// The names of everything in `dir` (files and folders).
-fn entry_names(dir: &Path) -> std::collections::HashSet<std::ffi::OsString> {
+fn entry_names(dir: &Path) -> NameSet {
     let Ok(rd) = std::fs::read_dir(dir) else { return Default::default() };
     rd.flatten().map(|e| e.file_name()).collect()
+}
+
+/// The one name in `after` that is not in `before`; `None` if there are none or several.
+fn single_new<'a>(before: &'a NameSet, after: &'a NameSet) -> Option<&'a std::ffi::OsString> {
+    let mut new = after.difference(before);
+    match (new.next(), new.next()) {
+        (Some(one), None) => Some(one),
+        _ => None,
+    }
+}
+
+/// A folder's names from before a shell menu was shown, to find what its verb created.
+#[derive(Debug, Clone)]
+pub struct MenuSnap {
+    /// The menu was the one of the empty space (New > ...), not of items.
+    background: bool,
+    folder: PathBuf,
+    before: NameSet,
+}
+
+/// Waiting for the folder watcher to show the item a shell menu verb makes late.
+struct FocusNew {
+    side: usize,
+    folder: PathBuf,
+    before: NameSet,
+    deadline: Instant,
+    /// The cursor's entry when the verb ran: if it moved, the user took over.
+    cursor: Option<String>,
 }
 
 fn is_modifier_key(key: Named) -> bool {
@@ -3831,6 +3909,16 @@ fn toggle_compare_option(opts: &mut CompareOptions, i: u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn single_new_needs_exactly_one() {
+        let set = |names: &[&str]| -> NameSet { names.iter().map(|n| n.into()).collect() };
+        let before = set(&["a", "b"]);
+        assert_eq!(single_new(&before, &set(&["a", "b", "c"])).unwrap(), "c");
+        assert_eq!(single_new(&before, &set(&["a", "b"])), None);
+        assert_eq!(single_new(&before, &set(&["a", "b", "c", "d"])), None);
+        assert_eq!(single_new(&before, &set(&["a", "c"])).unwrap(), "c");
+    }
 
     #[test]
     fn missing_folder_falls_back_to_parent() {
