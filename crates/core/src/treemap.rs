@@ -28,6 +28,8 @@ pub struct Tile {
 
 /// Lays out `node` inside `rect`, appending file tiles (and tiles of folders smaller than `min_px` in width or
 /// height) to `out`. Subfolders are inset by 1 px per side when big enough. Zero-size entries get no tile.
+/// Items of a folder that would get less than one square pixel share one tile of that folder (its `node`), so
+/// the number of tiles is bounded by the pixel count.
 pub fn layout(tree: &Tree, node: u32, rect: Rect, min_px: f32, out: &mut Vec<Tile>) {
     place(tree, node, rect, 0, min_px, out);
 }
@@ -57,6 +59,12 @@ fn place(tree: &Tree, node: u32, rect: Rect, depth: u8, min_px: f32, out: &mut V
     let (mut x, mut y, mut w, mut h) = (r.x as f64, r.y as f64, r.w as f64, r.h as f64);
     let mut start = 0;
     while start < items.len() {
+        // The rest is smaller than a pixel each (items are sorted descending): one tile for the folder's
+        // remaining area, so the tile count stays bounded by the pixel count.
+        if items[start].1 * scale < 1.0 {
+            out.push(Tile { node, rect: Rect::new(x as f32, y as f32, w as f32, h as f32), depth: child_depth });
+            break;
+        }
         let side = w.min(h);
         // Grow the row while the worst aspect ratio does not get worse.
         let mut sum = 0.0;
@@ -218,6 +226,24 @@ mod tests {
         assert!(tiles.iter().any(|t| t.node == 1));
         assert!(tiles.iter().all(|t| t.node != 2 && t.node != 3));
         assert_eq!(tiles.len(), 2);
+    }
+
+    #[test]
+    fn sub_pixel_items_share_a_folder_tile() {
+        // 1000 x 1 byte in a 10x10 rect: every file would get 0.1 px².
+        let t = flat(&[1; 1000]);
+        let tiles = run(&t, ROOT, Rect::new(0.0, 0.0, 10.0, 10.0), 3.0);
+        assert_eq!(tiles.len(), 1);
+        assert_eq!((tiles[0].node, tiles[0].rect), (ROOT, Rect::new(0.0, 0.0, 10.0, 10.0)));
+        // Big files keep their tiles; the tiny tail becomes one tile of the folder.
+        let mut sizes = vec![10_000, 5_000];
+        sizes.extend([1; 50]);
+        let t = flat(&sizes);
+        let tiles = run(&t, ROOT, Rect::new(0.0, 0.0, 10.0, 10.0), 0.0);
+        assert_eq!(tiles.len(), 3);
+        assert_eq!(tiles.iter().filter(|t| t.node == ROOT).count(), 1);
+        let total: f32 = tiles.iter().map(|t| area(&t.rect)).sum();
+        assert!((total - 100.0).abs() < 0.01, "{total}");
     }
 
     #[test]
