@@ -20,6 +20,10 @@ pub(super) struct Ftp {
     stream: RustlsFtpStream,
     /// The server lists with `MLSD` (exact sizes and UTC dates).
     mlsd: bool,
+    /// A download was aborted: servers may still send a reply for it (the
+    /// aborted `RETR`'s own), which would answer the next command, so the
+    /// session isn't used again.
+    aborted: bool,
 }
 
 /// Maps an FTP error to an `io::Error` about `path`: 550 (no such file /
@@ -220,7 +224,7 @@ impl Ftp {
         }
         stream.transfer_type(FileType::Binary).map_err(conn)?;
         let mlsd = stream.feat().is_ok_and(|f| f.contains_key("MLSD") || f.contains_key("MLST"));
-        Ok(Ftp { stream, mlsd })
+        Ok(Ftp { stream, mlsd, aborted: false })
     }
 }
 
@@ -343,6 +347,7 @@ impl Session for Ftp {
                 Ok(true)
             }
             other => {
+                self.aborted = true;
                 self.stream.abort(transfer).map_err(|e| io_err(path, e))?;
                 other
             }
@@ -389,6 +394,10 @@ impl Session for Ftp {
 
     fn rename(&mut self, from: &str, to: &str) -> io::Result<()> {
         self.stream.rename(from, to).map_err(|e| io_err(from, e))
+    }
+
+    fn reusable(&self) -> bool {
+        !self.aborted
     }
 
     fn keep_alive(&mut self) -> io::Result<()> {

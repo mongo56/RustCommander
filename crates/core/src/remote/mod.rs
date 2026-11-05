@@ -361,6 +361,11 @@ trait Session: Send {
     fn keep_alive(&mut self) -> io::Result<()> {
         Ok(())
     }
+    /// False once the session can't be trusted with another command (FTP
+    /// after an aborted download): it isn't put back in the pool.
+    fn reusable(&self) -> bool {
+        true
+    }
 }
 
 fn open_session(login: &Login) -> io::Result<Box<dyn Session>> {
@@ -533,6 +538,9 @@ impl Connection {
     }
 
     fn put_back(&self, session: Box<dyn Session>) {
+        if !session.reusable() {
+            return;
+        }
         let mut idle = self.idle.lock().unwrap_or_else(|e| e.into_inner());
         if idle.len() < IDLE_SESSIONS {
             idle.push(Idle { session, since: Instant::now() });

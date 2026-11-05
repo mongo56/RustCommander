@@ -175,9 +175,8 @@ fn exercise(root: &Path, disk: &Path) {
     let (outcome, _) = run_job(Job::Move(moved), Resolution::Skip);
     assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
     assert!(disk.join("up/renamed/deeper").is_dir());
-    let copy = vec![Transfer { src: root.join("docs"), dst: root.join("docs2") }];
-    let (outcome, _) = run_job(Job::Copy(copy), Resolution::Skip);
-    assert!(outcome.errors[0].1.contains("isn't supported"));
+    // (Copies on and between servers: `copy_between_servers`, which alone
+    // makes relay temp folders, so it can check none is left.)
 
     // Move up (local source removed), move out (server copy removed).
     let mover = local.0.join("mover.txt");
@@ -998,6 +997,186 @@ fn keep_alive_drops_dead_sessions_and_next_use_reconnects() {
     assert_eq!(listed.unwrap().len(), 1);
     assert_eq!(idle_count(&conn), 1);
     disconnect(&root);
+}
+
+// ---- Between servers -------------------------------------------------------------
+
+/// Serves plain FTP over `root` on `listener` (non-blocking).
+fn start_ftp_on(listener: TcpListener, root: PathBuf) {
+    serve(move || async move {
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        loop {
+            let Ok((socket, _)) = listener.accept().await else { return };
+            let root = root.clone();
+            let server =
+                libunftp::ServerBuilder::new(Box::new(move || unftp_sbe_fs::Filesystem::new(root.clone()).unwrap()))
+                    .passive_ports(44000..=44999)
+                    .build()
+                    .unwrap();
+            tokio::spawn(async move {
+                let _ = server.service(socket).await;
+            });
+        }
+    });
+}
+
+/// Whether a temp folder of a copy between servers is left over.
+fn relay_left() -> bool {
+    let prefix = format!("copy-relay-{}-", std::process::id());
+    fs::read_dir(crate::vfs::temp_root()).into_iter().flatten().flatten()
+        .any(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+}
+
+/// Cancels the job once `when` holds for the progress of the file `name`.
+/// Until then it takes 55 ms per report, so that every next report reaches
+/// it (they are throttled to one per 50 ms).
+struct CancelAt {
+    control: Arc<Control>,
+    name: &'static str,
+    when: Box<When>,
+}
+
+type When = dyn Fn(&Progress) -> bool;
+
+impl Reporter for CancelAt {
+    fn progress(&mut self, p: &Progress) {
+        let on_file = p.current.as_ref().is_some_and(|c| c.file_name().is_some_and(|n| n == self.name));
+        if self.control.is_cancelled() {
+            return;
+        }
+        if on_file && (self.when)(p) {
+            self.control.cancel();
+        } else {
+            std::thread::sleep(Duration::from_millis(55));
+        }
+    }
+    fn conflict(&mut self, _: Conflict) -> Resolution {
+        Resolution::Cancel
+    }
+}
+
+#[test]
+fn copy_between_servers() {
+    let _settings = settings();
+    let ftp_disk = TempDir::new("relay-ftp");
+    let sftp_disk = TempDir::new("relay-sftp");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    start_ftp_on(listener, ftp_disk.0.clone());
+    let ftp = connect_retrying(&Login {
+        protocol: Protocol::Ftp,
+        host: "127.0.0.1".into(),
+        port,
+        user: "tester".into(),
+        password: Some("secret".into()),
+        key_file: None,
+    });
+    let sftp_port = start_sftp(sftp_disk.0.clone(), 7);
+    let login = sftp_login(sftp_port, sftp_server::PASSWORD);
+    assert!(connect(login.clone(), "").is_err());
+    trust_host_key(&login).unwrap();
+    let sftp = connect(login, "").unwrap();
+
+    // A tree on the FTP server: two files, a subfolder and an empty folder.
+    let tree = ftp_disk.0.join("tree");
+    fs::create_dir_all(tree.join("sub/empty")).unwrap();
+    fs::write(tree.join("a.txt"), b"aaa").unwrap();
+    let big: Vec<u8> = (0..3_000_000u32).map(|i| (i % 251) as u8).collect();
+    fs::write(tree.join("sub/big.bin"), &big).unwrap();
+    let total = 3 + big.len() as u64;
+    let check = |dir: &Path, a: &[u8]| {
+        assert_eq!(fs::read(dir.join("a.txt")).unwrap(), a, "{}", dir.display());
+        assert_eq!(fs::read(dir.join("sub/big.bin")).unwrap(), big, "{}", dir.display());
+        assert!(dir.join("sub/empty").is_dir(), "{}", dir.display());
+    };
+
+    // FTP -> SFTP: everything arrives, the source stays, the temp folder goes,
+    // and the bytes are counted once (the progress counts both halves).
+    let transfers = ops::plan_transfer(&[ftp.join("tree")], &sftp.join("")).unwrap();
+    let (outcome, asked) = run_job(Job::Copy(transfers.clone()), Resolution::Skip);
+    assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+    assert_eq!((asked, outcome.done_items, outcome.done_bytes), (0, 5, total));
+    check(&sftp_disk.0.join("tree"), b"aaa");
+    check(&tree, b"aaa");
+    assert!(!relay_left());
+
+    // Again: both files conflict; skipped, then overwritten.
+    let (outcome, asked) = run_job(Job::Copy(transfers.clone()), Resolution::SkipAll);
+    assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+    assert_eq!((asked, outcome.skipped), (1, 2));
+    fs::write(tree.join("a.txt"), b"new").unwrap();
+    let (outcome, asked) = run_job(Job::Copy(transfers.clone()), Resolution::Overwrite);
+    assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+    assert_eq!(asked, 2);
+    check(&sftp_disk.0.join("tree"), b"new");
+    assert!(!relay_left());
+
+    // SFTP -> FTP under a new name.
+    let transfers = ops::plan_transfer(&[sftp.join("tree")], &ftp.join("back")).unwrap();
+    assert_eq!(transfers[0].dst, ftp.join("back"));
+    let (outcome, _) = run_job(Job::Copy(transfers), Resolution::Skip);
+    assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+    check(&ftp_disk.0.join("back"), b"new");
+
+    // Folder to folder on one server (both protocols); not into itself.
+    for (root, disk) in [(&sftp, &sftp_disk.0), (&ftp, &ftp_disk.0)] {
+        let transfers = ops::plan_transfer(&[root.join("tree")], &root.join("copy")).unwrap();
+        let (outcome, _) = run_job(Job::Copy(transfers), Resolution::Skip);
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        check(&disk.join("copy"), b"new");
+        let e = ops::plan_transfer(&[root.join("tree")], &root.join("tree").join("sub").join("")).unwrap_err();
+        assert!(e.contains("into itself"), "{e}");
+        // A sibling whose name starts the same is not inside.
+        assert!(ops::plan_transfer(&[root.join("tree")], &root.join("tree2")).is_ok());
+    }
+    assert!(!relay_left());
+
+    // Move between servers: a skipped file keeps the whole source.
+    let transfers = vec![Transfer { src: ftp.join("back"), dst: sftp.join("tree") }];
+    let (outcome, asked) = run_job(Job::Move(transfers), Resolution::Skip);
+    assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+    assert_eq!((asked, outcome.skipped), (2, 2));
+    check(&ftp_disk.0.join("back"), b"new");
+    // Without conflicts the source goes once everything is across.
+    let transfers = vec![Transfer { src: ftp.join("back"), dst: sftp.join("moved") }];
+    let (outcome, _) = run_job(Job::Move(transfers), Resolution::Skip);
+    assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+    assert_eq!(outcome.done_bytes, total);
+    check(&sftp_disk.0.join("moved"), b"new");
+    assert!(!ftp_disk.0.join("back").exists());
+    // A move on one server is a rename.
+    let transfers = vec![Transfer { src: sftp.join("moved"), dst: sftp.join("renamed") }];
+    let (outcome, _) = run_job(Job::Move(transfers), Resolution::Skip);
+    assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+    check(&sftp_disk.0.join("renamed"), b"new");
+    assert!(!sftp_disk.0.join("moved").exists());
+    assert!(!relay_left());
+
+    // Cancelled while the big file is downloaded, then while it is uploaded
+    // (by the bytes done so far): no temp folder, no part
+    // of it on the server, not counted as done; a cancelled move keeps its
+    // source.
+    // a.txt down and up is 6 bytes, the big file's download half `big.len()`.
+    let downloaded = 6 + big.len() as u64;
+    let phases: [Box<When>; 2] =
+        [Box::new(|p: &Progress| p.done_bytes > 6), Box::new(move |p: &Progress| p.done_bytes > downloaded)];
+    for (i, when) in phases.into_iter().enumerate() {
+        let dst = sftp.join(format!("cancelled{i}"));
+        let job = Job::Move(vec![Transfer { src: ftp.join("tree"), dst }]);
+        let control = Arc::new(Control::default());
+        let mut reporter = CancelAt { control: control.clone(), name: "big.bin", when };
+        let outcome = ops::run(&job, &control, &mut reporter);
+        assert!(outcome.cancelled, "{i}: {outcome:?}");
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(outcome.done_items < 5, "{}", outcome.done_items);
+        let part = sftp_disk.0.join(format!("cancelled{i}/sub/big.bin"));
+        assert!(!part.exists(), "{}", part.display());
+        assert!(!relay_left());
+        check(&tree, b"new");
+    }
+    disconnect(&ftp);
+    disconnect(&sftp);
 }
 
 // ---- Find files on a server ------------------------------------------------------

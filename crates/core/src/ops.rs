@@ -9,7 +9,9 @@
 //!
 //! Servers (`remote`) are written through their [`Vfs`] directly: uploads
 //! file by file (conflicts asked as they come), deletes deepest first;
-//! copies out of them are extracts like from an archive.
+//! copies out of them are extracts like from an archive. Between servers
+//! (or folders of one) each file is downloaded to a temp file, uploaded and
+//! deleted; a move on one server is a rename.
 
 use crate::entry::Entry;
 use crate::remote;
@@ -227,7 +229,14 @@ pub fn plan_transfer(sources: &[PathBuf], target: &Path) -> Result<Vec<Transfer>
         if src_n == dst_n {
             return Err(format!("Cannot copy '{}' onto itself", name.to_string_lossy()));
         }
-        if !is_link(src) && src.is_dir() && dst_n.starts_with(&src_n) {
+        let into_itself = match (remote::split(src), remote::split(&dst)) {
+            // On a server only a folder can have something inside it.
+            (Some((a, from)), Some((b, to))) => {
+                a.eq_ignore_ascii_case(&b) && to.strip_prefix(from.as_str()).is_some_and(|rest| rest.starts_with('/'))
+            }
+            _ => !is_link(src) && src.is_dir() && dst_n.starts_with(&src_n),
+        };
+        if into_itself {
             return Err(format!(
                 "Cannot copy folder '{}' into itself",
                 name.to_string_lossy()
@@ -353,28 +362,39 @@ pub fn run(job: &Job, control: &Control, reporter: &mut dyn Reporter) -> Outcome
         buffer: vec![0; BUFFER_SIZE],
         last_report: Instant::now(),
         staged: Vec::new(),
+        relayed: 0,
     };
 
     match job {
         Job::Copy(transfers) | Job::Move(transfers) => {
-            // A move on a server is a rename: not worth walking the tree.
-            let renamed = |t: &Transfer| remote::is_remote(&t.src) && remote::is_remote(&t.dst);
-            let sizes: Vec<(u64, u64)> =
-                transfers.iter().map(|t| if renamed(t) { (0, 1) } else { measure(&t.src) }).collect();
+            let is_move = matches!(job, Job::Move(_));
+            // A move on one server is a rename: not worth walking the tree.
+            let renamed = is_move && same_server(transfers);
+            // From one server to another (or to another folder of the same
+            // one) every byte goes down to a temp file and up again: both
+            // halves count (`Runner::relayed` takes the first out again).
+            let relayed = |t: &Transfer| remote::is_remote(&t.src) && remote::is_remote(&t.dst);
+            let sizes: Vec<(u64, u64)> = transfers
+                .iter()
+                .map(|t| match (renamed, relayed(t)) {
+                    (true, _) => (0, 1),
+                    (false, true) => {
+                        let (bytes, items) = measure(&t.src);
+                        (bytes * 2, items)
+                    }
+                    (false, false) => measure(&t.src),
+                })
+                .collect();
             for (bytes, items) in &sizes {
                 runner.progress.total_bytes += bytes;
                 runner.progress.total_items += items;
             }
             runner.report(true);
-            let is_move = matches!(job, Job::Move(_));
             let from_server = transfers.iter().find(|t| remote::is_remote(&t.src));
             if transfers.iter().any(|t| remote::is_remote(&t.dst)) {
-                match from_server {
-                    Some(t) if !is_move || !same_server(transfers) => {
-                        runner.fail_msg(&t.src, "Copying between or within servers isn't supported: copy to a local folder first");
-                    }
-                    Some(_) => runner.move_on_server(transfers),
-                    None => runner.upload(transfers, is_move),
+                match renamed {
+                    true => runner.move_on_server(transfers),
+                    false => runner.upload(transfers, is_move),
                 }
             } else if let (Some(t), Some(_)) = (from_server, dst_archive(transfers)) {
                 runner.fail_msg(&t.src, "Can't copy from a server into an archive: copy to a local folder first");
@@ -530,7 +550,7 @@ pub fn run(job: &Job, control: &Control, reporter: &mut dyn Reporter) -> Outcome
     runner.report(true);
     runner.outcome.cancelled = control.is_cancelled();
     runner.outcome.done_items = runner.progress.done_items - runner.outcome.skipped.min(runner.progress.done_items);
-    runner.outcome.done_bytes = runner.progress.done_bytes;
+    runner.outcome.done_bytes = runner.progress.done_bytes - runner.relayed.min(runner.progress.done_bytes);
     runner.outcome
 }
 
@@ -547,6 +567,9 @@ struct Runner<'a> {
     /// (temp path, the original), to show the original in errors and
     /// questions.
     staged: Vec<(PathBuf, PathBuf)>,
+    /// Bytes of the download half of copies between servers (counted in
+    /// the progress, not in the outcome).
+    relayed: u64,
 }
 
 impl Runner<'_> {
@@ -1358,9 +1381,14 @@ impl Runner<'_> {
 
     // ---- servers ----------------------------------------------------------
 
-    /// Uploads local files and folders to a server (the transfers'
-    /// destinations are on it). Conflicts are asked file by file; a moved
-    /// source is removed once everything in it was uploaded.
+    /// Uploads files and folders to a server (the transfers' destinations
+    /// are on it). Conflicts are asked file by file; a moved source is
+    /// removed once everything in it was uploaded.
+    ///
+    /// A source on a server (another one, or another folder of the same
+    /// one) is copied file by file through a temp file in a `copy-relay-*`
+    /// folder: downloaded, uploaded, deleted. The folder goes when the job
+    /// ends, however it ends.
     fn upload(&mut self, transfers: &[Transfer], is_move: bool) {
         let Some(first) = transfers.first() else { return };
         let server = match vfs::open(&first.dst) {
@@ -1370,6 +1398,16 @@ impl Runner<'_> {
                 return;
             }
         };
+        let relay = match transfers.iter().find(|t| remote::is_remote(&t.src)) {
+            Some(t) => match Stage::relay() {
+                Ok(stage) => Some(stage),
+                Err(e) => {
+                    self.fail_msg(&t.src, format!("Can't create a temp folder: {e}"));
+                    return;
+                }
+            },
+            None => None,
+        };
         // Listings of the target folders, to find conflicts without asking
         // the server about every file.
         let mut listed: HashMap<String, Vec<Entry>> = HashMap::new();
@@ -1378,13 +1416,20 @@ impl Runner<'_> {
                 return;
             }
             self.progress.current = Some(t.src.clone());
-            let items = match LocalFs.walk(&t.src) {
-                Ok(items) => items,
+            let from_server = remote::is_remote(&t.src);
+            let source: io::Result<Arc<dyn Vfs>> = match from_server {
+                true => vfs::open(&t.src),
+                false => Ok(Arc::new(LocalFs)),
+            };
+            let (items, source) = match source.and_then(|v| Ok((v.walk(&t.src)?, v))) {
+                Ok(found) => found,
                 Err(e) => {
                     self.fail(&t.src, e);
                     continue;
                 }
             };
+            // Each byte of a relayed file is counted twice (down and up).
+            let weight = if from_server { 2 } else { 1 };
             let mut complete = true;
             for item in items {
                 if !self.alive() {
@@ -1430,30 +1475,76 @@ impl Runner<'_> {
                         }
                         _ => {
                             self.outcome.skipped += 1;
-                            self.item_done(item.size);
+                            self.item_done(item.size * weight);
+                            if from_server {
+                                self.relayed += item.size;
+                            }
                             complete = false;
                             continue;
                         }
                     }
                 }
-                let mut input = match File::open(&item.path) {
-                    Ok(f) => f,
+                let opened = match (&relay, from_server) {
+                    (Some(relay), true) => self.download(source.as_ref(), &item.path, &relay.file),
+                    _ => File::open(&item.path).map(Some),
+                };
+                let mut input = match opened {
+                    Ok(Some(f)) => f,
+                    Ok(None) => return, // cancelled
                     Err(e) => {
                         complete = self.fail(&item.path, e);
                         continue;
                     }
                 };
                 let modified = item.modified.map(Into::into);
-                match server.write_file(&dst, modified, &mut |out| self.pump(&mut input, out)) {
+                let result = server.write_file(&dst, modified, &mut |out| self.pump(&mut input, out));
+                drop(input);
+                if let (Some(relay), true) = (&relay, from_server) {
+                    let _ = fs::remove_file(&relay.file);
+                }
+                match result {
                     Ok(true) => self.item_done(0),
                     Ok(false) => return,
                     Err(e) => complete = self.fail(&dst, e),
                 }
             }
             if is_move && complete && self.alive() {
-                self.remove_source(&t.src);
+                match from_server {
+                    true => {
+                        let saved = self.snapshot();
+                        self.delete_on_server(&t.src);
+                        self.restore(saved);
+                    }
+                    false => self.remove_source(&t.src),
+                }
             }
         }
+    }
+
+    /// Downloads the server file `src` to the local `temp` (replaced) and
+    /// opens it for reading. `None`: cancelled (nothing left at `temp`).
+    fn download(&mut self, source: &dyn Vfs, src: &Path, temp: &Path) -> io::Result<Option<File>> {
+        self.progress.current = Some(src.to_path_buf());
+        let before = self.progress.done_bytes;
+        let mut written = None;
+        let result = source.read_files(&[src.to_path_buf()], &mut |_, input| {
+            let r = self.write_out(input, temp, None);
+            let go_on = matches!(r, Ok(true));
+            written = Some(r);
+            Ok(go_on)
+        });
+        self.relayed += self.progress.done_bytes - before;
+        let outcome = match (result, written) {
+            (Err(e), _) | (Ok(()), Some(Err(e))) => Err(e),
+            (Ok(()), Some(Ok(true))) => match File::open(temp) {
+                Ok(f) => return Ok(Some(f)),
+                Err(e) => Err(e),
+            },
+            (Ok(()), Some(Ok(false))) => Ok(None),
+            (Ok(()), None) => Err(io::Error::other("The server sent no data")),
+        };
+        let _ = fs::remove_file(temp);
+        outcome
     }
 
     /// Moves or renames on one server (the transfers' sources and
@@ -1785,9 +1876,9 @@ fn inner_of(archive: &Path, path: &Path) -> Option<String> {
     Some(parts.join("/"))
 }
 
-/// A number not returned before in this process (for temp folder names).
 /// A temp folder (`copy-*` in [`vfs::temp_root`]) holding a copy of a
-/// nested archive while it's changed; removed when dropped.
+/// nested archive while it's changed, or files copied between servers;
+/// removed when dropped.
 struct Stage {
     dir: PathBuf,
     file: PathBuf,
@@ -1803,6 +1894,14 @@ impl Stage {
         fs::copy(vfs::on_disk(archive)?, &stage.file)?;
         Ok(stage)
     }
+
+    /// An empty temp folder for files copied between servers, which pass
+    /// through `file` one at a time.
+    fn relay() -> io::Result<Stage> {
+        let dir = vfs::temp_root().join(format!("copy-relay-{}-{}", std::process::id(), unique_id()));
+        fs::create_dir_all(&dir)?;
+        Ok(Stage { file: dir.join("file"), dir })
+    }
 }
 
 impl Drop for Stage {
@@ -1811,6 +1910,7 @@ impl Drop for Stage {
     }
 }
 
+/// A number not returned before in this process (for temp folder names).
 fn unique_id() -> u64 {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     NEXT.fetch_add(1, Ordering::Relaxed)

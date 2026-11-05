@@ -3425,16 +3425,15 @@ fn is_modifier_key(key: Named) -> bool {
 }
 
 /// Transfers involving archives or servers that can't be done: into a
-/// read-only archive, moving out of one, between servers, ...
+/// read-only archive, moving out of one, from a server into an archive, ...
+/// (Between servers is fine: each file goes through a temp file.)
 fn archive_transfer_problem(is_move: bool, sources: &[PathBuf], target: &Path) -> Option<&'static str> {
-    let server = |p: &Path| remote::split(p).map(|(key, _)| key.to_lowercase());
-    let from_server = sources.iter().find_map(|p| server(p));
-    match (from_server, server(target)) {
-        (Some(a), Some(b)) if a != b || !is_move => {
-            return Some("Can't copy between or within servers: copy to a local folder first (F6 moves on one server)");
+    let from_server = sources.iter().any(|p| remote::is_remote(p));
+    match (from_server, remote::is_remote(target)) {
+        (true, false) if vfs::in_archive(target) => {
+            return Some("Can't copy from a server into an archive: copy to a folder first");
         }
-        (Some(_), None) if vfs::in_archive(target) => return Some("Can't copy from a server into an archive: copy to a folder first"),
-        (None, Some(_)) if sources.iter().any(|p| vfs::is_virtual(p)) => {
+        (false, true) if sources.iter().any(|p| vfs::is_virtual(p)) => {
             return Some("Can't copy from an archive onto a server: copy out to a folder first");
         }
         _ => {}
@@ -3735,5 +3734,16 @@ mod tests {
         let gone = std::env::temp_dir().join("rc-no-such-folder").join("deeper");
         let (found, _) = read_restored(&gone).unwrap();
         assert_eq!(found, std::env::temp_dir());
+    }
+
+    #[test]
+    fn transfers_between_servers_are_allowed() {
+        let (a, b) = (remote::path_of("ftp://u@a", "/x/f"), remote::path_of("sftp://u@b", "/y"));
+        for is_move in [false, true] {
+            assert_eq!(archive_transfer_problem(is_move, std::slice::from_ref(&a), &b), None);
+            let same = remote::path_of("ftp://u@a", "/z");
+            assert_eq!(archive_transfer_problem(is_move, std::slice::from_ref(&a), &same), None);
+        }
+        assert_eq!(archive_transfer_problem(false, &[a], &std::env::temp_dir()), None);
     }
 }
