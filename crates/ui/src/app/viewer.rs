@@ -7,7 +7,7 @@ use crate::theme::filled;
 use iced::widget::text::{Span, Wrapping};
 use iced::widget::scrollable::{self, AbsoluteOffset, Direction, RelativeOffset};
 use iced::{Point, Size};
-use super::markdown::{self, Block};
+use super::markdown;
 use iced::widget::{center, column, container, lazy, mouse_area, responsive, rich_text, row, text, Column, Space};
 use iced::{Alignment, ContentFit, Element, Font, Length};
 use rc_core::viewer::{self, Document, Hit, Mode, Part, Selection, COPY_LIMIT, HEX_WIDTH, WINDOW};
@@ -94,8 +94,8 @@ fn search_input_id() -> text_input::Id {
 /// that window, and whether the search wrapped around.
 pub type Found = (Arc<Document>, Hit, bool);
 
-/// The parsed blocks of a Markdown file, if it is rendered.
-pub type Rendered = Option<Arc<[Block]>>;
+/// The parsed Markdown file, if it is rendered.
+pub type Rendered = Option<Arc<markdown::Doc>>;
 
 /// What a file was loaded as.
 #[derive(Debug, Clone)]
@@ -125,6 +125,36 @@ pub enum ViewerMsg {
     Press,
     /// A link in rendered Markdown was clicked (its target).
     Link(String),
+    /// The pointer entered / left a block (leaf) of rendered Markdown.
+    MdEnter(usize),
+    MdExit(usize),
+    /// Where the current find match's block of rendered Markdown is (for the load `seq`).
+    MdLocated(u64, Option<markdown::Located>),
+}
+
+/// A left press in rendered Markdown: where (body position), the block it
+/// was on, and whether it has moved (a drag, not a click).
+#[derive(Debug, Clone, Copy)]
+struct MdPress {
+    at: Point,
+    anchor: Option<usize>,
+    dragged: bool,
+}
+
+/// Selection and find state of the rendered Markdown view; reset per file.
+#[derive(Debug, Default)]
+struct MdState {
+    /// Selected blocks (leaves): anchor and head, either way round.
+    sel: Option<(usize, usize)>,
+    /// The block under the pointer.
+    hover: Option<usize>,
+    press: Option<MdPress>,
+    /// All matches of `found` (query, case sensitivity), and the current one.
+    hits: Vec<markdown::Hit>,
+    found: Option<(String, bool)>,
+    hit: Option<usize>,
+    /// Bumped when `hits` change (part of the view's cache key).
+    generation: u64,
 }
 
 #[derive(Debug)]
@@ -149,6 +179,7 @@ pub(super) struct Viewer {
     /// (key 5) instead of `mode`.
     md: Rendered,
     rendered: bool,
+    mds: MdState,
     wrap: bool,
     /// First row shown, and the first column when not wrapping.
     top: usize,
@@ -261,7 +292,7 @@ fn load(path: PathBuf, seq: u64) -> Task<Message> {
             std::thread::spawn(move || {
                 let result = load_sync(&path);
                 let md = match &result {
-                    Ok(Loaded::Doc(doc)) if renders_markdown(&path, doc) => Some(markdown::parse(doc.text()).into()),
+                    Ok(Loaded::Doc(doc)) if renders_markdown(&path, doc) => Some(Arc::new(markdown::parse_doc(doc.text()))),
                     _ => None,
                 };
                 let _ = tx.send((result, md));
@@ -311,6 +342,13 @@ impl App {
             ViewerMsg::Find => return self.viewer_submit(),
             ViewerMsg::Press => self.viewer_press(),
             ViewerMsg::Link(target) => return self.viewer_link(&target),
+            ViewerMsg::MdEnter(leaf) => self.viewer_md_enter(leaf),
+            ViewerMsg::MdExit(leaf) => {
+                if let Some(v) = self.screen.viewer_mut().filter(|v| v.mds.hover == Some(leaf)) {
+                    v.mds.hover = None;
+                }
+            }
+            ViewerMsg::MdLocated(seq, at) => return self.viewer_md_located(seq, at),
         }
         Task::none()
     }
@@ -335,6 +373,7 @@ impl App {
             mode: Mode::Text,
             md: None,
             rendered: false,
+            mds: MdState::default(),
             wrap: false,
             top: 0,
             left: 0,
@@ -365,6 +404,7 @@ impl App {
         v.content = Content::Loading;
         v.md = None;
         v.rendered = false;
+        v.mds = MdState::default();
         v.top = 0;
         v.left = 0;
         v.hit = None;
@@ -413,8 +453,9 @@ impl App {
         }
     }
 
-    /// Keys of the rendered Markdown view; `None` leaves the key to the
-    /// text view's handling (after switching to it for find).
+    /// Keys of the rendered Markdown view (find box closed); `None` leaves
+    /// the key to the text view's handling (opening the find box, files,
+    /// modes, closing).
     fn viewer_markdown_key(
         &mut self,
         named: Option<Named>,
@@ -427,20 +468,35 @@ impl App {
         let typed = ch.filter(|_| !ctrl && !mods.alt());
         let by = |dy: f32| scrollable::scroll_by(markdown_scroll_id(), AbsoluteOffset { x: 0.0, y: dy });
         Some(match (named, typed) {
-            _ if ctrl && (matches!(ch, Some("c" | "a")) || named == Some(Named::Insert)) => {
-                v.note = Some(("Copy works in the source view: press 1, select, then Ctrl+C".into(), Tone::Info));
+            _ if ctrl && (ch == Some("c") || named == Some(Named::Insert)) => self.viewer_md_copy(),
+            _ if ctrl && ch == Some("a") => {
+                let n = v.md.as_ref().map_or(0, |md| md.leaves.len());
+                if n > 0 {
+                    v.mds.sel = Some((0, n - 1));
+                    v.mds.press = None;
+                }
                 Task::none()
             }
-            // Find searches the source: switch to it and let the text view
-            // open the find box (or find the next match).
-            _ if ctrl && ch == Some("f") => {
-                v.rendered = false;
-                return None;
+            // Esc drops a selection before it closes.
+            (Some(Named::Escape), _) if v.mds.sel.is_some() => {
+                v.mds.sel = None;
+                Task::none()
             }
-            (Some(Named::F7 | Named::F3), _) | (_, Some("f" | "/")) => {
-                v.rendered = false;
-                v.note = Some(("Find works in the source view (5 shows the rendered view again)".into(), Tone::Info));
-                return None;
+            (Some(Named::F3), _) => self.viewer_find(!mods.shift()),
+            (_, Some("c")) => {
+                v.case = !v.case;
+                let mut note = format!("Case-sensitive search {}", if v.case { "on" } else { "off" });
+                // Matches on show follow the new setting.
+                if v.mds.found.is_some() {
+                    let at = v.mds.hit.and_then(|k| v.mds.hits.get(k)).map(|h| (h.leaf, h.piece, h.start));
+                    md_search(v);
+                    let hits = &v.mds.hits;
+                    let next = at.map(|at| hits.partition_point(|h| (h.leaf, h.piece, h.start) < at));
+                    v.mds.hit = next.filter(|&k| k < hits.len());
+                    note += &format!(" · {} match{}", hits.len(), if hits.len() == 1 { "" } else { "es" });
+                }
+                v.note = Some((note, Tone::Info));
+                return Some(self.viewer_md_locate());
             }
             (Some(Named::ArrowDown), _) => by(MD_STEP),
             (Some(Named::ArrowUp), _) => by(-MD_STEP),
@@ -451,6 +507,79 @@ impl App {
             (Some(Named::ArrowLeft | Named::ArrowRight), _) => Task::none(),
             _ => return None,
         })
+    }
+
+    /// The pointer entered block `leaf` of rendered Markdown: during a
+    /// press, reaching another block makes it a drag that selects up to it.
+    fn viewer_md_enter(&mut self, leaf: usize) {
+        let Some(v) = self.screen.viewer_mut() else { return };
+        let m = &mut v.mds;
+        m.hover = Some(leaf);
+        if let Some(press) = m.press.as_mut() {
+            if press.anchor != Some(leaf) {
+                press.dragged = true;
+            }
+            if press.dragged {
+                let anchor = *press.anchor.get_or_insert(leaf);
+                m.sel = Some((anchor, leaf));
+            }
+        }
+    }
+
+    /// F3 / Shift+F3 (and Enter in the find box) in rendered Markdown:
+    /// marks all matches and moves to the next / previous one, wrapping.
+    fn viewer_md_find(&mut self, forward: bool) -> Task<Message> {
+        let Some(v) = self.screen.viewer_mut() else { return Task::none() };
+        if v.mds.found != Some((v.query.clone(), v.case)) {
+            md_search(v);
+        }
+        let n = v.mds.hits.len();
+        if n == 0 {
+            v.note = Some((format!("\"{}\" not found", v.query), Tone::Error));
+            return Task::none();
+        }
+        let (k, wrapped) = match v.mds.hit {
+            None => (if forward { 0 } else { n - 1 }, false),
+            Some(i) if forward => if i + 1 < n { (i + 1, false) } else { (0, true) },
+            Some(i) => if i > 0 { (i - 1, false) } else { (n - 1, true) },
+        };
+        v.mds.hit = Some(k);
+        let wrapped = if wrapped { " (wrapped around)" } else { "" };
+        v.note = Some((format!("\"{}\": {} of {n}{wrapped}", v.query, k + 1), Tone::Info));
+        self.viewer_md_locate()
+    }
+
+    /// Scrolls the current match of rendered Markdown into view (after the
+    /// view has drawn it: `locate` finds its block, `MdLocated` scrolls).
+    fn viewer_md_locate(&self) -> Task<Message> {
+        let Some(v) = self.screen.viewer().filter(|v| v.mds.hit.is_some()) else { return Task::none() };
+        let seq = v.seq;
+        markdown::locate(markdown_scroll_id()).map(move |at| Message::Viewer(ViewerMsg::MdLocated(seq, at)))
+    }
+
+    fn viewer_md_located(&mut self, seq: u64, at: Option<markdown::Located>) -> Task<Message> {
+        let Some(v) = self.screen.viewer().filter(|v| v.seq == seq && v.rendered) else { return Task::none() };
+        let (Some(at), Some(md), Some(hit)) = (at, &v.md, v.mds.hit.and_then(|k| v.mds.hits.get(k))) else {
+            return Task::none();
+        };
+        match markdown::scroll_target(at, markdown::hit_depth(&md.leaves, *hit)) {
+            Some(y) => scrollable::scroll_to(markdown_scroll_id(), AbsoluteOffset { x: 0.0, y }),
+            None => Task::none(),
+        }
+    }
+
+    /// Ctrl+C / Ctrl+Insert in rendered Markdown: the selected blocks as plain text.
+    fn viewer_md_copy(&mut self) -> Task<Message> {
+        let Some(v) = self.screen.viewer_mut() else { return Task::none() };
+        let Some(md) = v.md.clone() else { return Task::none() };
+        let Some((a, b)) = v.mds.sel.filter(|_| !md.leaves.is_empty()) else {
+            v.note = Some(("Nothing selected: drag over blocks with the mouse or press Ctrl+A".into(), Tone::Info));
+            return Task::none();
+        };
+        let (a, b) = (a.min(b), a.max(b).min(md.leaves.len() - 1));
+        let n = b + 1 - a;
+        v.note = Some((format!("Copied {n} block{}", if n == 1 { "" } else { "s" }), Tone::Info));
+        iced::clipboard::write(markdown::copy_text(&md.leaves[a..=b]))
     }
 
     /// A clicked Markdown link: web links open in the browser, relative
@@ -582,14 +711,14 @@ impl App {
         ("P, Backspace", "Previous file in the panel"),
         ("1", "Text mode (images: actual size)"),
         ("3", "Hex mode"),
-        ("5", "Markdown files: rendered view (the default for .md; 1 shows the source, where copy and find work)"),
+        ("5", "Markdown files: rendered view (the default for .md; 1 shows the source)"),
         ("W", "Wrap long lines on / off"),
-        ("F7, F, /, Ctrl+F", "Find text"),
+        ("F7, F, /, Ctrl+F", "Find text (rendered Markdown: marks all matches in place)"),
         ("F3, Shift+F3", "Find next / previous"),
         ("C", "Case-sensitive find on / off"),
-        ("Mouse drag, Shift+click", "Select text (hex mode: in the hex or the character column)"),
-        ("Ctrl+C, Ctrl+Insert", "Copy the selection (hex column as hex digits; at most 16 MB)"),
-        ("Ctrl+A", "Select the whole file"),
+        ("Mouse drag, Shift+click", "Select text (hex mode: in the hex or the character column; rendered Markdown: whole blocks)"),
+        ("Ctrl+C, Ctrl+Insert", "Copy the selection (hex column as hex digits; at most 16 MB; rendered Markdown: as plain text)"),
+        ("Ctrl+A", "Select the whole file (rendered Markdown: all blocks)"),
         ("+, -, Ctrl+wheel", "Zoom an image in / out"),
         ("0, *", "Fit the image to the window"),
         ("Mouse drag", "Pan a zoomed image"),
@@ -657,6 +786,15 @@ impl App {
     fn viewer_pointer(&mut self, at: Option<Point>) {
         let Some(v) = self.screen.viewer_mut() else { return };
         v.pointer = at;
+        // Rendered Markdown: a press that moves becomes a block selection drag.
+        if let (Some(p), Some(press)) = (at, v.mds.press.as_mut()) {
+            if !press.dragged && p.distance(press.at) >= DRAG_THRESHOLD {
+                press.dragged = true;
+                if let Some(anchor) = press.anchor {
+                    v.mds.sel = Some((anchor, v.mds.hover.unwrap_or(anchor)));
+                }
+            }
+        }
         if let Some(p) = at.filter(|_| v.selecting) {
             self.viewer_drag_to(p);
         }
@@ -667,6 +805,12 @@ impl App {
     /// past its edges), or a zoomed image (drag panning).
     pub(super) fn viewer_tracks_mouse(&self) -> bool {
         self.screen.viewer().is_some_and(|v| (v.doc().is_some() && !v.rendered) || (v.is_image() && v.zoom.is_some()))
+    }
+
+    /// The viewer wants window-wide left presses for selecting blocks of
+    /// rendered Markdown (pointer moves come from the body's `mouse_area`).
+    pub(super) fn viewer_md_presses(&self) -> bool {
+        self.screen.viewer().is_some_and(|v| v.rendered && v.md.is_some())
     }
 
     /// A zoomed image larger than the view on some axis, so dragging pans it.
@@ -710,6 +854,24 @@ impl App {
         let view = self.viewer_body_size();
         let mouse = self.mouse;
         let Some(v) = self.screen.viewer_mut() else { return };
+        if v.rendered && v.md.is_some() {
+            // Not over the body, or on the scrollbar.
+            let Some(p) = v.pointer.filter(|p| p.x < view.width - IMAGE_BAR) else { return };
+            let m = &mut v.mds;
+            match (shift, m.hover) {
+                // Shift+click extends the selection (or selects that block).
+                (true, Some(head)) => {
+                    let anchor = m.sel.map_or(head, |s| s.0);
+                    m.sel = Some((anchor, head));
+                    m.press = Some(MdPress { at: p, anchor: Some(anchor), dragged: true });
+                }
+                // Shift+click off the blocks keeps the selection.
+                (true, None) => {}
+                _ => m.press = Some(MdPress { at: p, anchor: m.hover, dragged: false }),
+            }
+            v.note = None;
+            return;
+        }
         if v.is_image() {
             // Not over the body, or on its scrollbars.
             let on_image = v.pointer.is_some_and(|p| p.x < view.width - IMAGE_BAR && p.y < view.height - IMAGE_BAR);
@@ -734,6 +896,11 @@ impl App {
     /// Left button released anywhere: the drag ends; a plain click leaves no selection.
     pub(super) fn viewer_release(&mut self) {
         if let Some(v) = self.screen.viewer_mut() {
+            // A plain click in rendered Markdown clears the selection (a
+            // link under it opens through its own message).
+            if v.mds.press.take().is_some_and(|p| !p.dragged) {
+                v.mds.sel = None;
+            }
             v.selecting = false;
             v.pan = None;
             if v.sel.is_some_and(|s| s.is_empty()) {
@@ -1064,6 +1231,9 @@ impl App {
             v.search = Some(String::new());
             return text_input::focus(search_input_id());
         }
+        if v.rendered && v.md.is_some() {
+            return self.viewer_md_find(forward);
+        }
         let Some(doc) = v.doc_arc() else { return Task::none() };
         if !doc.is_whole() {
             return self.viewer_find_in_file(doc, forward);
@@ -1172,6 +1342,10 @@ impl App {
             Content::Loaded(Loaded::Doc(doc)) if v.rendered => {
                 info.push(rc_core::format::size(doc.size));
                 info.push("Markdown".into());
+                if let Some((a, b)) = v.mds.sel {
+                    let n = a.abs_diff(b) + 1;
+                    info.push(format!("{n} block{} selected", if n == 1 { "" } else { "s" }));
+                }
             }
             Content::Loaded(Loaded::Doc(doc)) => {
                 info.push(rc_core::format::size(doc.size));
@@ -1267,7 +1441,7 @@ impl App {
         let help = if v.image_size().is_some() {
             "Esc close · ←/→ prev/next image · N/P next/prev file · +/- or Ctrl+wheel zoom · 0 fit · 1 actual size · drag to pan"
         } else if v.rendered {
-            "Esc close · N/P next/prev file · 1 source · 3 hex · F7 find (in the source) · click a link to open it · copy: in the source"
+            "Esc close · N/P next/prev file · 1 source · 3 hex · F7 find · F3/Shift+F3 next/prev · C match case · drag select blocks · Ctrl+C copy · click a link to open it"
         } else if v.md.is_some() {
             "Esc close · N/P next/prev file · 1 text · 3 hex · 5 Markdown · W wrap · F7 find · F3/Shift+F3 next/prev · C match case · drag select · Ctrl+C copy"
         } else {
@@ -1371,18 +1545,31 @@ impl App {
 }
 
 /// The rendered Markdown of `v`, scrolling vertically. The widgets are
-/// built once per load (and theme), not on every redraw.
+/// built again only when the file, theme, block selection or find matches
+/// change, not on every redraw.
 fn markdown_body(v: &Viewer) -> Element<'_, Message> {
     let Some(md) = &v.md else { return Space::new(Length::Fill, Length::Fill).into() };
-    let blocks: &[Block] = md;
-    let key = (v.seq, blocks.as_ptr() as usize, markdown::theme_key());
-    scrollable::Scrollable::new(lazy(key, move |_| markdown::view(blocks)))
+    let m = &v.mds;
+    // Rebuilt only when what it shows changes: not on pointer moves.
+    let sel = m.sel.map(|(a, b)| (a.min(b), a.max(b)));
+    let key = (v.seq, Arc::as_ptr(md) as usize, markdown::theme_key(), sel, m.generation, m.hit);
+    let marks = markdown::Marks { sel, hits: &m.hits, current: m.hit };
+    scrollable::Scrollable::new(lazy(key, move |_| markdown::view(&md.blocks, marks)))
         .id(markdown_scroll_id())
         .direction(Direction::Vertical(scrollbar::bar()))
         .style(scrollbar::style)
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
+}
+
+/// Finds all matches of the query in the rendered Markdown of `v` (none current yet).
+fn md_search(v: &mut Viewer) {
+    let Some(md) = &v.md else { return };
+    v.mds.hits = markdown::find(&md.leaves, &v.query, v.case);
+    v.mds.found = Some((v.query.clone(), v.case));
+    v.mds.hit = None;
+    v.mds.generation += 1;
 }
 
 /// The file a relative link `target` in the file `from` points at

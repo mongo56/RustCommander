@@ -658,7 +658,10 @@ fn match_at(hay: &str, pos: usize, needle: &str, case: bool) -> Option<usize> {
     Some(hay_chars.next().map_or(hay.len(), |(i, _)| pos + i))
 }
 
-fn find_text(hay: &str, needle: &str, from: usize, case: bool, forward: bool) -> Option<(usize, usize)> {
+/// Byte range of the first match of `needle` in `hay` starting at or after
+/// `from` (forward) or the last one starting before it (backward); `case`
+/// false folds letters.
+pub fn find_text(hay: &str, needle: &str, from: usize, case: bool, forward: bool) -> Option<(usize, usize)> {
     let mut from = from.min(hay.len());
     while !hay.is_char_boundary(from) {
         from -= 1;

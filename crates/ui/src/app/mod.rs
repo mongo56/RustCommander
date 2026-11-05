@@ -713,7 +713,7 @@ impl App {
         // Viewer selections start on any left press over the body (seen
         // through `ViewerMsg::Pointer`): its `mouse_area` doesn't get presses on
         // highlighted rows, since `rich_text` captures presses on its spans.
-        if self.viewer_tracks_mouse() {
+        if self.viewer_tracks_mouse() || self.viewer_md_presses() {
             subs.push(event::listen_with(|event, _status, _window| match event {
                 Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                     Some(Message::Viewer(viewer::ViewerMsg::Press))
