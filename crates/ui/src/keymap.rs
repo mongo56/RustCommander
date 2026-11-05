@@ -432,6 +432,7 @@ const DEFAULTS: &[(&str, Command)] = {
         ("ctrl+shift+w", CloseTerminal),
         ("ctrl+shift+f", Disconnect),
         ("ctrl+shift+d", HotlistTree),
+        ("ctrl+shift+a", SetAttrib),
     ]
 };
 

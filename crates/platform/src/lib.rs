@@ -5,10 +5,12 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+mod attrib;
 pub mod credentials;
 mod editors;
 mod process_info;
 mod terminals;
+pub use attrib::set_file_attributes;
 pub use editors::{detect_editors, pick_program, FoundEditor};
 pub use process_info::{foreground_child, process_cwd};
 pub use terminals::{detect_terminals, find_pwsh, FoundTerminal};

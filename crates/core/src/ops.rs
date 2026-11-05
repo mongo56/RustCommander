@@ -64,6 +64,9 @@ pub enum Job {
     /// Joins the parts `x.001`, `x.002`, ... (`first` is the first) into the file `x`
     /// in the folder `target`, checking `x.crc` if it exists.
     Combine { first: PathBuf, target: PathBuf },
+    /// Changes attributes and dates of local `paths` (and, with `recursive`,
+    /// of everything inside the folders; links are not followed).
+    SetAttrib { paths: Vec<PathBuf>, change: crate::attrib::Change, recursive: bool },
 }
 
 /// Size and date of a file inside an archive (`None`: there's no such
@@ -94,6 +97,7 @@ impl Job {
             Job::Update { .. } => "Updated",
             Job::Split { .. } => "Split",
             Job::Combine { .. } => "Combined",
+            Job::SetAttrib { .. } => "Changed",
         }
     }
 
@@ -110,6 +114,7 @@ impl Job {
             Job::Update { .. } => "Updating",
             Job::Split { .. } => "Splitting",
             Job::Combine { .. } => "Combining",
+            Job::SetAttrib { .. } => "Changing",
         }
     }
 }
@@ -536,6 +541,18 @@ pub fn run(job: &Job, control: &Control, reporter: &mut dyn Reporter) -> Outcome
         }
         Job::Split { src, target, part_size } => runner.split(src, target, *part_size),
         Job::Combine { first, target } => runner.combine(first, target),
+        Job::SetAttrib { paths, change, recursive } => {
+            for path in paths {
+                runner.progress.total_items += if *recursive { measure(path).1 } else { 1 };
+            }
+            runner.report(true);
+            for path in paths {
+                if !runner.alive() {
+                    break;
+                }
+                runner.set_attrib(path, change, *recursive);
+            }
+        }
         Job::Delete { paths, to_trash: true } => {
             runner.progress.total_items = paths.len() as u64;
             runner.report(true);
@@ -2154,6 +2171,35 @@ impl Runner<'_> {
 
     /// Permanently deletes `path` (recursively). Links are removed, never
     /// followed.
+    /// `Job::SetAttrib` on `path` and, with `recursive`, what is inside it
+    /// (a failing item is recorded and the rest goes on).
+    fn set_attrib(&mut self, path: &Path, change: &crate::attrib::Change, recursive: bool) {
+        if !self.alive() {
+            return;
+        }
+        self.progress.current = Some(path.to_path_buf());
+        match crate::attrib::apply(path, change) {
+            Ok(()) => self.item_done(0),
+            Err(e) => {
+                self.fail(path, e);
+            }
+        }
+        let is_dir = fs::symlink_metadata(path).is_ok_and(|m| m.is_dir());
+        if !recursive || !is_dir || crate::attrib::is_link(path) {
+            return;
+        }
+        match fs::read_dir(path) {
+            Ok(children) => {
+                for child in children.flatten() {
+                    self.set_attrib(&child.path(), change, true);
+                }
+            }
+            Err(e) => {
+                self.fail(path, e);
+            }
+        }
+    }
+
     fn remove(&mut self, path: &Path) -> bool {
         if !self.alive() {
             return false;
@@ -2623,6 +2669,32 @@ mod tests {
         // Not offered, so the answer counts as Skip.
         assert_eq!((r.asked, outcome.skipped), (1, 1));
         assert_eq!(fs::read(tmp.0.join("out/a.txt")).unwrap(), b"ab");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn set_attrib_job_goes_into_subfolders_only_when_asked() {
+        use crate::attrib::{self, Change, Tri};
+        let tmp = TempDir::new("setattrib");
+        let inner = tmp.0.join("d").join("in.txt");
+        fs::create_dir_all(inner.parent().unwrap()).unwrap();
+        fs::write(&inner, b"x").unwrap();
+        let change = Change { flags: [Tri::Leave, Tri::Set, Tri::Leave, Tri::Leave], ..Default::default() };
+        let hidden = |p: &Path| attrib::get_attributes(p).unwrap() & attrib::HIDDEN != 0;
+        let job = Job::SetAttrib { paths: vec![tmp.0.join("d")], change: change.clone(), recursive: false };
+        let (outcome, _) = run_job(job, Resolution::Skip);
+        assert!(outcome.errors.is_empty());
+        assert!(hidden(&tmp.0.join("d")) && !hidden(&inner));
+        let job = Job::SetAttrib { paths: vec![tmp.0.join("d")], change, recursive: true };
+        let (outcome, _) = run_job(job, Resolution::Skip);
+        assert!(outcome.errors.is_empty() && outcome.done_items == 2);
+        assert!(hidden(&inner));
+        // A missing path is reported and the rest still done.
+        let change = Change { flags: [Tri::Leave, Tri::Clear, Tri::Leave, Tri::Leave], ..Default::default() };
+        let job = Job::SetAttrib { paths: vec![tmp.0.join("nope"), inner.clone()], change, recursive: false };
+        let (outcome, _) = run_job(job, Resolution::Skip);
+        assert_eq!(outcome.errors.len(), 1);
+        assert!(!hidden(&inner));
     }
 
     struct TempDir(PathBuf);

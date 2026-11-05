@@ -4311,6 +4311,7 @@ dependencies = [
  "junction",
  "libunftp",
  "memchr",
+ "rc-platform",
  "rcgen",
  "regex",
  "ring",

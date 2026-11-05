@@ -115,6 +115,8 @@ commands! {
         SplitFile => "cm_SplitFile", "Split the file under the cursor into parts (name.001, ...) in the other panel's folder", "Split";
         /// Join the parts name.001, name.002, ... into the other panel's folder.
         CombineFiles => "cm_CombineFiles", "Join the parts (name.001, name.002, ...) from the file under the cursor into the other panel's folder", "Combine";
+        /// Attributes and dates of the selected files, in a dialog (Ctrl+Shift+A).
+        SetAttrib => "cm_SetAttrib", "Change attributes and dates of the selected files", "Attrib";
         /// Find files by name and contents (Ctrl+F).
         FindFiles => "cm_SearchFor", "Find files by name and contents", "Find";
         /// What takes up space in a folder, as a tree (Alt+Shift+F7).

@@ -12,6 +12,7 @@ mod hotlist_tree;
 mod markdown;
 mod palette;
 mod screen;
+mod attrib;
 mod checksum;
 mod split;
 mod find_files;
@@ -296,6 +297,8 @@ enum Dialog {
     Update(update::UpdateDialog),
     /// SHA-256 calculation / verification (`checksum.rs`).
     Checksum(checksum::ChecksumDialog),
+    /// Attributes and dates of files (`attrib.rs`).
+    Attrib(Box<attrib::AttribDialog>),
     /// Split `src` (`size` bytes) into parts in `target` (`split.rs`); `input`: the part size.
     Split { src: PathBuf, size: u64, target: PathBuf, input: String },
     /// Closing terminal `id` while `program` runs in it.
@@ -522,6 +525,7 @@ pub enum Message {
     Settings(settings::SettingsMsg),
     Update(update::UpdateMsg),
     Checksum(checksum::ChecksumMsg),
+    Attrib(attrib::AttribMsg),
     /// Background listing for a pending navigation: (side, seq, listing).
     Navigated(usize, u64, Listing),
     /// A file inside an archive was extracted to a temp copy to be opened.
@@ -1366,6 +1370,7 @@ impl App {
             Message::Settings(msg) => return self.settings_update(msg),
             Message::Update(msg) => return self.update_msg(msg),
             Message::Checksum(msg) => return self.checksum_msg(msg),
+            Message::Attrib(msg) => return self.attrib_msg(msg),
             Message::ArchiveEdit(msg) => return self.archive_edit_update(msg),
             Message::Navigated(side, seq, result) => {
                 let current = self.sides[side].current;
@@ -1508,6 +1513,12 @@ impl App {
                 return Task::none();
             }
             return self.update_key(named, mods.shift());
+        }
+        if let Some(Dialog::Attrib(_)) = self.dialog {
+            if named.is_some_and(is_modifier_key) {
+                return Task::none();
+            }
+            return self.attrib_key(named, mods.shift(), captured);
         }
         if let Some(Dialog::Checksum(_)) = self.dialog {
             if named.is_some_and(is_modifier_key) || captured {
@@ -1721,6 +1732,7 @@ impl App {
             CompareFiles => return self.open_file_diff(),
             FindFiles => return self.open_find(),
             CalcChecksum => return self.calc_checksum(),
+            SetAttrib => return self.open_attrib(),
             VerifyChecksum => return self.verify_checksum(),
             SplitFile => return self.open_split(),
             CombineFiles => return self.combine_files(),
@@ -2494,6 +2506,7 @@ impl App {
             // Its buttons send their own messages.
             Dialog::Update(d) => self.dialog = Some(Dialog::Update(d)),
             Dialog::Checksum(d) => self.dialog = Some(Dialog::Checksum(d)),
+            Dialog::Attrib(d) => self.dialog = Some(Dialog::Attrib(d)),
             Dialog::Compare { opts } => {
                 let changed = self.compare_opts != opts;
                 self.compare_opts = opts;
