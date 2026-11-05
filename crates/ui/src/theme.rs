@@ -421,6 +421,21 @@ pub fn drive(current: bool) -> impl Fn(&Theme, button::Status) -> button::Style 
     }
 }
 
+/// Terminal sidebar entry: like `drive`, but without the accent border (the
+/// current entry has an accent bar beside it instead) and in the normal text colour.
+pub fn side_entry(current: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_, status| button::Style {
+        background: Some(Background::Color(match (current, status) {
+            (true, _) => c().cursor,
+            (false, button::Status::Hovered | button::Status::Pressed) => c().cursor_inactive,
+            _ => Color::TRANSPARENT,
+        })),
+        text_color: c().text,
+        border: Border { radius: 4.0.into(), ..Border::default() },
+        ..button::Style::default()
+    }
+}
+
 /// Floating label that follows the mouse while dragging.
 pub fn drag_label(_theme: &Theme) -> container::Style {
     container::Style {

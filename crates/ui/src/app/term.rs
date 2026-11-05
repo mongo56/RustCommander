@@ -2342,29 +2342,30 @@ impl App {
         let shown = self.screen.term().copied();
         // Over the panels only short entries fit; the x is left out (middle-click still closes).
         let collapsed = self.screen.is_none();
-        let entry = |label: String,
+        // Rows have fixed heights so the accent bar beside them matches and the
+        // list doesn't jump when a program starts or ends (expanded terminal
+        // entries always have room for the program line).
+        let line_h = 24.0;
+        let term_h = if collapsed { line_h } else { 34.0 };
+        let entry = |content: Element<'static, Message>,
                      tip: Option<String>,
                      current: bool,
                      press: TermMsg,
                      close: Option<u64>,
-                     cue: Option<Color>| {
-            let files = close.is_none();
-            let label = if files {
-                text(label).size(13).font(Font { weight: Weight::Bold, ..Font::DEFAULT })
-            } else {
-                text(label).size(12)
-            };
-            let label = match cue {
-                Some(color) => label.color(color),
-                None => label,
-            };
-            let label = if collapsed { label.width(Length::Fill).center() } else { label };
-            let name = button(label.wrapping(Wrapping::None))
+                     h: f32|
+         -> Element<'static, Message> {
+            let content = container(content).width(Length::Fill).height(Length::Fill).align_y(alignment::Vertical::Center);
+            let content = if collapsed { content.align_x(alignment::Horizontal::Center) } else { content };
+            let name = button(content)
                 .on_press(Message::Term(press))
                 .width(Length::Fill)
-                .padding(if collapsed { [4, 0] } else { [4, 8] })
-                .style(theme::drive(current));
-            let mut line = Row::new().align_y(iced::Alignment::Center).push(name);
+                .height(Length::Fixed(h))
+                .padding(if collapsed { [0, 0] } else { [0, 6] })
+                .style(theme::side_entry(current));
+            // The current entry's accent bar; a transparent one keeps the others lined up.
+            let accent = if current { c.accent } else { Color::TRANSPARENT };
+            let bar = container(Space::new(Length::Fixed(3.0), Length::Fixed(h - 6.0))).style(filled(accent));
+            let mut line = Row::new().spacing(2).align_y(iced::Alignment::Center).push(bar).push(name);
             if let Some(id) = close.filter(|_| !collapsed) {
                 line = line.push(
                     button(text("\u{d7}").size(13))
@@ -2391,15 +2392,43 @@ impl App {
         };
         let mut list = Column::new().spacing(2).width(Length::Fill);
         let files = if collapsed { "F" } else { "Files" };
-        list = list.push(entry(files.to_owned(), None, shown.is_none(), TermMsg::Show(None), None, None));
+        let files = text(files).size(13).font(Font { weight: Weight::Bold, ..Font::DEFAULT });
+        list = list.push(entry(files.into(), None, shown.is_none(), TermMsg::Show(None), None, line_h));
         list = list.push(
             container(Space::new(Length::Fill, Length::Fixed(1.0))).width(Length::Fill).style(filled(c.border)),
         );
         for (i, t) in self.terms.iter().enumerate() {
             let full = term_label(&t.dir, t.program.as_deref(), LABEL_CHARS);
-            // A cue: a dot instead of ">_", in green (finished) or amber (waiting).
-            let mark = if t.attention.is_some() { "\u{25cf}" } else { ">_" };
-            let label = if collapsed { format!("{mark}{}", i + 1) } else { format!("{mark} {full}") };
+            // A cue: a dot, in green (finished) or amber (waiting); the label keeps its colour.
+            let cue = t.attention.map(|a| match a {
+                Attention::Finished => c.success,
+                Attention::Waiting => c.selected,
+            });
+            let dot = |color: Color| text("\u{25cf}").size(10).color(color);
+            let content: Element<'static, Message> = if collapsed {
+                // The dot takes the place of ">_".
+                let mark: Element<'static, Message> = match cue {
+                    Some(color) => dot(color).into(),
+                    None => text(">_").size(12).into(),
+                };
+                row![mark, text(format!("{}", i + 1)).size(12)].align_y(iced::Alignment::Center).into()
+            } else {
+                // Folder name, the running program below it in a dimmer, smaller font.
+                let folder = text(cut(&folder_title(&t.dir), LABEL_CHARS)).size(12).wrapping(Wrapping::None);
+                let mut names = Column::new().push(folder);
+                if let Some(program) = &t.program {
+                    let program = text(cut(program, LABEL_CHARS)).size(11).color(c.muted);
+                    names = names.push(program.wrapping(Wrapping::None));
+                }
+                let mut content = Row::new()
+                    .spacing(4)
+                    .align_y(iced::Alignment::Center)
+                    .push(container(names).width(Length::Fill).clip(true));
+                if let Some(color) = cue {
+                    content = content.push(dot(color));
+                }
+                content.into()
+            };
             let mut tip = t.dir.display().to_string();
             if collapsed {
                 tip = format!("{}: {full}
@@ -2414,12 +2443,8 @@ impl App {
             if let Some(a) = t.attention {
                 tip.push_str(&format!("\n{}", a.tip()));
             }
-            let cue = t.attention.map(|a| match a {
-                Attention::Finished => c.success,
-                Attention::Waiting => c.selected,
-            });
             let (current, press) = (shown == Some(t.id), TermMsg::Show(Some(t.id)));
-            list = list.push(entry(label, Some(tip), current, press, Some(t.id), cue));
+            list = list.push(entry(content, Some(tip), current, press, Some(t.id), term_h));
         }
         list = list.push(
             button(text("+").size(13))
