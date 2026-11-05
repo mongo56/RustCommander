@@ -12,6 +12,7 @@ mod fileid;
 mod netuse;
 mod process_info;
 mod rename;
+mod shares;
 mod terminals;
 pub use attrib::set_file_attributes;
 pub use editors::{detect_editors, pick_program, FoundEditor};
@@ -19,6 +20,7 @@ pub use fileid::file_id;
 pub use netuse::{connect_share, is_logon_code, share_error, share_root, ShareError};
 pub use process_info::{foreground_child, process_cwd};
 pub use rename::rename_no_replace;
+pub use shares::{shares, Share};
 pub use terminals::{detect_terminals, find_pwsh, FoundTerminal};
 #[cfg(windows)]
 mod clipboard_win;

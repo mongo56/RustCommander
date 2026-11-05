@@ -60,7 +60,8 @@ pub fn share_root(path: &Path) -> Option<String> {
     Some(format!(r"\\{server}\{share}"))
 }
 
-/// Connects to `remote` (`\\server\share`, no drive letter) as `user`. With
+/// Connects to `remote` (`\\server\share`, or `\\server\IPC$` to log in to the
+/// server itself; no drive letter) as `user`. With
 /// `remember` Windows keeps the connection for later logons and may store the
 /// credentials in the Credential Manager; otherwise it lasts for this logon
 /// session only. Blocks (can take seconds): call it from a worker.
@@ -76,15 +77,17 @@ pub fn connect_share(
     use windows::Win32::Foundation::HWND;
     use windows::Win32::NetworkManagement::WNet::{
         WNetAddConnection3W, CONNECT_CMD_SAVECRED, CONNECT_TEMPORARY, CONNECT_UPDATE_PROFILE, NETRESOURCEW,
-        RESOURCETYPE_DISK,
+        RESOURCETYPE_ANY, RESOURCETYPE_DISK,
     };
 
     let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(Some(0)).collect() };
     let mut remote_w = wide(remote);
     let user_w = user.filter(|u| !u.is_empty()).map(wide);
     let mut pass_w = password.map(wide);
+    // `\\server\IPC$` (logging in to a server to list its shares) isn't a disk.
+    let ipc = remote.len() > 5 && remote.as_bytes()[remote.len() - 5..].eq_ignore_ascii_case(br"\IPC$");
     let res = NETRESOURCEW {
-        dwType: RESOURCETYPE_DISK,
+        dwType: if ipc { RESOURCETYPE_ANY } else { RESOURCETYPE_DISK },
         lpRemoteName: PWSTR(remote_w.as_mut_ptr()),
         ..Default::default()
     };

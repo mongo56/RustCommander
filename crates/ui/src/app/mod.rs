@@ -808,9 +808,11 @@ impl App {
             }));
         }
         // Watch the folders the visible tabs show, to refresh them on change.
-        // (Archives aren't watched.)
-        let mut dirs: Vec<PathBuf> =
-            (0..2).map(|side| self.panel(side).path.clone()).filter(|p| !vfs::in_archive(p)).collect();
+        // (Archives and a server's share list aren't watched.)
+        let mut dirs: Vec<PathBuf> = (0..2)
+            .map(|side| self.panel(side).path.clone())
+            .filter(|p| !vfs::in_archive(p) && vfs::unc_server_only(p).is_none())
+            .collect();
         dirs.dedup();
         // And the settings folder, to apply `config.toml` edits right away.
         if let Some(config) = crate::config::dir().filter(|d| !dirs.contains(d) && d.is_dir()) {
@@ -1182,7 +1184,9 @@ impl App {
                 // A right drag from outside lands our drop menu, like an
                 // internal one; archives and servers can't take it, so
                 // those keep the Copy dialog.
-                let usable = !vfs::in_archive(&target) && !remote::is_remote(&target);
+                let usable = !vfs::in_archive(&target)
+                    && !remote::is_remote(&target)
+                    && vfs::unc_server_only(&target).is_none();
                 if drop_right && usable {
                     // Desktop drags can mix folders (the user's Desktop and
                     // the Public Desktop); the shell's data object takes one
@@ -2371,6 +2375,9 @@ impl App {
         let ends_with_sep = raw.ends_with(['\\', '/']) || (raw.len() == 2 && raw.ends_with(':'));
         let (dir, prefix) = if ends_with_sep {
             (path.clone(), String::new())
+        } else if let Some((server, share)) = vfs::unc_share_parent(&path) {
+            // `\\server\sh`: the server's shares.
+            (server, share.to_lowercase())
         } else {
             match (path.parent(), path.file_name()) {
                 (Some(parent), Some(name)) => (parent.to_path_buf(), name.to_string_lossy().to_lowercase()),
@@ -2684,7 +2691,9 @@ impl App {
         let Some(target) = self.drop_target(&drag) else { return Task::none() };
         self.focus_panel(drag.side);
         // The shell's drop menu can't take files inside archives.
-        let in_archive = vfs::in_archive(&self.panel(drag.side).path) || vfs::in_archive(&target);
+        let in_archive = vfs::in_archive(&self.panel(drag.side).path)
+            || vfs::in_archive(&target)
+            || vfs::unc_server_only(&target).is_some();
         if drag.right && !in_archive {
             let (folder, items) = self.shell_items(drag.side, drag.sources.clone());
             return self.right_drop(RightDrop { side: drag.side, sources: drag.sources, folder, items, target });
@@ -3037,6 +3046,10 @@ impl App {
     /// done, says so and returns true. `zip_ok`: it can be done in an archive
     /// that can be changed (rar is read-only).
     fn refuse_in_archive(&mut self, side: usize, what: &str, zip_ok: bool) -> bool {
+        if vfs::unc_server_only(&self.panel(side).path).is_some() {
+            self.info(format!("Can't {what} in a server's list of shares: open a share first"));
+            return true;
+        }
         if remote::is_remote(&self.panel(side).path) {
             if !zip_ok {
                 self.info(format!("Can't {what} on a server: copy the files to a local folder first"));
@@ -3734,6 +3747,13 @@ fn is_modifier_key(key: Named) -> bool {
 /// read-only archive, moving out of one, from a server into an archive, ...
 /// (Between servers is fine: each file goes through a temp file.)
 fn archive_transfer_problem(is_move: bool, sources: &[PathBuf], target: &Path) -> Option<&'static str> {
+    if vfs::unc_server_only(target).is_some() {
+        return Some("Can't copy into a server's list of shares: open a share first");
+    }
+    // A whole share (from `\\server`): the root has no name to copy it as, and moving would empty it.
+    if sources.iter().any(|p| vfs::unc_share_parent(p).is_some()) {
+        return Some("Can't copy or move a whole share: open it and select its files");
+    }
     let from_server = sources.iter().any(|p| remote::is_remote(p));
     match (from_server, remote::is_remote(target)) {
         (true, false) if vfs::in_archive(target) => {
@@ -3846,6 +3866,10 @@ fn resolve_typed_path(raw: &str, base: &Path) -> PathBuf {
             .unwrap_or_else(|| PathBuf::from(raw)),
         None => PathBuf::from(raw),
     };
+    // `\\server` alone is a relative path to Rust (no share = no UNC prefix).
+    if let Some(server) = vfs::unc_server_only(&path) {
+        return vfs::server_path(server);
+    }
     if raw.len() == 2 && raw.ends_with(':') {
         path.push(MAIN_SEPARATOR.to_string());
     }
@@ -3877,12 +3901,18 @@ fn list_nav_target(path: &Path, file_ok: bool) -> Listing {
             let entries = vfs::list(parent, true).map_err(|e| e.to_string())?;
             Ok(Listed { file: name, entries })
         }
-        Err(e) if file_ok && e.kind() == io::ErrorKind::NotFound => Err(format!("Path not found: {}", path.display())),
+        // A server's error ("Server not found: \\x") says it better.
+        Err(e) if file_ok && e.kind() == io::ErrorKind::NotFound && vfs::unc_server_only(path).is_none() => {
+            Err(format!("Path not found: {}", path.display()))
+        }
         Err(e) => Err(e.to_string()),
     }
 }
 
 fn list_subfolders(dir: &Path) -> Vec<String> {
+    if vfs::unc_server_only(dir).is_some() {
+        return vfs::list(dir, false).map(|es| es.into_iter().map(|e| e.name).collect()).unwrap_or_default();
+    }
     let Ok(read) = std::fs::read_dir(dir) else { return Vec::new() };
     let mut names: Vec<String> = read
         .flatten()
@@ -3896,6 +3926,9 @@ fn list_subfolders(dir: &Path) -> Vec<String> {
 /// Resolves `.` and `..` without touching the disk (unlike canonicalize,
 /// which on Windows produces `\\?\` paths).
 fn normalize_lexically(path: &Path) -> PathBuf {
+    if let Some(server) = vfs::unc_server_only(path) {
+        return vfs::server_path(server);
+    }
     let mut out = PathBuf::new();
     for component in path.components() {
         match component {
@@ -4066,6 +4099,21 @@ mod tests {
         let gone = std::env::temp_dir().join("rc-no-such-folder").join("deeper");
         let (found, _) = read_restored(&gone).unwrap();
         assert_eq!(found, std::env::temp_dir());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn typed_server_paths_stay_unc() {
+        let base = Path::new(r"C:\work");
+        assert_eq!(resolve_typed_path(r"\\nas", base), PathBuf::from(r"\\nas"));
+        assert_eq!(resolve_typed_path(r"\\nas\", base), PathBuf::from(r"\\nas"));
+        assert_eq!(normalize_lexically(Path::new(r"\\nas")), PathBuf::from(r"\\nas"));
+        assert_eq!(resolve_typed_path(r"\\nas\data", base), PathBuf::from(r"\\nas\data"));
+        // Nothing can be copied into the share list, nor a whole share out of it.
+        let local = vec![PathBuf::from(r"C:\work\a.txt")];
+        assert!(archive_transfer_problem(false, &local, Path::new(r"\\nas")).is_some());
+        assert!(archive_transfer_problem(true, &[PathBuf::from(r"\\nas\data")], base).is_some());
+        assert!(archive_transfer_problem(false, &local, Path::new(r"\\nas\data\")).is_none());
     }
 
     #[test]

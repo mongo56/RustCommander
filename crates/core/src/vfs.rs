@@ -388,9 +388,69 @@ pub fn open(path: &Path) -> io::Result<Arc<dyn Vfs>> {
     }
 }
 
+/// The server of a UNC path naming only a server (`\\server`, `\\server\`,
+/// also with `/`), whose listing is its shares; None for anything else
+/// (`\\server\share`, `\\?\...`, local paths).
+pub fn unc_server_only(path: &Path) -> Option<&str> {
+    let s = path.to_str()?;
+    let rest = s.strip_prefix(r"\\").or_else(|| s.strip_prefix("//"))?;
+    let server = rest.strip_suffix(['\\', '/']).unwrap_or(rest);
+    let bad = server.is_empty() || server.contains(['\\', '/']) || matches!(server, "?" | ".");
+    (!bad).then_some(server)
+}
+
+/// The path of the share list of `server`: `\\server`.
+pub fn server_path(server: &str) -> PathBuf {
+    PathBuf::from(format!(r"\\{server}"))
+}
+
+/// For the root of a share (`\\server\share`, `\\server\share\`): the
+/// server's share list (`\\server`) and the share's name, which is where `..`
+/// leads (Windows paths see the share root as having no parent).
+pub fn unc_share_parent(path: &Path) -> Option<(PathBuf, String)> {
+    use std::path::Prefix;
+    let mut parts = path.components();
+    let Some(Component::Prefix(prefix)) = parts.next() else { return None };
+    if parts.any(|c| !matches!(c, Component::RootDir)) {
+        return None;
+    }
+    match prefix.kind() {
+        Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) if !share.is_empty() => {
+            Some((server_path(&server.to_string_lossy()), share.to_string_lossy().into_owned()))
+        }
+        _ => None,
+    }
+}
+
+/// The shares of the server `server` as folder entries (`\\server\share`);
+/// ones ending in `$` are hidden.
+fn list_shares(server: &str) -> io::Result<Vec<Entry>> {
+    let shares = rc_platform::shares(server)?;
+    let entries = shares
+        .into_iter()
+        .map(|s| Entry {
+            path: PathBuf::from(format!(r"\\{server}\{}", s.name)),
+            name: s.name,
+            kind: EntryKind::Dir,
+            size: 0,
+            modified: None,
+            hidden: s.hidden,
+        })
+        .collect();
+    Ok(entries)
+}
+
 /// Lists the folder `path` wherever it lives (local folder or a folder in
-/// an archive), leaving out hidden entries unless `show_hidden`.
+/// an archive), leaving out hidden entries unless `show_hidden`. A server
+/// alone (`\\server`) lists its shares.
 pub fn list(path: &Path, show_hidden: bool) -> io::Result<Vec<Entry>> {
+    if let Some(server) = unc_server_only(path).filter(|_| cfg!(windows)) {
+        let mut entries = list_shares(server)?;
+        if !show_hidden {
+            entries.retain(|e| !e.hidden);
+        }
+        return Ok(entries);
+    }
     let vfs = match split_archive(path) {
         None if crate::remote::is_remote(path) => crate::remote::open(path)?,
         None => return crate::fs::list_dir(path, show_hidden),
@@ -1254,6 +1314,39 @@ pub(crate) mod tests {
         .unwrap();
         out.sort();
         out
+    }
+
+    #[test]
+    fn server_only_unc_paths() {
+        let only = |s: &str| unc_server_only(Path::new(s)).map(str::to_owned);
+        assert_eq!(only(r"\\nas").as_deref(), Some("nas"));
+        assert_eq!(only(r"\\nas\").as_deref(), Some("nas"));
+        assert_eq!(only("//nas/").as_deref(), Some("nas"));
+        assert_eq!(only(r"\\192.168.1.5").as_deref(), Some("192.168.1.5"));
+        assert_eq!(only(r"\\nas\share"), None);
+        assert_eq!(only(r"\\nas\share\"), None);
+        assert_eq!(only(r"\\nas\\"), None);
+        assert_eq!(only(r"\\"), None);
+        assert_eq!(only(r"\\\"), None);
+        assert_eq!(only(r"\\?"), None);
+        assert_eq!(only(r"\\?\C:\x"), None);
+        assert_eq!(only(r"\\.\pipe"), None);
+        assert_eq!(only(r"\nas"), None);
+        assert_eq!(only(r"C:\nas"), None);
+        assert_eq!(server_path("nas"), PathBuf::from(r"\\nas"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn share_root_goes_up_to_the_server() {
+        let up = |s: &str| unc_share_parent(Path::new(s));
+        assert_eq!(up(r"\\nas\share"), Some((PathBuf::from(r"\\nas"), "share".into())));
+        assert_eq!(up(r"\\nas\share\"), Some((PathBuf::from(r"\\nas"), "share".into())));
+        assert_eq!(up(r"\\?\UNC\nas\share\"), Some((PathBuf::from(r"\\nas"), "share".into())));
+        assert_eq!(up(r"\\nas\share\sub"), None);
+        assert_eq!(up(r"\\nas"), None);
+        assert_eq!(up(r"C:\"), None);
+        assert_eq!(up(r"\\?\C:\"), None);
     }
 
     #[test]

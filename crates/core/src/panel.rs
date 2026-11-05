@@ -428,6 +428,14 @@ impl Panel {
         if crate::remote::split(&self.path).is_some_and(|(_, remote)| remote == "/") {
             return None;
         }
+        // A share's root: up to the server's share list, cursor on the share.
+        if let Some((server, share)) = vfs::unc_share_parent(&self.path) {
+            return Some(Nav::To { path: server, focus: Some(share) });
+        }
+        // The share list of a server is the top (its `Path::parent` is `\`).
+        if vfs::unc_server_only(&self.path).is_some() {
+            return None;
+        }
         let parent = self.path.parent()?.to_path_buf();
         let focus = self.path.file_name().map(|n| n.to_string_lossy().into_owned());
         Some(Nav::To { path: parent, focus })
@@ -436,6 +444,9 @@ impl Panel {
     pub fn root_nav(&self) -> Option<Nav> {
         if let Some((key, remote)) = crate::remote::split(&self.path) {
             return (remote != "/").then(|| Nav::to(crate::remote::path_of(&key, "/")));
+        }
+        if vfs::unc_server_only(&self.path).is_some() {
+            return None;
         }
         let root = self.path.ancestors().last()?;
         (root != self.path).then(|| Nav::to(root))
@@ -949,6 +960,19 @@ fn cmp_name(a: &str, b: &str) -> Ordering {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn up_from_a_share_root_is_the_server() {
+        let up = |p: &str| match Panel::unlisted(p).parent_nav() {
+            Some(Nav::To { path, focus }) => Some((path, focus)),
+            _ => None,
+        };
+        assert_eq!(up(r"\\nas\data\"), Some((PathBuf::from(r"\\nas"), Some("data".into()))));
+        assert_eq!(up(r"\\nas\data\sub"), Some((PathBuf::from(r"\\nas\data\"), Some("sub".into()))));
+        assert_eq!(up(r"\\nas"), None);
+        assert!(Panel::unlisted(r"\\nas").root_nav().is_none());
+    }
 
     #[test]
     fn visible_start_keeps_cursor_on_screen() {

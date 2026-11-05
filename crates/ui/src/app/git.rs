@@ -68,7 +68,8 @@ impl App {
         for side in 0..2 {
             let path = &self.sides[side].tabs[self.sides[side].current].path;
             let g = &self.git[side];
-            if !self.config.git_status || self.git_missing || vfs::is_virtual(path) {
+            if !self.config.git_status || self.git_missing || vfs::is_virtual(path) || vfs::unc_server_only(path).is_some()
+            {
                 if g.view.is_some() || g.want.is_some() {
                     self.git[side] = GitSide::default();
                 }

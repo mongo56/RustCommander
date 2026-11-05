@@ -13,6 +13,9 @@ pub fn list_dir(path: &Path, show_hidden: bool) -> io::Result<Vec<Entry>> {
 
     if let Some(parent) = path.parent() {
         entries.push(Entry::parent(parent.to_path_buf()));
+    } else if let Some((server, _)) = crate::vfs::unc_share_parent(path) {
+        // A share's root: up is the server's share list.
+        entries.push(Entry::parent(server));
     }
 
     for item in fs::read_dir(path)? {

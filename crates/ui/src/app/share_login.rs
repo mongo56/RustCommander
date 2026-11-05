@@ -51,6 +51,16 @@ pub(super) fn is_logon_error(error: &str) -> bool {
     digits.parse::<i32>().is_ok_and(rc_platform::is_logon_code)
 }
 
+/// What to connect to log in to `server` itself: its `IPC$` share.
+fn login_share(server: &str) -> String {
+    format!(r"\\{server}\IPC$")
+}
+
+/// The share as the dialog names it: `\\server` for a server login.
+fn shown_name(share: &str) -> &str {
+    share.strip_suffix(r"\IPC$").unwrap_or(share)
+}
+
 fn focus_task(c: Control) -> Task<Message> {
     match c {
         Control::User => Task::batch([text_input::focus(dialog_input_id()), text_input::select_all(dialog_input_id())]),
@@ -70,10 +80,11 @@ impl App {
     }
 
     /// Navigation of `side` to `target` failed with a logon error: asks for
-    /// credentials for its share. None when the target isn't on a share, a
+    /// credentials for its share (for a server's share list, `IPC$`, which
+    /// logs in to the server). None when the target isn't on a share, a
     /// dialog is open, or we just connected this share (no loop).
     pub(super) fn ask_share_login(&mut self, side: usize, target: &Path) -> Option<Task<Message>> {
-        let share = rc_platform::share_root(target)?;
+        let share = rc_platform::share_root(target).or_else(|| vfs::unc_server_only(target).map(login_share))?;
         let just_connected = self.share_retry.take().is_some_and(|s| s.eq_ignore_ascii_case(&share));
         if self.dialog.is_some() || just_connected {
             return None;
@@ -258,7 +269,7 @@ impl App {
         let status = if d.busy { "Connecting..." } else { "Tab moves between the controls" };
         let content = column![
             text("Network login").size(16),
-            text(format!("{} needs a user name and password.", d.share)).size(13).color(c.muted),
+            text(format!("{} needs a user name and password.", shown_name(&d.share))).size(13).color(c.muted),
             label("User"),
             user,
             label("Password"),
@@ -275,5 +286,19 @@ impl App {
         ]
         .spacing(8);
         container(content).padding(20).width(Length::Fixed(520.0)).style(theme::dialog).into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_login_goes_through_ipc() {
+        assert_eq!(login_share("nas"), r"\\nas\IPC$");
+        assert_eq!(shown_name(&login_share("nas")), r"\\nas");
+        assert_eq!(shown_name(r"\\nas\data"), r"\\nas\data");
+        assert!(is_logon_error("Access is denied. (os error 5)"));
+        assert!(!is_logon_error(r"Server not found: \\nas"));
     }
 }
