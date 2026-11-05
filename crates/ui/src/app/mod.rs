@@ -87,6 +87,9 @@ pub struct App {
     sides: [Side; 2],
     active: usize,
     drives: Vec<String>,
+    /// Explorer's names of the drives ("Local Disk (C:)"), for the drive
+    /// buttons' tooltips; read by `read_drive_labels`.
+    drive_labels: HashMap<String, String>,
     status: Option<(String, Tone)>,
     window_width: f32,
     window_height: f32,
@@ -448,6 +451,8 @@ pub enum Message {
     DriveRight(usize, String),
     /// The set of drives changed (mount, eject, USB plug-in, ...).
     DrivesChanged(Vec<String>),
+    /// Names of the drives, read on a worker thread.
+    DriveLabels(HashMap<String, String>),
     Sort(usize, SortKey),
     Resized(Size),
     CloseRequested,
@@ -561,6 +566,7 @@ impl App {
             active: session.as_ref().map_or(0, |s| if s.hide_left && s.hotlist_tree { 1 } else { s.active.min(1) }),
             // Filled by `list_drives` on a worker thread.
             drives: Vec::new(),
+            drive_labels: HashMap::new(),
             status: None,
             window_width: width,
             window_height: height,
@@ -1089,7 +1095,11 @@ impl App {
                 self.focus_panel(side);
                 return self.drive_context_menu(side, drive);
             }
-            Message::DrivesChanged(drives) => self.drives = drives,
+            Message::DrivesChanged(drives) => {
+                self.drives = drives;
+                return read_drive_labels(self.drives.clone());
+            }
+            Message::DriveLabels(labels) => self.drive_labels = labels,
             Message::Sort(side, key) => {
                 self.focus_panel(side);
                 self.panel_mut(side).sort_by(key);
@@ -1738,7 +1748,8 @@ impl App {
                 self.drives = rc_platform::roots();
                 self.disk.borrow_mut().clear();
                 let path = self.panel(active).path.clone();
-                return Task::batch([self.list_in_background(path.clone()), remote_space(&path)]);
+                let labels = read_drive_labels(self.drives.clone());
+                return Task::batch([self.list_in_background(path.clone()), remote_space(&path), labels]);
             }
             QuickFilter => {
                 if self.filter_edit == Some(active) {
@@ -3690,6 +3701,22 @@ pub(super) fn entry_icon_key(entry: &Entry) -> String {
     } else {
         key
     }
+}
+
+/// Reads the drives' names on a worker thread (`Message::DriveLabels`); a
+/// slow network drive only delays the tooltips.
+fn read_drive_labels(drives: Vec<String>) -> Task<Message> {
+    Task::perform(
+        async {
+            let (tx, rx) = iced::futures::channel::oneshot::channel();
+            std::thread::spawn(move || {
+                let labels = drives.into_iter().filter_map(|d| rc_platform::drive_label(&d).map(|l| (d, l))).collect();
+                let _ = tx.send(labels);
+            });
+            rx.await.unwrap_or_default()
+        },
+        Message::DriveLabels,
+    )
 }
 
 /// Reads the drive list on a worker thread (`Message::DrivesChanged`).

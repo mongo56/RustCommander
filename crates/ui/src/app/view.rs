@@ -305,7 +305,7 @@ impl App {
                 content = content.push(image(icon).width(ICON).height(ICON));
             }
             content = content.push(text(letter).size(12));
-            mouse_area(
+            let button: Element<'_, Message> = mouse_area(
                 button(content)
                     .on_press(Message::Drive(side, drive.clone()))
                     .padding([2, 6])
@@ -313,7 +313,16 @@ impl App {
             )
             .on_middle_press(Message::DriveMiddle(side, drive.clone()))
             .on_right_press(Message::DriveRight(side, drive.clone()))
-            .into()
+            .into();
+            match self.drive_labels.get(drive) {
+                Some(label) => tooltip(
+                    button,
+                    container(text(label).size(12)).padding([3, 8]).style(theme::drag_label),
+                    tooltip::Position::Bottom,
+                )
+                .into(),
+                None => button,
+            }
         })))
         .spacing(2);
 

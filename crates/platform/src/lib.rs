@@ -15,6 +15,8 @@ pub use terminals::{detect_terminals, find_pwsh, FoundTerminal};
 #[cfg(windows)]
 mod clipboard_win;
 #[cfg(windows)]
+mod drive_win;
+#[cfg(windows)]
 mod thumb_win;
 #[cfg(windows)]
 mod win;
@@ -58,6 +60,20 @@ pub fn roots() -> Vec<String> {
     #[cfg(not(windows))]
     {
         vec!["/".to_string()]
+    }
+}
+
+/// The name the OS shows for a root from `roots` ("Local Disk (C:)"), if
+/// any. May block on network or optical drives: call it off the UI thread.
+pub fn drive_label(root: &str) -> Option<String> {
+    #[cfg(windows)]
+    {
+        drive_win::drive_label(root)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = root;
+        None
     }
 }
 
