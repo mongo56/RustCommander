@@ -201,7 +201,6 @@ impl App {
         let header = container(
             row![
                 text("Help: keys and features").size(16),
-                text(concat!("RustCommander ", env!("CARGO_PKG_VERSION"))).size(12).color(colors.muted),
                 search,
                 Space::with_width(Length::Fill),
                 text(format!("{count} shown")).size(12).color(colors.muted),
@@ -256,10 +255,22 @@ impl App {
             .style(filled(colors.panel));
 
         let footer = container(
-            text("Type to filter · Backspace edit · Esc clear filter / close · Up/Down/PgUp/PgDn/Home/End scroll")
-                .size(12)
-                .color(colors.muted)
-                .wrapping(Wrapping::None),
+            row![
+                container(
+                    text("Type to filter · Backspace edit · Esc clear filter / close · Up/Down/PgUp/PgDn/Home/End scroll")
+                        .size(12)
+                        .color(colors.muted)
+                        .wrapping(Wrapping::None),
+                )
+                .width(Length::Fill)
+                .clip(true),
+                text(concat!("RustCommander ", env!("CARGO_PKG_VERSION")))
+                    .size(12)
+                    .color(colors.accent)
+                    .wrapping(Wrapping::None),
+            ]
+            .spacing(16)
+            .align_y(Alignment::Center),
         )
         .padding([4, 12])
         .width(Length::Fill)
