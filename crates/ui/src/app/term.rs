@@ -134,8 +134,9 @@ pub enum Mouse {
     Drag { line: u16, col: u16, right: bool },
     /// Left button released.
     Up,
-    /// Wheel: lines, positive scrolls back into the history.
-    Wheel(i32),
+    /// Wheel: lines, positive scrolls back into the history; the cell
+    /// under the mouse.
+    Wheel { lines: i32, line: u16, col: u16 },
     /// Right press: copy the selection, or paste.
     Context,
 }
@@ -195,6 +196,9 @@ pub(super) struct TermSession {
     /// A line to type once the shell shows its prompt (running a script,
     /// `App::run_script`); sent once.
     pending: Option<String>,
+    /// Wheel lines not yet reported to a program that tracks the mouse
+    /// (one report per `WHEEL_LINES`).
+    wheel_rest: i32,
 }
 
 impl TermSession {
@@ -246,6 +250,7 @@ impl TermSession {
             exit_code: None,
             frame: Frame::default(),
             pending: None,
+            wheel_rest: 0,
         };
         session.refresh();
         Ok(session)
@@ -334,9 +339,17 @@ impl TermSession {
                         term.selection = None;
                     }
                 }
-                Mouse::Wheel(lines) => {
+                Mouse::Wheel { lines, line, col } => {
                     let mode = *term.mode();
-                    if !mode.contains(TermMode::ALT_SCREEN) {
+                    if mode.intersects(TermMode::MOUSE_MODE) {
+                        // The program handles the wheel itself (Claude Code, vim
+                        // with mouse=a, htop, ...): report wheel buttons.
+                        drop(term);
+                        let total = self.wheel_rest + lines;
+                        self.wheel_rest = total % WHEEL_LINES;
+                        self.write_raw(wheel_reports(mode, total / WHEEL_LINES, line, col));
+                        return None;
+                    } else if !mode.contains(TermMode::ALT_SCREEN) {
                         term.scroll_display(Scroll::Delta(lines));
                     } else if mode.contains(TermMode::ALTERNATE_SCROLL) {
                         drop(term);
@@ -1262,7 +1275,7 @@ impl Widget<Message, Theme, iced::Renderer> for Grid<'_> {
                 event::Status::Captured
             }
             Event::Mouse(mouse::Event::WheelScrolled { delta }) if cursor.is_over(bounds) => {
-                let lines = match delta {
+                let amount = match delta {
                     mouse::ScrollDelta::Lines { y, .. } => (y * 3.0).round() as i32,
                     mouse::ScrollDelta::Pixels { y, .. } => {
                         state.wheel += y / CELL_H;
@@ -1271,8 +1284,10 @@ impl Widget<Message, Theme, iced::Renderer> for Grid<'_> {
                         whole as i32
                     }
                 };
-                if lines != 0 {
-                    send(Mouse::Wheel(lines));
+                if amount != 0 {
+                    let at = cursor.position_in(bounds).unwrap_or(Point::ORIGIN);
+                    let (line, col, _) = cell_at(at, cols, lines);
+                    send(Mouse::Wheel { lines: amount, line, col });
                 }
                 event::Status::Captured
             }
@@ -1355,6 +1370,25 @@ fn wheel_arrows(app_cursor: bool, lines: i32) -> Vec<u8> {
         (false, false) => "\x1b[B",
     };
     key.repeat(lines.unsigned_abs() as usize).into_bytes()
+}
+
+/// Wheel lines per wheel report sent to a program tracking the mouse (one
+/// notch; programs scroll a few lines per report themselves).
+const WHEEL_LINES: i32 = 3;
+
+/// Wheel reports (buttons 4/5) for a program that turned on mouse tracking:
+/// `notches` reports up (positive) or down, at viewport cell `line`, `col`,
+/// in SGR form if the program asked for it, else the legacy X10 form (cells
+/// past 223 can't be sent that way and are clamped).
+fn wheel_reports(mode: TermMode, notches: i32, line: u16, col: u16) -> Vec<u8> {
+    let button = if notches > 0 { 64 } else { 65 };
+    let one = if mode.contains(TermMode::SGR_MOUSE) {
+        format!("\x1b[<{button};{};{}M", col as u32 + 1, line as u32 + 1).into_bytes()
+    } else {
+        let pos = |v: u16| (32 + 1 + v.min(222)) as u8;
+        vec![0x1b, b'[', b'M', 32 + button, pos(col), pos(line)]
+    };
+    one.repeat(notches.unsigned_abs() as usize)
 }
 
 /// Whether closing a terminal asks first: a program other than the idle
@@ -1478,7 +1512,7 @@ impl App {
         ("Ctrl+Shift+C or Ctrl+Insert", "Copy the selected text (select with the mouse: drag, double-click a word, triple-click a line)"),
         ("Right-click", "Copies the selection and clears it; with no selection pastes the clipboard"),
         ("Ctrl+Shift+V or Shift+Insert", "Paste the clipboard (bracketed when the program asks for it)"),
-        ("Mouse wheel, Shift+PgUp/PgDn, Shift+Home/End", "Scroll the history (full-screen programs get arrow keys from the wheel); typing jumps back to the bottom"),
+        ("Mouse wheel, Shift+PgUp/PgDn, Shift+Home/End", "Scroll the history (programs that use the mouse get wheel events, other full-screen programs arrow keys); typing jumps back to the bottom"),
         ("Every other key", "Goes to the shell (Esc, Tab, Ctrl+C, arrows, F1-F12, ...)"),
         ("exit", "Ends the shell and closes the terminal"),
     ];
@@ -2202,6 +2236,16 @@ mod tests {
     fn wheel_in_full_screen_programs_sends_arrows() {
         assert_eq!(wheel_arrows(false, 3), b"\x1b[A\x1b[A\x1b[A");
         assert_eq!(wheel_arrows(true, -2), b"\x1bOB\x1bOB");
+    }
+
+    #[test]
+    fn wheel_reports_for_mouse_tracking_programs() {
+        let sgr = TermMode::MOUSE_REPORT_CLICK | TermMode::SGR_MOUSE;
+        assert_eq!(wheel_reports(sgr, 2, 4, 9), b"\x1b[<64;10;5M\x1b[<64;10;5M");
+        assert_eq!(wheel_reports(sgr, -1, 0, 0), b"\x1b[<65;1;1M");
+        assert_eq!(wheel_reports(sgr, 0, 0, 0), b"");
+        let x10 = TermMode::MOUSE_DRAG;
+        assert_eq!(wheel_reports(x10, 1, 0, 300), [0x1b, b'[', b'M', 96, 255, 33]);
     }
 
     #[test]
