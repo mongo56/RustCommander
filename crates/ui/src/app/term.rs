@@ -1317,6 +1317,7 @@ impl App {
     pub(super) const TERM_KEYS: &'static [(&'static str, &'static str)] = &[
         ("Ctrl+Shift+F9 (cm_ToggleTerminal)", "Back to the panels; the terminal keeps running (F9 shows it again)"),
         ("Ctrl+Shift+Down/Up (cm_NextTerminal, cm_PrevTerminal)", "Next/previous entry of the sidebar: Files, terminal 1, 2, ..."),
+        ("Ctrl+Tab, Ctrl+Shift+Tab (cm_NextTab, cm_PrevTab)", "Next/previous terminal (Files is skipped; in the panels they switch panel tabs)"),
         ("Ctrl+Shift+T (cm_NewTerminal)", "Another terminal in the active panel's folder (the + of the sidebar)"),
         ("Ctrl+Shift+W (cm_CloseTerminal)", "End the shown terminal and close it (middle-click or x on its sidebar entry too)"),
         ("cm_TerminalFolderToPanel (no key by default)", "Active panel goes to the terminal's current folder and Files is shown"),
@@ -1441,6 +1442,16 @@ impl App {
     }
 
     /// `NextTerminal` / `PrevTerminal`: around Files and the terminals.
+    /// Ctrl+Tab / Ctrl+Shift+Tab in a terminal: the next/previous terminal,
+    /// around, skipping Files (nothing with fewer than two terminals).
+    fn cycle_among_terms(&mut self, delta: isize) {
+        let order: Vec<u64> = self.terms.iter().map(|t| t.id).collect();
+        let Some(&current) = self.screen.term() else { return };
+        if let Some(id) = next_terminal(&order, current, delta) {
+            self.show_term(id);
+        }
+    }
+
     pub(super) fn cycle_term(&mut self, delta: isize) {
         if self.terms.is_empty() || !matches!(self.screen, None | Some(Screen::Term(_))) {
             return;
@@ -1651,9 +1662,17 @@ impl App {
             Command::PrevTerminal,
             Command::CloseTerminal,
             Command::TerminalFolderToPanel,
+            Command::NextTab,
+            Command::PrevTab,
         ];
         if let Some(cmd) = self.keymap.command(key, mods).filter(|c| reserved.contains(c)) {
-            return self.run(cmd);
+            match cmd {
+                // Panel tabs in the panels, terminals here.
+                Command::NextTab => self.cycle_among_terms(1),
+                Command::PrevTab => self.cycle_among_terms(-1),
+                _ => return self.run(cmd),
+            }
+            return Task::none();
         }
         let Some(t) = self.term(id) else { return Task::none() };
         let named = match key {
@@ -1705,6 +1724,10 @@ impl App {
         };
         let key = |cmd| keymap::Keymap::keys_for(&bindings, cmd).first().map(|k| k.to_string());
         let switch = switch_tip(key(Command::PrevTerminal), key(Command::NextTerminal), key(Command::NewTerminal));
+        let switch = match key(Command::NextTab) {
+            Some(tab) => format!("{tab}: next terminal \u{b7} {switch}"),
+            None => switch,
+        };
         let footer = row![
             text(switch).size(12).color(colors.muted).wrapping(Wrapping::None),
             Space::with_width(Length::Fill),
@@ -1736,7 +1759,13 @@ impl App {
         let c = theme::c();
         let shown = self.screen.term().copied();
         let entry = |label: String, tip: Option<String>, current: bool, press: TermMsg, close: Option<u64>| {
-            let name = button(text(label).size(12).wrapping(Wrapping::None))
+            let files = close.is_none();
+            let label = if files {
+                text(label).size(13).font(Font { weight: Weight::Bold, ..Font::DEFAULT })
+            } else {
+                text(format!(">_ {label}")).size(12)
+            };
+            let name = button(label.wrapping(Wrapping::None))
                 .on_press(Message::Term(press))
                 .width(Length::Fill)
                 .padding([4, 8])
@@ -1759,13 +1788,18 @@ impl App {
                 )
                 .into();
             }
-            match close {
+            let line: Element<'_, Message> = match close {
                 Some(id) => mouse_area(line).on_middle_press(Message::Term(TermMsg::Close(id))).into(),
-                None => line,
-            }
+                // Files sits in its own band, above a separator line.
+                None => container(line).padding(2).width(Length::Fill).style(filled(c.header)).into(),
+            };
+            line
         };
         let mut list = Column::new().spacing(2).width(Length::Fill);
         list = list.push(entry("Files".to_owned(), None, shown.is_none(), TermMsg::Show(None), None));
+        list = list.push(
+            container(Space::new(Length::Fill, Length::Fixed(1.0))).width(Length::Fill).style(filled(c.border)),
+        );
         for t in &self.terms {
             let label = term_label(&t.dir, t.program.as_deref(), LABEL_CHARS);
             let mut tip = t.dir.display().to_string();
@@ -1797,6 +1831,16 @@ fn cycle(index: usize, count: usize, delta: isize) -> usize {
     (index as isize + delta).rem_euclid(count.max(1) as isize) as usize
 }
 
+/// The terminal after (`delta` 1) or before (-1) `current` in `order`, around;
+/// `None` when there is no other terminal.
+fn next_terminal(order: &[u64], current: u64, delta: isize) -> Option<u64> {
+    if order.len() < 2 {
+        return None;
+    }
+    let pos = order.iter().position(|&id| id == current)?;
+    Some(order[cycle(pos, order.len(), delta)])
+}
+
 /// The terminal to show when `closed` of `order` ends: the one before it,
 /// or Files (`None`) when it was the first.
 fn fallback_after_close(order: &[u64], closed: u64) -> Option<u64> {
@@ -1825,6 +1869,16 @@ mod tests {
         let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
         parser.advance(&mut term, input.as_bytes());
         term
+    }
+
+    #[test]
+    fn ctrl_tab_cycles_terminals_only() {
+        assert_eq!(next_terminal(&[5], 5, 1), None);
+        assert_eq!(next_terminal(&[], 5, 1), None);
+        assert_eq!(next_terminal(&[5, 7, 9], 5, 1), Some(7));
+        assert_eq!(next_terminal(&[5, 7, 9], 9, 1), Some(5));
+        assert_eq!(next_terminal(&[5, 7, 9], 5, -1), Some(9));
+        assert_eq!(next_terminal(&[5, 7, 9], 7, -1), Some(5));
     }
 
     #[test]

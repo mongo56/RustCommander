@@ -74,6 +74,7 @@ with a modern, minimalist look. Written in Rust with [iced](https://iced.rs).
 | Shift+F8 / Shift+Del | Delete permanently |
 | F9 / Ctrl+F9 | Built-in terminal / external terminal |
 | Ctrl+Shift+F9 | Back from the built-in terminal to the panels (it keeps running) |
+| Ctrl+Tab, Ctrl+Shift+Tab (in a terminal) | Next / previous terminal (Files is skipped); in the panels they switch panel tabs |
 | Ctrl+Shift+T / Ctrl+Shift+Down, Up / Ctrl+Shift+W | New terminal / next, previous entry of the terminal sidebar / close the shown terminal |
 | Ctrl+Shift+C, Ctrl+Shift+V / right-click (in the terminal) | Copy the mouse selection / paste (right-click copies the selection, else pastes); mouse wheel and Shift+PgUp/PgDn scroll the history |
 | F10 | Settings |
