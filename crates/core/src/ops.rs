@@ -959,7 +959,9 @@ impl Runner<'_> {
         let src_meta = input.metadata()?;
         let mut output = match File::create(dst) {
             Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
-                clear_readonly(dst)?;
+                if !clear_readonly(dst) {
+                    return Err(e);
+                }
                 File::create(dst)?
             }
             other => other?,
@@ -1422,7 +1424,9 @@ impl Runner<'_> {
         };
         let mut output = match open() {
             Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
-                clear_readonly(dst)?;
+                if !clear_readonly(dst) {
+                    return Err(e);
+                }
                 open()?
             }
             other => other?,
@@ -2494,14 +2498,18 @@ fn set_dir_modified(dir: &Path, modified: SystemTime) -> io::Result<()> {
     handle.set_modified(modified)
 }
 
-fn clear_readonly(path: &Path) -> io::Result<()> {
-    let mut perms = fs::metadata(path)?.permissions();
-    if perms.readonly() {
-        #[allow(clippy::permissions_set_readonly_false)]
-        perms.set_readonly(false);
-        fs::set_permissions(path, perms)?;
+/// Clears `path`'s read-only flag, for a retry after "access denied". False when there was none to clear
+/// (or `path` doesn't exist, or the flag can't be changed): the denial has another cause, so the caller
+/// reports the original error rather than a confusing one from here ("file not found" for a new target).
+fn clear_readonly(path: &Path) -> bool {
+    let Ok(meta) = fs::metadata(path) else { return false };
+    let mut perms = meta.permissions();
+    if !perms.readonly() {
+        return false;
     }
-    Ok(())
+    #[allow(clippy::permissions_set_readonly_false)]
+    perms.set_readonly(false);
+    fs::set_permissions(path, perms).is_ok()
 }
 
 /// The check after a resumed transfer: the file must now be `want` bytes
@@ -2528,7 +2536,9 @@ fn kept_partial(e: io::Error, bytes: u64) -> io::Error {
 fn remove_file_force(path: &Path) -> io::Result<()> {
     match fs::remove_file(path) {
         Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
-            clear_readonly(path)?;
+            if !clear_readonly(path) {
+                return Err(e);
+            }
             fs::remove_file(path)
         }
         other => other,

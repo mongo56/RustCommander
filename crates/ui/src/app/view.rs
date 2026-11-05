@@ -1168,19 +1168,41 @@ impl App {
             }
         };
         let line = self.status_line();
+        // The full message, when the line can't show all of it (cut, or several lines): hovering shows it.
+        let mut full_msg = None;
         let status = match &line {
-            Some((msg, tone)) => text(ellipsize(&msg.replace('\n', " "))).size(12).color(match tone {
-                Tone::Info => theme::c().text,
-                Tone::Success => theme::c().success,
-                Tone::Error => theme::c().error,
-            }),
+            Some((msg, tone)) => {
+                let flat = msg.replace('\n', " ");
+                let shown = ellipsize(&flat);
+                if shown != flat || msg.contains('\n') {
+                    full_msg = Some(msg.clone());
+                }
+                text(shown).size(12).color(match tone {
+                    Tone::Info => theme::c().text,
+                    Tone::Success => theme::c().success,
+                    Tone::Error => theme::c().error,
+                })
+            }
             None => text(""),
+        };
+        let tip_w = (self.window_width - 40.0).clamp(200.0, 720.0);
+        let with_tip = |el: Element<'static, Message>| -> Element<'static, Message> {
+            match full_msg {
+                Some(msg) => tooltip(
+                    el,
+                    container(text(msg).size(12)).padding([4, 8]).max_width(tip_w).style(theme::drag_label),
+                    tooltip::Position::Top,
+                )
+                .gap(4)
+                .into(),
+                None => el,
+            }
         };
 
         if !self.config.show_fkeys {
             // Just a status line with a quiet hint on the right.
             let hint = text(hint).size(12).color(theme::c().muted).wrapping(Wrapping::None);
-            let status = self.status_clickable(container(status.wrapping(Wrapping::None)).clip(true).into());
+            let status = self.status_clickable(with_tip(container(status.wrapping(Wrapping::None)).clip(true).into()));
             return container(row![status, Space::with_width(Length::Fill), hint].spacing(16))
                 .padding([3, 10])
                 .width(Length::Fill)
@@ -1203,7 +1225,7 @@ impl App {
         .spacing(6);
 
         column![
-            self.status_clickable(container(status.wrapping(Wrapping::None)).padding([3, 10]).clip(true).into()),
+            self.status_clickable(with_tip(container(status.wrapping(Wrapping::None)).padding([3, 10]).clip(true).into())),
             container(fkeys).padding(Padding { top: 0.0, right: 8.0, bottom: 8.0, left: 8.0 }),
         ]
         .into()
