@@ -12,6 +12,7 @@
 //! panels. When the shell exits, its terminal is removed.
 
 use super::*;
+use super::term_activity::{wants_cue, Activity, Attention, Check};
 use crate::theme::filled;
 use alacritty_terminal::event::{Event as TermEvent, EventListener, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg, State};
@@ -167,6 +168,8 @@ pub enum TermMsg {
     /// Type terminal `id`'s pending script line now, if no prompt was seen
     /// in time (`SCRIPT_WAIT`).
     SendPending(u64),
+    /// Whether terminal `id`'s busy title went steady (`Activity::check`).
+    IdleCheck(u64),
 }
 
 /// What the mouse did in the grid; cells are viewport positions.
@@ -282,6 +285,11 @@ pub(super) struct TermSession {
     reported: Option<Btn>,
     /// A left press started a selection (its drags and release extend it).
     selecting: bool,
+    /// Highlight of its sidebar entry while the user doesn't look at it (a
+    /// command finished, the program waits); cleared when it is shown.
+    attention: Option<Attention>,
+    /// What `attention` is worked out from (`term_activity`).
+    activity: Activity,
 }
 
 impl TermSession {
@@ -336,6 +344,8 @@ impl TermSession {
             wheel_rest: 0,
             reported: None,
             selecting: false,
+            attention: None,
+            activity: Activity::default(),
         };
         session.refresh();
         Ok(session)
@@ -800,6 +810,13 @@ fn cut(s: &str, max: usize) -> String {
     let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
     out.push('\u{2026}');
     out
+}
+
+/// `RC_TERM_DEBUG` is set: OSC title changes and bells are logged to
+/// stderr (to see what a program sends when the attention cue misbehaves).
+fn term_debug() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("RC_TERM_DEBUG").is_some())
 }
 
 /// Whether a title a program set says something: not empty and not an exe
@@ -1882,8 +1899,18 @@ impl App {
         }
         if let Some(t) = self.term_mut(id) {
             t.set_visible(true);
+            t.attention = None;
             self.term_last = Some(id);
             self.screen = Some(Screen::Term(id));
+        }
+    }
+
+    /// The window got the focus: the shown terminal is looked at again.
+    pub(super) fn term_looked_at(&mut self) {
+        if let Some(&id) = self.screen.term() {
+            if let Some(t) = self.term_mut(id) {
+                t.attention = None;
+            }
         }
     }
 
@@ -2030,6 +2057,9 @@ impl App {
 
     pub(super) fn term_update(&mut self, msg: TermMsg) -> Task<Message> {
         let shown = self.screen.term().copied();
+        // Whether a cue for terminal `id` is wanted (the user doesn't look at it).
+        let focused = self.focused;
+        let cue = |id: u64| wants_cue(shown == Some(id), focused);
         match msg {
             TermMsg::Show(Some(id)) => {
                 self.leave_edits();
@@ -2069,11 +2099,31 @@ impl App {
                 }
             }
             TermMsg::Info(id, info) => {
+                let cue = cue(id);
                 if let Some(t) = self.term_mut(id) {
                     if let Some(dir) = info.dir {
                         t.dir = dir;
                     }
+                    if let Some(a) = t.activity.program(info.program.is_some(), Instant::now()).filter(|_| cue) {
+                        t.attention = Some(a);
+                    }
                     t.program = info.program;
+                }
+            }
+            TermMsg::IdleCheck(id) => {
+                let cue = cue(id);
+                let Some(t) = self.term_mut(id) else { return Task::none() };
+                match t.activity.check(Instant::now()) {
+                    Check::Stop => {}
+                    Check::Again(wait) => return delayed(wait, Message::Term(TermMsg::IdleCheck(id))),
+                    Check::Idle => {
+                        if term_debug() {
+                            eprintln!("[term {id}] title steady: waiting");
+                        }
+                        if cue {
+                            t.attention = Some(Attention::Waiting);
+                        }
+                    }
                 }
             }
             TermMsg::Resize(id, cols, lines) => {
@@ -2083,6 +2133,7 @@ impl App {
                 }
             }
             TermMsg::Event(id, event) => {
+                let cue = cue(id);
                 let Some(t) = self.term_mut(id) else { return Task::none() };
                 match event {
                     // (A late one for a terminal just hidden is dropped: showing
@@ -2096,8 +2147,33 @@ impl App {
                             t.refresh();
                         }
                     }
-                    TermEvent::Title(title) => t.osc_title = meaningful_title(&title).then_some(title),
-                    TermEvent::ResetTitle => t.osc_title = None,
+                    TermEvent::Title(title) => {
+                        if term_debug() {
+                            eprintln!("[term {id}] title {title:?}");
+                        }
+                        let check = t.activity.title(&title, Instant::now());
+                        t.osc_title = meaningful_title(&title).then_some(title);
+                        if let Some(wait) = check {
+                            return delayed(wait, Message::Term(TermMsg::IdleCheck(id)));
+                        }
+                    }
+                    TermEvent::ResetTitle => {
+                        if term_debug() {
+                            eprintln!("[term {id}] title reset");
+                        }
+                        t.osc_title = None;
+                        if let Some(wait) = t.activity.title("", Instant::now()) {
+                            return delayed(wait, Message::Term(TermMsg::IdleCheck(id)));
+                        }
+                    }
+                    TermEvent::Bell => {
+                        if term_debug() {
+                            eprintln!("[term {id}] bell");
+                        }
+                        if cue {
+                            t.attention = Some(Attention::Waiting);
+                        }
+                    }
                     // Answers to queries (cursor position, device attributes...):
                     // a program waits for them.
                     TermEvent::PtyWrite(text) => {
@@ -2129,8 +2205,7 @@ impl App {
                     // on purpose; the rest needs nothing here.
                     TermEvent::ClipboardLoad(..)
                     | TermEvent::MouseCursorDirty
-                    | TermEvent::CursorBlinkingChange
-                    | TermEvent::Bell => {}
+                    | TermEvent::CursorBlinkingChange => {}
                 }
             }
         }
@@ -2254,12 +2329,21 @@ impl App {
         let shown = self.screen.term().copied();
         // Over the panels only short entries fit; the x is left out (middle-click still closes).
         let collapsed = self.screen.is_none();
-        let entry = |label: String, tip: Option<String>, current: bool, press: TermMsg, close: Option<u64>| {
+        let entry = |label: String,
+                     tip: Option<String>,
+                     current: bool,
+                     press: TermMsg,
+                     close: Option<u64>,
+                     cue: Option<Color>| {
             let files = close.is_none();
             let label = if files {
                 text(label).size(13).font(Font { weight: Weight::Bold, ..Font::DEFAULT })
             } else {
                 text(label).size(12)
+            };
+            let label = match cue {
+                Some(color) => label.color(color),
+                None => label,
             };
             let label = if collapsed { label.width(Length::Fill).center() } else { label };
             let name = button(label.wrapping(Wrapping::None))
@@ -2294,13 +2378,15 @@ impl App {
         };
         let mut list = Column::new().spacing(2).width(Length::Fill);
         let files = if collapsed { "F" } else { "Files" };
-        list = list.push(entry(files.to_owned(), None, shown.is_none(), TermMsg::Show(None), None));
+        list = list.push(entry(files.to_owned(), None, shown.is_none(), TermMsg::Show(None), None, None));
         list = list.push(
             container(Space::new(Length::Fill, Length::Fixed(1.0))).width(Length::Fill).style(filled(c.border)),
         );
         for (i, t) in self.terms.iter().enumerate() {
             let full = term_label(&t.dir, t.program.as_deref(), LABEL_CHARS);
-            let label = if collapsed { format!(">_{}", i + 1) } else { format!(">_ {full}") };
+            // A cue: a dot instead of ">_", in green (finished) or amber (waiting).
+            let mark = if t.attention.is_some() { "\u{25cf}" } else { ">_" };
+            let label = if collapsed { format!("{mark}{}", i + 1) } else { format!("{mark} {full}") };
             let mut tip = t.dir.display().to_string();
             if collapsed {
                 tip = format!("{}: {full}
@@ -2312,7 +2398,15 @@ impl App {
             if let Some(title) = &t.osc_title {
                 tip.push_str(&format!("\nTitle: {title}"));
             }
-            list = list.push(entry(label, Some(tip), shown == Some(t.id), TermMsg::Show(Some(t.id)), Some(t.id)));
+            if let Some(a) = t.attention {
+                tip.push_str(&format!("\n{}", a.tip()));
+            }
+            let cue = t.attention.map(|a| match a {
+                Attention::Finished => c.success,
+                Attention::Waiting => c.selected,
+            });
+            let (current, press) = (shown == Some(t.id), TermMsg::Show(Some(t.id)));
+            list = list.push(entry(label, Some(tip), current, press, Some(t.id), cue));
         }
         list = list.push(
             button(text("+").size(13))

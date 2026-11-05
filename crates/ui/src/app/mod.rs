@@ -16,6 +16,7 @@ mod find_files;
 mod multi_rename;
 mod settings;
 mod term;
+mod term_activity;
 mod thumbs;
 mod update;
 mod viewer;
@@ -786,7 +787,10 @@ impl App {
                     self.leaked_enter = false;
                 }
             }
-            Message::WindowFocused => self.focused = true,
+            Message::WindowFocused => {
+                self.focused = true;
+                self.term_looked_at();
+            }
             Message::WindowUnfocused => self.focused = false,
             Message::Modifiers(m) => self.modifiers = m,
             Message::Run(cmd) => return self.run(cmd),
