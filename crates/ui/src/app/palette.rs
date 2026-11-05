@@ -19,7 +19,10 @@ const PAGE: usize = 8;
 pub(super) struct Palette {
     query: String,
     items: Vec<(Command, String)>,
-    /// Indexes into `items`, best match first.
+    /// The user commands, listed after `items` (`shown` indexes continue
+    /// from `items.len()`): label, run line, keys.
+    users: Vec<(String, String, String)>,
+    /// Indexes into `items` and then `users`, best match first.
     pub shown: Vec<usize>,
     /// Index into `shown`.
     pub selected: usize,
@@ -34,6 +37,42 @@ pub(super) fn items(keymap: &keymap::Keymap) -> Vec<(Command, String)> {
         .filter(|&c| c != Command::CommandPalette)
         .map(|c| (c, keymap::Keymap::keys_for(&bindings, c).join(", ")))
         .collect()
+}
+
+/// The user commands as palette rows: "User: name", the run line, the keys.
+pub(super) fn user_items(
+    cmds: &[crate::config::UserCommand],
+    keys: &std::collections::HashMap<String, usize>,
+) -> Vec<(String, String, String)> {
+    cmds.iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let mut names: Vec<String> =
+                keys.iter().filter(|(_, &n)| n == i).map(|(k, _)| keymap::display_key(k)).collect();
+            names.sort();
+            (format!("User: {}", c.name), c.run.clone(), names.join(", "))
+        })
+        .collect()
+}
+
+/// The indexes of the user commands matching `query` (every word in the
+/// label, run line or keys), in their order.
+pub(super) fn rank_users(query: &str, users: &[(String, String, String)]) -> Vec<usize> {
+    let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+    (0..users.len())
+        .filter(|&i| {
+            let (label, run, keys) = &users[i];
+            let hay = format!("{label} {run} {keys}").to_lowercase();
+            words.iter().all(|w| hay.contains(w.as_str()))
+        })
+        .collect()
+}
+
+/// Built-in matches, then the user commands' (indexes after `items.len()`).
+fn show(query: &str, items: &[(Command, String)], users: &[(String, String, String)], recent: &[Command]) -> Vec<usize> {
+    let mut shown = rank(query, items, recent);
+    shown.extend(rank_users(query, users).into_iter().map(|i| items.len() + i));
+    shown
 }
 
 /// Whether `hay[i..]` starts a word: the start, after a non-letter, or a
@@ -102,8 +141,9 @@ impl App {
     pub(super) fn open_palette(&mut self) -> Task<Message> {
         self.leave_edits();
         let items = items(&self.keymap);
-        let shown = rank("", &items, &self.recent_commands);
-        self.dialog = Some(Dialog::Palette(Palette { query: String::new(), items, shown, selected: 0 }));
+        let users = user_items(&self.user_cmds, &self.user_keys);
+        let shown = show("", &items, &users, &self.recent_commands);
+        self.dialog = Some(Dialog::Palette(Palette { query: String::new(), items, users, shown, selected: 0 }));
         self.popup_snap()
     }
 
@@ -120,7 +160,7 @@ impl App {
         let last = count.saturating_sub(1);
         let requery = |p: &mut Palette, query: String| {
             p.query = query;
-            p.shown = rank(&p.query, &p.items, &self.recent_commands);
+            p.shown = show(&p.query, &p.items, &p.users, &self.recent_commands);
             p.selected = 0;
         };
         match named {
@@ -156,7 +196,13 @@ impl App {
     /// palette) and remembers it as recently run.
     pub(super) fn palette_pick(&mut self, i: usize) -> Task<Message> {
         let Some(Dialog::Palette(p)) = &self.dialog else { return Task::none() };
-        let Some(&(cmd, _)) = p.shown.get(i).and_then(|&j| p.items.get(j)) else { return Task::none() };
+        let Some(&j) = p.shown.get(i) else { return Task::none() };
+        if j >= p.items.len() {
+            let user = j - p.items.len();
+            self.dialog = None;
+            return self.run_user(user);
+        }
+        let (cmd, _) = p.items[j];
         self.dialog = None;
         self.recent_commands.retain(|&c| c != cmd);
         self.recent_commands.insert(0, cmd);
@@ -181,15 +227,23 @@ impl App {
         let recent = p.query.is_empty() && !self.recent_commands.is_empty();
         let mut list = Column::new();
         for (n, &i) in p.shown.iter().enumerate() {
-            let (cmd, keys) = &p.items[i];
-            let mut desc = cmd.description().to_owned();
-            if recent && self.recent_commands.contains(cmd) {
-                desc.push_str("  \u{b7} recent");
-            }
+            let (desc, keys, id) = match p.items.get(i) {
+                Some((cmd, keys)) => {
+                    let mut desc = cmd.description().to_owned();
+                    if recent && self.recent_commands.contains(cmd) {
+                        desc.push_str("  \u{b7} recent");
+                    }
+                    (desc, keys.as_str(), cmd.id())
+                }
+                None => {
+                    let (label, run, keys) = &p.users[i - p.items.len()];
+                    (format!("{label}  \u{b7}  {run}"), keys.as_str(), "user command")
+                }
+            };
             let content = row![
                 text(desc).size(13).width(Length::Fill).wrapping(Wrapping::None),
-                text(keys.as_str()).size(12).color(colors.dir).wrapping(Wrapping::None),
-                text(cmd.id()).size(11).color(colors.muted).wrapping(Wrapping::None),
+                text(keys).size(12).color(colors.dir).wrapping(Wrapping::None),
+                text(id).size(11).color(colors.muted).wrapping(Wrapping::None),
             ]
             .spacing(10)
             .align_y(Alignment::Center);
@@ -263,6 +317,22 @@ mod tests {
         assert_eq!(ranked("new tab", &[])[0], Command::NewTab);
         assert!(ranked("zzzz", &[]).is_empty());
         assert!(ranked("COPY", &[]).contains(&Command::Copy));
+    }
+
+    #[test]
+    fn user_commands_follow_the_built_in_ones() {
+        let users = vec![
+            ("User: Code".to_owned(), "code %P".to_owned(), "Ctrl+Alt+1".to_owned()),
+            ("User: Hash".to_owned(), "sha %F".to_owned(), String::new()),
+        ];
+        let items = items(&keymap::Keymap::default());
+        let n = items.len();
+        let all = show("", &items, &users, &[]);
+        assert_eq!(all.len(), n + 2);
+        assert_eq!(all[n..], [n, n + 1]);
+        assert_eq!(show("user hash", &items, &users, &[]), [n + 1]);
+        assert_eq!(show("ctrl+alt+1", &items, &users, &[]), [n]);
+        assert_eq!(rank_users("%f", &users), [1]);
     }
 
     #[test]

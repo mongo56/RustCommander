@@ -1124,6 +1124,22 @@ impl App {
                         .into()
                     ),
                 ]
+                .push(heading("User commands (read-only: edit config.toml to change)"))
+                .extend(self.user_cmds.iter().map(|c| {
+                    let keys: Vec<String> = self
+                        .user_keys
+                        .iter()
+                        .filter(|(_, &i)| self.user_cmds.get(i).is_some_and(|u| u.name == c.name))
+                        .map(|(k, _)| keymap::display_key(k))
+                        .collect();
+                    let tail = if keys.is_empty() { String::new() } else { format!("   [{}]", keys.join(", ")) };
+                    let term = if c.terminal { " (terminal)" } else { "" };
+                    container(text(format!("{}: {}{term}{tail}", c.name, c.run)).size(13)).padding([2, 14]).into()
+                }))
+                .push_maybe(self.user_cmds.is_empty().then(|| {
+                    container(hint("None. Add [[user_commands]] entries (name, run, key) to config.toml".into()))
+                        .padding([2, 14])
+                }))
                 .into()
             }
             Page::Keys => {

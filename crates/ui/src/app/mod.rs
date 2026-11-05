@@ -22,6 +22,7 @@ mod term;
 mod term_activity;
 mod thumbs;
 mod update;
+mod user_cmds;
 mod viewer;
 
 use self::screen::{Screen, ScreenSlot};
@@ -220,6 +221,11 @@ pub struct App {
     /// Last good `config.toml` and the key bindings built from it.
     config: crate::config::Config,
     keymap: keymap::Keymap,
+    /// The valid `[[user_commands]]`, the key of each (canonical key name ->
+    /// index) and what was wrong with the others (`apply_config`).
+    user_cmds: Vec<crate::config::UserCommand>,
+    user_keys: std::collections::HashMap<String, usize>,
+    config_notes: Vec<String>,
     /// Modification time of `config.toml` when it was last read; `None` =
     /// not read yet.
     config_stamp: Option<Option<std::time::SystemTime>>,
@@ -653,6 +659,9 @@ impl App {
             rename_undo: Vec::new(),
             config: crate::config::Config::default(),
             keymap: keymap::Keymap::default(),
+            user_cmds: Vec::new(),
+            user_keys: std::collections::HashMap::new(),
+            config_notes: Vec::new(),
             config_stamp: None,
             placement: session.as_ref().and_then(|s| s.window).map(Into::into),
             archive_edits: archive_edit::ArchiveEdits::default(),
@@ -1621,7 +1630,10 @@ impl App {
             }
             return match self.keymap.command(&key, mods) {
                 Some(cmd) => self.run(cmd),
-                None => Task::none(),
+                None => match self.user_key(&key, mods) {
+                    Some(i) => self.run_user(i),
+                    None => Task::none(),
+                },
             };
         }
 
@@ -1681,7 +1693,10 @@ impl App {
 
         match self.keymap.command(&key, mods) {
             Some(cmd) => self.run(cmd),
-            None => Task::none(),
+            None => match self.user_key(&key, mods) {
+                Some(i) => self.run_user(i),
+                None => Task::none(),
+            },
         }
     }
 
@@ -3413,6 +3428,9 @@ impl App {
         let first = self.config_stamp.is_none();
         self.config_stamp = Some(stamp);
         match self.apply_config() {
+            Ok(()) if !self.config_notes.is_empty() => {
+                self.error(format!("config.toml: {}", self.config_notes.join("; ")));
+            }
             Ok(()) if !first => self.info("Settings reloaded"),
             Ok(()) => {}
             Err(e) => self.error(format!("Bad config: {e}")),
@@ -3436,6 +3454,10 @@ impl App {
         if let Some(compare) = config.compare {
             self.compare_opts = compare.into();
         }
+        let (cmds, keys, notes) = crate::config::resolve_user_commands(&config, &keymap);
+        self.user_cmds = cmds;
+        self.user_keys = keys;
+        self.config_notes = notes;
         self.config = config;
         self.keymap = keymap;
         theme::set(colors);

@@ -1861,6 +1861,19 @@ impl App {
         delayed(SCRIPT_WAIT, Message::Term(TermMsg::SendPending(id)))
     }
 
+    /// A user command with `terminal = true`: a new terminal in `dir` that
+    /// types `line` once the shell's prompt is up (like `run_script`).
+    pub(super) fn run_line_in_term(&mut self, dir: &Path, line: String) -> Task<Message> {
+        self.leave_edits();
+        self.refresh_config();
+        let shell = self.config.builtin_shell();
+        let Some(id) = self.start_term(dir, &shell) else { return Task::none() };
+        if let Some(t) = self.term_mut(id) {
+            t.pending = Some(line);
+        }
+        delayed(SCRIPT_WAIT, Message::Term(TermMsg::SendPending(id)))
+    }
+
     /// The context menu's "Run in external terminal": a new console window
     /// in the script's folder that runs it and stays open.
     pub(super) fn run_script_external(&mut self, path: &Path) {

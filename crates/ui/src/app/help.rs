@@ -65,7 +65,7 @@ pub(super) fn filter<'a>(
 
 /// All sections: the commands with their effective keys, then the
 /// hard-coded keys.
-pub(super) fn sections(keymap: &keymap::Keymap) -> Vec<Section> {
+pub(super) fn sections(keymap: &keymap::Keymap, users: &[(String, String, String)]) -> Vec<Section> {
     let bindings = keymap.bindings();
     let commands = Command::ALL
         .iter()
@@ -86,11 +86,20 @@ pub(super) fn sections(keymap: &keymap::Keymap) -> Vec<Section> {
             })
             .collect(),
     };
-    vec![
-        Section {
-            title: "Commands (rebind in the settings, F10, or config.toml [keys], Ctrl+,)",
-            items: commands,
-        },
+    let mut out = vec![Section {
+        title: "Commands (rebind in the settings, F10, or config.toml [keys], Ctrl+,)",
+        items: commands,
+    }];
+    if !users.is_empty() {
+        out.push(Section {
+            title: "User commands (config.toml [[user_commands]], Ctrl+,)",
+            items: users
+                .iter()
+                .map(|(label, run, keys)| Item { keys: keys.clone(), text: format!("{label} - {run}"), id: "" })
+                .collect(),
+        });
+    }
+    out.extend([
         fixed("Panels: typing and mouse", App::PANEL_KEYS),
         fixed("Directory hotlist (Ctrl+D)", App::HOTLIST_KEYS),
         fixed("Hotlist tree (left of the panels; turn it on in the settings, F10)", App::TREE_KEYS),
@@ -104,7 +113,8 @@ pub(super) fn sections(keymap: &keymap::Keymap) -> Vec<Section> {
         fixed("Connect to server (Ctrl+F7)", App::CONNECT_KEYS),
         fixed("Built-in terminal (F9)", App::TERM_KEYS),
         fixed("Settings (F10)", App::SETTINGS_KEYS),
-    ]
+    ]);
+    out
 }
 
 impl App {
@@ -112,7 +122,7 @@ impl App {
         self.leave_edits();
         self.screen = Some(Screen::Help(Help {
             query: String::new(),
-            sections: sections(&self.keymap),
+            sections: sections(&self.keymap, &palette::user_items(&self.user_cmds, &self.user_keys)),
         }));
         scrollable::snap_to(list_id(), RelativeOffset::START)
     }
@@ -269,7 +279,7 @@ mod tests {
 
     #[test]
     fn every_command_is_listed_once() {
-        let all = sections(&keymap::Keymap::default());
+        let all = sections(&keymap::Keymap::default(), &[]);
         assert_eq!(all[0].items.len(), Command::ALL.len());
         let help = all[0]
             .items
@@ -283,8 +293,18 @@ mod tests {
     }
 
     #[test]
+    fn lists_user_commands_after_the_built_in_ones() {
+        let users = [("User: Code".to_owned(), "code %P".to_owned(), "Ctrl+Alt+1".to_owned())];
+        let all = sections(&keymap::Keymap::default(), &users);
+        assert_eq!(all[0].items.len(), Command::ALL.len());
+        assert!(all[1].title.starts_with("User commands"));
+        assert_eq!(all[1].items[0].keys, "Ctrl+Alt+1");
+        assert!(all[1].items[0].text.contains("code %P"));
+    }
+
+    #[test]
     fn filter_needs_every_word() {
-        let all = sections(&keymap::Keymap::default());
+        let all = sections(&keymap::Keymap::default(), &[]);
         let found = |q: &str| -> Vec<String> {
             filter(&all, q)
                 .into_iter()

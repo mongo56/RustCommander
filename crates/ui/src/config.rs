@@ -60,6 +60,25 @@ pub struct Config {
     /// Compare-folders options (Ctrl+Shift+F2); `None` = no `[compare]`
     /// table (older files kept them in `session.toml`).
     pub compare: Option<CompareState>,
+    /// `[[user_commands]]`, as written (see [`resolve_user_commands`]).
+    pub user_commands: Vec<UserCommand>,
+}
+
+/// One `[[user_commands]]` entry.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct UserCommand {
+    /// Shown in the palette and help; what `[keys]` names as `user:<name>`.
+    pub name: String,
+    /// Program and arguments as one command line, with the placeholders of
+    /// `rc_core::user_cmd` (`%P %T %N %F %S %%`).
+    pub run: String,
+    /// Working folder (placeholders allowed); empty = the active panel's folder.
+    pub cwd: String,
+    /// Run in the built-in terminal (typed into a new shell) instead of detached.
+    pub terminal: bool,
+    /// Optional key, like in `[keys]`.
+    pub key: String,
 }
 
 /// [`rc_core::compare::CompareOptions`] in `[compare]` (hidden files
@@ -102,7 +121,69 @@ impl Default for Config {
             keys: BTreeMap::new(),
             colors: BTreeMap::new(),
             compare: None,
+            user_commands: Vec::new(),
         }
+    }
+}
+
+/// The usable user commands, the key of each (canonical name -> index) and
+/// a message per problem. Entries without a name or `run`, with a duplicate
+/// name, a bad key, a key that a built-in command (`keymap`) or an earlier
+/// user command has, or a `user:<name>` in `[keys]` naming no command, are
+/// skipped.
+pub fn resolve_user_commands(
+    config: &Config,
+    keymap: &crate::keymap::Keymap,
+) -> (Vec<UserCommand>, std::collections::HashMap<String, usize>, Vec<String>) {
+    let mut cmds: Vec<UserCommand> = Vec::new();
+    let mut keys = std::collections::HashMap::new();
+    let mut problems = Vec::new();
+    for (i, c) in config.user_commands.iter().enumerate() {
+        let (name, run) = (c.name.trim(), c.run.trim());
+        let label = if name.is_empty() { format!("user command #{}", i + 1) } else { format!("user command \"{name}\"") };
+        if name.is_empty() || run.is_empty() {
+            problems.push(format!("{label}: needs a name and a run line"));
+        } else if cmds.iter().any(|o| o.name == name) {
+            problems.push(format!("{label}: name used twice"));
+        } else {
+            let mut cmd = c.clone();
+            cmd.name = name.to_owned();
+            cmd.run = run.to_owned();
+            let key = c.key.trim();
+            if !key.is_empty() {
+                bind_user_key(key, cmds.len(), &label, keymap, &mut keys, &mut problems);
+            }
+            cmds.push(cmd);
+        }
+    }
+    for (key, action) in &config.keys {
+        let Some(name) = action.trim().strip_prefix("user:") else { continue };
+        match cmds.iter().position(|c| c.name == name.trim()) {
+            Some(i) => bind_user_key(key, i, &format!("[keys] {key}"), keymap, &mut keys, &mut problems),
+            None => problems.push(format!("[keys] {key}: no user command \"{}\"", name.trim())),
+        }
+    }
+    (cmds, keys, problems)
+}
+
+fn bind_user_key(
+    key: &str,
+    index: usize,
+    label: &str,
+    keymap: &crate::keymap::Keymap,
+    keys: &mut std::collections::HashMap<String, usize>,
+    problems: &mut Vec<String>,
+) {
+    let Some(name) = crate::keymap::parse_key(key) else {
+        problems.push(format!("{label}: unknown key \"{key}\""));
+        return;
+    };
+    if let Some(cmd) = keymap.command_of(&name) {
+        problems.push(format!("{label}: {key} is already {}", cmd.id()));
+    } else if keys.get(&name).is_some_and(|&other| other != index) {
+        problems.push(format!("{label}: {key} is already used by another user command"));
+    } else {
+        keys.insert(name, index);
     }
 }
 
@@ -451,6 +532,17 @@ fn template(editor: &str, compare: CompareState) -> String {
          [keys]\n\
          # \"Ctrl+K\" = \"cm_MkDir\"\n\
          # \"F8\" = \"\"\n\
+         # \"Ctrl+Alt+1\" = \"user:Name\"   (runs the [[user_commands]] entry with that name)\n\
+         \n\
+         # Your own commands (command palette, F1 help, optional \"key\"). Placeholders: %P\n\
+         # active folder, %T other folder, %N cursor name, %F its full path, %S selected\n\
+         # full paths, %% a percent sign. Paths with spaces are quoted for you.\n\
+         # [[user_commands]]\n\
+         # name = \"Open in VS Code\"\n\
+         # run = \"code %P\"\n\
+         # terminal = false   # true: type the line into a new built-in terminal\n\
+         # cwd = \"%P\"         # default: the active folder\n\
+         # key = \"Ctrl+Alt+1\"\n\
          \n\
          # Colours as \"#rrggbb\"; the values below are the gruvbox theme's.\n\
          [colors]\n\
@@ -461,6 +553,75 @@ fn template(editor: &str, compare: CompareState) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn user_commands_are_validated() {
+        let config = parse(
+            r#"
+[keys]
+"Ctrl+Alt+2" = "user:Two"
+"Ctrl+Alt+3" = "user:Nope"
+"F5" = "user:Two"
+
+[[user_commands]]
+name = "One"
+run = "tool %P"
+key = "Ctrl+Alt+1"
+terminal = true
+
+[[user_commands]]
+name = "Two"
+run = "other %S"
+
+[[user_commands]]
+name = "One"
+run = "again"
+
+[[user_commands]]
+name = ""
+run = "x"
+
+[[user_commands]]
+name = "NoRun"
+
+[[user_commands]]
+name = "Clash"
+run = "x"
+key = "Ctrl+Alt+1"
+
+[[user_commands]]
+name = "BadKey"
+run = "x"
+key = "Hyper+Q"
+"#,
+        )
+        .unwrap();
+        let keymap = crate::keymap::Keymap::new(&config.keys).unwrap();
+        let (cmds, keys, problems) = resolve_user_commands(&config, &keymap);
+        let names: Vec<&str> = cmds.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["One", "Two", "Clash", "BadKey"]);
+        assert!(cmds[0].terminal && !cmds[1].terminal);
+        assert_eq!(keys["ctrl+alt+1"], 0);
+        assert_eq!(keys["ctrl+alt+2"], 1);
+        // [keys] "F5" = "user:Two" unbinds the built-in F5 and gives it to the command.
+        assert_eq!(keys["f5"], 1);
+        assert_eq!(keys.len(), 3);
+        assert_eq!(problems.len(), 6, "{problems:?}");
+        assert!(crate::config::parse("").unwrap().user_commands.is_empty());
+    }
+
+    #[test]
+    fn built_in_keys_win_over_user_command_keys() {
+        let config = parse("[[user_commands]]
+name = \"A\"
+run = \"x\"
+key = \"F7\"
+").unwrap();
+        let (cmds, keys, problems) = resolve_user_commands(&config, &crate::keymap::Keymap::default());
+        assert_eq!(cmds.len(), 1);
+        assert!(keys.is_empty());
+        assert!(problems[0].contains("cm_MkDir"), "{problems:?}");
+    }
 
     #[test]
     fn template_parses_back() {

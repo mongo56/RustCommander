@@ -23,7 +23,9 @@ impl Keymap {
         for (key, id) in keys {
             let name = parse_key(key).ok_or_else(|| format!("unknown key \"{key}\""))?;
             let cmd = match id.trim() {
+                // A user command's key (`config::resolve_user_commands`): it frees the key.
                 "" => None,
+                id if id.starts_with("user:") => None,
                 id => Some(Command::from_id(id).ok_or_else(|| format!("unknown command \"{id}\" for {key}"))?),
             };
             overrides.insert(name, cmd);
