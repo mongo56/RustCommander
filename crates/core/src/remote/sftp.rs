@@ -94,6 +94,22 @@ impl client::Handler for Client {
     }
 }
 
+/// russh's safe defaults, then SHA-1 key exchanges, CBC ciphers and SHA-1 MACs as a last resort,
+/// so old servers (OpenSSH 5/6, NAS boxes, routers) still connect. Modern servers pick from the
+/// front of each list, so they are unaffected.
+fn preferred() -> russh::Preferred {
+    use russh::{cipher, kex, mac};
+    let mut p = russh::Preferred::DEFAULT;
+    let mut kexes = p.kex.to_vec();
+    // Extension markers stay last; the real algorithms go before them.
+    let at = kexes.iter().position(|k| *k == kex::EXTENSION_SUPPORT_AS_CLIENT).unwrap_or(kexes.len());
+    kexes.splice(at..at, [kex::DH_GEX_SHA1, kex::DH_G14_SHA1, kex::DH_G1_SHA1]);
+    p.kex = kexes.into();
+    p.cipher = [&p.cipher[..], &[cipher::AES_256_CBC, cipher::AES_192_CBC, cipher::AES_128_CBC]].concat().into();
+    p.mac = [&p.mac[..], &[mac::HMAC_SHA1_ETM, mac::HMAC_SHA1]].concat().into();
+    p
+}
+
 pub(super) struct Sftp {
     handle: Option<client::Handle<Client>>,
     sftp: SftpSession,
@@ -107,6 +123,7 @@ impl Sftp {
             inactivity_timeout: None,
             keepalive_interval: Some(Duration::from_secs(30)),
             keepalive_max: 3,
+            preferred: preferred(),
             ..Default::default()
         };
         let handler = Client { login: login.clone(), problem: problem.clone() };

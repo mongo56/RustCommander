@@ -571,11 +571,12 @@ mod sftp_server {
     }
 
     /// Serves `root` on `listener` with the host key from `seed`.
-    pub async fn run(root: PathBuf, listener: std::net::TcpListener, seed: u8) {
+    pub async fn run(root: PathBuf, listener: std::net::TcpListener, seed: u8, preferred: russh::Preferred) {
         let config = Arc::new(russh::server::Config {
             auth_rejection_time: Duration::from_millis(10),
             auth_rejection_time_initial: Some(Duration::ZERO),
             keys: vec![host_key(seed)],
+            preferred,
             ..Default::default()
         });
         let listener = tokio::net::TcpListener::from_std(listener).unwrap();
@@ -593,13 +594,17 @@ mod sftp_server {
 }
 
 fn start_sftp(root: PathBuf, seed: u8) -> u16 {
+    start_sftp_with(root, seed, russh::Preferred::DEFAULT)
+}
+
+fn start_sftp_with(root: PathBuf, seed: u8, preferred: russh::Preferred) -> u16 {
     // Bound here and handed over: a port from `free_port` can be handed out
     // twice to tests running in parallel, and the second server's bind fails
     // (its test then talks to another test's server with another host key).
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port();
-    serve(move || sftp_server::run(root, listener, seed));
+    serve(move || sftp_server::run(root, listener, seed, preferred));
     // Wait for the listener.
     for _ in 0..50 {
         if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
@@ -619,6 +624,30 @@ fn sftp_login(port: u16, password: &str) -> Login {
         password: Some(password.into()),
         key_file: None,
     }
+}
+
+/// An old server (only SHA-1 key exchange, CBC ciphers and SHA-1 MACs, like OpenSSH 5) still connects.
+#[test]
+fn sftp_legacy_algorithms() {
+    use russh::{cipher, kex, mac};
+    let _settings = settings();
+    let disk = TempDir::new("sftp-legacy");
+    fs::write(disk.0.join("a.txt"), b"old").unwrap();
+    let old = russh::Preferred {
+        kex: vec![kex::DH_G14_SHA1, kex::EXTENSION_SUPPORT_AS_SERVER].into(),
+        cipher: vec![cipher::AES_128_CBC].into(),
+        mac: vec![mac::HMAC_SHA1].into(),
+        ..russh::Preferred::DEFAULT
+    };
+    let port = start_sftp_with(disk.0.clone(), 7, old);
+    let login = sftp_login(port, sftp_server::PASSWORD);
+    let e = connect(login.clone(), "").unwrap_err().to_string();
+    assert!(e.contains(HOST_KEY_UNKNOWN), "{e}");
+    trust_host_key(&login).unwrap();
+    let root = connect(login, "").unwrap();
+    let names: Vec<String> =
+        crate::vfs::list(&root, true).unwrap().into_iter().filter(|e| !e.is_parent()).map(|e| e.name).collect();
+    assert_eq!(names, ["a.txt"]);
 }
 
 #[test]
@@ -1592,7 +1621,7 @@ fn local_servers_for_manual_testing() {
     start_ftps_on(ftps, root.clone(), Arc::new(Mutex::new((crt, key))));
     let sftp = TcpListener::bind("127.0.0.1:2222").unwrap();
     sftp.set_nonblocking(true).unwrap();
-    serve(move || sftp_server::run(root, sftp, 9));
+    serve(move || sftp_server::run(root, sftp, 9, russh::Preferred::DEFAULT));
     loop {
         std::thread::sleep(Duration::from_secs(3600));
     }
