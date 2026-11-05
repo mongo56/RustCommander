@@ -59,28 +59,73 @@ const HISTORY: usize = 10_000;
 /// Redraws happen at most this often (output arriving faster is coalesced).
 const FRAME: Duration = Duration::from_millis(16);
 
+/// The advance of "0" and the baseline (from the top of the line) of `font` at
+/// the grid's size and line height.
+fn measure(font: Font) -> (f32, f32) {
+    use iced::advanced::text::Paragraph as _;
+    const N: usize = 100;
+    let sample = "0".repeat(N);
+    let paragraph = iced::advanced::graphics::text::Paragraph::with_text(iced::advanced::Text {
+        content: sample.as_str(),
+        bounds: Size::INFINITY,
+        size: Pixels(FONT_SIZE),
+        line_height: LineHeight::Absolute(Pixels(CELL_H)),
+        font,
+        horizontal_alignment: alignment::Horizontal::Left,
+        vertical_alignment: alignment::Vertical::Top,
+        shaping: Shaping::Basic,
+        wrapping: Wrapping::None,
+    });
+    let baseline = paragraph.buffer().layout_runs().next().map_or(0.0, |run| run.line_y);
+    (paragraph.min_width() / N as f32, baseline)
+}
+
 /// Width of a cell: a monospace character at `FONT_SIZE`, measured once with
 /// the font the system resolves `Font::MONOSPACE` to.
 fn cell_w() -> f32 {
-    use iced::advanced::text::Paragraph as _;
     static W: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
     *W.get_or_init(|| {
-        const N: usize = 100;
-        let sample = "0".repeat(N);
-        let paragraph = iced::advanced::graphics::text::Paragraph::with_text(iced::advanced::Text {
-            content: sample.as_str(),
-            bounds: Size::INFINITY,
-            size: Pixels(FONT_SIZE),
-            line_height: LineHeight::Absolute(Pixels(CELL_H)),
-            font: Font::MONOSPACE,
-            horizontal_alignment: alignment::Horizontal::Left,
-            vertical_alignment: alignment::Vertical::Top,
-            shaping: Shaping::Basic,
-            wrapping: Wrapping::None,
-        });
-        let w = paragraph.min_width() / N as f32;
+        let w = measure(Font::MONOSPACE).0;
         if w.is_finite() && w > 1.0 { w } else { 8.4 }
     })
+}
+
+/// How far the second copy of synthetic bold text is drawn to the right.
+const BOLD_OFFSET: f32 = 0.6;
+
+/// The font a style is drawn with, and whether to embolden it by drawing it
+/// twice (`BOLD_OFFSET` apart). A bold or italic face is only used when it
+/// has the regular face's advance and baseline: `Font::MONOSPACE` can resolve
+/// the styles to other families (on Windows regular is Cascadia Code, a
+/// variable font cosmic-text sees only at weight 400, so bold and italic come
+/// from Consolas, narrower and with another baseline), which would put the
+/// text off the cell grid. Then bold is synthetic and italic is drawn upright.
+fn style_font(bold: bool, italic: bool) -> (Font, bool) {
+    static STYLES: std::sync::OnceLock<[(Font, bool); 4]> = std::sync::OnceLock::new();
+    let styles = STYLES.get_or_init(|| {
+        let regular = measure(Font::MONOSPACE);
+        let face = |bold: bool, italic: bool| Font {
+            weight: if bold { Weight::Bold } else { Weight::Normal },
+            style: if italic { FontStyle::Italic } else { FontStyle::Normal },
+            ..Font::MONOSPACE
+        };
+        let fits = |font: Font| {
+            let (w, baseline) = measure(font);
+            (w - regular.0).abs() < 0.05 && (baseline - regular.1).abs() < 0.5
+        };
+        let italic_fits = fits(face(false, true));
+        let pick = |bold: bool, italic: bool| {
+            if (bold || italic) && fits(face(bold, italic)) {
+                (face(bold, italic), false)
+            } else if italic && italic_fits {
+                (face(false, true), bold)
+            } else {
+                (Font::MONOSPACE, bold)
+            }
+        };
+        [pick(false, false), pick(true, false), pick(false, true), pick(true, true)]
+    });
+    styles[bold as usize | (italic as usize) << 1]
 }
 
 /// Columns and lines that fit in an area of `size` pixels (the grid widget).
@@ -137,8 +182,9 @@ pub enum Mouse {
     /// Wheel: lines, positive scrolls back into the history; the cell
     /// under the mouse.
     Wheel { lines: i32, line: u16, col: u16 },
-    /// Right press: copy the selection, or paste.
-    Context,
+    /// Right press: copy the selection (`one_line`: Shift was down, as one
+    /// line, `join_lines`), or paste.
+    Context { one_line: bool },
 }
 
 /// A terminal shell's folder (`None`: not known, keep the last one) and the
@@ -286,13 +332,16 @@ impl TermSession {
         let _ = self.chan.send(Msg::Input(bytes.into()));
     }
 
-    /// The selected text, if any is selected.
-    fn selected_text(&self) -> Option<String> {
+    /// The selected text, if any is selected; `one_line`: with the line
+    /// breaks and the indentation after them removed (`join_lines`).
+    fn selected_text(&self, one_line: bool) -> Option<String> {
         let term = self.term.lock();
         if term.selection.as_ref().is_none_or(Selection::is_empty) {
             return None;
         }
-        term.selection_to_string().filter(|s| !s.is_empty())
+        let text = selection_text(&term)?;
+        let text = if one_line { join_lines(&text) } else { text };
+        Some(text).filter(|s| !s.is_empty())
     }
 
     /// Scrolls the view and redraws it.
@@ -358,9 +407,9 @@ impl TermSession {
                         return None;
                     }
                 }
-                Mouse::Context => {
+                Mouse::Context { one_line } => {
                     drop(term);
-                    copy = self.selected_text();
+                    copy = self.selected_text(one_line);
                     if copy.is_some() {
                         self.term.lock().selection = None;
                     }
@@ -929,15 +978,6 @@ struct Run {
     complex: bool,
 }
 
-impl Run {
-    fn font(&self) -> Font {
-        Font {
-            weight: if self.bold { Weight::Bold } else { Weight::Normal },
-            style: if self.italic { FontStyle::Italic } else { FontStyle::Normal },
-            ..Font::MONOSPACE
-        }
-    }
-}
 
 #[derive(Debug, Clone)]
 struct Cursor {
@@ -959,6 +999,52 @@ fn simple_char(c: char) -> bool {
 }
 
 /// The cells of the viewport inside `range`, a run per line.
+/// The selected text, like `Term::selection_to_string`, but a line that ends
+/// in a character in its last column is joined to the next one without a
+/// line break: ConPTY often re-sends a soft-wrapped line as a hard break, so
+/// alacritty never marks it wrapped (`Flags::WRAPLINE`). Box drawing at the
+/// edge (rules across the window) still ends the line.
+fn selection_text<T>(term: &Term<T>) -> Option<String> {
+    let selection = term.selection.as_ref()?;
+    let text = term.selection_to_string()?;
+    if selection.ty == SelectionType::Block {
+        return Some(text);
+    }
+    let range = selection.to_range(term)?;
+    let last = term.last_column();
+    // The line ends `selection_to_string` turned into "\n", in order: every
+    // selected line but the last that isn't marked wrapped.
+    let mut join = (range.start.line.0..range.end.line.0).filter_map(|line| {
+        let row = &term.grid()[Line(line)];
+        let cell = &row[last];
+        if cell.flags.contains(Flags::WRAPLINE) {
+            return None;
+        }
+        let edge = cell.flags.contains(Flags::WIDE_CHAR_SPACER)
+            || (!cell.c.is_whitespace() && !matches!(cell.c as u32, 0x2500..=0x259f));
+        Some(edge)
+    });
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c == '\n' && join.next() == Some(true) {
+            continue;
+        }
+        out.push(c);
+    }
+    Some(out)
+}
+
+/// Text as one line, for paths, URLs and commands a program wrapped itself
+/// (with its own indentation): each line break goes, with the whitespace
+/// around it.
+fn join_lines(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for (i, line) in text.lines().enumerate() {
+        out.push_str(if i == 0 { line.trim_end() } else { line.trim() });
+    }
+    out.trim().to_owned()
+}
+
 fn selection_cells(range: &SelectionRange, offset: usize, cols: usize, lines: usize) -> Vec<(u16, u16, u16)> {
     let mut cells = Vec::new();
     for view in 0..lines {
@@ -1122,22 +1208,22 @@ impl Grid<'_> {
         let cw = cell_w();
         let x = origin.x + run.col as f32 * cw;
         let y = origin.y + run.line as f32 * CELL_H;
-        renderer.fill_text(
-            iced::advanced::Text {
-                content: run.text.clone(),
-                bounds: Size::new((run.cells + 1) as f32 * cw, CELL_H),
-                size: Pixels(FONT_SIZE),
-                line_height: LineHeight::Absolute(Pixels(CELL_H)),
-                font: run.font(),
-                horizontal_alignment: alignment::Horizontal::Left,
-                vertical_alignment: alignment::Vertical::Top,
-                shaping: if run.complex { Shaping::Advanced } else { Shaping::Basic },
-                wrapping: Wrapping::None,
-            },
-            Point::new(x, y),
-            run.color,
-            clip,
-        );
+        let (font, synthetic_bold) = style_font(run.bold, run.italic);
+        let text = || iced::advanced::Text {
+            content: run.text.clone(),
+            bounds: Size::new((run.cells + 1) as f32 * cw, CELL_H),
+            size: Pixels(FONT_SIZE),
+            line_height: LineHeight::Absolute(Pixels(CELL_H)),
+            font,
+            horizontal_alignment: alignment::Horizontal::Left,
+            vertical_alignment: alignment::Vertical::Top,
+            shaping: if run.complex { Shaping::Advanced } else { Shaping::Basic },
+            wrapping: Wrapping::None,
+        };
+        renderer.fill_text(text(), Point::new(x, y), run.color, clip);
+        if synthetic_bold {
+            renderer.fill_text(text(), Point::new(x + BOLD_OFFSET, y), run.color, clip);
+        }
         let width = run.cells as f32 * cw;
         if run.underline {
             fill(renderer, Rectangle { x, y: y + CELL_H - 2.0, width, height: 1.0 }, run.color);
@@ -1172,6 +1258,8 @@ struct GridState {
     click: Option<(Instant, u16, u16, u8)>,
     /// Pixels of wheel movement not yet worth a line.
     wheel: f32,
+    /// Shift is down (Shift+right-click copies as one line).
+    shift: bool,
 }
 
 /// Longest time between presses of a double or triple click.
@@ -1236,6 +1324,10 @@ impl Widget<Message, Theme, iced::Renderer> for Grid<'_> {
             return event::Status::Ignored;
         }
         let state = tree.state.downcast_mut::<GridState>();
+        if let Event::Keyboard(keyboard::Event::ModifiersChanged(mods)) = event {
+            state.shift = mods.shift();
+            return event::Status::Ignored;
+        }
         let bounds = layout.bounds();
         let (cols, lines) = (self.frame.cols, self.frame.lines);
         let mut send = |m: Mouse| shell.publish(Message::Term(TermMsg::Mouse(self.id, m)));
@@ -1257,7 +1349,7 @@ impl Widget<Message, Theme, iced::Renderer> for Grid<'_> {
                 event::Status::Captured
             }
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) if cursor.is_over(bounds) => {
-                send(Mouse::Context);
+                send(Mouse::Context { one_line: state.shift });
                 event::Status::Captured
             }
             Event::Mouse(mouse::Event::CursorMoved { position }) if state.dragging => {
@@ -1510,7 +1602,9 @@ impl App {
         ("Ctrl+Shift+W (cm_CloseTerminal)", "End the shown terminal and close it (middle-click or x on its sidebar entry too)"),
         ("cm_TerminalFolderToPanel (no key by default)", "Active panel goes to the terminal's current folder and Files is shown"),
         ("Ctrl+Shift+C or Ctrl+Insert", "Copy the selected text (select with the mouse: drag, double-click a word, triple-click a line)"),
+        ("Ctrl+Shift+J", "Copy the selected text as one line: line breaks and the indentation after them removed (paths, URLs, commands a program wrapped)"),
         ("Right-click", "Copies the selection and clears it; with no selection pastes the clipboard"),
+        ("Shift+Right-click", "Copies the selection as one line (like Ctrl+Shift+J) and clears it"),
         ("Ctrl+Shift+V or Shift+Insert", "Paste the clipboard (bracketed when the program asks for it)"),
         ("Mouse wheel, Shift+PgUp/PgDn, Shift+Home/End", "Scroll the history (programs that use the mouse get wheel events, other full-screen programs arrow keys); typing jumps back to the bottom"),
         ("Every other key", "Goes to the shell (Esc, Tab, Ctrl+C, arrows, F1-F12, ...)"),
@@ -1810,7 +1904,7 @@ impl App {
                 if let Some(text) = t.mouse(mouse) {
                     return iced::clipboard::write(text);
                 }
-                if mouse == Mouse::Context && t.selected_text().is_none() {
+                if matches!(mouse, Mouse::Context { .. }) && t.selected_text(false).is_none() {
                     return iced::clipboard::read().map(move |text| Message::Term(TermMsg::Paste(id, text)));
                 }
             }
@@ -1940,8 +2034,10 @@ impl App {
         let letter = |l: &str| matches!(key, keyboard::Key::Character(c) if c.eq_ignore_ascii_case(l));
         let (ctrl, alt, shift) = (mods.control(), mods.alt(), mods.shift());
         // Keys the terminal keeps for itself (TERM_KEYS): copy, paste, scrolling.
-        if (ctrl && shift && !alt && letter("c")) || (ctrl && !shift && !alt && named == Some(Named::Insert)) {
-            return match t.selected_text() {
+        let copy = (ctrl && shift && !alt && letter("c")) || (ctrl && !shift && !alt && named == Some(Named::Insert));
+        let copy_one_line = ctrl && shift && !alt && letter("j");
+        if copy || copy_one_line {
+            return match t.selected_text(copy_one_line) {
                 Some(text) => iced::clipboard::write(text),
                 None => Task::none(),
             };
@@ -2121,6 +2217,54 @@ mod tests {
     use iced::keyboard::Key;
     use iced::keyboard::Modifiers as M;
 
+    /// Measures how the grid's font resolves: run with
+    /// `cargo test -p rustcommander measure_fonts -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn measure_fonts() {
+        use iced::advanced::graphics::text::{font_system, Paragraph};
+        use iced::advanced::text::Paragraph as _;
+        let fonts = [
+            ("MONOSPACE", Font::MONOSPACE),
+            ("Cascadia Mono", Font::with_name("Cascadia Mono")),
+            ("Consolas", Font::with_name("Consolas")),
+        ];
+        for (name, base) in fonts {
+            for (style, w, it) in [("regular", Weight::Normal, false), ("bold", Weight::Bold, false),
+                ("italic", Weight::Normal, true), ("bold italic", Weight::Bold, true)] {
+                let font = Font { weight: w, style: if it { FontStyle::Italic } else { FontStyle::Normal }, ..base };
+                let sample = "0".repeat(100);
+                let p = Paragraph::with_text(iced::advanced::Text {
+                    content: sample.as_str(),
+                    bounds: Size::INFINITY,
+                    size: Pixels(FONT_SIZE),
+                    line_height: LineHeight::Absolute(Pixels(CELL_H)),
+                    font,
+                    horizontal_alignment: alignment::Horizontal::Left,
+                    vertical_alignment: alignment::Vertical::Top,
+                    shaping: Shaping::Basic,
+                    wrapping: Wrapping::None,
+                });
+                let mut face = String::new();
+                let mut y = 0.0;
+                if let Some(run) = p.buffer().layout_runs().next() {
+                    y = run.line_y;
+                    if let Some(g) = run.glyphs.first() {
+                        let mut fs = font_system().write().unwrap();
+                        if let Some(f) = fs.raw().db().face(g.font_id) {
+                            face = format!("{} ({:?} {:?})", f.post_script_name, f.weight, f.style);
+                        }
+                    }
+                }
+                println!("{name:14} {style:12} w={:.4} baseline={y:.2} face={face}", p.min_width() / 100.0);
+            }
+        }
+        for (bold, italic) in [(true, false), (false, true), (true, true)] {
+            let (font, synthetic) = style_font(bold, italic);
+            println!("bold={bold} italic={italic}: drawn with {font:?}, synthetic bold {synthetic}");
+        }
+    }
+
     #[test]
     fn scripts_are_known_by_extension() {
         assert_eq!(script_kind(Path::new(r"C:\a\b.ps1")), Some(Script::PowerShell));
@@ -2266,6 +2410,58 @@ mod tests {
         // A click without a drag selects nothing.
         let click = Selection::new(SelectionType::Simple, at(0, 2), Side::Left);
         assert!(click.is_empty());
+    }
+
+    #[test]
+    fn copy_joins_lines_filled_to_the_edge() {
+        let at = |line, col| GridPoint::new(Line(line), GridColumn(col));
+        let select = |term: &mut Term<Proxy>, from: (i32, usize), to: (i32, usize)| {
+            let mut selection = Selection::new(SelectionType::Simple, at(from.0, from.1), Side::Left);
+            selection.update(at(to.0, to.1), Side::Right);
+            term.selection = Some(selection);
+            selection_text(term).unwrap()
+        };
+        // A hard break after a full line (as ConPTY sends a soft wrap) joins;
+        // a short line keeps its break, without its trailing spaces.
+        let mut term = small_term(10, 4, "C:\\Users\\a\r\nb\\c   \r\nnext");
+        assert_eq!(select(&mut term, (0, 0), (2, 3)), "C:\\Users\\ab\\c\nnext");
+        // A real soft wrap joins too (alacritty marks it).
+        let mut term = small_term(5, 3, "abcdefgh");
+        assert_eq!(select(&mut term, (0, 0), (1, 4)), "abcdefgh");
+        // A rule across the window ends its line.
+        let mut term = small_term(4, 3, "\u{2500}\u{2500}\u{2500}\u{2500}\r\nx");
+        assert_eq!(select(&mut term, (0, 0), (1, 0)), "\u{2500}\u{2500}\u{2500}\u{2500}\nx");
+        // A whole-line selection keeps its final break.
+        let mut term = small_term(10, 3, "one\r\ntwo");
+        term.selection = Some(Selection::new(SelectionType::Lines, at(1, 0), Side::Left));
+        assert_eq!(selection_text(&term).as_deref(), Some("two\n"));
+    }
+
+    #[test]
+    fn copy_as_one_line_drops_breaks_and_indentation() {
+        assert_eq!(join_lines("C:\\Users\\a\\AppData\\  \n  Local\\Temp\n"), "C:\\Users\\a\\AppData\\Local\\Temp");
+        assert_eq!(join_lines("  cargo build\r\n    --release"), "cargo build--release");
+        assert_eq!(join_lines("one"), "one");
+        let mut term = small_term(12, 3, "path: C:\\a\\\r\n  b\\c.txt");
+        let mut selection = Selection::new(SelectionType::Simple, GridPoint::new(Line(0), GridColumn(6)), Side::Left);
+        selection.update(GridPoint::new(Line(1), GridColumn(8)), Side::Right);
+        term.selection = Some(selection);
+        assert_eq!(join_lines(&selection_text(&term).unwrap()), "C:\\a\\b\\c.txt");
+    }
+
+    #[test]
+    fn styles_keep_the_cell_grid() {
+        // Whatever face each style ends up with, it has the regular advance
+        // and baseline (else bold/italic text drifts off the cells).
+        let regular = measure(Font::MONOSPACE);
+        for (bold, italic) in [(false, false), (true, false), (false, true), (true, true)] {
+            let (font, synthetic) = style_font(bold, italic);
+            let (w, baseline) = measure(font);
+            assert!((w - regular.0).abs() < 0.05, "{bold} {italic}: {w} vs {}", regular.0);
+            assert!((baseline - regular.1).abs() < 0.5, "{bold} {italic}: {baseline} vs {}", regular.1);
+            assert!(!synthetic || bold);
+        }
+        assert!((cell_w() - regular.0).abs() < 0.001);
     }
 
     #[test]
