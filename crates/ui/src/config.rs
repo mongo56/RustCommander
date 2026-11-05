@@ -513,7 +513,7 @@ fn template(editor: &str, compare: CompareState) -> String {
          # Examples: builtin_shell = 'pwsh.exe -NoLogo', builtin_shell = 'cmd.exe'\n\
          builtin_shell = \"\"\n\
          \n\
-         # Show hidden files at the first start (Ctrl+H toggles them per tab).\n\
+         # Show hidden and system files at the first start (Ctrl+H toggles them per tab).\n\
          show_hidden = false\n\
          \n\
          # Open Markdown files (.md) with Enter / double-click in the internal viewer\n\

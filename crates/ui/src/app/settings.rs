@@ -102,12 +102,12 @@ const ROW_SHELL: usize = 2;
 const ROW_MARKDOWN: usize = 3;
 const ROW_SCRIPTS: usize = 4;
 const ROW_HIDDEN: usize = 5;
-const ROW_FKEYS: usize = 6;
+const ROW_GIT: usize = 6;
 const ROW_TREE: usize = 7;
-const ROW_UPDATES: usize = 8;
-const ROW_RENDER: usize = 9;
+const ROW_FKEYS: usize = 8;
+const ROW_UPDATES: usize = 9;
+const ROW_RENDER: usize = 10;
 /// Compare options 0..3 (`toggle_compare_option`) are rows 11..14.
-const ROW_GIT: usize = 10;
 const ROW_COMPARE: usize = 11;
 const ROW_CONFIG: usize = 14;
 
@@ -999,7 +999,7 @@ impl App {
                     )
                 };
                 column![
-                    heading("Files"),
+                    heading("Programs"),
                     line(
                         ROW_EDITOR,
                         row![label("Editor for F4"), editor, browse].spacing(8).align_y(Alignment::Center).into()
@@ -1023,6 +1023,7 @@ impl App {
                     ),
                     container(hint("A program and arguments, started in the panel's folder; for new terminals. Enter saves.".into()))
                         .padding([0, 14 + LABEL_W as u16 + 8]),
+                    heading("Opening files"),
                     line(
                         ROW_MARKDOWN,
                         row![
@@ -1051,23 +1052,24 @@ impl App {
                         .align_y(Alignment::Center)
                         .into()
                     ),
+                    heading("Panels"),
                     line(
                         ROW_HIDDEN,
                         row![
-                            label("Show hidden files"),
+                            label("Show hidden and system files"),
                             switch(self.config.show_hidden, SettingsMsg::ShowHidden(!self.config.show_hidden)),
-                            hint("Every tab now and at the first start; Ctrl+H toggles one tab".into()),
+                            hint("Files with the Hidden or System attribute, every tab now and at the first start; Ctrl+H toggles one tab".into()),
                         ]
                         .spacing(8)
                         .align_y(Alignment::Center)
                         .into()
                     ),
                     line(
-                        ROW_FKEYS,
+                        ROW_GIT,
                         row![
-                            label("Function-key bar"),
-                            switch(self.config.show_fkeys, SettingsMsg::ShowFkeys(!self.config.show_fkeys)),
-                            hint("Buttons F1-F10 under the panels; off = a one-line hint".into()),
+                            label("Git status"),
+                            switch(self.config.git_status, SettingsMsg::GitStatus(!self.config.git_status)),
+                            hint("In a git work tree (git on PATH): a status letter after each name and the branch in the path bar".into()),
                         ]
                         .spacing(8)
                         .align_y(Alignment::Center)
@@ -1084,6 +1086,18 @@ impl App {
                         .align_y(Alignment::Center)
                         .into()
                     ),
+                    line(
+                        ROW_FKEYS,
+                        row![
+                            label("Function-key bar"),
+                            switch(self.config.show_fkeys, SettingsMsg::ShowFkeys(!self.config.show_fkeys)),
+                            hint("Buttons F1-F10 under the panels; off = a one-line hint".into()),
+                        ]
+                        .spacing(8)
+                        .align_y(Alignment::Center)
+                        .into()
+                    ),
+                    heading("Startup and display"),
                     line(
                         ROW_UPDATES,
                         row![
@@ -1107,17 +1121,6 @@ impl App {
                                 SettingsMsg::SoftwareRendering(!self.config.software_rendering)
                             ),
                             hint("Draw with the CPU instead of the graphics card: starts sooner, but scrolling and big folders are slower. Applies at the next start".into()),
-                        ]
-                        .spacing(8)
-                        .align_y(Alignment::Center)
-                        .into()
-                    ),
-                    line(
-                        ROW_GIT,
-                        row![
-                            label("Git status"),
-                            switch(self.config.git_status, SettingsMsg::GitStatus(!self.config.git_status)),
-                            hint("In a git work tree (git on PATH): a status letter after each name and the branch in the path bar".into()),
                         ]
                         .spacing(8)
                         .align_y(Alignment::Center)
