@@ -100,29 +100,18 @@ impl Keymap {
 
     /// The hint shown instead of the function-key bar: the first key of
     /// help, the command palette and the settings, as they are bound now.
+    #[cfg(test)]
     pub fn bar_hint(&self) -> String {
-        self.bar_hint_with(true)
+        self.bar_hints().iter().map(|(key, what)| format!("{key} {what}")).collect::<Vec<_>>().join(" \u{b7} ")
     }
 
-    /// `bar_hint` without the descriptions ("F1 · Ctrl+Space · F10"), for narrow windows.
-    pub fn bar_hint_short(&self) -> String {
-        self.bar_hint_with(false)
-    }
-
-    fn bar_hint_with(&self, described: bool) -> String {
+    /// The pairs of `bar_hint`: (key, what it does), for the ones that are bound.
+    pub fn bar_hints(&self) -> Vec<(String, &'static str)> {
         let bindings = self.bindings();
-        let part = |cmd: Command, what: &str| {
-            Keymap::keys_for(&bindings, cmd).first().map(|key| if described { format!("{key} {what}") } else { key.to_string() })
-        };
-        let parts: Vec<String> = [
-            part(Command::Help, "help"),
-            part(Command::CommandPalette, "command palette"),
-            part(Command::Configuration, "settings"),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
-        parts.join(" · ")
+        [(Command::Help, "help"), (Command::CommandPalette, "command palette"), (Command::Configuration, "settings")]
+            .into_iter()
+            .filter_map(|(cmd, what)| Keymap::keys_for(&bindings, cmd).first().map(|key| (key.to_string(), what)))
+            .collect()
     }
 
     /// Every effective binding as (display name, command), defaults with the

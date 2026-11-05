@@ -124,6 +124,13 @@ pub(super) struct ConnectTool {
 }
 
 impl ConnectTool {
+    /// The cursor is the selected site. "Press Del again", "Connecting… (Esc cancels)" and the password
+    /// prompt's note stay while they wait.
+    pub(super) fn note_state(&mut self) -> NoteState<'_> {
+        let pending = self.deleting.is_some() || matches!(self.mode, Mode::Connecting { .. } | Mode::Password { .. });
+        NoteState { cursor: (self.selected, 0), pending, note: &mut self.note }
+    }
+
     fn new_form(&self, index: Option<usize>) -> Form {
         match index.and_then(|i| self.sites.get(i)) {
             Some(s) => Form {
@@ -703,16 +710,38 @@ impl App {
                 Tone::Success => colors.success,
                 Tone::Info => colors.text,
             }),
-            None => (
-                match c.mode {
-                    Mode::Edit(_) => "Tab next field \u{b7} Ctrl+P protocol \u{b7} Enter save \u{b7} Esc back",
-                    Mode::Password { .. } => "Enter connect \u{b7} Esc back",
-                    Mode::Trust { .. } => "Y trust and connect \u{b7} N or Esc cancel",
-                    _ => "Enter connect \u{b7} N new \u{b7} E edit \u{b7} Del delete \u{b7} Esc close",
-                }
-                .to_owned(),
-                colors.muted,
-            ),
+            None => (String::new(), colors.muted),
+        };
+        const EDIT: &[theme::Hint] = &[
+            (&["Tab"], "next field"),
+            (&["Ctrl+P"], "protocol"),
+            (&["Enter"], "save"),
+            (&["Esc"], "back"),
+        ];
+        const PASSWORD: &[theme::Hint] = &[(&["Enter"], "connect"), (&["Esc"], "back")];
+        const TRUST: &[theme::Hint] = &[(&["Y"], "trust and connect"), (&["N", "Esc"], "cancel")];
+        const LIST: &[theme::Hint] = &[
+            (&["Enter"], "connect"),
+            (&["N"], "new"),
+            (&["E"], "edit"),
+            (&["Del"], "delete"),
+            (&["Esc"], "close"),
+        ];
+        let hints = match c.mode {
+            Mode::Edit(_) => EDIT,
+            Mode::Password { .. } => PASSWORD,
+            Mode::Trust { .. } => TRUST,
+            _ => LIST,
+        };
+        let reserved = match &c.mode {
+            Mode::List => 420.0,
+            Mode::Edit(_) => 190.0,
+            _ => 90.0,
+        };
+        let left: Element<'a, Message> = if note.is_empty() {
+            theme::key_hints_row(hints, self.window_width - reserved - 50.0)
+        } else {
+            text(note).size(12).color(color).wrapping(Wrapping::None).into()
         };
         let mut buttons = Row::new().spacing(8);
         match &c.mode {
@@ -732,7 +761,7 @@ impl App {
         }
         let footer = container(
             row![
-                container(text(note).size(12).color(color).wrapping(Wrapping::None)).width(Length::Fill).clip(true),
+                container(left).width(Length::Fill).clip(true),
                 Space::with_width(Length::Fixed(8.0)),
                 buttons
             ]

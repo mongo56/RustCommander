@@ -71,6 +71,11 @@ pub(super) struct MultiRename {
 }
 
 impl MultiRename {
+    /// The cursor is the row whose name is edited by hand. Nothing waits for an answer here.
+    pub(super) fn note_state(&mut self) -> NoteState<'_> {
+        NoteState { cursor: (self.editing.map_or(0, |i| i + 1), 0), pending: false, note: &mut self.note }
+    }
+
     fn refresh(&mut self) {
         let parse = |s: &str, what: &str| s.trim().parse::<i64>().map_err(|_| format!("Counter {what}: not a number"));
         let counter = (|| {
@@ -549,11 +554,19 @@ impl App {
                 };
                 text(msg.as_str()).size(12).color(color).wrapping(Wrapping::None).into()
             }
-            None => text("Enter rename \u{b7} Ctrl+Z undo \u{b7} click a new name or F2 to edit it \u{b7} Ctrl+R regex \u{b7} Ctrl+E match case \u{b7} Ctrl+U case \u{b7} Tab next field \u{b7} Esc close")
-                .size(11)
-                .color(colors.muted)
-                .wrapping(Wrapping::None)
-                .into(),
+            None => {
+                const HINTS: &[theme::Hint] = &[
+                    (&["Enter"], "rename"),
+                    (&["Ctrl+Z"], "undo"),
+                    (&["F2"], "or click a new name to edit it"),
+                    (&["Ctrl+R"], "regex"),
+                    (&["Ctrl+E"], "match case"),
+                    (&["Ctrl+U"], "case"),
+                    (&["Tab"], "next field"),
+                    (&["Esc"], "close"),
+                ];
+                theme::key_hints_row(HINTS, self.window_width - 360.0)
+            }
         };
         let action = |label: &'a str, msg: MrMsg, primary: bool| {
             button(text(label).size(13))

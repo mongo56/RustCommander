@@ -716,6 +716,8 @@ impl App {
                 }))
             });
 
+        // Key hints shown as key caps (after `note`, if any) when no status message replaces them.
+        let mut hints: &[theme::Hint] = &[];
         let (note, color) = if let Some(e) = &f.error {
             (e.clone(), colors.error)
         } else if f.dup_view && f.running.is_some() {
@@ -735,7 +737,7 @@ impl App {
             (t, colors.text)
         } else if let (true, Some(i)) = (f.dup_view, f.dup_info) {
             let mut t = format!(
-                "{} groups, {} wasted \u{b7} {} files checked \u{b7} Space marks \u{b7} Ctrl+N/O mark all but newest/oldest \u{b7} Ctrl+L feed to panel",
+                "{} groups, {} wasted \u{b7} {} files checked",
                 f.groups.len(),
                 rc_core::format::size(i.wasted),
                 i.files
@@ -746,6 +748,11 @@ impl App {
             if i.cancelled {
                 t.push_str(" \u{b7} stopped");
             }
+            hints = &[
+                (&["Space"], "marks"),
+                (&["Ctrl+N", "Ctrl+O"], "mark all but newest/oldest"),
+                (&["Ctrl+L"], "feed to panel"),
+            ];
             (t, if f.groups.is_empty() { colors.text } else { colors.success })
         } else if f.running.is_some() {
             (
@@ -755,13 +762,19 @@ impl App {
         } else if let Some(s) = &f.summary {
             (summary_text(s), if s.hits > 0 { colors.success } else { colors.text })
         } else {
-            (
-                "Enter search \u{b7} Esc stop/close \u{b7} \u{2191}\u{2193} pick a hit, Enter/double-click/Ctrl+G go to it \u{b7} \
-                 Ctrl+L feed to panel \u{b7} Ctrl+R/T regex \u{b7} Ctrl+E case \u{b7} Ctrl+S subfolders \u{b7} Ctrl+H hidden \u{b7} \
-                 Ctrl+P archives"
-                    .to_owned(),
-                colors.muted,
-            )
+            hints = &[
+                (&["Enter"], "search"),
+                (&["Esc"], "stop/close"),
+                (&["\u{2191}\u{2193}"], "pick a hit"),
+                (&["Enter", "Ctrl+G"], "go to it (or double-click)"),
+                (&["Ctrl+L"], "feed to panel"),
+                (&["Ctrl+R", "Ctrl+T"], "regex"),
+                (&["Ctrl+E"], "case"),
+                (&["Ctrl+S"], "subfolders"),
+                (&["Ctrl+H"], "hidden"),
+                (&["Ctrl+P"], "archives"),
+            ];
+            (String::new(), colors.muted)
         };
         let action = |label: &'a str, msg: FindMsg, primary: bool| {
             button(text(label).size(13))
@@ -785,9 +798,26 @@ impl App {
         } else {
             buttons.push(action("Search", FindMsg::Start, true))
         };
+        let mut reserved = 130.0;
+        if !f.results.is_empty() {
+            reserved += 210.0;
+        }
+        if f.dup_view && !f.groups.is_empty() {
+            reserved += 400.0;
+        }
+        let note_w = note.chars().count() as f32 * 6.6;
+        let left: Element<'a, Message> = if hints.is_empty() {
+            text(note).size(12).color(color).wrapping(Wrapping::None).into()
+        } else {
+            let mut left = Row::new().spacing(10).align_y(Alignment::Center);
+            if !note.is_empty() {
+                left = left.push(text(note).size(12).color(color).wrapping(Wrapping::None));
+            }
+            left.push(theme::key_hints_row(hints, self.window_width - reserved - note_w - 30.0)).into()
+        };
         let footer = container(
             row![
-                container(text(note).size(12).color(color).wrapping(Wrapping::None)).width(Length::Fill).clip(true),
+                container(left).width(Length::Fill).clip(true),
                 Space::with_width(Length::Fixed(8.0)),
                 buttons
             ]

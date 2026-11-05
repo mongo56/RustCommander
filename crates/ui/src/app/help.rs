@@ -8,7 +8,7 @@ use super::*;
 use crate::theme::filled;
 use iced::widget::scrollable::{AbsoluteOffset, RelativeOffset};
 use iced::widget::text::Wrapping;
-use iced::widget::{column, container, responsive, row, scrollable, text, Column, Row, Space};
+use iced::widget::{column, container, mouse_area, responsive, row, scrollable, text, Column, Row, Space};
 use iced::{Alignment, Element, Length};
 
 const LINE: f32 = 40.0;
@@ -27,7 +27,20 @@ fn key_chip<'a>(label: &'a str, colors: theme::Colors) -> Element<'a, Message> {
     theme::key_chip(label, colors, colors.header)
 }
 
-fn list_id() -> scrollable::Id {
+/// A full-width list row that reports the mouse entering/leaving and tints
+/// itself when `hovered`.
+fn hover_row<'a>(content: Element<'a, Message>, i: usize, hovered: bool, colors: theme::Colors) -> Element<'a, Message> {
+    let tint = hovered.then(|| theme::hover_bg(colors.panel));
+    mouse_area(container(content).width(Length::Fill).style(move |_: &Theme| container::Style {
+        background: tint.map(Into::into),
+        ..container::Style::default()
+    }))
+    .on_enter(Message::HelpHover(Some(i)))
+    .on_exit(Message::HelpHover(None))
+    .into()
+}
+
+fn list_id()-> scrollable::Id {
     scrollable::Id::new("help-list")
 }
 
@@ -49,6 +62,8 @@ pub(super) struct Section {
 pub(super) struct Help {
     query: String,
     sections: Vec<Section>,
+    /// Row under the mouse (index over all shown rows).
+    pub(super) hovered: Option<usize>,
 }
 
 /// The sections with only the items matching `query`: every word must
@@ -134,6 +149,7 @@ impl App {
         self.leave_edits();
         self.screen = Some(Screen::Help(Help {
             query: String::new(),
+            hovered: None,
             sections: sections(&self.keymap, &palette::user_items(&self.user_cmds, &self.user_keys)),
         }));
         scrollable::snap_to(list_id(), RelativeOffset::START)
@@ -153,6 +169,8 @@ impl App {
         let Some(h) = self.screen.help_mut() else {
             return Task::none();
         };
+        // Rows shift when the filter or scroll position changes.
+        h.hovered = None;
         let scroll = |y: f32| scrollable::scroll_by(list_id(), AbsoluteOffset { x: 0.0, y });
         let top = || scrollable::snap_to(list_id(), RelativeOffset::START);
         match named {
@@ -225,6 +243,7 @@ impl App {
         .style(filled(colors.header));
 
         let query_text = h.query.as_str();
+        let hovered = h.hovered;
         let list = responsive(move |size| {
             let wide = size.width >= HIDE_ID_BELOW;
             let stacked = size.width < STACK_BELOW;
@@ -237,6 +256,7 @@ impl App {
                         .color(colors.muted),
                 );
             }
+            let mut index = 0usize;
             for &(title, ref items) in &shown {
                 list = list.push(container(text(title).size(theme::SIZE_HEAD).color(colors.accent)).padding([10, 0]));
                 for &item in items.iter() {
@@ -255,14 +275,19 @@ impl App {
                             .into()
                         }
                     };
+                    let i = index;
+                    index += 1;
+                    // Full-width row that tints under the mouse.
+                    let hoverable = |content: Element<'a, Message>| hover_row(content, i, hovered == Some(i), colors);
                     if stacked {
-                        list = list.push(
+                        list = list.push(hoverable(
                             column![
                                 keys_el(Length::Shrink),
                                 container(text(item.text.as_str()).size(theme::SIZE_BODY).width(Length::Fill)).padding([0, 12]),
                             ]
-                            .padding([2, 0]),
-                        );
+                            .padding([2, 0])
+                            .into(),
+                        ));
                         continue;
                     }
                     let mut line = row![
@@ -275,7 +300,7 @@ impl App {
                     if wide {
                         line = line.push(text(item.id).size(theme::SIZE_SMALL).color(colors.muted).wrapping(Wrapping::None));
                     }
-                    list = list.push(line);
+                    list = list.push(hoverable(line.into()));
                 }
             }
             scrollbar::thin(list).id(list_id()).height(Length::Fill).into()

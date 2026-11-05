@@ -469,7 +469,8 @@ impl App {
                 .style(theme::suggestion(edit.selected == Some(i)))
                 .into()
         }));
-        let hint = text("Tab completes · ↑↓ choose · Enter go").size(11).color(theme::c().muted);
+        const HINTS: &[theme::Hint] = &[(&["Tab"], "completes"), (&["\u{2191}\u{2193}"], "choose"), (&["Enter"], "go")];
+        let hint = theme::key_hints_row(HINTS, self.window_width - 60.0);
         let card = container(column![items, container(hint).padding([4, 8])])
             .padding(4)
             .width(Length::Fill)
@@ -478,12 +479,16 @@ impl App {
     }
 
     fn footer<'a>(&'a self, side: usize, panel: &'a Panel) -> Element<'a, Message> {
+        const QUICK: &[theme::Hint] = &[(&["\u{2191}\u{2193}"], "next match"), (&["Esc"], "close")];
+        const FILTER_EDIT: &[theme::Hint] =
+            &[(&[], "type to filter"), (&["*.ext;"], "wildcards"), (&["Esc"], "clear")];
+        const FILTER_SET: &[theme::Hint] = &[(&["Ctrl+S"], "edit"), (&["Esc"], "clear")];
         if let Some(q) = self.quick_search.as_ref().filter(|q| q.side == side) {
             return container(
                 row![
                     text("Find").size(12).color(theme::c().muted),
                     container(text(&q.text).size(12)).padding([1, 6]).style(theme::drag_label),
-                    text("↑↓ next match · Esc close").size(11).color(theme::c().muted),
+                    theme::key_hints_row(QUICK, self.window_width / 2.0 - 140.0),
                 ]
                 .spacing(8)
                 .align_y(Alignment::Center),
@@ -498,7 +503,7 @@ impl App {
         if editing || !panel.filter().is_empty() {
             let shown = panel.entries.iter().filter(|e| !e.is_parent()).count();
             let all = panel.unfiltered_len() - panel.entries.iter().filter(|e| e.is_parent()).count();
-            let hint = if editing { "type to filter · *.ext; wildcards · Esc clear" } else { "Ctrl+S edit · Esc clear" };
+            let hint = theme::key_hints_row(if editing { FILTER_EDIT } else { FILTER_SET }, self.window_width / 2.0 - 220.0);
             return container(
                 row![
                     text("Filter").size(12).color(theme::c().muted),
@@ -506,7 +511,7 @@ impl App {
                         .padding([1, 6])
                         .style(theme::drag_label),
                     text(format!("{shown} of {all}")).size(12),
-                    text(hint).size(11).color(theme::c().muted),
+                    hint,
                 ]
                 .spacing(8)
                 .align_y(Alignment::Center),
@@ -1053,12 +1058,16 @@ impl App {
             .push(text(toggle).size(13));
         items = items.push(row_button(toggle_row, n));
         let empty = (n == 0).then(|| text("No folders yet.").size(13).color(theme::c().muted));
-        let hint = if menu.naming.is_some() {
-            "Type the name \u{b7} Enter OK \u{b7} Esc cancel"
-        } else {
-            "Enter go \u{b7} Shift+Enter new tab \u{b7} 1-9 jump \u{b7} N submenu \u{b7} Ctrl+arrows move \u{b7} Del remove"
-        };
-        let hint = text(hint).size(11).color(theme::c().muted);
+        const NAMING: &[theme::Hint] = &[(&[], "Type the name"), (&["Enter"], "OK"), (&["Esc"], "cancel")];
+        const PICK: &[theme::Hint] = &[
+            (&["Enter"], "go"),
+            (&["Shift+Enter"], "new tab"),
+            (&["1-9"], "jump"),
+            (&["N"], "submenu"),
+            (&["Ctrl+\u{2191}\u{2193}", "Ctrl+\u{2190}\u{2192}"], "move"),
+            (&["Del"], "remove"),
+        ];
+        let hint = theme::key_hints_row(if menu.naming.is_some() { NAMING } else { PICK }, 488.0);
         // Title: the submenu path, with a way back for the mouse.
         let mut title = String::from("Hotlist");
         let mut level = self.hotlist.as_slice();
@@ -1098,7 +1107,9 @@ impl App {
                     .style(theme::suggestion(selected == i)),
             );
         }
-        let hint = text("Most recent first \u{b7} Enter go \u{b7} 1-9 jump \u{b7} Esc close").size(11).color(theme::c().muted);
+        const HINTS: &[theme::Hint] =
+            &[(&[], "Most recent first"), (&["Enter"], "go"), (&["1-9"], "jump"), (&["Esc"], "close")];
+        let hint = theme::key_hints_row(HINTS, 488.0);
         let title = format!("Folder history ({} of {})", selected + 1, list.len());
         let content = column![text(title).size(16), self.popup_list(items), hint].spacing(10);
         container(content).padding(16).width(Length::Fixed(520.0)).style(theme::dialog).into()
@@ -1164,22 +1175,18 @@ impl App {
 
     fn bottom_bar(&self) -> Element<'_, Message> {
         const CHAR_W: f32 = 6.6; // rough width of a size-12 character
-        // Hint on the right (only without the function-key bar): full, keys only, or hidden as the window narrows.
-        let hint = if self.config.show_fkeys {
-            String::new()
+        // Hints on the right (only without the function-key bar): as many as fit in under half the window.
+        let (hint, hint_w) = if self.config.show_fkeys {
+            (None, 0.0)
         } else {
-            let full = self.keymap.bar_hint();
-            let short = self.keymap.bar_hint_short();
-            let need = |s: &str| s.chars().count() as f32 * CHAR_W + 20.0;
-            if self.window_width >= need(&full) * 2.2 {
-                full
-            } else if self.window_width >= need(&short) * 2.5 {
-                short
-            } else {
-                String::new()
-            }
+            let hints: Vec<theme::HintOwned> =
+                self.keymap.bar_hints().into_iter().map(|(key, what)| theme::HintOwned::new([key], what)).collect();
+            let c = theme::c();
+            // Quiet: no pill (the bar's own background), key caps barely lighter, muted action text.
+            let chip = theme::mix(c.bg, c.panel, 0.6);
+            let (line, w) = theme::key_hints_fit_on::<Message>(&hints, self.window_width * 0.45 - 20.0, c.bg, chip, c.muted);
+            if w > 0.0 { (Some(line), w + 16.0) } else { (None, 0.0) }
         };
-        let hint_w = if hint.is_empty() { 0.0 } else { hint.chars().count() as f32 * CHAR_W + 16.0 };
         let room = ((self.window_width - 20.0 - hint_w) / CHAR_W).max(0.0) as usize;
         let ellipsize = |msg: &str| -> String {
             if msg.chars().count() <= room {
@@ -1226,10 +1233,13 @@ impl App {
 
         if !self.config.show_fkeys {
             // Just a status line with a quiet hint on the right.
-            let hint = text(hint).size(theme::SIZE_SMALL).color(theme::c().muted).wrapping(Wrapping::None);
             let status = self.status_clickable(with_tip(container(status.wrapping(Wrapping::None)).clip(true).into()));
-            return container(row![status, Space::with_width(Length::Fill), hint].spacing(theme::SPACING_LOOSE))
-                .padding([3, 10])
+            let hint: Element<'_, Message> = match hint {
+                Some(line) => line.into(),
+                None => Space::with_width(0).into(),
+            };
+            return container(row![status, Space::with_width(Length::Fill), hint].spacing(theme::SPACING_LOOSE).align_y(Alignment::Center))
+                .padding([1, 10])
                 .width(Length::Fill)
                 .clip(true)
                 .into();

@@ -292,8 +292,6 @@ pub enum SettingsMsg {
     PickHex(String),
     PickOk,
     PickCancel,
-    /// The footer note with this generation has been shown long enough.
-    NoteExpired(u32),
     Close,
 }
 
@@ -354,12 +352,16 @@ pub(super) struct Settings {
     /// Ctrl+R pressed once on the keys page (twice resets every key).
     reset_all: bool,
     note: Option<(String, Tone)>,
-    /// Bumped for every new note, so only the latest note's timer clears it.
-    note_gen: u32,
 }
 
-/// The note, page and selected row before a message; see settings_after.
-pub(super) type NoteMark = (Option<(String, Tone)>, Page, usize);
+impl Settings {
+    /// The cursor is the page and its selected row; a note asking for input (key capture, the second
+    /// Ctrl+R) stays while that is pending.
+    pub(super) fn note_state(&mut self) -> NoteState<'_> {
+        let pending = self.capture.is_some() || self.reset_all;
+        NoteState { cursor: (self.page.index(), self.row[self.page.index()]), pending, note: &mut self.note }
+    }
+}
 
 fn current_hex() -> Vec<String> {
     let colors = theme::c();
@@ -385,7 +387,6 @@ impl App {
             picker: None,
             reset_all: false,
             note: None,
-            note_gen: 0,
         })));
         Task::batch([
             scrollable::snap_to(list_id(), RelativeOffset::START),
@@ -633,47 +634,7 @@ impl App {
         }
     }
 
-    /// Taken before Settings handles a message or key: the note, page and selected row.
-    pub(super) fn settings_mark(&self) -> Option<NoteMark> {
-        let s = self.screen.settings()?;
-        Some((s.note.clone(), s.page, s.row[s.page.index()]))
-    }
-
-    /// After a message or key: a new note fades out after a while (errors stay longer),
-    /// and moving to another row clears an old one (not an error). A note asking for input (key capture,
-    /// the second Ctrl+R) stays while that is pending.
-    pub(super) fn settings_after(
-        &mut self,
-        mark: Option<NoteMark>,
-        task: Task<Message>,
-    ) -> Task<Message> {
-        let (Some((note, page, row)), Some(s)) = (mark, self.screen.settings_mut()) else { return task };
-        let pending = s.capture.is_some() || s.reset_all;
-        match &s.note {
-            Some((_, tone)) if s.note != note => {
-                s.note_gen = s.note_gen.wrapping_add(1);
-                let secs = if *tone == Tone::Error { 8 } else { 4 };
-                let expire = delayed(Duration::from_secs(secs), Message::Settings(SettingsMsg::NoteExpired(s.note_gen)));
-                Task::batch([task, expire])
-            }
-            // Errors stay until their timer runs out, so a failed save isn't missed.
-            Some((_, tone)) if *tone != Tone::Error && !pending && (s.page != page || s.row[s.page.index()] != row) => {
-                s.note = None;
-                task
-            }
-            _ => task,
-        }
-    }
-
     pub(super) fn settings_update(&mut self, msg: SettingsMsg) -> Task<Message> {
-        if let SettingsMsg::NoteExpired(gen) = msg {
-            if let Some(s) = self.screen.settings_mut() {
-                if s.note_gen == gen && s.capture.is_none() && !s.reset_all {
-                    s.note = None;
-                }
-            }
-            return Task::none();
-        }
         if matches!(msg, SettingsMsg::Click(_) | SettingsMsg::Theme(_) | SettingsMsg::ResetColor(_)) {
             self.picker_close(false);
         }
@@ -686,8 +647,6 @@ impl App {
         let selected = shown.get(s.row[Page::Keys.index()]).copied();
         match msg {
             SettingsMsg::Page(page) => return self.settings_page(page),
-            // Handled before the reset_all reset above.
-            SettingsMsg::NoteExpired(_) => {}
             SettingsMsg::Click(i) => {
                 let i = i.min(Self::rows_of(s.page, shown.len()).saturating_sub(1));
                 let again = s.row[s.page.index()] == i;

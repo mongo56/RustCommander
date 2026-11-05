@@ -127,6 +127,11 @@ pub(super) struct SyncTool {
 }
 
 impl SyncTool {
+    /// The cursor is the row. A note stays while the comparison runs or the confirmation shows.
+    pub(super) fn note_state(&mut self) -> NoteState<'_> {
+        NoteState { cursor: (self.cursor, 0), pending: self.running.is_some() || self.confirm, note: &mut self.note }
+    }
+
     fn stop(&mut self) {
         if let Some(cancel) = self.running.take() {
             cancel.store(true, Ordering::Relaxed);
@@ -772,7 +777,13 @@ impl App {
         } else if t.compared {
             (summary_line(&t.summary()), colors.text)
         } else {
-            ("Esc close \u{b7} Ctrl+R compare".to_owned(), colors.muted)
+            (String::new(), colors.muted)
+        };
+        const HINTS: &[theme::Hint] = &[(&["Esc"], "close"), (&["Ctrl+R"], "compare")];
+        let left: Element<'a, Message> = if note.is_empty() {
+            theme::key_hints_row(HINTS, self.window_width - 400.0)
+        } else {
+            text(note).size(12).color(color).wrapping(Wrapping::None).into()
         };
         let mut buttons = Row::new().spacing(8);
         buttons = buttons.push(action("Close", SyncMsg::Close, false));
@@ -783,7 +794,7 @@ impl App {
         };
         let footer = container(
             row![
-                container(text(note).size(12).color(color).wrapping(Wrapping::None)).width(Length::Fill).clip(true),
+                container(left).width(Length::Fill).clip(true),
                 Space::with_width(Length::Fixed(8.0)),
                 buttons
             ]

@@ -308,6 +308,13 @@ pub(super) struct DiskUsage {
 }
 
 impl DiskUsage {
+    /// The cursor is the tree row and the chosen extension. A note stays while a scan runs ("… scanning
+    /// again").
+    pub(super) fn note_state(&mut self) -> NoteState<'_> {
+        let cursor = (self.cursor, self.ext_sel.map_or(0, |e| usize::from(e) + 1));
+        NoteState { cursor, pending: self.running.is_some(), note: &mut self.note }
+    }
+
     fn stop(&mut self) {
         if let Some(cancel) = self.running.take() {
             cancel.store(true, Ordering::Relaxed);
@@ -973,13 +980,24 @@ impl App {
                 let (t, tone) = d.note.as_ref().expect("checked");
                 (t.clone(), tone_color(tone))
             }
-            None => (
-                "\u{2191}\u{2193} move \u{b7} \u{2192}/+ expand \u{b7} \u{2190}/- collapse \u{b7} Ctrl+Enter go to it \
-                 \u{b7} F8 delete \u{b7} Shift+F10 menu \u{b7} Z zoom map \u{b7} Tab extensions \u{b7} F5 scan again \
-                 \u{b7} Esc close"
-                    .to_owned(),
-                colors.muted,
-            ),
+            None => (String::new(), colors.muted),
+        };
+        const HINTS: &[theme::Hint] = &[
+            (&["\u{2191}\u{2193}"], "move"),
+            (&["\u{2192}", "+"], "expand"),
+            (&["\u{2190}", "-"], "collapse"),
+            (&["Ctrl+Enter"], "go to it"),
+            (&["F8"], "delete"),
+            (&["Shift+F10"], "menu"),
+            (&["Z"], "zoom map"),
+            (&["Tab"], "extensions"),
+            (&["F5"], "scan again"),
+            (&["Esc"], "close"),
+        ];
+        let left: Element<'a, Message> = if note.is_empty() {
+            theme::key_hints_row(HINTS, self.window_width - 340.0)
+        } else {
+            text(note).size(12).color(note_color).wrapping(Wrapping::None).into()
         };
         let action = |label: &'a str, msg: DuMsg, primary: bool| {
             button(text(label).size(13))
@@ -997,7 +1015,7 @@ impl App {
         }
         let footer = container(
             row![
-                container(text(note).size(12).color(note_color).wrapping(Wrapping::None)).width(Length::Fill).clip(true),
+                container(left).width(Length::Fill).clip(true),
                 Space::with_width(Length::Fixed(8.0)),
                 buttons
             ]

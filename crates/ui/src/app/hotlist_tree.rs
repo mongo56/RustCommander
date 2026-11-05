@@ -21,6 +21,11 @@ const INDENT: f32 = 16.0;
 const CHEVRON: f32 = 14.0;
 const MENU_W: f32 = 290.0;
 const MENU_ROW_H: f32 = 26.0;
+/// Sidebar widths (estimated) from which the title shows "Hide left" in words / also the folder count,
+/// and the action bar says "+ Current folder" instead of "+ Folder".
+const TITLE_FULL_W: f32 = 165.0;
+const TITLE_COUNT_W: f32 = 230.0;
+const BAR_FULL_W: f32 = 210.0;
 
 fn name_input_id() -> text_input::Id {
     text_input::Id::new("tree-name-input")
@@ -159,6 +164,13 @@ pub(super) fn takes_focus(cmd: Command) -> bool {
     matches!(cmd, Command::QuickFilter | Command::Rename)
 }
 
+/// The `+` key (main row on any layout, Shift+= on US, or the numpad) without Ctrl/Alt/Win: adds the current
+/// folder to the tree. Matches the typed text first, then the key itself in case no text came with it.
+pub(super) fn is_plus(key: &keyboard::Key, text: Option<&str>, mods: keyboard::Modifiers) -> bool {
+    let plain = !mods.control() && !mods.alt() && !mods.logo();
+    plain && (text == Some("+") || (text.is_none() && matches!(key, keyboard::Key::Character(c) if c.as_str() == "+")))
+}
+
 impl App {
     /// Keys of `tree_key`, for the F1 help. Keep in sync.
     pub(super) const TREE_KEYS: &'static [(&'static str, &'static str)] = &[
@@ -172,7 +184,7 @@ impl App {
         ("Space", "Open or close the group"),
         ("F7 (new folder key)", "New group after the cursor: type its name, Enter"),
         ("F2", "Rename the group; on a folder: edit its display name and comment (tooltip)"),
-        ("+", "Add the last active panel's folder (into the group, or after the entry)"),
+        ("+ (also in a panel)", "Add the last active panel's folder (into the group, or after the entry at the cursor)"),
         ("Del", "Remove the entry (asks first for a group with entries)"),
         ("Ctrl+Up, Ctrl+Down", "Move the entry up / down"),
         ("Ctrl+Right / Ctrl+Left", "Move the entry into the group above it / out of its group"),
@@ -425,6 +437,15 @@ impl App {
         }
     }
 
+    /// `+` in a panel while the tree is shown: adds the panel's folder where the tree's `+` would (the focus
+    /// stays in the panel).
+    pub(super) fn tree_add_from_panel(&mut self) {
+        self.tree_fix_cursor();
+        let rows = hotlist::rows(&self.hotlist);
+        let target = rows.iter().any(|r| r.path == self.tree.cursor).then(|| self.tree.cursor.clone());
+        self.tree_add_current(target);
+    }
+
     fn tree_add_current(&mut self, target: Option<Vec<usize>>) {
         self.leave_edits();
         let (at, index) = self.tree_add_spot(target.as_deref());
@@ -571,9 +592,12 @@ impl App {
             Some(Named::F2) if plain && row.is_some() => return Some(self.tree_start_naming(cur, false)),
             _ => {}
         }
+        if is_plus(key, text, mods) {
+            self.tree_add_current(row.map(|_| cur));
+            return none;
+        }
         if let Some(t) = text.filter(|t| plain && !t.is_empty() && !t.chars().any(char::is_control)) {
             match t {
-                "+" => self.tree_add_current(row.map(|_| cur)),
                 " " if is_group => self.tree_toggle_group(&cur, None),
                 " " => {}
                 _ => {
@@ -971,13 +995,20 @@ impl App {
     }
 
     /// Small button in the tree's title: hide or show the left panel.
-    fn hide_left_button(&self) -> Element<'_, Message> {
+    /// `short`: an arrow instead of the words, for a narrow sidebar (the tooltip says what it does).
+    fn hide_left_button(&self, short: bool) -> Element<'_, Message> {
         let hidden = self.tree.hide_left;
         let keys = keymap::Keymap::keys_for(&self.keymap.bindings(), Command::HotlistTreeHideLeft).join(", ");
         let tip = if hidden { "Show the left panel" } else { "Hide the left panel" };
         let tip = if keys.is_empty() { tip.to_owned() } else { format!("{tip} ({keys})") };
+        let label = match (hidden, short) {
+            (true, false) => "Show left",
+            (false, false) => "Hide left",
+            (true, true) => "»",
+            (false, true) => "«",
+        };
         tooltip(
-            button(text(if hidden { "Show left" } else { "Hide left" }).size(11).wrapping(Wrapping::None))
+            button(text(label).size(11).wrapping(Wrapping::None))
                 .on_press(Message::Tree(TreeMsg::ToggleLeft))
                 .padding([1, 6])
                 .style(theme::drive(hidden)),
@@ -1003,12 +1034,17 @@ impl App {
         };
         let accent = container(Space::new(Length::Fill, Length::Fixed(2.0))).style(filled(strip));
 
+        // What fits beside the tab: the folder count only when wide, `Hide left` shrinks to an arrow, and the
+        // second action gets a shorter label (the bar wraps when even that doesn't fit). Widths are estimates.
+        let width = self.tree_width();
         let folders = count_folders(&self.hotlist);
-        let title = container(
-            row![
-                button(text("Hotlist").size(12).wrapping(Wrapping::None)).padding([3, 10]).style(theme::tab(true)),
-                Space::with_width(Length::Fill),
-                self.hide_left_button(),
+        let mut title_row = row![
+            button(text("Hotlist").size(12).wrapping(Wrapping::None)).padding([3, 10]).style(theme::tab(true)),
+            Space::with_width(Length::Fill),
+            self.hide_left_button(width < TITLE_FULL_W),
+        ];
+        if width >= TITLE_COUNT_W {
+            title_row = title_row.push(
                 text(match folders {
                     1 => "1 folder".to_owned(),
                     n => format!("{n} folders"),
@@ -1016,7 +1052,10 @@ impl App {
                 .size(11)
                 .color(c.muted)
                 .wrapping(Wrapping::None),
-            ]
+            );
+        }
+        let title = container(
+            title_row
             .spacing(6)
             .align_y(Alignment::End),
         )
@@ -1034,35 +1073,37 @@ impl App {
         let bar = container(
             row![
                 action("+ Group", TreeMsg::NewGroup),
-                action("+ Current folder", TreeMsg::AddCurrent),
-                Space::with_width(Length::Fill),
+                action(if width >= BAR_FULL_W { "+ Current folder" } else { "+ Folder" }, TreeMsg::AddCurrent),
             ]
             .spacing(2)
-            .align_y(Alignment::Center),
+            .align_y(Alignment::Center)
+            .wrap(),
         )
         .padding([4, 8])
         .width(Length::Fill)
         .clip(true)
         .style(filled(c.header));
 
-        let hint = if self.tree.naming.is_some() {
-            "Type the name \u{b7} Enter OK \u{b7} Esc cancel"
+        const NAMING: &[theme::Hint] = &[(&[], "Type the name"), (&["Enter"], "OK"), (&["Esc"], "cancel")];
+        const DRAGGING: &[theme::Hint] = &[(&[], "Drop between entries or on a group"), (&["Esc"], "cancel")];
+        // Wrapped onto up to three lines (the rest are dropped from the end).
+        const IDLE: &[theme::Hint] = &[
+            (&["Enter"], "open"),
+            (&["Shift+Enter"], "new tab"),
+            (&["+"], "add folder"),
+            (&["F7"], "group"),
+            (&["F2"], "rename"),
+            (&["Del"], "remove"),
+            (&[], "drag to move"),
+        ];
+        let hints = if self.tree.naming.is_some() {
+            NAMING
         } else if self.tree_dragging() {
-            "Drop between entries or on a group \u{b7} Esc cancel"
+            DRAGGING
         } else {
-            // As much as fits on one line.
-            let room = ((self.tree_width() - 20.0) / 5.5) as usize;
-            [
-                "Enter open \u{b7} Shift+Enter new tab \u{b7} F7 group \u{b7} F2 rename \u{b7} Del remove \u{b7} drag to move",
-                "Enter open \u{b7} Shift+Enter new tab \u{b7} F7 group \u{b7} F2 rename \u{b7} Del remove",
-                "Enter open \u{b7} F7 group \u{b7} F2 rename \u{b7} Del remove",
-                "Enter open \u{b7} F7 group \u{b7} Del remove",
-            ]
-            .into_iter()
-            .find(|h| h.chars().count() <= room)
-            .unwrap_or("F1 help")
+            IDLE
         };
-        let footer = container(text(hint).size(11).color(c.muted).wrapping(Wrapping::None))
+        let footer = container(theme::key_hints_compact(hints, self.tree_width() - 20.0))
             .padding([4, 10])
             .width(Length::Fill)
             .clip(true)
@@ -1384,6 +1425,21 @@ fn glyph_covers(g: Glyph, x: f32, y: f32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plus_is_matched_on_any_layout() {
+        use keyboard::{Key, Modifiers};
+        let plus = Key::Character("+".into());
+        // Its own key (Slovenian, German) or the numpad.
+        assert!(is_plus(&plus, Some("+"), Modifiers::empty()));
+        // Shift+= on a US layout: the key is "=", the text "+".
+        assert!(is_plus(&Key::Character("=".into()), Some("+"), Modifiers::SHIFT));
+        // No text came with it.
+        assert!(is_plus(&plus, None, Modifiers::empty()));
+        assert!(!is_plus(&plus, Some("+"), Modifiers::CTRL));
+        assert!(!is_plus(&Key::Character("=".into()), Some("="), Modifiers::empty()));
+        assert!(!is_plus(&Key::Character("a".into()), Some("a"), Modifiers::empty()));
+    }
 
     #[test]
     fn glyphs_are_drawn() {

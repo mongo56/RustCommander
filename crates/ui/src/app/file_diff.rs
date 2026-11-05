@@ -284,15 +284,20 @@ impl App {
             });
 
         let (summary, tone) = d.outcome().map_or((String::new(), Tone::Info), |o| summary(o, d.block));
-        let help = "Esc close · N/Space next difference · P/Shift+Space previous · arrows/PgUp/PgDn scroll";
+        const HINTS: &[theme::Hint] = &[
+            (&["Esc"], "close"),
+            (&["N", "Space"], "next difference"),
+            (&["P", "Shift+Space"], "previous"),
+            (&["\u{2191}\u{2193}", "PgUp", "PgDn"], "scroll"),
+        ];
+        let help = theme::key_hints_row(HINTS, self.window_width - 24.0 - 16.0 - summary.chars().count() as f32 * 7.0);
         let footer = row![
             text(summary).size(12).color(match tone {
                 Tone::Error => theme::c().error,
                 Tone::Success => theme::c().success,
                 Tone::Info => theme::c().text,
             }),
-            Space::with_width(Length::Fill),
-            text(help).size(12).color(theme::c().muted).wrapping(Wrapping::None),
+            help,
         ]
         .spacing(16);
         let footer = container(footer).padding([4, 12]).width(Length::Fill).clip(true).style(filled(theme::c().header));

@@ -344,11 +344,16 @@ pub fn mix(a: Color, b: Color, t: f32) -> Color {
 
 /// Clickable list row (Settings): `bg` normally, a soft step towards the inactive cursor colour while hovered.
 /// The selected row passes `hover: false` and keeps its colour.
+/// Background of a list row under the mouse, given its normal background.
+pub fn hover_bg(bg: Color) -> Color {
+    mix(bg, c().cursor_inactive, 0.5)
+}
+
 pub fn list_row(bg: Color, hover: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
     move |_, status| {
         let hovered = hover && matches!(status, button::Status::Hovered | button::Status::Pressed);
         button::Style {
-            background: Some(Background::Color(if hovered { mix(bg, c().cursor_inactive, 0.5) } else { bg })),
+            background: Some(Background::Color(if hovered { hover_bg(bg) } else { bg })),
             text_color: c().text,
             border: Border::default(),
             ..button::Style::default()
@@ -396,9 +401,13 @@ pub fn hint_footer<'a, M: 'a>(
 }
 
 /// One key combo as a small boxed key cap with background `bg`.
-pub fn key_chip<'a, M: 'a>(label: &'a str, colors: Colors, bg: Color) -> iced::Element<'a, M> {
+pub fn key_chip<'a, M: 'a>(label: impl iced::widget::text::IntoFragment<'a>, colors: Colors, bg: Color) -> iced::Element<'a, M> {
+    chip(label, colors, bg, [1, 5])
+}
+
+fn chip<'a, M: 'a>(label: impl iced::widget::text::IntoFragment<'a>, colors: Colors, bg: Color, padding: [u16; 2]) -> iced::Element<'a, M> {
     container(iced::widget::text(label).size(SIZE_SMALL).color(colors.dir).wrapping(iced::widget::text::Wrapping::None))
-        .padding([1, 5])
+        .padding(padding)
         .style(move |_: &Theme| container::Style {
             background: Some(Background::Color(bg)),
             border: Border { color: colors.border, width: 1.0, radius: 3.0.into() },
@@ -410,48 +419,175 @@ pub fn key_chip<'a, M: 'a>(label: &'a str, colors: Colors, bg: Color) -> iced::E
 /// A footer hint: the keys (one chip each) and what they do.
 pub type Hint = (&'static [&'static str], &'static str);
 
+/// A footer hint whose keys come from the user's keymap at run time.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HintOwned {
+    pub keys: Vec<String>,
+    pub action: String,
+}
+
+impl HintOwned {
+    pub fn new<K: Into<String>>(keys: impl IntoIterator<Item = K>, action: impl Into<String>) -> Self {
+        HintOwned { keys: keys.into_iter().map(Into::into).collect(), action: action.into() }
+    }
+}
+
+/// What the hint rows need of a hint: its key caps and its action text.
+pub trait AsHint {
+    fn keys(&self) -> Vec<&str>;
+    fn action(&self) -> &str;
+}
+
+impl AsHint for Hint {
+    fn keys(&self) -> Vec<&str> {
+        self.0.to_vec()
+    }
+    fn action(&self) -> &str {
+        self.1
+    }
+}
+
+impl AsHint for HintOwned {
+    fn keys(&self) -> Vec<&str> {
+        self.keys.iter().map(String::as_str).collect()
+    }
+    fn action(&self) -> &str {
+        &self.action
+    }
+}
+
 const HINT_GAP: f32 = 8.0;
 /// Left/right padding inside a hint's pill.
 const HINT_PAD_X: u16 = 8;
 
 /// Estimated width of a hint pair (chips, gap, action text, gap to the next pair).
-fn hint_width(h: &Hint) -> f32 {
+fn hint_width(h: &impl AsHint) -> f32 {
     let char_w = SIZE_SMALL as f32 * 0.55;
-    let keys: f32 = h.0.iter().map(|k| k.chars().count() as f32 * char_w + 12.0).sum::<f32>() + 3.0 * h.0.len().saturating_sub(1) as f32;
-    keys + 6.0 + h.1.chars().count() as f32 * char_w + 2.0 * HINT_PAD_X as f32 + HINT_GAP
+    let keys = h.keys();
+    let chips: f32 = keys.iter().map(|k| k.chars().count() as f32 * char_w + 12.0).sum::<f32>() + 3.0 * keys.len().saturating_sub(1) as f32;
+    let gap = if keys.is_empty() { 0.0 } else { 6.0 };
+    chips + gap + h.action().chars().count() as f32 * char_w + 2.0 * HINT_PAD_X as f32 + HINT_GAP
 }
 
-/// The hint pairs as one row of key caps and muted action text; pairs that don't fit in `room` px are dropped
-/// from the end.
-pub fn key_hints_row<'a, M: 'a>(hints: &[Hint], mut room: f32) -> iced::Element<'a, M> {
+/// The pairs that fit in `room` px as a row of pills (as wide as its content), and that width.
+pub fn key_hints_fit<'a, M: 'a>(hints: &[impl AsHint], room: f32) -> (iced::widget::Row<'a, M>, f32) {
+    let colors = c();
+    key_hints_fit_on(hints, room, mix(colors.header, colors.border, 0.45), colors.panel, colors.text)
+}
+
+/// `key_hints_fit` with its own pill and key-cap backgrounds and action text colour (the main window's status
+/// bar uses quiet ones that blend in).
+pub fn key_hints_fit_on<'a, M: 'a>(
+    hints: &[impl AsHint],
+    mut room: f32,
+    pill_bg: Color,
+    chip_bg: Color,
+    action_color: Color,
+) -> (iced::widget::Row<'a, M>, f32) {
     let colors = c();
     let mut line = iced::widget::Row::new().spacing(HINT_GAP).align_y(iced::Alignment::Center);
+    let mut used = 0.0;
     for h in hints {
-        room -= hint_width(h);
+        let w = hint_width(h);
+        room -= w;
         if room < 0.0 {
             break;
         }
-        let mut chips = iced::widget::Row::new().spacing(3).align_y(iced::Alignment::Center);
-        for k in h.0 {
-            chips = chips.push(key_chip::<M>(k, colors, colors.panel));
+        used += w;
+        let mut pair = iced::widget::Row::new().spacing(6).align_y(iced::Alignment::Center);
+        let keys = h.keys();
+        if !keys.is_empty() {
+            let mut chips = iced::widget::Row::new().spacing(3).align_y(iced::Alignment::Center);
+            for k in keys {
+                chips = chips.push(key_chip::<M>(k.to_owned(), colors, chip_bg));
+            }
+            pair = pair.push(chips);
         }
         // Each key group and its action sit in one pill, so it's clear what belongs together.
-        let action = iced::widget::text(h.1).size(SIZE_SMALL).color(colors.text).wrapping(iced::widget::text::Wrapping::None);
-        let pair = iced::widget::Row::new().push(chips).push(action).spacing(6).align_y(iced::Alignment::Center);
-        let pill_bg = mix(colors.header, colors.border, 0.45);
+        let action = iced::widget::text(h.action().to_owned()).size(SIZE_SMALL).color(action_color).wrapping(iced::widget::text::Wrapping::None);
+        let pair = pair.push(action);
         line = line.push(container(pair).padding([2, HINT_PAD_X]).style(move |_: &Theme| container::Style {
             background: Some(Background::Color(pill_bg)),
             border: Border { radius: 4.0.into(), ..Border::default() },
             ..container::Style::default()
         }));
     }
-    container(line).width(iced::Length::Fill).clip(true).into()
+    (line, (used - HINT_GAP).max(0.0))
+}
+
+/// The hint pairs as one row of key caps and muted action text; pairs that don't fit in `room` px are dropped
+/// from the end.
+pub fn key_hints_row<'a, M: 'a>(hints: &[impl AsHint], room: f32) -> iced::Element<'a, M> {
+    container(key_hints_fit(hints, room).0).width(iced::Length::Fill).clip(true).into()
+}
+
+/// Gap between pairs in `key_hints_compact`.
+const COMPACT_GAP: f32 = 10.0;
+/// Most lines `key_hints_compact` takes; pairs past them are dropped.
+const COMPACT_LINES: usize = 3;
+
+/// Estimated width of a compact hint pair (small chips, no pill).
+fn compact_hint_width(h: &Hint) -> f32 {
+    let char_w = SIZE_SMALL as f32 * 0.55;
+    let keys: f32 = h.0.iter().map(|k| k.chars().count() as f32 * char_w + 8.0).sum::<f32>()
+        + 2.0 * h.0.len().saturating_sub(1) as f32;
+    let gap = if h.0.is_empty() { 0.0 } else { 4.0 };
+    keys + gap + h.1.chars().count() as f32 * char_w
+}
+
+/// Splits pairs of widths `widths` into lines of at most `room` px (pairs `gap` apart; a pair wider than `room`
+/// gets a line of its own), at most `max_lines` of them: the pair counts of the lines.
+fn wrap_lines(widths: &[f32], room: f32, gap: f32, max_lines: usize) -> Vec<usize> {
+    let mut lines: Vec<usize> = Vec::new();
+    let mut x = 0.0;
+    for &w in widths {
+        if let Some(n) = lines.last_mut().filter(|_| x + gap + w <= room) {
+            *n += 1;
+            x += gap + w;
+        } else if lines.len() == max_lines {
+            break;
+        } else {
+            lines.push(1);
+            x = w;
+        }
+    }
+    lines
+}
+
+/// The hint pairs for narrow places (sidebars): small chips without pills, wrapped onto up to three lines of
+/// `room` px; pairs past them are dropped.
+pub fn key_hints_compact<'a, M: 'a>(hints: &[Hint], room: f32) -> iced::Element<'a, M> {
+    let colors = c();
+    let widths: Vec<f32> = hints.iter().map(compact_hint_width).collect();
+    let mut lines = iced::widget::Column::new().spacing(3);
+    let mut rest = hints;
+    for n in wrap_lines(&widths, room, COMPACT_GAP, COMPACT_LINES) {
+        let (now, later) = rest.split_at(n);
+        rest = later;
+        let mut line = iced::widget::Row::new().spacing(COMPACT_GAP).align_y(iced::Alignment::Center);
+        for h in now {
+            let action =
+                iced::widget::text(h.1).size(SIZE_SMALL).color(colors.text).wrapping(iced::widget::text::Wrapping::None);
+            if h.0.is_empty() {
+                line = line.push(action);
+                continue;
+            }
+            let mut chips = iced::widget::Row::new().spacing(2).align_y(iced::Alignment::Center);
+            for k in h.0 {
+                chips = chips.push(chip::<M>(*k, colors, colors.panel, [0, 3]));
+            }
+            let pair = iced::widget::Row::new().push(chips).push(action).spacing(4);
+            line = line.push(pair.align_y(iced::Alignment::Center));
+        }
+        lines = lines.push(line);
+    }
+    container(lines).width(iced::Length::Fill).clip(true).into()
 }
 
 /// Footer with key hints drawn as key caps plus muted action text. `width` is the window/page width, `reserved`
 /// the width taken by `trailing` (Close button, version text); pairs that don't fit are dropped from the end.
 pub fn key_hints_footer<'a, M: 'a>(
-    hints: &[Hint],
+    hints: &[impl AsHint],
     width: f32,
     reserved: f32,
     padding: [u16; 2],
@@ -668,6 +804,18 @@ pub fn suggestion(selected: bool) -> impl Fn(&Theme, button::Status) -> button::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_hints_wrap_and_stop_after_the_last_line() {
+        // Pairs fit while the gaps fit too.
+        assert_eq!(wrap_lines(&[40.0, 40.0, 40.0], 100.0, 10.0, 3), vec![2, 1]);
+        assert_eq!(wrap_lines(&[40.0, 50.0], 100.0, 10.0, 3), vec![2]);
+        // A pair wider than the room gets a line of its own.
+        assert_eq!(wrap_lines(&[150.0, 40.0], 100.0, 10.0, 3), vec![1, 1]);
+        // Pairs past the last line are dropped.
+        assert_eq!(wrap_lines(&[60.0; 5], 100.0, 10.0, 3), vec![1, 1, 1]);
+        assert!(wrap_lines(&[], 100.0, 10.0, 3).is_empty());
+    }
 
     #[test]
     fn hsv_round_trips_every_preset_colour() {

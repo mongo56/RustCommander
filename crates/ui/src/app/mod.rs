@@ -33,7 +33,7 @@ mod update;
 mod user_cmds;
 mod viewer;
 
-use self::screen::{Screen, ScreenSlot};
+use self::screen::{NoteState, Screen, ScreenSlot};
 use crate::keymap;
 use crate::select_range::{self, Part, SelectRange};
 use crate::scrollbar;
@@ -219,6 +219,11 @@ pub struct App {
     /// connect (Ctrl+F7), help (F1), settings (F10) or a built-in terminal
     /// (F9). See `screen.rs`.
     screen: Option<Screen>,
+    /// Bumped for every new footer note of the open tool, so only the latest note's timer clears it
+    /// (see `screen::NoteState`).
+    note_gen: u32,
+    /// The same for the status line (`status`): only the latest status's timer clears it.
+    status_gen: u32,
     /// The closed find tool (fields and results), kept for the next Ctrl+F.
     find_last: Option<find_files::FindFiles>,
     /// The jobs a confirmed folder synchronisation still has to start, and
@@ -569,6 +574,12 @@ pub enum Message {
     Term(term::TermMsg),
     Connect(connect::ConnectMsg),
     Settings(settings::SettingsMsg),
+    /// Help: the row under the mouse (index over all shown rows), if any.
+    HelpHover(Option<usize>),
+    /// The open tool's footer note with this generation has been shown long enough.
+    NoteExpired(u32),
+    /// The status line's message with this generation has been shown long enough.
+    StatusExpired(u32),
     Update(update::UpdateMsg),
     Checksum(checksum::ChecksumMsg),
     Attrib(attrib::AttribMsg),
@@ -699,6 +710,8 @@ impl App {
             restoring: HashSet::new(),
             nav: [None, None],
             screen: None,
+            note_gen: 0,
+            status_gen: 0,
             find_last: None,
             sync_chain: None,
             focus_new: None,
@@ -852,7 +865,9 @@ impl App {
             Message::FsChanged(path) => Some(path.clone()),
             _ => None,
         };
+        let mark = self.note_mark();
         let task = self.handle(message);
+        let task = self.note_after(mark, task);
         let thumbs = self.pump_thumbs();
         let git = self.git_check(changed.as_deref());
         let quick = self.quick_view_check();
@@ -1449,10 +1464,13 @@ impl App {
             Message::DiskUsage(msg) => return self.disk_usage_update(msg),
             Message::Term(msg) => return self.term_update(msg),
             Message::Connect(msg) => return self.connect_update(msg),
-            Message::Settings(msg) => {
-                let mark = self.settings_mark();
-                let task = self.settings_update(msg);
-                return self.settings_after(mark, task);
+            Message::Settings(msg) => return self.settings_update(msg),
+            Message::NoteExpired(gen) => self.note_expired(gen),
+            Message::StatusExpired(gen) => self.status_expired(gen),
+            Message::HelpHover(row) => {
+                if let Some(h) = self.screen.help_mut() {
+                    h.hovered = row;
+                }
             }
             Message::Update(msg) => return self.update_msg(msg),
             Message::Checksum(msg) => return self.checksum_msg(msg),
@@ -1567,11 +1585,7 @@ impl App {
             }
             return match self.screen {
                 Some(Screen::Help(_)) => self.help_key(named, &key, mods, text.as_deref()),
-                Some(Screen::Settings(_)) => {
-                    let mark = self.settings_mark();
-                    let task = self.settings_key(named, &key, mods, text.as_deref(), captured);
-                    self.settings_after(mark, task)
-                }
+                Some(Screen::Settings(_)) => self.settings_key(named, &key, mods, text.as_deref(), captured),
                 Some(Screen::MultiRename(_)) => self.multi_rename_key(named, &key, mods, captured),
                 Some(Screen::Find(_)) => self.find_key(named, &key, mods, captured),
                 Some(Screen::Sync(_)) => self.sync_key(named, &key, mods),
@@ -1770,6 +1784,11 @@ impl App {
         }
 
         let searching = self.quick_search.as_ref().is_some_and(|q| q.side == self.active);
+        // With the hotlist tree shown, + adds the panel's folder to it (while not quick searching).
+        if !searching && self.tree_visible() && hotlist_tree::is_plus(&key, typed.as_deref(), mods) {
+            self.tree_add_from_panel();
+            return Task::none();
+        }
         if let Some(t) = typed {
             if t != " " || searching {
                 return self.quick_search_type(&t);

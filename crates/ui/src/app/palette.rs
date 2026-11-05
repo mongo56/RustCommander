@@ -268,7 +268,8 @@ impl App {
             text(format!("{} shown", p.shown.len())).size(12).color(colors.muted),
         ]
         .align_y(Alignment::Center);
-        let hint = text("Enter run \u{b7} Up/Down pick \u{b7} Esc close").size(11).color(colors.muted);
+        const HINTS: &[theme::Hint] = &[(&["Enter"], "run"), (&["\u{2191}\u{2193}"], "pick"), (&["Esc"], "close")];
+        let hint = theme::key_hints_row(HINTS, 568.0);
         let content = column![header, search, body, hint].spacing(10);
         container(content).padding(16).width(Length::Fixed(600.0)).style(theme::dialog).into()
     }

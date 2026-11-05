@@ -198,6 +198,8 @@ pub(super) struct Viewer {
     pointer: Option<Point>,
     /// Stops the running search of a large file.
     cancel: Arc<AtomicBool>,
+    /// A large-file search runs ("Searching for …" stays until it ends).
+    searching: bool,
     /// Mouse selection, by file offsets; `selecting` while the left button drags it.
     sel: Option<Selection>,
     selecting: bool,
@@ -248,6 +250,12 @@ impl Viewer {
     /// Stops a running search, if any.
     fn cancel_search(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
+        self.searching = false;
+    }
+
+    /// The cursor is the file shown and its top row. The note of a running large-file search stays.
+    pub(super) fn note_state(&mut self) -> NoteState<'_> {
+        NoteState { cursor: (self.index, self.top), pending: self.searching, note: &mut self.note }
     }
 
     /// Replaces the window of a large file with one whose text starts at
@@ -393,6 +401,7 @@ impl App {
             offset: AbsoluteOffset { x: 0.0, y: 0.0 },
             pointer: None,
             cancel: Arc::new(AtomicBool::new(false)),
+            searching: false,
             sel: None,
             selecting: false,
             pan: None,
@@ -1282,6 +1291,7 @@ impl App {
         v.cancel_search();
         let cancel = Arc::new(AtomicBool::new(false));
         v.cancel = cancel.clone();
+        v.searching = true;
         let token = cancel.clone();
         v.note = Some((format!("Searching for \"{}\"…", v.query), Tone::Info));
         let (path, encoding, mode, query, case, size, seq) =
@@ -1311,6 +1321,7 @@ impl App {
         if !Arc::ptr_eq(&v.cancel, search) || search.load(Ordering::Relaxed) {
             return;
         }
+        v.searching = false;
         match result {
             Ok(Some((doc, hit, wrapped))) => {
                 v.content = Content::Loaded(Loaded::Doc(doc));
@@ -1447,25 +1458,67 @@ impl App {
                 .style(filled(theme::c().header)),
             );
         }
+        const IMAGE: &[theme::Hint] = &[
+            (&["Esc"], "close"),
+            (&["\u{2190}", "\u{2192}"], "prev/next image"),
+            (&["N", "P"], "next/prev file"),
+            (&["+", "-", "Ctrl+wheel"], "zoom"),
+            (&["0"], "fit"),
+            (&["1"], "actual size"),
+            (&[], "drag to pan"),
+        ];
+        const RENDERED: &[theme::Hint] = &[
+            (&["Esc"], "close"),
+            (&["N", "P"], "next/prev file"),
+            (&["1"], "source"),
+            (&["3"], "hex"),
+            (&["F7"], "find"),
+            (&["F3", "Shift+F3"], "next/prev"),
+            (&["C"], "match case"),
+            (&[], "drag select blocks"),
+            (&["Ctrl+C"], "copy"),
+            (&[], "click a link to open it"),
+        ];
+        const MARKDOWN: &[theme::Hint] = &[
+            (&["Esc"], "close"),
+            (&["N", "P"], "next/prev file"),
+            (&["1"], "text"),
+            (&["3"], "hex"),
+            (&["5"], "Markdown"),
+            (&["W"], "wrap"),
+            (&["F7"], "find"),
+            (&["F3", "Shift+F3"], "next/prev"),
+            (&["C"], "match case"),
+            (&[], "drag select"),
+            (&["Ctrl+C"], "copy"),
+        ];
+        const PLAIN: &[theme::Hint] = &[
+            (&["Esc"], "close"),
+            (&["N", "P"], "next/prev file"),
+            (&["1"], "text"),
+            (&["3"], "hex"),
+            (&["W"], "wrap"),
+            (&["F7"], "find"),
+            (&["F3", "Shift+F3"], "next/prev"),
+            (&["C"], "match case"),
+            (&[], "drag select"),
+            (&["Ctrl+C"], "copy"),
+        ];
         let help = if v.image_size().is_some() {
-            "Esc close · ←/→ prev/next image · N/P next/prev file · +/- or Ctrl+wheel zoom · 0 fit · 1 actual size · drag to pan"
+            IMAGE
         } else if v.rendered {
-            "Esc close · N/P next/prev file · 1 source · 3 hex · F7 find · F3/Shift+F3 next/prev · C match case · drag select blocks · Ctrl+C copy · click a link to open it"
+            RENDERED
         } else if v.md.is_some() {
-            "Esc close · N/P next/prev file · 1 text · 3 hex · 5 Markdown · W wrap · F7 find · F3/Shift+F3 next/prev · C match case · drag select · Ctrl+C copy"
+            MARKDOWN
         } else {
-            "Esc close · N/P next/prev file · 1 text · 3 hex · W wrap · F7 find · F3/Shift+F3 next/prev · C match case · drag select · Ctrl+C copy"
+            PLAIN
         };
         let footer: Element<'a, Message> = match &v.note {
             Some((msg, tone)) => text(msg.as_str())
                 .size(12)
                 .color(if *tone == Tone::Error { theme::c().error } else { theme::c().text })
                 .into(),
-            None => text(help)
-            .size(12)
-            .color(theme::c().muted)
-            .wrapping(Wrapping::None)
-            .into(),
+            None => theme::key_hints_row(help, self.window_width - 24.0),
         };
         page = page.push(container(footer).padding([4, 12]).width(Length::Fill).clip(true).style(filled(theme::c().header)));
         container(page).width(Length::Fill).height(Length::Fill).style(filled(theme::c().bg)).into()

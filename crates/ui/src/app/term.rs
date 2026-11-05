@@ -13,7 +13,7 @@
 
 use super::*;
 use super::term_activity::{wants_cue, Activity, Attention, Check};
-use crate::theme::filled;
+use crate::theme::{filled, HintOwned};
 use alacritty_terminal::event::{Event as TermEvent, EventListener, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg, State};
 use alacritty_terminal::grid::{Dimensions, Scroll};
@@ -45,7 +45,7 @@ const CELL_H: f32 = 18.0;
 /// Space around the grid.
 const PAD: f32 = 6.0;
 /// Height of the line under the grid (how to switch, how to get back).
-const FOOTER_H: f32 = 22.0;
+const FOOTER_H: f32 = 26.0;
 /// Width of the sidebar (Files, the terminals, +) incl. its separator line.
 const SIDE_W: f32 = 160.0;
 /// Width of the sidebar while the panels are shown: collapsed to short
@@ -827,30 +827,35 @@ fn meaningful_title(title: &str) -> bool {
     !t.is_empty() && !t.to_ascii_lowercase().contains(".exe")
 }
 
-/// The footer's tip for switching terminals, from the keys of the
-/// previous/next/new terminal commands (`Ctrl+Shift+Up/Down: switch
-/// terminals · Ctrl+Shift+T: new terminal`).
-fn switch_tip(prev: Option<String>, next: Option<String>, new: Option<String>) -> String {
+/// The footer's hints for switching terminals, from the keys of the previous/next/new terminal commands
+/// (`Ctrl+Shift+Up/Down` switch terminals, `Ctrl+Shift+T` new terminal).
+fn switch_hints(prev: Option<String>, next: Option<String>, new: Option<String>) -> Vec<HintOwned> {
     let switch = match (prev, next) {
         (Some(prev), Some(next)) => {
             // Shared modifiers once: Ctrl+Shift+Up/Down.
-            let keys = match (prev.rsplit_once('+'), next.rsplit_once('+')) {
-                (Some((a, up)), Some((b, down))) if a == b => format!("{a}+{up}/{down}"),
-                _ => format!("{prev} / {next}"),
-            };
-            Some(format!("{keys}: switch terminals"))
+            Some(match (prev.rsplit_once('+'), next.rsplit_once('+')) {
+                (Some((a, up)), Some((b, down))) if a == b => HintOwned::new([format!("{a}+{up}/{down}")], "switch terminals"),
+                _ => HintOwned::new([prev, next], "switch terminals"),
+            })
         }
-        (Some(key), None) => Some(format!("{key}: previous terminal")),
-        (None, Some(key)) => Some(format!("{key}: next terminal")),
+        (Some(key), None) => Some(HintOwned::new([key], "previous terminal")),
+        (None, Some(key)) => Some(HintOwned::new([key], "next terminal")),
         (None, None) => None,
     };
-    let new = new.map(|key| format!("{key}: new terminal"));
+    let new = new.map(|key| HintOwned::new([key], "new terminal"));
     match (switch, new) {
-        (Some(s), Some(n)) => format!("{s} \u{b7} {n}"),
-        (Some(s), None) => s,
-        (None, Some(n)) => format!("Sidebar: switch terminals \u{b7} {n}"),
-        (None, None) => "The sidebar on the right switches terminals".to_owned(),
+        (Some(s), Some(n)) => vec![s, n],
+        (Some(s), None) => vec![s],
+        (None, Some(n)) => vec![HintOwned::new(Vec::<String>::new(), "Sidebar: switch terminals"), n],
+        (None, None) => vec![HintOwned::new(Vec::<String>::new(), "The sidebar on the right switches terminals")],
     }
+}
+
+/// `switch_hints` as one line of text (`Ctrl+Shift+Up/Down: switch terminals \u{b7} Ctrl+Shift+T: new terminal`).
+#[cfg(test)]
+fn switch_tip(prev: Option<String>, next: Option<String>, new: Option<String>) -> String {
+    let part = |h: HintOwned| if h.keys.is_empty() { h.action } else { format!("{}: {}", h.keys.join(" / "), h.action) };
+    switch_hints(prev, next, new).into_iter().map(part).collect::<Vec<_>>().join(" \u{b7} ")
 }
 
 /// The folder a shell's default prompt shows, from the text of the line up
@@ -2300,24 +2305,41 @@ impl App {
         let Some(t) = self.term(id) else { return Space::new(Length::Fill, Length::Fill).into() };
         let bindings = self.keymap.bindings();
         let back = keymap::Keymap::keys_for(&bindings, Command::ToggleTerminal).first().map(|k| k.to_string());
-        let back = match back {
-            Some(key) => format!("{key}: back to the panels (the terminal keeps running)"),
-            None => "Bind cm_ToggleTerminal to a key to get back to the panels".to_owned(),
-        };
         let key = |cmd| keymap::Keymap::keys_for(&bindings, cmd).first().map(|k| k.to_string());
-        let switch = switch_tip(key(Command::PrevTerminal), key(Command::NextTerminal), key(Command::NewTerminal));
-        let switch = match key(Command::NextTab) {
-            Some(tab) => format!("{tab}: next terminal \u{b7} {switch}"),
-            None => switch,
+        let mut hints = switch_hints(key(Command::PrevTerminal), key(Command::NextTerminal), key(Command::NewTerminal));
+        if let Some(tab) = key(Command::NextTab) {
+            hints.insert(0, HintOwned::new([tab], "next terminal"));
+        }
+        // The terminal area's width (the sidebar takes the rest), less the footer's padding and spacing.
+        let total = self.area_width() - 20.0 - 12.0;
+        // The way back keeps its place on the right; the switching hints drop pairs from the end to make room.
+        let (back_line, back_w): (Element<'_, Message>, f32) = match back {
+            Some(key) => {
+                let long = [HintOwned::new([key.clone()], "back to the panels (the terminal keeps running)")];
+                let short = [HintOwned::new([key], "back to the panels")];
+                let (line, w) = theme::key_hints_fit::<Message>(&long, total - 120.0);
+                if w > 0.0 {
+                    (line.into(), w)
+                } else {
+                    let (line, w) = theme::key_hints_fit::<Message>(&short, total - 120.0);
+                    (line.into(), w)
+                }
+            }
+            None => (
+                text("Bind cm_ToggleTerminal to a key to get back to the panels")
+                    .size(12)
+                    .color(colors.muted)
+                    .wrapping(Wrapping::None)
+                    .into(),
+                330.0,
+            ),
         };
-        let footer = row![
-            text(switch).size(12).color(colors.muted).wrapping(Wrapping::None),
-            Space::with_width(Length::Fill),
-            text(back).size(12).color(colors.muted).wrapping(Wrapping::None),
-        ]
-        .spacing(12)
-        .padding([3, 10])
-        .height(Length::Fixed(FOOTER_H));
+        let left = theme::key_hints_row::<Message>(&hints, total - back_w);
+        let footer = row![left, back_line]
+            .spacing(12)
+            .padding([2, 10])
+            .align_y(iced::Alignment::Center)
+            .height(Length::Fixed(FOOTER_H));
         let grid = Element::new(Grid { id, frame: &t.frame, focused: self.focused });
         // The bar's position is the history line at the top of the view.
         let (history, offset, lines) = (t.frame.history, t.frame.offset, t.frame.lines);
