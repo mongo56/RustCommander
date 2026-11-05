@@ -290,10 +290,10 @@ mod tests {
 
         // A new .gz by packing a file named like it.
         let src = out.join("notes.txt");
-        ok(Job::Pack { sources: vec![src.clone()], archive: gz.clone() });
+        ok(Job::Pack { sources: vec![src.clone()], archive: gz.clone(), password: None });
         assert_eq!(read(&gz), (b"moved out".to_vec(), Some("notes.txt".into())));
         let wrong = tmp.0.join("wrong.gz");
-        refused(Job::Pack { sources: vec![src], archive: wrong.clone() }, "just one file");
+        refused(Job::Pack { sources: vec![src], archive: wrong.clone(), password: None }, "just one file");
         assert!(!wrong.exists());
         assert_eq!(leftovers(&tmp.0), Vec::<String>::new());
     }
@@ -304,7 +304,7 @@ mod tests {
         let gz = tmp.0.join("inner.txt.gz");
         make(&gz, b"inner");
         let zip = tmp.0.join("outer.zip");
-        ok(Job::Pack { sources: vec![gz.clone()], archive: zip.clone() });
+        ok(Job::Pack { sources: vec![gz.clone()], archive: zip.clone(), password: None });
         fs::remove_file(&gz).unwrap();
         let nested = zip.join("inner.txt.gz");
         let entry = nested.join("inner.txt");

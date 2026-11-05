@@ -213,6 +213,21 @@ pub(crate) fn format_of(name: &OsStr) -> Option<Format> {
     }
 }
 
+/// Why packing with a password into a tar or gz archive is refused.
+pub const NO_ENCRYPTION: &str = "Only zip and 7z archives can be encrypted (tar and gz can't)";
+
+/// What packing into an archive named `name` can do: `None` if packing
+/// can't create it (no such archive kind can be written, or a plain `.gz`,
+/// which holds just one file), else whether a password can encrypt it (zip
+/// and 7z).
+pub fn pack_encryptable(name: &OsStr) -> Option<bool> {
+    match format_of(name)? {
+        Format::Zip | Format::SevenZ => Some(true),
+        Format::Tar | Format::TarGz | Format::TarBz2 => Some(false),
+        Format::Gz | Format::Rar => None,
+    }
+}
+
 /// Whether a file with this name can be entered like a folder.
 pub fn is_archive_name(name: &str) -> bool {
     format_of(OsStr::new(name)).is_some()

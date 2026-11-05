@@ -16,6 +16,7 @@ mod attrib;
 mod share_login;
 mod checksum;
 mod split;
+mod pack;
 mod find_files;
 mod branch;
 mod git;
@@ -288,8 +289,8 @@ enum Tone {
 enum Dialog {
     Transfer { is_move: bool, sources: Vec<PathBuf>, base: PathBuf, input: String },
     MakeDir { input: String },
-    /// Alt+F5: the zip to pack `sources` into (`base`: for relative input).
-    Pack { sources: Vec<PathBuf>, base: PathBuf, input: String },
+    /// Alt+F5: the archive to pack into and its password (`pack.rs`).
+    Pack(Box<pack::PackDialog>),
     /// Alt+F9: the folder to unpack `archives` into.
     Unpack { archives: Vec<PathBuf>, base: PathBuf, input: String },
     /// The password of an encrypted archive; `retry`: a side to take there
@@ -548,6 +549,7 @@ pub enum Message {
     Checksum(checksum::ChecksumMsg),
     Attrib(attrib::AttribMsg),
     Share(share_login::ShareMsg),
+    Pack(pack::PackMsg),
     /// Background listing for a pending navigation: (side, seq, listing).
     Navigated(usize, u64, Listing),
     /// A file inside an archive was extracted to a temp copy to be opened.
@@ -1322,7 +1324,6 @@ impl App {
                     Dialog::Transfer { input, .. }
                     | Dialog::MakeDir { input }
                     | Dialog::EditNew { input }
-                    | Dialog::Pack { input, .. }
                     | Dialog::Split { input, .. }
                     | Dialog::Unpack { input, .. }
                     | Dialog::Password { input, .. },
@@ -1411,6 +1412,7 @@ impl App {
             Message::Checksum(msg) => return self.checksum_msg(msg),
             Message::Attrib(msg) => return self.attrib_msg(msg),
             Message::Share(msg) => return self.share_msg(msg),
+            Message::Pack(msg) => return self.pack_msg(msg),
             Message::ArchiveEdit(msg) => return self.archive_edit_update(msg),
             Message::Navigated(side, seq, result) => {
                 let current = self.sides[side].current;
@@ -1559,6 +1561,12 @@ impl App {
                 return Task::none();
             }
             return self.share_key(named, mods.shift(), captured);
+        }
+        if let Some(Dialog::Pack(_)) = self.dialog {
+            if named.is_some_and(is_modifier_key) {
+                return Task::none();
+            }
+            return self.pack_key(named, mods.shift(), captured);
         }
         if let Some(Dialog::Attrib(_)) = self.dialog {
             if named.is_some_and(is_modifier_key) {
@@ -2482,27 +2490,6 @@ impl App {
                 }
                 self.edit_file(&path, name);
             }
-            Dialog::Pack { sources, base, input } => {
-                let mut archive = resolve_typed_path(input.trim().trim_matches('"'), &base);
-                if !archive.extension().is_some_and(|e| e.eq_ignore_ascii_case("zip") || e.eq_ignore_ascii_case("jar")) {
-                    let mut name = archive.file_name().unwrap_or_default().to_os_string();
-                    name.push(".zip");
-                    archive.set_file_name(name);
-                }
-                if archive.is_dir() || vfs::in_archive(archive.parent().unwrap_or(&archive)) {
-                    self.error(format!("Can't pack into {}", archive.display()));
-                    return Task::none();
-                }
-                let title = format!("Packing {} → {}", describe(&sources), archive.display());
-                let other = 1 - self.active;
-                let focus = (archive.parent() == Some(self.panel(other).path.as_path()))
-                    .then(|| (other, archive.file_name().unwrap_or_default().to_string_lossy().into_owned()));
-                let task = self.start_job(Job::Pack { sources, archive }, title);
-                if let Some(job) = self.jobs.last_mut() {
-                    job.focus = focus;
-                }
-                return task;
-            }
             Dialog::Split { src, size, target, input } => return self.split_submit(src, size, target, input),
             Dialog::Unpack { archives, base, input } => {
                 let target = resolve_typed_path(input.trim().trim_matches('"'), &base);
@@ -2565,6 +2552,7 @@ impl App {
             Dialog::Checksum(d) => self.dialog = Some(Dialog::Checksum(d)),
             Dialog::Attrib(d) => self.dialog = Some(Dialog::Attrib(d)),
             Dialog::ShareLogin(d) => self.dialog = Some(Dialog::ShareLogin(d)),
+            Dialog::Pack(d) => self.dialog = Some(Dialog::Pack(d)),
             Dialog::Compare { opts } => {
                 let changed = self.compare_opts != opts;
                 self.compare_opts = opts;
@@ -3008,29 +2996,6 @@ impl App {
     fn ask_password(&mut self, path: PathBuf, retry: Option<usize>) -> Task<Message> {
         let archive = vfs::split_archive(&path).map_or(path, |(file, _)| file);
         self.open_dialog(Dialog::Password { archive, input: String::new(), retry })
-    }
-
-    /// Alt+F5: asks for the name of a zip to pack the selection into, in
-    /// the other panel's folder.
-    fn open_pack(&mut self) -> Task<Message> {
-        let sources = self.target_paths(self.active);
-        if sources.is_empty() {
-            return Task::none();
-        }
-        if sources.iter().any(|p| vfs::is_virtual(p)) {
-            self.info("Can't pack files inside archives or on servers: copy them out first");
-            return Task::none();
-        }
-        let target = self.panel(1 - self.active).path.clone();
-        let folder = if vfs::in_archive(&target) { self.panel(self.active).path.clone() } else { target };
-        let stem = match &sources[..] {
-            [one] if one.is_dir() => one.file_name().map(|n| n.to_string_lossy().into_owned()),
-            [one] => one.file_stem().map(|n| n.to_string_lossy().into_owned()),
-            _ => self.panel(self.active).path.file_name().map(|n| n.to_string_lossy().into_owned()),
-        };
-        let input = folder.join(format!("{}.zip", stem.unwrap_or_else(|| "archive".into()))).display().to_string();
-        let base = self.panel(self.active).path.clone();
-        self.open_dialog(Dialog::Pack { sources, base, input })
     }
 
     /// Alt+F9: asks where to unpack the selected archives (the other

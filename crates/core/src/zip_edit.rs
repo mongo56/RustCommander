@@ -51,16 +51,22 @@ pub(crate) struct ZipEdit {
     dirs: HashSet<String>,
     /// Stored name bytes of entries copied raw while encrypted (ZipCrypto).
     encrypted: Vec<Vec<u8>>,
+    /// New files are encrypted with this (AES-256); only for a new zip.
+    password: Option<String>,
 }
 
 impl ZipEdit {
-    /// Starts rewriting `archive` (which may not exist yet: a new zip).
-    pub fn begin(archive: &Path) -> io::Result<ZipEdit> {
+    /// Starts rewriting `archive` (which may not exist yet: a new zip). With
+    /// a `password` the files added are encrypted with it (AES-256;
+    /// folder entries and names stay plain, as zip has no way to hide them).
+    /// Only for a new zip: [`Self::copy_existing`] fails if it exists.
+    pub fn begin(archive: &Path, password: Option<&str>) -> io::Result<ZipEdit> {
         let name = archive.file_name().ok_or_else(|| io::Error::other("Invalid archive path"))?;
         let temp = archive.with_file_name(format!(".{}.{}.rctmp", name.to_string_lossy(), std::process::id()));
         let file = File::create(&temp)?;
         let writer = ZipWriter::new(BufWriter::new(file));
-        Ok(ZipEdit { archive: archive.to_path_buf(), temp, writer: Some(writer), dirs: HashSet::new(), encrypted: Vec::new() })
+        let password = password.map(str::to_owned);
+        Ok(ZipEdit { archive: archive.to_path_buf(), temp, writer: Some(writer), dirs: HashSet::new(), encrypted: Vec::new(), password })
     }
 
     fn writer(&mut self) -> &mut ZipWriter<BufWriter<File>> {
@@ -72,6 +78,9 @@ impl ZipEdit {
     pub fn copy_existing(&mut self, edits: &Edits, alive: &mut dyn FnMut() -> bool) -> io::Result<bool> {
         if !self.archive.exists() {
             return Ok(true);
+        }
+        if self.password.is_some() {
+            return Err(io::Error::other("A password can only be set on a new archive, and this one exists"));
         }
         let mut source = ZipArchive::new(BufReader::new(File::open(&self.archive)?)).map_err(io_err)?;
         let remove: Vec<String> = edits.remove.iter().map(|r| key(r)).collect();
@@ -156,7 +165,12 @@ impl ZipEdit {
     /// start the next one (or [`Self::abort_file`] on failure).
     pub fn start_file(&mut self, inner: &str, modified: Option<SystemTime>, size: u64) -> io::Result<()> {
         let opts = options(modified, size);
-        self.writer().start_file(inner, opts).map_err(io_err)
+        let writer = self.writer.as_mut().expect("writer is present until commit");
+        match &self.password {
+            Some(password) => writer.start_file(inner, opts.with_aes_encryption(zip::AesMode::Aes256, password)),
+            None => writer.start_file(inner, opts),
+        }
+        .map_err(io_err)
     }
 
     pub fn output(&mut self) -> &mut dyn Write {
@@ -253,10 +267,16 @@ pub(crate) enum Rewrite {
 impl Rewrite {
     /// Starts rewriting `archive`, which must be a zip, a 7z, a tar (plain,
     /// gz or bz2) or a plain gz on disk; it may not exist yet.
-    pub fn begin(archive: &Path) -> io::Result<Rewrite> {
-        match archive.file_name().and_then(vfs::format_of) {
-            Some(Format::Zip) => Ok(Rewrite::Zip(Box::new(ZipEdit::begin(archive)?))),
-            Some(Format::SevenZ) => Ok(Rewrite::SevenZ(Box::new(SevenZEdit::begin(archive)?))),
+    /// With a `password` it must be a new zip or 7z, its files encrypted
+    /// with it (other formats fail).
+    pub fn begin(archive: &Path, password: Option<&str>) -> io::Result<Rewrite> {
+        let format = archive.file_name().and_then(vfs::format_of);
+        if password.is_some() && !matches!(format, Some(Format::Zip | Format::SevenZ)) {
+            return Err(io::Error::other(vfs::NO_ENCRYPTION));
+        }
+        match format {
+            Some(Format::Zip) => Ok(Rewrite::Zip(Box::new(ZipEdit::begin(archive, password)?))),
+            Some(Format::SevenZ) => Ok(Rewrite::SevenZ(Box::new(SevenZEdit::begin(archive, password)?))),
             Some(f @ (Format::Tar | Format::TarGz | Format::TarBz2)) => Ok(Rewrite::Tar(Box::new(TarEdit::begin(archive, f)?))),
             Some(Format::Gz) => Ok(Rewrite::Gz(Box::new(GzEdit::begin(archive)?))),
             _ => Err(io::Error::other("Only zip, 7z, tar and gz archives can be changed")),

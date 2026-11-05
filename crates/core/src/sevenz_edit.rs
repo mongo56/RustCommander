@@ -45,11 +45,16 @@ pub(crate) struct SevenZEdit {
     dirs: HashSet<String>,
     /// The output when no file was started: refuses writes.
     none: NoFile,
+    /// Set for a new archive written encrypted (refuses to copy an old one).
+    encrypted: bool,
 }
 
 impl SevenZEdit {
-    /// Starts rewriting `archive` (which may not exist yet: a new 7z).
-    pub fn begin(archive: &Path) -> io::Result<SevenZEdit> {
+    /// Starts rewriting `archive` (which may not exist yet: a new 7z). With
+    /// a `password` everything added is encrypted with it (AES-256),
+    /// the names too (an encrypted header). Only for a new 7z:
+    /// [`Self::copy_existing`] fails if it exists.
+    pub fn begin(archive: &Path, password: Option<&str>) -> io::Result<SevenZEdit> {
         let name = archive.file_name().ok_or_else(|| io::Error::other("Invalid archive path"))?.to_string_lossy();
         let temp = archive.with_file_name(format!(".{name}.{}.rctmp", std::process::id()));
         let spool = archive.with_file_name(format!(".{name}.{}.rcspool", std::process::id()));
@@ -57,6 +62,11 @@ impl SevenZEdit {
         // Names are written plain: an archive whose 7z hid them comes out with
         // them shown.
         writer.set_encrypt_header(false);
+        if let Some(password) = password {
+            use sevenz_rust2::{encoder_options::AesEncoderOptions, EncoderMethod};
+            writer.set_content_methods(vec![AesEncoderOptions::new(password.into()).into(), EncoderMethod::LZMA2.into()]);
+            writer.set_encrypt_header(true);
+        }
         Ok(SevenZEdit {
             archive: archive.to_path_buf(),
             temp,
@@ -65,6 +75,7 @@ impl SevenZEdit {
             pending: None,
             dirs: HashSet::new(),
             none: NoFile,
+            encrypted: password.is_some(),
         })
     }
 
@@ -77,6 +88,9 @@ impl SevenZEdit {
     pub fn copy_existing(&mut self, edits: &Edits, alive: &mut dyn FnMut() -> bool) -> io::Result<bool> {
         if !self.archive.exists() {
             return Ok(true);
+        }
+        if self.encrypted {
+            return Err(io::Error::other("A password can only be set on a new archive, and this one exists"));
         }
         let (archive, password) = vfs::open_7z(&self.archive, &self.archive)?;
         let aes = sevenz_rust2::EncoderMethod::ID_AES256_SHA256;

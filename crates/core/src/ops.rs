@@ -49,8 +49,9 @@ pub enum Job {
     /// Renames inside an archive (`to` is the full new path).
     Rename { from: PathBuf, to: PathBuf },
     /// Packs `sources` into the archive `archive` (created if missing, else
-    /// added to).
-    Pack { sources: Vec<PathBuf>, archive: PathBuf },
+    /// added to). With a `password` the archive must be a new zip or 7z: its
+    /// files are encrypted with it (AES-256; a 7z's names too).
+    Pack { sources: Vec<PathBuf>, archive: PathBuf, password: Option<Secret> },
     /// Unpacks each archive's contents into the folder `target`.
     Unpack { archives: Vec<PathBuf>, target: PathBuf },
     /// Puts the edited temp copy `src` back into its archive as the file `dst`
@@ -67,6 +68,31 @@ pub enum Job {
     /// Changes attributes and dates of local `paths` (and, with `recursive`,
     /// of everything inside the folders; links are not followed).
     SetAttrib { paths: Vec<PathBuf>, change: crate::attrib::Change, recursive: bool },
+}
+
+/// A password, shown as `***` in `Debug` output.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Secret(pub String);
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("***")
+    }
+}
+
+/// Why [`Job::Pack`] can't encrypt `archive` with `password`: the password
+/// is empty, the archive can't be encrypted (only zip and 7z can), or it
+/// exists already (only a new archive gets a password; files added to an
+/// existing one would sit next to unencrypted ones).
+pub fn pack_password_problem(archive: &Path, password: &Secret) -> Option<&'static str> {
+    match archive.file_name().and_then(vfs::pack_encryptable) {
+        _ if password.0.is_empty() => Some("The password is empty"),
+        Some(true) if archive_exists(archive) => {
+            Some("Files can't be added to an existing archive with a password: pack into a new one")
+        }
+        Some(true) => None,
+        _ => Some(vfs::NO_ENCRYPTION),
+    }
 }
 
 /// Size and date of a file inside an archive (`None`: there's no such
@@ -388,6 +414,7 @@ pub fn run(job: &Job, control: &Control, reporter: &mut dyn Reporter) -> Outcome
         last_report: Instant::now(),
         staged: Vec::new(),
         relayed: 0,
+        password: None,
     };
 
     match job {
@@ -497,23 +524,29 @@ pub fn run(job: &Job, control: &Control, reporter: &mut dyn Reporter) -> Outcome
                 },
             }
         }
-        Job::Pack { sources, archive } => {
-            let mut transfers = Vec::new();
-            for src in sources {
-                match src.file_name() {
-                    Some(name) => transfers.push(Transfer { src: src.clone(), dst: archive.join(name) }),
-                    None => {
-                        runner.fail_msg(src, "Can't pack a drive root");
+        Job::Pack { sources, archive, password } => match password.as_ref().and_then(|p| pack_password_problem(archive, p)) {
+            Some(problem) => {
+                runner.fail_msg(archive, problem);
+            }
+            None => {
+                runner.password = password.clone();
+                let mut transfers = Vec::new();
+                for src in sources {
+                    match src.file_name() {
+                        Some(name) => transfers.push(Transfer { src: src.clone(), dst: archive.join(name) }),
+                        None => {
+                            runner.fail_msg(src, "Can't pack a drive root");
+                        }
                     }
                 }
+                for (bytes, items) in transfers.iter().map(|t| measure(&t.src)) {
+                    runner.progress.total_bytes += bytes;
+                    runner.progress.total_items += items;
+                }
+                runner.report(true);
+                runner.pack(archive, &transfers, false);
             }
-            for (bytes, items) in transfers.iter().map(|t| measure(&t.src)) {
-                runner.progress.total_bytes += bytes;
-                runner.progress.total_items += items;
-            }
-            runner.report(true);
-            runner.pack(archive, &transfers, false);
-        }
+        },
         Job::Unpack { archives, target } => {
             let all: Vec<_> = archives.iter().map(|a| vfs::open(a).and_then(|v| v.walk(a))).collect();
             for items in all.iter().flatten() {
@@ -609,6 +642,8 @@ struct Runner<'a> {
     /// Bytes of the download half of copies between servers (counted in
     /// the progress, not in the outcome).
     relayed: u64,
+    /// [`Job::Pack`]'s password, taken by the one archive write it does.
+    password: Option<Secret>,
 }
 
 impl Runner<'_> {
@@ -2082,7 +2117,8 @@ impl Runner<'_> {
             false => None,
         };
         let target = stage.as_ref().map_or_else(|| archive.to_path_buf(), |s| s.file.clone());
-        let mut edit = Rewrite::begin(&target)?;
+        let password = self.password.take();
+        let mut edit = Rewrite::begin(&target, password.as_ref().map(|p| p.0.as_str()))?;
         let control = self.control;
         if !edit.copy_existing(edits, &mut || control.checkpoint())? {
             return Ok(false);
@@ -3054,7 +3090,7 @@ mod tests {
         let local = tmp.0.join("in");
         fs::create_dir_all(local.join("deep")).unwrap();
         fs::write(local.join("deep/note.txt"), b"note").unwrap();
-        ok(Job::Pack { sources: vec![local], archive: seven.clone() });
+        ok(Job::Pack { sources: vec![local], archive: seven.clone(), password: None });
         assert_eq!(zip_read(&seven.join("in/deep/note.txt")), b"note");
         ok(Job::Delete { paths: vec![seven.join("in"), seven.join("folder"), seven.join("B.txt")], to_trash: false });
         assert!(zip_names(&seven).is_empty());
@@ -3099,6 +3135,120 @@ mod tests {
             let (o, _) = run_job(Job::Copy(plan_transfer(std::slice::from_ref(&local), &seven).unwrap()), Resolution::Cancel);
             assert!(o.errors.len() == 1 && o.errors[0].1.contains("encrypted"), "{:?}", o.errors);
             assert_eq!(fs::read(&seven).unwrap(), before);
+        }
+    }
+
+    /// Every file under `root` (relative `/` path, contents), sorted.
+    fn files_under(root: &Path) -> Vec<(String, Vec<u8>)> {
+        let mut out: Vec<(String, Vec<u8>)> = LocalFs
+            .walk(root)
+            .unwrap()
+            .into_iter()
+            .filter(|e| !e.is_dir())
+            .map(|e| (inner_of(root, &e.path).unwrap(), fs::read(&e.path).unwrap()))
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn secret(p: &str) -> Option<Secret> {
+        Some(Secret(p.into()))
+    }
+
+    #[test]
+    fn packs_encrypted_zip_and_7z() {
+        let tmp = TempDir::new("pack-pw");
+        let src = tree(&tmp.0);
+        fs::create_dir_all(src.join("empty")).unwrap();
+        fs::write(src.join("sub/nothing.txt"), b"").unwrap();
+        for name in ["enc.zip", "enc.7z"] {
+            let archive = tmp.0.join(name);
+            let job = Job::Pack { sources: vec![src.clone()], archive: archive.clone(), password: secret("s3cret pw") };
+            assert!(!format!("{job:?}").contains("s3cret"), "{job:?}");
+            let (o, _) = run_job(job, Resolution::Cancel);
+            assert!(o.errors.is_empty() && !o.cancelled, "{name}: {:?}", o.errors);
+            let left: Vec<_> = fs::read_dir(&tmp.0).unwrap().flatten().map(|e| e.file_name()).collect();
+            assert!(!left.iter().any(|n| n.to_string_lossy().contains(".rc")), "{name}: temp files left: {left:?}");
+
+            if name.ends_with(".zip") {
+                // Names show, every file is AES-encrypted, folders are plain.
+                let mut zip = zip::ZipArchive::new(File::open(&archive).unwrap()).unwrap();
+                for i in 0..zip.len() {
+                    let f = zip.by_index_raw(i).unwrap();
+                    assert_eq!(f.encrypted(), !f.is_dir(), "{name}: {:?}", f.name());
+                }
+                assert!(vfs::needs_password(&archive));
+                let listed = vfs::list(&archive.join("src"), true).unwrap();
+                assert!(listed.iter().any(|e| e.name == "a.txt"));
+            } else {
+                // The names are hidden too.
+                let err = vfs::list(&archive, true).unwrap_err();
+                assert!(err.to_string().contains(vfs::PASSWORD_REQUIRED), "{err}");
+            }
+            let err = vfs::open(&archive)
+                .and_then(|v| v.read_files(&[archive.join("src/a.txt")], &mut |_, r| io::copy(r, &mut io::sink()).map(|_| true)));
+            assert!(err.is_err(), "{name}: read without the password");
+
+            assert!(!vfs::try_password(&archive, "wrong").unwrap(), "{name}");
+            assert!(vfs::try_password(&archive, "s3cret pw").unwrap(), "{name}");
+            let out = tmp.0.join(format!("out-{name}"));
+            let (o, _) = run_job(Job::Unpack { archives: vec![archive.clone()], target: out.clone() }, Resolution::Cancel);
+            assert!(o.errors.is_empty(), "{name}: {:?}", o.errors);
+            assert_eq!(files_under(&out.join("src")), files_under(&src), "{name}");
+            assert!(out.join("src/empty").is_dir(), "{name}");
+
+            // An existing archive takes no password: refused, left as it was.
+            let before = fs::read(&archive).unwrap();
+            let job = Job::Pack { sources: vec![src.clone()], archive: archive.clone(), password: secret("pw") };
+            let (o, _) = run_job(job, Resolution::Cancel);
+            assert!(o.errors.len() == 1 && o.errors[0].1.contains("existing archive"), "{name}: {:?}", o.errors);
+            assert_eq!(fs::read(&archive).unwrap(), before, "{name}");
+        }
+    }
+
+    #[test]
+    fn password_refused_for_tar_and_empty() {
+        let tmp = TempDir::new("pack-pw-tar");
+        let src = tree(&tmp.0);
+        for name in ["a.tar", "a.tar.gz", "a.tgz", "a.tar.bz2", "a.txt.gz"] {
+            let archive = tmp.0.join(name);
+            let job = Job::Pack { sources: vec![src.clone()], archive: archive.clone(), password: secret("pw") };
+            let (o, _) = run_job(job, Resolution::Cancel);
+            assert!(o.errors.len() == 1 && o.errors[0].1 == vfs::NO_ENCRYPTION, "{name}: {:?}", o.errors);
+            assert!(!archive.exists(), "{name}");
+        }
+        assert!(Rewrite::begin(&tmp.0.join("b.tar"), Some("pw")).is_err());
+        assert!(!tmp.0.join("b.tar").exists());
+        let archive = tmp.0.join("e.zip");
+        let (o, _) = run_job(Job::Pack { sources: vec![src], archive: archive.clone(), password: secret("") }, Resolution::Cancel);
+        assert!(o.errors.len() == 1 && o.errors[0].1.contains("empty"), "{:?}", o.errors);
+        assert!(!archive.exists());
+    }
+
+    #[test]
+    fn cancelled_encrypted_pack_leaves_nothing() {
+        struct CancelAtArchive(Arc<Control>, PathBuf);
+        impl Reporter for CancelAtArchive {
+            fn progress(&mut self, p: &Progress) {
+                if p.current.as_deref() == Some(self.1.as_path()) {
+                    self.0.cancel();
+                }
+            }
+            fn conflict(&mut self, _: Conflict) -> Resolution {
+                Resolution::Cancel
+            }
+        }
+        let tmp = TempDir::new("pack-pw-cancel");
+        let src = tree(&tmp.0);
+        for name in ["c.zip", "c.7z"] {
+            let archive = tmp.0.join(name);
+            let control = Arc::new(Control::default());
+            let job = Job::Pack { sources: vec![src.clone()], archive: archive.clone(), password: secret("pw") };
+            let o = run(&job, &control, &mut CancelAtArchive(control.clone(), archive.clone()));
+            assert!(o.cancelled, "{name}");
+            let left: Vec<_> = fs::read_dir(&tmp.0).unwrap().flatten().map(|e| e.file_name()).collect();
+            assert_eq!(left, ["src"], "{name}");
+            assert_eq!(files_under(&src).len(), 3, "{name}: sources kept");
         }
     }
 
@@ -3377,7 +3527,7 @@ mod tests {
         let src = tree(&tmp.0);
         let inner = tmp.0.join("inner.zip");
         crate::vfs::tests::make_zip(&inner);
-        let (o, _) = run_job(Job::Pack { sources: vec![inner.clone()], archive: tmp.0.join("outer.zip") }, Resolution::Cancel);
+        let (o, _) = run_job(Job::Pack { sources: vec![inner.clone()], archive: tmp.0.join("outer.zip"), password: None }, Resolution::Cancel);
         assert!(o.errors.is_empty(), "{:?}", o.errors);
         let outer = tmp.0.join("outer.zip");
         let nested = outer.join("inner.zip");
@@ -3458,17 +3608,17 @@ mod tests {
         let archive = tmp.0.join("out").join("new.zip");
         fs::create_dir(tmp.0.join("out")).unwrap();
         let sources = vec![src.join("sub"), src.join("a.txt")];
-        let (o, _) = run_job(Job::Pack { sources: sources.clone(), archive: archive.clone() }, Resolution::Cancel);
+        let (o, _) = run_job(Job::Pack { sources: sources.clone(), archive: archive.clone(), password: None }, Resolution::Cancel);
         assert!(o.errors.is_empty(), "{:?}", o.errors);
         assert_eq!(zip_names(&archive), ["a.txt", "sub", "sub/b.bin", "sub/deep", "sub/deep/c.txt"]);
         // Packing again into it asks about each file.
-        let (o, asked) = run_job(Job::Pack { sources, archive: archive.clone() }, Resolution::SkipAll);
+        let (o, asked) = run_job(Job::Pack { sources, archive: archive.clone(), password: None }, Resolution::SkipAll);
         assert_eq!((asked, o.skipped), (1, 3));
 
         // A folder's date survives the round trip.
         let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1_500_000_000);
         set_dir_modified(&src.join("sub").join("deep"), old).unwrap();
-        let (o, _) = run_job(Job::Pack { sources: vec![src.join("sub")], archive: tmp.0.join("d.zip") }, Resolution::OverwriteAll);
+        let (o, _) = run_job(Job::Pack { sources: vec![src.join("sub")], archive: tmp.0.join("d.zip"), password: None }, Resolution::OverwriteAll);
         assert!(o.errors.is_empty());
 
         let target = tmp.0.join("unpacked");
