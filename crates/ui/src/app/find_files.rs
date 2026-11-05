@@ -12,6 +12,7 @@ use crate::theme::filled;
 use iced::widget::text::Wrapping;
 use iced::widget::{button, checkbox, column, container, mouse_area, responsive, row, text, text_input, Column, Row, Space};
 use iced::{Alignment, Element, Length};
+use rc_core::duplicates::{self, Group};
 use rc_core::panel::visible_start;
 use rc_core::search::{self, Batch, Query, Summary};
 
@@ -41,12 +42,16 @@ pub enum Opt {
     Subfolders,
     Hidden,
     Archives,
+    Duplicates,
+    SameName,
 }
 
 #[derive(Debug, Clone)]
 pub enum Progress {
     Batch(Batch),
     Done(Result<Summary, String>),
+    Dups(duplicates::Progress),
+    DupsDone(Result<duplicates::Report, String>),
 }
 
 #[derive(Debug, Clone)]
@@ -59,6 +64,11 @@ pub enum FindMsg {
     Click(usize),
     GoTo,
     Feed,
+    /// Duplicates: mark all but the newest / oldest file of each group.
+    MarkAllBut(bool),
+    ClearMarks,
+    Mark(usize),
+    MarkCursor,
     Close,
     Wheel(f32),
     /// Scrollbar: first row to show, rows on screen.
@@ -86,9 +96,70 @@ pub(super) struct FindFiles {
     summary: Option<Summary>,
     error: Option<String>,
     last_click: Option<(usize, Instant)>,
+    /// "Find duplicates" and "Same name too" as set in the form.
+    dups: bool,
+    same_name: bool,
+    /// The results are duplicate groups (`groups`, shown as `rows`).
+    dup_view: bool,
+    groups: Vec<Group>,
+    rows: Vec<DupRow>,
+    /// Marked files (names relative to the search root).
+    marks: HashSet<String>,
+    dup_progress: Option<duplicates::Progress>,
+    dup_info: Option<DupInfo>,
+}
+
+/// A line of the duplicate list: a group's header or one of its files.
+#[derive(Debug, Clone, Copy)]
+enum DupRow {
+    Header(usize),
+    File(usize, usize),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DupInfo {
+    wasted: u64,
+    files: u64,
+    errors: u64,
+    cancelled: bool,
 }
 
 impl FindFiles {
+    /// Lines in the list.
+    fn len(&self) -> usize {
+        if self.dup_view { self.rows.len() } else { self.results.len() }
+    }
+
+    /// The file under the cursor (the first of the group on a header).
+    fn current(&self) -> Option<&Entry> {
+        if !self.dup_view {
+            return self.results.get(self.cursor);
+        }
+        match *self.rows.get(self.cursor)? {
+            DupRow::Header(g) => self.groups[g].files.first(),
+            DupRow::File(g, i) => self.groups[g].files.get(i),
+        }
+    }
+
+    /// Marks every file but the newest (or oldest) of each group. Files of a
+    /// group are sorted oldest first.
+    fn mark_all_but(&mut self, newest: bool) {
+        self.marks.clear();
+        for g in &self.groups {
+            let n = g.files.len();
+            let range = if newest { 0..n - 1 } else { 1..n };
+            self.marks.extend(g.files[range].iter().map(|e| e.name.clone()));
+        }
+    }
+
+    fn toggle_mark(&mut self, row: usize) {
+        let Some(DupRow::File(g, i)) = self.rows.get(row).copied() else { return };
+        let name = self.groups[g].files[i].name.clone();
+        if !self.marks.remove(&name) {
+            self.marks.insert(name);
+        }
+    }
+
     fn stop(&mut self) {
         if let Some(cancel) = self.running.take() {
             cancel.store(true, Ordering::Relaxed);
@@ -98,6 +169,8 @@ impl FindFiles {
     fn set_option(&mut self, opt: Opt) {
         let q = &mut self.query;
         let flag = match opt {
+            Opt::Duplicates => &mut self.dups,
+            Opt::SameName => &mut self.same_name,
             Opt::NameRegex => &mut q.name_regex,
             Opt::TextRegex => &mut q.text_regex,
             Opt::MatchCase => &mut q.match_case,
@@ -157,6 +230,14 @@ impl App {
             summary: None,
             error: None,
             last_click: None,
+            dups: false,
+            same_name: false,
+            dup_view: false,
+            groups: Vec::new(),
+            rows: Vec::new(),
+            marks: HashSet::new(),
+            dup_progress: None,
+            dup_info: None,
         });
         // Hits deleted or renamed since (e.g. after going to one) go away.
         if find.running.is_none() {
@@ -185,9 +266,9 @@ impl App {
     fn find_move(&mut self, delta: isize) {
         let rows = self.find_rows();
         let Some(f) = self.screen.find_mut() else { return };
-        let max = f.results.len().saturating_sub(1);
+        let max = f.len().saturating_sub(1);
         f.cursor = f.cursor.saturating_add_signed(delta).min(max);
-        f.top = visible_start(f.top, f.cursor, rows, f.results.len());
+        f.top = visible_start(f.top, f.cursor, rows, f.len());
     }
 
     fn start_find(&mut self) -> Task<Message> {
@@ -196,6 +277,10 @@ impl App {
         let Some(f) = self.screen.find_mut() else { return Task::none() };
         f.stop();
         let root = resolve_typed_path(f.root.trim(), &self.sides[f.side].tabs[self.sides[f.side].current].path);
+        if f.dups && rc_core::vfs::in_archive(&root) {
+            f.error = Some("Finding duplicates works on local folders only".into());
+            return Task::none();
+        }
         if !root.is_dir() && !rc_core::vfs::in_archive(&root) {
             f.error = Some(format!("Not a folder: {}", root.display()));
             return Task::none();
@@ -212,7 +297,31 @@ impl App {
         f.checked = 0;
         f.summary = None;
         f.error = None;
+        f.dup_view = f.dups;
+        f.groups.clear();
+        f.rows.clear();
+        f.marks.clear();
+        f.dup_progress = None;
+        f.dup_info = None;
         let (tx, rx) = iced::futures::channel::mpsc::unbounded();
+        if f.dups {
+            let opts = duplicates::Options {
+                root: query.root.clone(),
+                name: query.name.clone(),
+                name_regex: query.name_regex,
+                subfolders: query.subfolders,
+                hidden: query.hidden,
+                same_name: f.same_name,
+                include_empty: false,
+            };
+            std::thread::spawn(move || {
+                let result = duplicates::find(&opts, &cancel, |p| {
+                    let _ = tx.unbounded_send(Progress::Dups(p));
+                });
+                let _ = tx.unbounded_send(Progress::DupsDone(result));
+            });
+            return Task::run(rx, move |p| Message::Find(FindMsg::Progress(seq, p)));
+        }
         std::thread::spawn(move || {
             let result = search::search(&query, &cancel, |b| tx.unbounded_send(Progress::Batch(b)).is_ok());
             let _ = tx.unbounded_send(Progress::Done(result));
@@ -223,7 +332,7 @@ impl App {
     /// Shows the hit under the cursor in its folder, in the tool's panel.
     fn find_go_to(&mut self) -> Task<Message> {
         let Some(f) = self.screen.find() else { return Task::none() };
-        let Some(hit) = f.results.get(f.cursor) else { return Task::none() };
+        let Some(hit) = f.current() else { return Task::none() };
         let Some(folder) = hit.path.parent().map(Path::to_path_buf) else { return Task::none() };
         let focus = hit.path.file_name().map(|n| n.to_string_lossy().into_owned());
         let side = f.side;
@@ -241,14 +350,20 @@ impl App {
             return Task::none();
         };
         f.stop();
-        let (side, hits, cursor) = (f.side, f.results.clone(), f.cursor);
+        let (side, hits) = (f.side, f.results.clone());
+        let name = f.current().map(|e| e.name.clone());
+        let marks = if f.dup_view { f.marks.clone() } else { HashSet::new() };
+        let label = if f.dup_view { format!("Duplicates of {label}") } else { label };
         self.close_find();
         self.focus_panel(side);
         self.nav[side] = None;
         let panel = self.panel_mut(side);
         // The cursor goes to the hit that was under it in the list.
-        let name = hits.get(cursor).map(|e| e.name.clone());
         panel.show_results(root, label, hits);
+        // Marked duplicates stay selected in the panel, ready for F8.
+        if !marks.is_empty() {
+            panel.set_selection(marks);
+        }
         if let Some(name) = name {
             panel.focus(&name);
         }
@@ -278,6 +393,28 @@ impl App {
                         f.folder = b.folder;
                         f.checked = b.checked;
                     }
+                    Progress::Dups(p) => f.dup_progress = Some(p),
+                    Progress::DupsDone(result) => {
+                        f.running = None;
+                        f.dup_progress = None;
+                        match result {
+                            Ok(r) => {
+                                f.dup_info = Some(DupInfo {
+                                    wasted: r.wasted(),
+                                    files: r.files,
+                                    errors: r.errors,
+                                    cancelled: r.cancelled,
+                                });
+                                for (g, group) in r.groups.iter().enumerate() {
+                                    f.rows.push(DupRow::Header(g));
+                                    f.rows.extend((0..group.files.len()).map(|i| DupRow::File(g, i)));
+                                    f.results.extend(group.files.iter().cloned());
+                                }
+                                f.groups = r.groups;
+                            }
+                            Err(e) => f.error = Some(e),
+                        }
+                    }
                     Progress::Done(result) => {
                         f.running = None;
                         match result {
@@ -287,10 +424,17 @@ impl App {
                     }
                 }
             }
+            FindMsg::MarkAllBut(newest) => f.mark_all_but(newest),
+            FindMsg::ClearMarks => f.marks.clear(),
+            FindMsg::Mark(i) => {
+                f.cursor = i.min(f.len().saturating_sub(1));
+                f.toggle_mark(i);
+            }
+            FindMsg::MarkCursor => f.toggle_mark(f.cursor),
             FindMsg::Click(i) => {
                 let now = Instant::now();
                 let double = matches!(f.last_click, Some((j, t)) if j == i && now - t < DOUBLE_CLICK);
-                f.cursor = i.min(f.results.len().saturating_sub(1));
+                f.cursor = i.min(f.len().saturating_sub(1));
                 f.last_click = Some((i, now));
                 if double {
                     f.last_click = None;
@@ -303,8 +447,8 @@ impl App {
             FindMsg::Wheel(lines) => self.find_move((-lines * 3.0).round() as isize),
             // The list keeps its cursor on screen: it moves along with the view.
             FindMsg::ScrollTo(start, rows) => {
-                let start = start.min(f.results.len().saturating_sub(rows));
-                f.cursor = f.cursor.clamp(start, (start + rows).saturating_sub(1).min(f.results.len().saturating_sub(1)));
+                let start = start.min(f.len().saturating_sub(rows));
+                f.cursor = f.cursor.clamp(start, (start + rows).saturating_sub(1).min(f.len().saturating_sub(1)));
                 f.top = start;
             }
         }
@@ -325,6 +469,11 @@ impl App {
         ("Ctrl+S", "Search subfolders on / off"),
         ("Ctrl+H", "Search hidden files on / off"),
         ("Ctrl+P", "Search inside archives (zip, 7z, rar, tar, gz) on / off"),
+        ("Ctrl+U", "Find duplicates on / off (same content, by size and SHA-256)"),
+        ("Ctrl+M", "Duplicates: also require the same name on / off"),
+        ("Space", "Duplicates: mark / unmark the file (feeding keeps the marks selected)"),
+        ("Ctrl+N, Ctrl+O", "Duplicates: mark all but the newest / oldest of each group"),
+        ("Ctrl+D", "Duplicates: clear the marks"),
         ("*.txt;*.md|skip*", "Name masks: ; separates, | starts exclusions"),
     ];
 
@@ -347,6 +496,7 @@ impl App {
             Some(Named::Enter) if !captured => {
                 if f.results.is_empty() { FindMsg::Start } else { FindMsg::GoTo }
             }
+            Some(Named::Space) if !captured && f.dup_view => FindMsg::MarkCursor,
             Some(Named::ArrowDown) => {
                 self.find_move(1);
                 return Task::none();
@@ -385,6 +535,11 @@ impl App {
                     "s" => FindMsg::Toggle(Opt::Subfolders),
                     "h" => FindMsg::Toggle(Opt::Hidden),
                     "p" => FindMsg::Toggle(Opt::Archives),
+                    "u" => FindMsg::Toggle(Opt::Duplicates),
+                    "m" => FindMsg::Toggle(Opt::SameName),
+                    "n" if f.dup_view => FindMsg::MarkAllBut(true),
+                    "o" if f.dup_view => FindMsg::MarkAllBut(false),
+                    "d" if f.dup_view => FindMsg::ClearMarks,
                     _ => return Task::none(),
                 }
             }
@@ -421,9 +576,15 @@ impl App {
         ]
         .spacing(8)
         .align_y(Alignment::Center);
+        let text_box = if f.dups {
+            // Duplicates compare whole files: the text search is off.
+            text_input("Not used when finding duplicates", "").padding(6).size(13).style(theme::input)
+        } else {
+            input(Field::Text, "Text inside files (empty = names only)", &q.text)
+        };
         let contents = row![
             label_w("Containing"),
-            input(Field::Text, "Text inside files (empty = names only)", &q.text),
+            text_box,
             toggle("Regex", q.text_regex, Opt::TextRegex),
             toggle("Match case", q.match_case, Opt::MatchCase),
         ]
@@ -434,10 +595,33 @@ impl App {
             toggle("Subfolders", q.subfolders, Opt::Subfolders),
             toggle("Hidden files", q.hidden, Opt::Hidden),
             toggle("Archives", q.archives, Opt::Archives),
+            toggle("Find duplicates", f.dups, Opt::Duplicates),
+            {
+                let mut same = checkbox("Same name too", f.same_name).size(14).text_size(13);
+                if f.dups {
+                    same = same.on_toggle(|_| Message::Find(FindMsg::Toggle(Opt::SameName)));
+                }
+                same
+            },
         ]
         .spacing(16)
         .align_y(Alignment::Center);
-        let form = container(column![header, root, name, contents, options].spacing(10))
+        let mut form_col = column![header, root, name, contents, options].spacing(10);
+        if let (true, Some(info)) = (f.dup_view, f.dup_info.filter(|_| f.running.is_none())) {
+            let marked: u64 = f.groups.iter().flat_map(|g| g.files.iter()).filter(|e| f.marks.contains(&e.name)).map(|e| e.size).sum();
+            form_col = form_col.push(
+                text(format!(
+                    "Wasted space: {} in {} groups \u{b7} marked: {} files, {}",
+                    rc_core::format::size(info.wasted),
+                    f.groups.len(),
+                    f.marks.len(),
+                    rc_core::format::size(marked)
+                ))
+                .size(13)
+                .color(colors.selected),
+            );
+        }
+        let form = container(form_col)
             .padding(14)
             .style(filled(colors.header));
 
@@ -455,48 +639,71 @@ impl App {
 
         let list = responsive(move |size| {
             let rows = (size.height / ROW_H).floor().max(1.0) as usize;
-            let start = visible_start(f.top, f.cursor, rows, f.results.len());
-            let end = (start + rows).min(f.results.len());
+            let start = visible_start(f.top, f.cursor, rows, f.len());
+            let end = (start + rows).min(f.len());
             let lines = (start..end).map(|i| {
-                let e = &f.results[i];
                 let cursor = i == f.cursor;
-                let color = if e.is_dir() {
-                    colors.dir
+                // (name, size, date, color, background shade index, header, mark)
+                let (name, size, date, color, shade, header, mark) = if f.dup_view {
+                    match f.rows[i] {
+                        DupRow::Header(g) => {
+                            let group = &f.groups[g];
+                            let n = group.files.len();
+                            let t = format!(
+                                "{n} files \u{d7} {}, {} wasted",
+                                rc_core::format::size(group.size),
+                                rc_core::format::size(group.wasted())
+                            );
+                            (t, String::new(), String::new(), colors.accent, g, true, None)
+                        }
+                        DupRow::File(g, j) => {
+                            let e = &f.groups[g].files[j];
+                            let size = rc_core::format::size(e.size);
+                            let on = f.marks.contains(&e.name);
+                            (e.name.clone(), size, rc_core::format::date(&e.modified), colors.text, g, false, Some(on))
+                        }
+                    }
                 } else {
-                    colors.text
+                    let e = &f.results[i];
+                    let size = if e.is_dir() { "<DIR>".to_owned() } else { rc_core::format::size(e.size) };
+                    let color = if e.is_dir() { colors.dir } else { colors.text };
+                    (e.name.clone(), size, rc_core::format::date(&e.modified), color, i, false, None)
                 };
-                let size = if e.is_dir() { "<DIR>".to_owned() } else { rc_core::format::size(e.size) };
                 let cell = |s: String, w: Length| {
                     container(text(s).size(13).color(color).wrapping(Wrapping::None)).width(w).clip(true)
                 };
                 let bg = if cursor {
                     colors.cursor
-                } else if i % 2 == 1 {
+                } else if header {
+                    colors.header
+                } else if shade % 2 == 1 {
                     colors.zebra
                 } else {
                     colors.panel
                 };
-                mouse_area(
-                    container(
-                        row![
-                            cell(e.name.clone(), Length::Fill),
-                            cell(size, Length::Fixed(COL_SIZE)),
-                            cell(rc_core::format::date(&e.modified), Length::Fixed(COL_DATE)),
-                        ]
-                        .spacing(8),
-                    )
-                    .height(Length::Fixed(ROW_H))
-                    .padding([1, 14])
-                    .style(filled(bg)),
-                )
-                .on_press(Message::Find(FindMsg::Click(i)))
-                .into()
+                let mut line = Row::new().spacing(8);
+                if f.dup_view {
+                    let (glyph, mark_color) = match mark {
+                        Some(true) => ("[x]", colors.selected),
+                        Some(false) => ("[ ]", colors.muted),
+                        None => ("", colors.muted),
+                    };
+                    let box_ = container(text(glyph).size(13).color(mark_color)).width(Length::Fixed(26.0));
+                    line = line.push(mouse_area(box_).on_press(Message::Find(FindMsg::Mark(i))));
+                }
+                line = line
+                    .push(cell(name, Length::Fill))
+                    .push(cell(size, Length::Fixed(COL_SIZE)))
+                    .push(cell(date, Length::Fixed(COL_DATE)));
+                mouse_area(container(line).height(Length::Fixed(ROW_H)).padding([1, 14]).style(filled(bg)))
+                    .on_press(Message::Find(FindMsg::Click(i)))
+                    .into()
             });
             let lines = container(Column::with_children(lines).width(Length::Fill))
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .clip(true);
-            let len = f.results.len();
+            let len = f.len();
             scrollbar::attach(lines, start as f32, rows as f32, len as f32, move |at| {
                 Message::Find(FindMsg::ScrollTo(at.round() as usize, rows))
             })
@@ -511,6 +718,35 @@ impl App {
 
         let (note, color) = if let Some(e) = &f.error {
             (e.clone(), colors.error)
+        } else if f.dup_view && f.running.is_some() {
+            let t = match f.dup_progress {
+                None => "Looking for duplicates\u{2026}".to_owned(),
+                Some(p) => match p.phase {
+                    duplicates::Phase::Scan => format!("Scanning\u{2026} {} files", p.done),
+                    duplicates::Phase::Head => format!("Comparing file starts\u{2026} {} / {}", p.done, p.total),
+                    duplicates::Phase::Full => format!(
+                        "Hashing\u{2026} file {} / {} \u{b7} {} read",
+                        p.done,
+                        p.total,
+                        rc_core::format::size(p.bytes)
+                    ),
+                },
+            };
+            (t, colors.text)
+        } else if let (true, Some(i)) = (f.dup_view, f.dup_info) {
+            let mut t = format!(
+                "{} groups, {} wasted \u{b7} {} files checked \u{b7} Space marks \u{b7} Ctrl+N/O mark all but newest/oldest \u{b7} Ctrl+L feed to panel",
+                f.groups.len(),
+                rc_core::format::size(i.wasted),
+                i.files
+            );
+            if i.errors > 0 {
+                t.push_str(&format!(" \u{b7} {} unreadable", i.errors));
+            }
+            if i.cancelled {
+                t.push_str(" \u{b7} stopped");
+            }
+            (t, if f.groups.is_empty() { colors.text } else { colors.success })
         } else if f.running.is_some() {
             (
                 format!("Searching\u{2026} {} found \u{b7} {} checked \u{b7} {}", f.results.len(), f.checked, f.folder.display()),
@@ -536,6 +772,12 @@ impl App {
         let mut buttons = Row::new().spacing(8);
         if !f.results.is_empty() {
             buttons = buttons.push(action("Go to file", FindMsg::GoTo, false)).push(action("Feed to panel", FindMsg::Feed, false));
+        }
+        if f.dup_view && !f.groups.is_empty() {
+            buttons = buttons
+                .push(action("Mark all but newest", FindMsg::MarkAllBut(true), false))
+                .push(action("Mark all but oldest", FindMsg::MarkAllBut(false), false))
+                .push(action("Clear marks", FindMsg::ClearMarks, false));
         }
         buttons = buttons.push(action("Close", FindMsg::Close, false));
         buttons = if f.running.is_some() {
