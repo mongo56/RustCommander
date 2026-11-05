@@ -16,6 +16,7 @@ mod attrib;
 mod checksum;
 mod split;
 mod find_files;
+mod git;
 mod multi_rename;
 mod settings;
 mod term;
@@ -186,6 +187,11 @@ pub struct App {
     /// Latest background listing requested per folder (`Message::Listed`).
     listings: HashMap<PathBuf, u64>,
     next_listing: u64,
+    /// Git status per panel side (`git_status` setting), the request counter,
+    /// and whether `git` turned out not to be installed.
+    git: [git::GitSide; 2],
+    git_gen: u64,
+    git_missing: bool,
     /// Tab folders from the session still being read at startup
     /// (`Message::Restored`); their path bar says "reading".
     restoring: HashSet<PathBuf>,
@@ -515,6 +521,7 @@ pub enum Message {
     Answer(u64, Resolution),
     /// A watched folder changed on disk.
     FsChanged(PathBuf),
+    Git(git::GitMsg),
     /// A background listing of a folder finished (`u64`: request number).
     Listed(PathBuf, u64, Result<Vec<Entry>, String>),
     /// A tab folder from the session was read at startup: the folder the
@@ -645,6 +652,9 @@ impl App {
             disk: RefCell::new(HashMap::new()),
             listings: HashMap::new(),
             next_listing: 0,
+            git: Default::default(),
+            git_gen: 0,
+            git_missing: false,
             restoring: HashSet::new(),
             nav: [None, None],
             screen: None,
@@ -789,12 +799,17 @@ impl App {
     // ---- update -----------------------------------------------------------
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        let changed = match &message {
+            Message::FsChanged(path) => Some(path.clone()),
+            _ => None,
+        };
         let task = self.handle(message);
         let thumbs = self.pump_thumbs();
+        let git = self.git_check(changed.as_deref());
         if self.deferred.is_empty() {
-            return Task::batch([task, thumbs]);
+            return Task::batch([task, thumbs, git]);
         }
-        Task::batch([task, thumbs].into_iter().chain(self.deferred.drain(..)))
+        Task::batch([task, thumbs, git].into_iter().chain(self.deferred.drain(..)))
     }
 
     fn handle(&mut self, message: Message) -> Task<Message> {
@@ -1346,6 +1361,7 @@ impl App {
                 }
                 return self.list_in_background(path);
             }
+            Message::Git(msg) => return self.git_update(msg),
             Message::Listed(path, seq, result) => self.apply_listing(path, seq, result),
             Message::RemoteSpace(key, space) => {
                 self.disk.borrow_mut().insert(key, (Instant::now(), space));
@@ -3459,6 +3475,7 @@ impl App {
         self.user_keys = keys;
         self.config_notes = notes;
         self.config = config;
+        self.git_missing = false; // look for git again
         self.keymap = keymap;
         theme::set(colors);
         Ok(())

@@ -11,6 +11,7 @@ pub mod diff;
 pub mod disk_usage;
 pub mod entry;
 pub mod format;
+pub mod git_status;
 pub mod fs;
 pub mod ops;
 pub mod panel;

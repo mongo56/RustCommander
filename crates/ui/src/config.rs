@@ -36,6 +36,10 @@ pub struct Config {
     /// menu's "Run with PowerShell" does too. On unless set to false (also
     /// when the key is missing).
     pub run_scripts_in_terminal: bool,
+    /// Inside a git work tree, panels show a status letter (M, A, D, R, ?, U)
+    /// per entry and the branch name in the path bar. On unless set to false
+    /// (also when the key is missing).
+    pub git_status: bool,
     /// The function-key bar (F1-F10 buttons) under the panels; off = a
     /// one-line hint instead.
     pub show_fkeys: bool,
@@ -113,6 +117,7 @@ impl Default for Config {
             show_hidden: false,
             markdown_in_viewer: true,
             run_scripts_in_terminal: true,
+            git_status: true,
             show_fkeys: false,
             hotlist_tree: false,
             check_updates_at_startup: false,
@@ -487,6 +492,11 @@ fn template(editor: &str, compare: CompareState) -> String {
          # terminal and Run in external terminal.\n\
          run_scripts_in_terminal = true\n\
          \n\
+         # Inside a git work tree (needs git on PATH) show a status letter (M modified,\n\
+         # A added, D deleted, R renamed, ? untracked, U conflict) after each name and\n\
+         # the branch in the path bar. Folders show the strongest status inside.\n\
+         git_status = true\n\
+         \n\
          # Show the function-key bar (F1-F10 buttons) under the panels. Off = only a\n\
          # one-line hint (F1 help, command palette, F10 settings).\n\
          show_fkeys = false\n\
@@ -673,6 +683,11 @@ key = \"F7\"
         assert!(parse(&template("", CompareState::default())).unwrap().run_scripts_in_terminal);
         let off = apply(&out, &[Edit::Flag("run_scripts_in_terminal", false)]).unwrap();
         assert!(!parse(&off).unwrap().run_scripts_in_terminal);
+        assert!(Config::default().git_status);
+        assert!(parse("").unwrap().git_status, "on when the key is missing");
+        assert!(parse(&template("", CompareState::default())).unwrap().git_status);
+        let off = apply(&out, &[Edit::Flag("git_status", false)]).unwrap();
+        assert!(!parse(&off).unwrap().git_status);
         assert!(!parse(&template("", CompareState::default())).unwrap().hotlist_tree);
         assert!(parse(&apply(&out, &[Edit::Flag("hotlist_tree", true)]).unwrap()).unwrap().hotlist_tree);
         assert!(!parse(&template("", CompareState::default())).unwrap().check_updates_at_startup);

@@ -95,7 +95,7 @@ impl Page {
 }
 
 /// Rows of the General page.
-const GENERAL_ROWS: usize = 14;
+const GENERAL_ROWS: usize = 15;
 const ROW_EDITOR: usize = 0;
 const ROW_TERMINAL: usize = 1;
 const ROW_SHELL: usize = 2;
@@ -106,9 +106,10 @@ const ROW_FKEYS: usize = 6;
 const ROW_TREE: usize = 7;
 const ROW_UPDATES: usize = 8;
 const ROW_RENDER: usize = 9;
-/// Compare options 0..3 (`toggle_compare_option`) are rows 10..13.
-const ROW_COMPARE: usize = 10;
-const ROW_CONFIG: usize = 13;
+/// Compare options 0..3 (`toggle_compare_option`) are rows 11..14.
+const ROW_GIT: usize = 10;
+const ROW_COMPARE: usize = 11;
+const ROW_CONFIG: usize = 14;
 
 /// General rows that are text boxes (Enter there saves instead of toggling).
 fn text_row(row: usize) -> bool {
@@ -146,6 +147,7 @@ pub enum SettingsMsg {
     ShowHidden(bool),
     MarkdownViewer(bool),
     ScriptsInTerminal(bool),
+    GitStatus(bool),
     ShowFkeys(bool),
     HotlistTree(bool),
     CheckUpdates(bool),
@@ -387,6 +389,7 @@ impl App {
                 ROW_SCRIPTS => {
                     self.settings_update(SettingsMsg::ScriptsInTerminal(!self.config.run_scripts_in_terminal))
                 }
+                ROW_GIT => self.settings_update(SettingsMsg::GitStatus(!self.config.git_status)),
                 ROW_HIDDEN => self.settings_update(SettingsMsg::ShowHidden(!self.config.show_hidden)),
                 ROW_FKEYS => self.settings_update(SettingsMsg::ShowFkeys(!self.config.show_fkeys)),
                 ROW_TREE => self.settings_update(SettingsMsg::HotlistTree(!self.config.hotlist_tree)),
@@ -537,6 +540,11 @@ impl App {
                 s.row[0] = ROW_SCRIPTS;
                 let state = if on { "run in the built-in terminal" } else { "open with the default app" };
                 self.settings_write(&[Edit::Flag("run_scripts_in_terminal", on)], format!("Scripts {state}"));
+            }
+            SettingsMsg::GitStatus(on) => {
+                s.row[0] = ROW_GIT;
+                let state = if on { "shown in git work trees" } else { "off" };
+                self.settings_write(&[Edit::Flag("git_status", on)], format!("Git status {state}"));
             }
             SettingsMsg::ShowFkeys(on) => {
                 s.row[0] = ROW_FKEYS;
@@ -1099,6 +1107,17 @@ impl App {
                                 SettingsMsg::SoftwareRendering(!self.config.software_rendering)
                             ),
                             hint("Draw with the CPU instead of the graphics card: starts sooner, but scrolling and big folders are slower. Applies at the next start".into()),
+                        ]
+                        .spacing(8)
+                        .align_y(Alignment::Center)
+                        .into()
+                    ),
+                    line(
+                        ROW_GIT,
+                        row![
+                            label("Git status"),
+                            switch(self.config.git_status, SettingsMsg::GitStatus(!self.config.git_status)),
+                            hint("In a git work tree (git on PATH): a status letter after each name and the branch in the path bar".into()),
                         ]
                         .spacing(8)
                         .align_y(Alignment::Center)

@@ -368,7 +368,7 @@ impl App {
                 .style(theme::input)
                 .into(),
             _ => mouse_area(
-                container(match self.pending_nav(side) {
+                container(Row::new().spacing(10).push(match self.pending_nav(side) {
                     // Waiting for a slow folder: show where we're going.
                     Some(target) => text(elide_left(&format!("{}  (reading…)", rc_core::remote::display(target)), self.path_chars(side)))
                         .size(13)
@@ -392,7 +392,13 @@ impl App {
                         .size(13)
                         .color(if active { theme::c().text } else { theme::c().muted })
                         .wrapping(Wrapping::None),
-                })
+                }.width(Length::Fill))
+                .push_maybe(
+                    self.git[side]
+                        .marks_for(&panel.path)
+                        .and_then(|v| v.branch.as_deref())
+                        .map(|b| text(format!("[{b}]")).size(13).color(theme::c().accent).wrapping(Wrapping::None)),
+                ))
                 .padding([4, 6])
                 .width(Length::Fill),
             )
@@ -657,6 +663,15 @@ impl App {
                 .push(cell(ext.to_string(), Length::Fixed(self.columns[0]))),
             None => content.push(cell(fit(&entry.name), Length::Fill)),
         };
+        // Git status letter; every row of a work tree folder reserves the room.
+        if let Some(view) = self.git[side].marks_for(&panel.path).filter(|v| v.branch.is_some()) {
+            content = content.push(match view.marks.get(entry.name.as_str()) {
+                Some(&letter) => Element::from(
+                    text(letter.to_string()).size(12).color(git_color(letter)).wrapping(Wrapping::None).width(Length::Fixed(9.0)),
+                ),
+                None => Space::new(9.0, 1.0).into(),
+            });
+        }
         if cols.size {
             // Aligned by a container (see `column_header`).
             let size = container(cell(size, Length::Shrink)).width(Length::Fixed(self.columns[1])).align_x(Alignment::End);
@@ -1321,6 +1336,17 @@ fn drag_edge(start: [f32; 3], visible: &[usize], edge: usize, dx: f32, name_spar
     }
     w
 }
+
+/// Colour of a git status letter (see `rc_core::git_status`).
+fn git_color(letter: char) -> iced::Color {
+    match letter {
+        'A' => theme::c().success,
+        'D' | 'U' => theme::c().error,
+        '?' => theme::c().muted,
+        _ => theme::c().accent,
+    }
+}
+
 
 #[cfg(test)]
 mod drag_edge_tests {
