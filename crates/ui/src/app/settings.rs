@@ -12,12 +12,41 @@ use crate::config::Edit;
 use crate::theme::filled;
 use iced::widget::scrollable::RelativeOffset;
 use iced::widget::text::Wrapping;
-use iced::widget::{button, checkbox, column, container, mouse_area, row, scrollable, text, Column, Row, Space};
+use iced::widget::{button, checkbox, column, container, mouse_area, responsive, row, scrollable, text, Column, Row, Space};
 use iced::{Alignment, Element, Length};
 
 const ROW_H: f32 = 26.0;
 const LABEL_W: f32 = 220.0;
+const LABEL_W_NARROW: f32 = 150.0;
+/// Window widths (px) below which setting descriptions go under their control, the key list drops
+/// the command id column, and the footer stacks its note above the buttons.
+const NARROW_BELOW: f32 = 900.0;
+const FOOTER_STACK_BELOW: f32 = 1100.0;
+/// Header width taken by the title and the page tabs; the config path gets the rest.
+const HEADER_FIXED_W: f32 = 480.0;
+const HEADER_PATH_SIZE: f32 = 12.0;
+/// Average glyph width as a fraction of the font size, for fitting text into a width.
+const CHAR_W: f32 = 0.55;
+/// Width a checkbox row spends besides the label column and the description: checkbox, two gaps, scrollbar.
+const TOGGLE_FIXED_W: f32 = 14.0 + 16.0 + 16.0 + 16.0;
+
+/// `s` cut to `max_chars` with a trailing "…" when it is longer.
+fn elide_right(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    if max_chars == 0 {
+        return String::new();
+    }
+    let head: String = s.chars().take(max_chars - 1).collect();
+    format!("{}…", head.trim_end())
+}
+/// Estimated width of a theme button without its name (swatches, spacing, padding).
+const THEME_CHIP_W: f32 = 80.0;
+/// Room kept for the "N colour(s) changed" note next to the theme buttons.
+const THEME_NOTE_W: f32 = 130.0;
 const KEYS_W: f32 = 240.0;
+const KEYS_W_NARROW: f32 = 170.0;
 
 fn list_id() -> scrollable::Id {
     scrollable::Id::new("settings-list")
@@ -886,21 +915,31 @@ impl App {
     }
 
     pub(super) fn settings_view<'a>(&'a self, s: &'a Settings) -> Element<'a, Message> {
+        responsive(move |size| self.settings_build(s, size.width)).into()
+    }
+
+    fn settings_build<'a>(&'a self, s: &'a Settings, width: f32) -> Element<'a, Message> {
+        let narrow = width < NARROW_BELOW;
+        let lw = if narrow { LABEL_W_NARROW } else { LABEL_W };
         let colors = theme::c();
         let msg = Message::Settings;
         let action = |label: &'a str, m: SettingsMsg, primary: bool| {
-            button(text(label).size(13)).on_press(msg(m)).padding([6, 14]).style(if primary { theme::primary } else { theme::fkey })
+            button(text(label).size(13).wrapping(Wrapping::None)).on_press(msg(m)).padding([6, 14]).style(if primary { theme::primary } else { theme::fkey })
         };
         let tabs = Page::ALL.iter().fold(Row::new().spacing(4), |r, &p| {
-            r.push(button(text(p.title()).size(13)).on_press(msg(SettingsMsg::Page(p))).padding([5, 14]).style(theme::tab(p == s.page)))
+            r.push(button(text(p.title()).size(13).wrapping(Wrapping::None)).on_press(msg(SettingsMsg::Page(p))).padding([5, 14]).style(theme::tab(p == s.page)))
         });
         let path = crate::config::file().map(|p| p.display().to_string()).unwrap_or_default();
+        let path_budget = ((width - HEADER_FIXED_W) / (HEADER_PATH_SIZE * CHAR_W)).max(0.0) as usize;
+        let path = if path_budget < 12 { String::new() } else { super::view::elide_left(&path, path_budget) };
         let header = container(
             row![
-                text("Settings").size(16),
+                text("Settings").size(16).wrapping(Wrapping::None),
                 tabs,
-                Space::with_width(Length::Fill),
-                text(path).size(12).color(colors.muted).wrapping(Wrapping::None),
+                container(text(path).size(HEADER_PATH_SIZE).color(colors.muted).wrapping(Wrapping::None))
+                    .width(Length::Fill)
+                    .align_x(iced::alignment::Horizontal::Right)
+                    .clip(true),
             ]
             .spacing(16)
             .align_y(Alignment::Center),
@@ -924,8 +963,31 @@ impl App {
                 .into()
         };
         let heading = |t: &'a str| container(text(t).size(14).color(colors.accent)).padding([10, 14]);
-        let label = |t: &'a str| text(t).size(13).width(Length::Fixed(LABEL_W));
-        let hint = |t: String| text(t).size(12).color(colors.muted);
+        let label = move |t: &'a str| text(t).size(13).width(Length::Fixed(lw));
+        let hint = |t: String| text(t).size(12).color(colors.muted).width(Length::Fill);
+        // Label, control and description: the description is a third column, or under the control when narrow.
+        let described = move |label: iced::widget::Text<'a>, control: Element<'a, Message>, about: String| -> Element<'a, Message> {
+            if narrow {
+                column![
+                    row![label, control].spacing(8).align_y(Alignment::Center),
+                    row![Space::with_width(Length::Fixed(lw + 8.0)), hint(about)],
+                ]
+                .spacing(2)
+                .into()
+            } else {
+                row![label, control, hint(about)].spacing(8).align_y(Alignment::Center).into()
+            }
+        };
+        // Row with a checkbox: the description stays on the line, cut with "…" at the right edge.
+        let toggle_row = move |label: iced::widget::Text<'a>, control: Element<'a, Message>, about: String| -> Element<'a, Message> {
+            let avail = width - 2.0 * 14.0 - lw - TOGGLE_FIXED_W;
+            let budget = (avail / (12.0 * CHAR_W)).max(0.0) as usize;
+            let about = elide_right(&about, budget);
+            row![label, control, container(text(about).size(12).color(colors.muted).wrapping(Wrapping::None)).width(Length::Fill).clip(true)]
+                .spacing(8)
+                .align_y(Alignment::Center)
+                .into()
+        };
         let switch = |on: bool, m: SettingsMsg| checkbox("", on).on_toggle(move |_| msg(m.clone())).size(14);
 
         let body: Element<'a, Message> = match s.page {
@@ -951,11 +1013,11 @@ impl App {
                     .padding(5)
                     .size(13)
                     .style(theme::input);
-                let browse = button(text("Browse...").size(13))
+                let browse = button(text("Browse...").size(13).wrapping(Wrapping::None))
                     .on_press(msg(SettingsMsg::Browse))
                     .padding([3, 12])
                     .style(theme::fkey);
-                let browse_terminal = button(text("Browse...").size(13))
+                let browse_terminal = button(text("Browse...").size(13).wrapping(Wrapping::None))
                     .on_press(msg(SettingsMsg::BrowseTerminal))
                     .padding([3, 12])
                     .style(theme::fkey);
@@ -992,10 +1054,7 @@ impl App {
                 let compare = |i: u8, title: &'a str, on: bool, about: &'a str| {
                     line(
                         ROW_COMPARE + i as usize,
-                        row![label(title), switch(on, SettingsMsg::Compare(i)), hint(about.into())]
-                            .spacing(8)
-                            .align_y(Alignment::Center)
-                            .into(),
+                        toggle_row(label(title), switch(on, SettingsMsg::Compare(i)).into(), about.into()),
                     )
                 };
                 column![
@@ -1005,7 +1064,7 @@ impl App {
                         row![label("Editor for F4"), editor, browse].spacing(8).align_y(Alignment::Center).into()
                     ),
                     container(hint("A program and arguments; %1 is the file (added when missing). Enter saves.".into()))
-                        .padding([0, 14 + LABEL_W as u16 + 8]),
+                        .padding([0, 14 + lw as u16 + 8]),
                     row![label("Installed editors"), detected].spacing(8).padding([3, 14]),
                     line(
                         ROW_TERMINAL,
@@ -1015,116 +1074,60 @@ impl App {
                             .into()
                     ),
                     container(hint("Starts in the panel's folder; %1 is that folder (optional). Enter saves.".into()))
-                        .padding([0, 14 + LABEL_W as u16 + 8]),
+                        .padding([0, 14 + lw as u16 + 8]),
                     row![label("Installed terminals"), detected_terminals].spacing(8).padding([3, 14]),
                     line(
                         ROW_SHELL,
                         row![label("Built-in terminal shell (F9)"), shell].spacing(8).align_y(Alignment::Center).into()
                     ),
                     container(hint("A program and arguments, started in the panel's folder; for new terminals. Enter saves.".into()))
-                        .padding([0, 14 + LABEL_W as u16 + 8]),
+                        .padding([0, 14 + lw as u16 + 8]),
                     heading("Opening files"),
                     line(
                         ROW_MARKDOWN,
-                        row![
-                            label("Markdown in the viewer"),
-                            switch(
+                        toggle_row(label("Markdown in the viewer"), switch(
                                 self.config.markdown_in_viewer,
                                 SettingsMsg::MarkdownViewer(!self.config.markdown_in_viewer)
-                            ),
-                            hint("Open Markdown files (.md) in the internal viewer, shown rendered; off = the default app".into()),
-                        ]
-                        .spacing(8)
-                        .align_y(Alignment::Center)
-                        .into()
+                            ).into(), "Open Markdown files (.md) in the internal viewer, shown rendered; off = the default app".into())
                     ),
                     line(
                         ROW_SCRIPTS,
-                        row![
-                            label("Run scripts in terminal"),
-                            switch(
+                        toggle_row(label("Run scripts in terminal"), switch(
                                 self.config.run_scripts_in_terminal,
                                 SettingsMsg::ScriptsInTerminal(!self.config.run_scripts_in_terminal)
-                            ),
-                            hint("Enter on a .ps1, .cmd or .bat file runs it in a new built-in terminal (F9) in its folder; off = the default app".into()),
-                        ]
-                        .spacing(8)
-                        .align_y(Alignment::Center)
-                        .into()
+                            ).into(), "Enter on a .ps1, .cmd or .bat file runs it in a new built-in terminal (F9) in its folder; off = the default app".into())
                     ),
                     heading("Panels"),
                     line(
                         ROW_HIDDEN,
-                        row![
-                            label("Show hidden and system files"),
-                            switch(self.config.show_hidden, SettingsMsg::ShowHidden(!self.config.show_hidden)),
-                            hint("Files with the Hidden or System attribute, every tab now and at the first start; Ctrl+H toggles one tab".into()),
-                        ]
-                        .spacing(8)
-                        .align_y(Alignment::Center)
-                        .into()
+                        toggle_row(label("Show hidden and system files"), switch(self.config.show_hidden, SettingsMsg::ShowHidden(!self.config.show_hidden)).into(), "Files with the Hidden or System attribute, every tab now and at the first start; Ctrl+H toggles one tab".into())
                     ),
                     line(
                         ROW_GIT,
-                        row![
-                            label("Git status"),
-                            switch(self.config.git_status, SettingsMsg::GitStatus(!self.config.git_status)),
-                            hint("In a git work tree (git on PATH): a status letter after each name and the branch in the path bar".into()),
-                        ]
-                        .spacing(8)
-                        .align_y(Alignment::Center)
-                        .into()
+                        toggle_row(label("Git status"), switch(self.config.git_status, SettingsMsg::GitStatus(!self.config.git_status)).into(), "In a git work tree (git on PATH): a status letter after each name and the branch in the path bar".into())
                     ),
                     line(
                         ROW_TREE,
-                        row![
-                            label("Hotlist tree"),
-                            switch(self.config.hotlist_tree, SettingsMsg::HotlistTree(!self.config.hotlist_tree)),
-                            hint("A button left of the left panel's drives (Ctrl+Shift+D) shows the hotlist as a tree left of the panels".into()),
-                        ]
-                        .spacing(8)
-                        .align_y(Alignment::Center)
-                        .into()
+                        toggle_row(label("Hotlist tree"), switch(self.config.hotlist_tree, SettingsMsg::HotlistTree(!self.config.hotlist_tree)).into(), "A button left of the left panel's drives (Ctrl+Shift+D) shows the hotlist as a tree left of the panels".into())
                     ),
                     line(
                         ROW_FKEYS,
-                        row![
-                            label("Function-key bar"),
-                            switch(self.config.show_fkeys, SettingsMsg::ShowFkeys(!self.config.show_fkeys)),
-                            hint("Buttons F1-F10 under the panels; off = a one-line hint".into()),
-                        ]
-                        .spacing(8)
-                        .align_y(Alignment::Center)
-                        .into()
+                        toggle_row(label("Function-key bar"), switch(self.config.show_fkeys, SettingsMsg::ShowFkeys(!self.config.show_fkeys)).into(), "Buttons F1-F10 under the panels; off = a one-line hint".into())
                     ),
                     heading("Startup and display"),
                     line(
                         ROW_UPDATES,
-                        row![
-                            label("Check for updates"),
-                            switch(
+                        toggle_row(label("Check for updates"), switch(
                                 self.config.check_updates_at_startup,
                                 SettingsMsg::CheckUpdates(!self.config.check_updates_at_startup)
-                            ),
-                            hint("At startup, ask GitHub for a newer release (the command palette's Check for updates looks any time)".into()),
-                        ]
-                        .spacing(8)
-                        .align_y(Alignment::Center)
-                        .into()
+                            ).into(), "At startup, ask GitHub for a newer release (the command palette's Check for updates looks any time)".into())
                     ),
                     line(
                         ROW_RENDER,
-                        row![
-                            label("Software rendering"),
-                            switch(
+                        toggle_row(label("Software rendering"), switch(
                                 self.config.software_rendering,
                                 SettingsMsg::SoftwareRendering(!self.config.software_rendering)
-                            ),
-                            hint("Draw with the CPU instead of the graphics card: starts sooner, but scrolling and big folders are slower. Applies at the next start".into()),
-                        ]
-                        .spacing(8)
-                        .align_y(Alignment::Center)
-                        .into()
+                            ).into(), "Draw with the CPU instead of the graphics card: starts sooner, but scrolling and big folders are slower. Applies at the next start".into())
                     ),
                     heading("Compare folders (Shift+F2; saved with the session)"),
                     compare(0, "Compare contents", opts.by_content, "Same-size files are read; equal contents are never marked"),
@@ -1133,17 +1136,15 @@ impl App {
                     heading("Configuration file"),
                     line(
                         ROW_CONFIG,
-                        row![
+                        described(
                             label("config.toml"),
-                            button(text("Open in the editor (Ctrl+,)").size(13))
+                            button(text("Open in the editor (Ctrl+,)").size(13).wrapping(Wrapping::None))
                                 .on_press(msg(SettingsMsg::EditConfig))
                                 .padding([3, 12])
-                                .style(theme::fkey),
-                            hint("Changes made here keep the file's comments".into()),
-                        ]
-                        .spacing(8)
-                        .align_y(Alignment::Center)
-                        .into()
+                                .style(theme::fkey)
+                                .into(),
+                            "Changes made here keep the file's comments".into(),
+                        )
                     ),
                 ]
                 .push(heading("User commands (read-only: edit config.toml to change)"))
@@ -1178,11 +1179,13 @@ impl App {
                     line(
                         i,
                         row![
-                            text(keys).size(13).color(color).width(Length::Fixed(KEYS_W)).wrapping(Wrapping::None),
+                            text(keys).size(13).color(color).width(Length::Fixed(if narrow { KEYS_W_NARROW } else { KEYS_W })).wrapping(Wrapping::None),
                             text(cmd.description()).size(13).width(Length::Fill).wrapping(Wrapping::None),
                             text(changed).size(11).color(colors.selected).width(Length::Fixed(60.0)),
-                            text(cmd.id()).size(12).color(colors.muted).width(Length::Fixed(200.0)).wrapping(Wrapping::None),
                         ]
+                        .push_maybe((!narrow).then(|| {
+                            text(cmd.id()).size(12).color(colors.muted).width(Length::Fixed(200.0)).wrapping(Wrapping::None)
+                        }))
                         .spacing(10)
                         .height(Length::Fixed(ROW_H - 6.0))
                         .align_y(Alignment::Center)
@@ -1197,25 +1200,46 @@ impl App {
             }
             Page::Colors => {
                 let current = theme::preset(&self.config.theme);
-                let presets = theme::PRESETS.iter().fold(Row::new().spacing(6), |r, p| {
-                    let on = current.is_some_and(|c| c.id == p.id);
-                    let swatch = |c: iced::Color| container(Space::new(10, 10)).style(filled(c));
-                    let content = row![
-                        row![swatch(p.colors.bg), swatch(p.colors.panel), swatch(p.colors.text), swatch(p.colors.accent)],
-                        text(p.name).size(13)
-                    ]
-                    .spacing(6)
-                    .align_y(Alignment::Center);
-                    r.push(button(content).on_press(msg(SettingsMsg::Theme(p.id))).padding([4, 12]).style(theme::drive(on)))
-                });
                 let custom = if self.config.colors.is_empty() {
                     String::new()
                 } else {
                     format!("{} colour(s) changed", self.config.colors.len())
                 };
+                // Theme buttons flow onto several lines: chunk them by their estimated width.
+                let avail = width - 28.0 - lw - 8.0 - if narrow || custom.is_empty() { 0.0 } else { THEME_NOTE_W };
+                let mut chunks: Vec<Vec<&theme::Preset>> = vec![Vec::new()];
+                let mut used = 0.0;
+                for p in theme::PRESETS.iter() {
+                    let w = THEME_CHIP_W + p.name.chars().count() as f32 * 13.0 * CHAR_W + 6.0;
+                    if used + w > avail && !chunks.last().is_some_and(|c| c.is_empty()) {
+                        chunks.push(Vec::new());
+                        used = 0.0;
+                    }
+                    used += w;
+                    chunks.last_mut().unwrap().push(p);
+                }
+                let presets = chunks.into_iter().fold(Column::new().spacing(6), |col, chunk| col.push(chunk.into_iter().fold(Row::new().spacing(6), |r, p| {
+                    let on = current.is_some_and(|c| c.id == p.id);
+                    let swatch = |c: iced::Color| container(Space::new(10, 10)).style(filled(c));
+                    let content = row![
+                        row![swatch(p.colors.bg), swatch(p.colors.panel), swatch(p.colors.text), swatch(p.colors.accent)],
+                        text(p.name).size(13).wrapping(Wrapping::None)
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center);
+                    r.push(button(content).on_press(msg(SettingsMsg::Theme(p.id))).padding([4, 12]).style(theme::drive(on)))
+                })));
                 let mut list = Column::new().push(heading("Theme")).push(line(
                     0,
-                    row![label("Theme (Left / Right)"), presets, hint(custom)].spacing(8).align_y(Alignment::Center).into(),
+                    if narrow {
+                        let mut c = Column::new().spacing(2).push(row![label("Theme (Left / Right)"), presets].spacing(8));
+                        if !custom.is_empty() {
+                            c = c.push(row![Space::with_width(Length::Fixed(lw + 8.0)), hint(custom)]);
+                        }
+                        c.into()
+                    } else {
+                        row![label("Theme (Left / Right)"), presets, hint(custom)].spacing(8).align_y(Alignment::Center).into()
+                    },
                 ));
                 list = list.push(heading("Colours (#rrggbb; applied as you type)"));
                 let preset = current.map_or(theme::DARK, |p| p.colors);
@@ -1250,8 +1274,16 @@ impl App {
                             .style(theme::fkey)
                             .into()
                     };
-                    list = list.push(line(
-                        i + 1,
+                    let content: Element<'a, Message> = if narrow {
+                        column![
+                            row![text(*name).size(13).width(Length::Fixed(140.0)), swatch, input, changed]
+                                .spacing(10)
+                                .align_y(Alignment::Center),
+                            hint(theme::PURPOSES[i].into()),
+                        ]
+                        .spacing(2)
+                        .into()
+                    } else {
                         row![
                             text(*name).size(13).width(Length::Fixed(140.0)),
                             swatch,
@@ -1261,8 +1293,9 @@ impl App {
                         ]
                         .spacing(10)
                         .align_y(Alignment::Center)
-                        .into(),
-                    ));
+                        .into()
+                    };
+                    list = list.push(line(i + 1, content));
                 }
                 list.into()
             }
@@ -1277,7 +1310,7 @@ impl App {
                 .style(theme::input);
             let count = format!("{} of {}", shown.len(), Command::ALL.len());
             let bar = row![filter, text(count).size(12).color(colors.muted)].spacing(10).align_y(Alignment::Center);
-            column![container(bar).padding([6, 14]).style(filled(colors.header)), list].into()
+            column![container(bar).padding([6, 14]).style(filled(colors.header)), list].height(Length::Fill).into()
         } else {
             list
         };
@@ -1324,14 +1357,18 @@ impl App {
             _ => {}
         }
         buttons = buttons.push(action("Close", SettingsMsg::Close, s.capture.is_none()));
-        let footer = container(
+        let footer: Element<'a, Message> = if width < FOOTER_STACK_BELOW && s.page == Page::Keys {
+            column![text(note).size(12).color(color).width(Length::Fill), buttons.wrap()].spacing(6).into()
+        } else {
             row![
                 container(text(note).size(12).color(color).wrapping(Wrapping::None)).width(Length::Fill).clip(true),
                 Space::with_width(Length::Fixed(8.0)),
                 buttons
             ]
-            .align_y(Alignment::Center),
-        )
+            .align_y(Alignment::Center)
+            .into()
+        };
+        let footer = container(footer)
         .padding([8, 14])
         .style(filled(colors.header));
 
@@ -1398,6 +1435,13 @@ fn off_thread<T: Send + 'static>(work: fn() -> T, done: fn(T) -> Message) -> Tas
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn elide_right_cuts_with_ellipsis() {
+        assert_eq!(elide_right("abcdef", 6), "abcdef");
+        assert_eq!(elide_right("abcdef", 4), "abc…");
+        assert_eq!(elide_right("abcdef", 0), "");
+    }
 
     fn found(query: &str) -> Vec<Command> {
         filter_commands(query, &keymap::Keymap::default().bindings())

@@ -517,12 +517,9 @@ impl App {
             .into();
         }
         let (sel, total, sel_bytes, total_bytes) = panel.summary();
+        let room = ((self.panel_width(side) - 2.0 * FOOTER_PAD) / (12.0 * FOOTER_CHAR_WIDTH)).max(1.0) as usize;
         container(
-            text(format!(
-                "{sel} of {total} selected  ·  {} of {}",
-                format::size(sel_bytes),
-                format::size(total_bytes)
-            ))
+            text(summary_text(sel, total, sel_bytes, total_bytes, room))
             .size(12)
             .wrapping(Wrapping::None)
             .color(theme::c().muted),
@@ -1394,10 +1391,36 @@ fn git_color(letter: char) -> iced::Color {
     }
 }
 
+/// Horizontal padding of the panel status line, and the estimated glyph width as a fraction of the font size.
+const FOOTER_PAD: f32 = 10.0;
+const FOOTER_CHAR_WIDTH: f32 = 0.55;
+
+/// The panel status line: full form when `room` characters fit it, else a compact one, else counts only.
+fn summary_text(sel: usize, total: usize, sel_bytes: u64, total_bytes: u64, room: usize) -> String {
+    let (sb, tb) = (format::size(sel_bytes), format::size(total_bytes));
+    let full = format!("{sel} of {total} selected  ·  {sb} of {tb}");
+    if full.chars().count() <= room {
+        return full;
+    }
+    let compact = format!("{sel}/{total} · {sb}/{tb}");
+    if compact.chars().count() <= room {
+        return compact;
+    }
+    format!("{sel}/{total}")
+}
 
 #[cfg(test)]
 mod drag_edge_tests {
     use super::*;
+
+    #[test]
+    fn summary_text_shrinks_to_fit() {
+        let full = summary_text(0, 20, 0, 351 * 1024, 100);
+        assert!(full.contains("selected"));
+        let compact = summary_text(0, 20, 0, 351 * 1024, full.chars().count() - 1);
+        assert!(!compact.contains("selected") && compact.starts_with("0/20 · "));
+        assert_eq!(summary_text(0, 20, 0, 351 * 1024, 4), "0/20");
+    }
 
     const ALL: [usize; 3] = [0, 1, 2];
 

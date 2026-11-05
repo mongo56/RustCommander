@@ -98,6 +98,7 @@ fn main() -> iced::Result {
         .subscription(app::App::subscription)
         .window(iced::window::Settings {
             size,
+            min_size: Some(iced::Size::new(640.0, 400.0)),
             icon: icon::window_icon(),
             visible: !app::hidden_until_placed(&session),
             // Closing goes through the app so it can save the session.

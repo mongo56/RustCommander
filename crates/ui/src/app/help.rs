@@ -8,11 +8,17 @@ use super::*;
 use crate::theme::filled;
 use iced::widget::scrollable::{AbsoluteOffset, RelativeOffset};
 use iced::widget::text::Wrapping;
-use iced::widget::{column, container, row, scrollable, text, Column, Space};
+use iced::widget::{column, container, responsive, row, scrollable, text, Column, Space};
 use iced::{Alignment, Element, Length};
 
 const LINE: f32 = 40.0;
 const KEYS_W: f32 = 260.0;
+const KEYS_W_NARROW: f32 = 180.0;
+/// List widths (px) below which the command id column is dropped, the keys
+/// column narrows, and the keys are stacked above the description.
+const HIDE_ID_BELOW: f32 = 900.0;
+const NARROW_KEYS_BELOW: f32 = 760.0;
+const STACK_BELOW: f32 = 560.0;
 /// Header and footer around the list (for paging).
 const HELP_CHROME_H: f32 = 110.0;
 
@@ -182,13 +188,15 @@ impl App {
         let count: usize = shown.iter().map(|(_, items)| items.len()).sum();
 
         let query: Element<'a, Message> = if h.query.is_empty() {
-            text("Type to filter").size(13).color(colors.muted).into()
+            text("Type to filter").size(13).color(colors.muted).wrapping(Wrapping::None).into()
         } else {
-            text(format!("{}|", h.query)).size(13).into()
+            text(format!("{}|", h.query)).size(13).wrapping(Wrapping::None).into()
         };
         let search = container(query)
             .padding([5, 8])
-            .width(Length::Fixed(320.0))
+            .width(Length::Fill)
+            .max_width(320.0)
+            .clip(true)
             .style(move |_: &Theme| container::Style {
                 background: Some(colors.panel.into()),
                 border: iced::Border {
@@ -200,10 +208,10 @@ impl App {
             });
         let header = container(
             row![
-                text("Help: keys and features").size(16),
+                text("Help: keys and features").size(16).wrapping(Wrapping::None),
                 search,
                 Space::with_width(Length::Fill),
-                text(format!("{count} shown")).size(12).color(colors.muted),
+                text(format!("{count} shown")).size(12).color(colors.muted).wrapping(Wrapping::None),
             ]
             .spacing(16)
             .align_y(Alignment::Center),
@@ -211,45 +219,54 @@ impl App {
         .padding([10, 14])
         .style(filled(colors.header));
 
-        let mut list = Column::new().spacing(2).padding([8, 14]);
-        if shown.is_empty() {
-            list = list.push(
-                text(format!("Nothing matches \"{}\"", h.query))
-                    .size(13)
-                    .color(colors.muted),
-            );
-        }
-        for (title, items) in shown {
-            list = list.push(container(text(title).size(14).color(colors.accent)).padding([10, 0]));
-            for item in items {
-                let keys = if item.keys.is_empty() {
-                    "(no key)"
-                } else {
-                    item.keys.as_str()
-                };
+        let query_text = h.query.as_str();
+        let list = responsive(move |size| {
+            let wide = size.width >= HIDE_ID_BELOW;
+            let stacked = size.width < STACK_BELOW;
+            let keys_w = if size.width >= NARROW_KEYS_BELOW { KEYS_W } else { KEYS_W_NARROW };
+            let mut list = Column::new().spacing(2).padding([8, 14]);
+            if shown.is_empty() {
                 list = list.push(
-                    row![
-                        text(keys)
-                            .size(13)
-                            .color(if item.keys.is_empty() {
-                                colors.muted
-                            } else {
-                                colors.dir
-                            })
-                            .width(Length::Fixed(KEYS_W)),
+                    text(format!("Nothing matches \"{query_text}\""))
+                        .size(13)
+                        .color(colors.muted),
+                );
+            }
+            for &(title, ref items) in &shown {
+                list = list.push(container(text(title).size(14).color(colors.accent)).padding([10, 0]));
+                for &item in items.iter() {
+                    let keys = if item.keys.is_empty() {
+                        "(no key)"
+                    } else {
+                        item.keys.as_str()
+                    };
+                    let keys_color = if item.keys.is_empty() { colors.muted } else { colors.dir };
+                    if stacked {
+                        list = list.push(
+                            column![
+                                text(keys).size(13).color(keys_color).wrapping(Wrapping::None),
+                                container(text(item.text.as_str()).size(13).width(Length::Fill)).padding([0, 12]),
+                            ]
+                            .padding([2, 0]),
+                        );
+                        continue;
+                    }
+                    let mut line = row![
+                        text(keys).size(13).color(keys_color).width(Length::Fixed(keys_w)),
                         text(item.text.as_str()).size(13).width(Length::Fill),
-                        text(item.id)
-                            .size(12)
-                            .color(colors.muted)
-                            .wrapping(Wrapping::None),
                     ]
                     .spacing(12)
                     .padding([2, 0])
-                    .align_y(Alignment::Center),
-                );
+                    .align_y(Alignment::Center);
+                    if wide {
+                        line = line.push(text(item.id).size(12).color(colors.muted).wrapping(Wrapping::None));
+                    }
+                    list = list.push(line);
+                }
             }
-        }
-        let body = container(scrollbar::thin(list).id(list_id()).height(Length::Fill))
+            scrollbar::thin(list).id(list_id()).height(Length::Fill).into()
+        });
+        let body = container(list)
             .width(Length::Fill)
             .height(Length::Fill)
             .style(filled(colors.panel));
