@@ -1362,11 +1362,13 @@ impl App {
         }
 
         // A pending overwrite question blocks everything else.
-        if let Some(id) = self.jobs.iter().find(|j| j.conflict.is_some()).map(|j| j.id) {
+        let pending = self.jobs.iter().find_map(|j| j.conflict.as_ref().map(|c| (j.id, c.resumable)));
+        if let Some((id, resumable)) = pending {
             if escape {
                 return self.update(Message::Answer(id, Resolution::Cancel));
             }
-            let count = button_focus::CONFLICT_ANSWERS.len();
+            let answers = button_focus::conflict_answers(resumable);
+            let count = answers.len();
             match named {
                 Some(Named::ArrowLeft) => self.conflict_focus = Some(button_focus::step(self.conflict_focus, count, true)),
                 Some(Named::ArrowRight) => {
@@ -1377,7 +1379,9 @@ impl App {
                 }
                 Some(Named::Enter) => {
                     if let Some(i) = self.conflict_focus {
-                        return self.update(Message::Answer(id, button_focus::CONFLICT_ANSWERS[i].1));
+                        if let Some(&(_, answer)) = answers.get(i) {
+                            return self.update(Message::Answer(id, answer));
+                        }
                     }
                 }
                 _ => {}

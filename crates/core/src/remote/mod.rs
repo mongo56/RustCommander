@@ -45,6 +45,38 @@ pub const IO_TIMEOUT: Duration = Duration::from_secs(30);
 /// Logged-in sessions kept per connection while idle.
 const IDLE_SESSIONS: usize = 4;
 
+/// A transfer to or from a server that fails (not cancelled) after this many
+/// bytes keeps its partial file, so that copying again can resume it.
+pub const KEEP_PARTIAL: u64 = 1 << 20;
+
+/// Whether the partial target of a resumable transfer (one that started at
+/// `offset`, 0 for a new file) stays after it failed (`cancelled`: the user
+/// stopped it) with `written` bytes written. A resumed one always keeps
+/// what was there before; a new one only after an error past
+/// [`KEEP_PARTIAL`] bytes (a cancelled one is removed, as is a small one,
+/// since a partial file looks complete).
+pub fn keeps_partial(offset: u64, written: u64, cancelled: bool) -> bool {
+    offset > 0 || (!cancelled && written >= KEEP_PARTIAL)
+}
+
+/// Counts the bytes written through it.
+struct Counting<'a> {
+    inner: &'a mut dyn Write,
+    written: u64,
+}
+
+impl Write for Counting<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.written += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 /// In the error of a connection to an SFTP server whose host key isn't
 /// trusted yet.
 pub const HOST_KEY_UNKNOWN: &str = "Unknown host key";
@@ -331,15 +363,22 @@ trait Session: Send {
     fn list(&mut self, dir: &str) -> io::Result<Vec<Item>>;
     /// `path` itself; `None` if it doesn't exist.
     fn stat(&mut self, path: &str) -> io::Result<Option<Item>>;
-    /// Calls `each` with a reader of the file's contents; returns what
-    /// `each` returned.
-    fn read(&mut self, path: &str, each: &mut dyn FnMut(&mut dyn Read) -> io::Result<bool>) -> io::Result<bool>;
+    /// Calls `each` with a reader of the file's contents from byte `offset`
+    /// on (FTP `REST`, SFTP seek); returns what `each` returned.
+    fn read(&mut self, path: &str, offset: u64, each: &mut dyn FnMut(&mut dyn Read) -> io::Result<bool>)
+        -> io::Result<bool>;
     /// Creates or replaces the file `path` with what `fill` writes, then
     /// sets its modification time where the server allows it. `fill`
-    /// returns Ok(false) to cancel: the partial file is removed.
+    /// returns Ok(false) to cancel. With `resume` `Some(offset)` the
+    /// transfer is resumable: for an offset above 0 the data goes after the
+    /// first `offset` bytes of the existing file (FTP `APPE`, or `REST` +
+    /// `STOR`; SFTP seek), and a partial file is kept as [`keeps_partial`]
+    /// says. Otherwise (`None`, or `keeps_partial` false) the partial file
+    /// is removed.
     fn write(
         &mut self,
         path: &str,
+        resume: Option<u64>,
         modified: Option<SystemTime>,
         fill: &mut dyn FnMut(&mut dyn Write) -> io::Result<bool>,
     ) -> io::Result<bool>;
@@ -633,12 +672,22 @@ impl Vfs for Connection {
 
     fn read_files(&self, files: &[PathBuf], each: &mut dyn FnMut(usize, &mut dyn Read) -> io::Result<bool>)
         -> io::Result<()> {
+        self.read_files_from(files, &[], each)
+    }
+
+    fn read_files_from(
+        &self,
+        files: &[PathBuf],
+        offsets: &[u64],
+        each: &mut dyn FnMut(usize, &mut dyn Read) -> io::Result<bool>,
+    ) -> io::Result<()> {
         for (i, path) in files.iter().enumerate() {
             let remote = self.remote(path)?;
+            let offset = offsets.get(i).copied().unwrap_or(0);
             let started = std::cell::Cell::new(false);
             let go_on = self.with_if(
                 |s| {
-                    s.read(&remote, &mut |r| {
+                    s.read(&remote, offset, &mut |r| {
                         started.set(true);
                         each(i, r)
                     })
@@ -684,6 +733,7 @@ impl Vfs for Connection {
     fn write_file(
         &self,
         path: &Path,
+        resume: Option<u64>,
         modified: Option<SystemTime>,
         fill: &mut dyn FnMut(&mut dyn Write) -> io::Result<bool>,
     ) -> io::Result<bool> {
@@ -691,7 +741,7 @@ impl Vfs for Connection {
         let started = std::cell::Cell::new(false);
         self.with_if(
             |s| {
-                s.write(&remote, modified, &mut |w| {
+                s.write(&remote, resume, modified, &mut |w| {
                     started.set(true);
                     fill(w)
                 })

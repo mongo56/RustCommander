@@ -7,12 +7,12 @@ use russh::client;
 use russh::keys::{HashAlg, PrivateKeyWithHashAlg, PublicKey, PublicKeyOrCertificate};
 use russh_sftp::client::error::Error as SftpError;
 use russh_sftp::client::SftpSession;
-use russh_sftp::protocol::{FileAttributes, StatusCode};
+use russh_sftp::protocol::{FileAttributes, OpenFlags, StatusCode};
 use std::future::Future;
-use std::io::{self, Read, Write};
+use std::io::{self, Read, SeekFrom, Write};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 use tokio::runtime::Runtime;
 
 fn runtime() -> &'static Runtime {
@@ -227,9 +227,16 @@ impl Session for Sftp {
         })
     }
 
-    fn read(&mut self, path: &str, each: &mut dyn FnMut(&mut dyn Read) -> io::Result<bool>) -> io::Result<bool> {
+    fn read(&mut self, path: &str, offset: u64, each: &mut dyn FnMut(&mut dyn Read) -> io::Result<bool>)
+        -> io::Result<bool> {
         let sftp = &self.sftp;
-        let mut file = block(IO_TIMEOUT, path, async { sftp.open(path).await.map_err(|e| sftp_err(path, e)) })?;
+        let mut file = block(IO_TIMEOUT, path, async {
+            let mut file = sftp.open(path).await.map_err(|e| sftp_err(path, e))?;
+            if offset > 0 {
+                file.seek(SeekFrom::Start(offset)).await.map_err(|e| err(e.kind(), path, e))?;
+            }
+            Ok(file)
+        })?;
         let result = each(&mut Blocking(&mut file));
         let _ = block(IO_TIMEOUT, path, async { file.shutdown().await });
         result
@@ -238,12 +245,26 @@ impl Session for Sftp {
     fn write(
         &mut self,
         path: &str,
+        resume: Option<u64>,
         modified: Option<SystemTime>,
         fill: &mut dyn FnMut(&mut dyn Write) -> io::Result<bool>,
     ) -> io::Result<bool> {
         let sftp = &self.sftp;
-        let mut file = block(IO_TIMEOUT, path, async { sftp.create(path).await.map_err(|e| sftp_err(path, e)) })?;
-        let result = fill(&mut Blocking(&mut file));
+        let offset = resume.unwrap_or(0);
+        let mut file = block(IO_TIMEOUT, path, async {
+            if offset == 0 {
+                return sftp.create(path).await.map_err(|e| sftp_err(path, e));
+            }
+            // Kept as it is up to `offset`; written on from there.
+            let flags = OpenFlags::WRITE | OpenFlags::CREATE;
+            let mut file = sftp.open_with_flags(path, flags).await.map_err(|e| sftp_err(path, e))?;
+            file.seek(SeekFrom::Start(offset)).await.map_err(|e| err(e.kind(), path, e))?;
+            Ok(file)
+        })?;
+        let mut blocking = Blocking(&mut file);
+        let mut counted = super::Counting { inner: &mut blocking, written: 0 };
+        let result = fill(&mut counted);
+        let written = counted.written;
         let closed = block(IO_TIMEOUT, path, async { file.shutdown().await });
         match (result, closed) {
             (Ok(true), Ok(())) => {
@@ -255,7 +276,9 @@ impl Session for Sftp {
                 Ok(true)
             }
             (result, closed) => {
-                let _ = block(IO_TIMEOUT, path, async { sftp.remove_file(path).await.map_err(|e| sftp_err(path, e)) });
+                if !resume.is_some_and(|o| super::keeps_partial(o, written, matches!(result, Ok(false)))) {
+                    let _ = block(IO_TIMEOUT, path, async { sftp.remove_file(path).await.map_err(|e| sftp_err(path, e)) });
+                }
                 result.and(closed.map(|_| false))
             }
         }

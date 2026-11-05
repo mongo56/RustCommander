@@ -1030,10 +1030,22 @@ impl App {
             ]
         };
         let focus = self.conflict_focus;
+        let answers = button_focus::conflict_answers(c.resumable);
         let answer = |i: usize, primary| {
-            let (label, r) = button_focus::CONFLICT_ANSWERS[i];
+            let (label, r) = answers[i];
             dialog_button(label, Message::Answer(id, r), primary, focus == Some(i))
         };
+        // Overwrite..., then Resume (when offered), then Skip... and Cancel.
+        let n = answers.len();
+        let resume = c.resumable.then(|| {
+            row![
+                answer(3, false),
+                answer(4, false),
+                text("keep the existing part, copy the rest").size(12).color(theme::c().muted),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center)
+        });
 
         let content = column![
             text("File already exists").size(16),
@@ -1050,14 +1062,17 @@ impl App {
                 answer(2, false),
             ]
             .spacing(8),
+        ]
+        .push_maybe(resume)
+        .push(
             row![
-                answer(3, false),
-                answer(4, false),
+                answer(n - 3, false),
+                answer(n - 2, false),
                 Space::with_width(Length::Fill),
-                answer(5, false),
+                answer(n - 1, false),
             ]
             .spacing(8),
-        ]
+        )
         .spacing(12);
 
         container(content).padding(20).width(Length::Fixed(520.0)).style(theme::dialog).into()

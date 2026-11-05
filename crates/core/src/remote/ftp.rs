@@ -335,7 +335,12 @@ impl Session for Ftp {
         }
     }
 
-    fn read(&mut self, path: &str, each: &mut dyn FnMut(&mut dyn Read) -> io::Result<bool>) -> io::Result<bool> {
+    fn read(&mut self, path: &str, offset: u64, each: &mut dyn FnMut(&mut dyn Read) -> io::Result<bool>)
+        -> io::Result<bool> {
+        if offset > 0 {
+            let offset = usize::try_from(offset).map_err(|_| err(io::ErrorKind::InvalidInput, path, "Too large"))?;
+            let _ = self.stream.resume_transfer(offset);
+        }
         let mut transfer = self.stream.retr_as_stream(path).map_err(|e| io_err(path, e))?;
         let _ = set_timeouts(transfer.get_ref().get_ref());
         let result = each(&mut transfer);
@@ -357,12 +362,31 @@ impl Session for Ftp {
     fn write(
         &mut self,
         path: &str,
+        resume: Option<u64>,
         modified: Option<SystemTime>,
         fill: &mut dyn FnMut(&mut dyn Write) -> io::Result<bool>,
     ) -> io::Result<bool> {
-        let mut transfer = self.stream.put_with_stream(path).map_err(|e| io_err(path, e))?;
+        let offset = resume.unwrap_or(0);
+        let opened = match offset {
+            0 => self.stream.put_with_stream(path),
+            // APPE adds to the end (the file is `offset` bytes long); servers
+            // without it may still take REST + STOR.
+            _ => match self.stream.append_with_stream(path) {
+                Err(FtpError::UnexpectedResponse(r))
+                    if matches!(r.status, Status::NotImplemented | Status::CommandNotImplemented | Status::BadCommand) =>
+                {
+                    let at = usize::try_from(offset).map_err(|_| err(io::ErrorKind::InvalidInput, path, "Too large"))?;
+                    let _ = self.stream.resume_transfer(at);
+                    self.stream.put_with_stream(path)
+                }
+                other => other,
+            },
+        };
+        let mut transfer = opened.map_err(|e| io_err(path, e))?;
         let _ = set_timeouts(transfer.get_ref().get_ref());
-        let result = fill(&mut transfer);
+        let mut counted = super::Counting { inner: &mut transfer, written: 0 };
+        let result = fill(&mut counted);
+        let written = counted.written;
         let finished = transfer.finish().map_err(|e| io_err(path, e));
         match (result, finished) {
             (Ok(true), Ok(())) => {
@@ -374,7 +398,10 @@ impl Session for Ftp {
                 Ok(true)
             }
             (result, finished) => {
-                let _ = self.stream.rm(path);
+                let cancelled = matches!(result, Ok(false));
+                if !resume.is_some_and(|o| super::keeps_partial(o, written, cancelled)) {
+                    let _ = self.stream.rm(path);
+                }
                 result.and(finished.map(|_| false))
             }
         }

@@ -167,6 +167,10 @@ pub struct Conflict {
     pub dst_size: u64,
     pub src_modified: Option<DateTime<Local>>,
     pub dst_modified: Option<DateTime<Local>>,
+    /// The existing file can be finished instead of replaced
+    /// ([`Resolution::Resume`]): a download from or an upload to a server,
+    /// and the existing file is smaller.
+    pub resumable: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,6 +181,12 @@ pub enum Resolution {
     OverwriteOlder,
     Skip,
     SkipAll,
+    /// Keep the existing (smaller) file and transfer only the rest of the
+    /// new one onto its end. Only when the conflict is `resumable`; the
+    /// result must end up as long as the new file, else it's an error.
+    Resume,
+    /// Resume this and all later resumable conflicts (the others are asked).
+    ResumeAll,
     Cancel,
 }
 
@@ -771,13 +781,33 @@ impl Runner<'_> {
     fn resolve(
         &mut self,
         src: &Path,
+        src_stat: (u64, Option<SystemTime>),
+        dst: &Path,
+        dst_stat: (u64, Option<SystemTime>),
+    ) -> Resolution {
+        self.resolve_resumable(src, src_stat, dst, dst_stat, false)
+    }
+
+    /// [`Runner::resolve`] for a transfer that can resume (to or from a
+    /// server): Resume is offered when `resumable` and the existing file is
+    /// smaller. Returns Overwrite, Resume, Skip or Cancel.
+    fn resolve_resumable(
+        &mut self,
+        src: &Path,
         (src_size, src_modified): (u64, Option<SystemTime>),
         dst: &Path,
         (dst_size, dst_modified): (u64, Option<SystemTime>),
+        resumable: bool,
     ) -> Resolution {
         let target_older = matches!((src_modified, dst_modified), (Some(s), Some(d)) if d < s);
+        let resumable = resumable && dst_size < src_size;
 
         let answer = match self.sticky {
+            // Not resumable: asked after all.
+            Some(Resolution::ResumeAll) if !resumable => None,
+            other => other,
+        };
+        let answer = match answer {
             Some(sticky) => sticky,
             None => {
                 let conflict = Conflict {
@@ -787,13 +817,14 @@ impl Runner<'_> {
                     dst_size,
                     src_modified: src_modified.map(DateTime::from),
                     dst_modified: dst_modified.map(DateTime::from),
+                    resumable,
                 };
                 self.reporter.conflict(conflict)
             }
         };
 
         match answer {
-            Resolution::OverwriteAll | Resolution::SkipAll | Resolution::OverwriteOlder => {
+            Resolution::OverwriteAll | Resolution::SkipAll | Resolution::OverwriteOlder | Resolution::ResumeAll => {
                 self.sticky = Some(answer)
             }
             _ => {}
@@ -801,6 +832,7 @@ impl Runner<'_> {
         match answer {
             Resolution::Overwrite | Resolution::OverwriteAll => Resolution::Overwrite,
             Resolution::OverwriteOlder if target_older => Resolution::Overwrite,
+            Resolution::Resume | Resolution::ResumeAll if resumable => Resolution::Resume,
             Resolution::Cancel => Resolution::Cancel,
             _ => Resolution::Skip,
         }
@@ -873,7 +905,10 @@ impl Runner<'_> {
             }
         };
         let (items, vfs) = items;
+        // From a server a download can be resumed (and a partial one kept).
+        let from_server = remote::is_remote(&t.src);
         let mut files = Vec::new();
+        let mut offsets = Vec::new();
         let mut targets = Vec::new();
         // Folders made here, to get their dates once their files are in.
         let mut made = Vec::new();
@@ -907,13 +942,17 @@ impl Runner<'_> {
                 }
                 continue;
             }
+            let mut offset = 0;
             if let Ok(dst_meta) = existing {
                 if dst_meta.is_dir() {
                     self.fail_msg(&dst, "A folder with this name already exists");
                     continue;
                 }
-                match self.resolve(&item.path, (item.size, item.modified.map(Into::into)), &dst, stat_of(&dst_meta)) {
+                let src_stat = (item.size, item.modified.map(Into::into));
+                let resumable = from_server && dst_meta.is_file();
+                match self.resolve_resumable(&item.path, src_stat, &dst, stat_of(&dst_meta), resumable) {
                     Resolution::Overwrite => {}
+                    Resolution::Resume => offset = dst_meta.len(),
                     Resolution::Cancel => {
                         self.control.cancel();
                         return;
@@ -926,13 +965,19 @@ impl Runner<'_> {
                 }
             }
             files.push(item.path.clone());
+            offsets.push(offset);
             targets.push((dst, item));
         }
         let mut failures = Vec::new();
-        let result = vfs.read_files(&files, &mut |i, input| {
+        let result = vfs.read_files_from(&files, &offsets, &mut |i, input| {
             let (dst, item) = &targets[i];
             self.progress.current = Some(item.path.clone());
-            match self.write_out(input, dst, item.modified.map(Into::into)) {
+            let resume = from_server.then_some(offsets[i]);
+            let written = self.write_out(input, dst, item.modified.map(Into::into), resume);
+            match written.and_then(|done| match done && offsets[i] > 0 {
+                true => check_resumed(fs::metadata(dst)?.len(), item.size).map(|()| true),
+                false => Ok(done),
+            }) {
                 Ok(true) => {
                     self.item_done(0);
                     Ok(self.alive())
@@ -957,15 +1002,38 @@ impl Runner<'_> {
     }
 
     /// Writes `input` to the new file `dst` with progress. Ok(false) means
-    /// cancelled; a partial file is removed.
-    fn write_out(&mut self, input: &mut dyn Read, dst: &Path, modified: Option<SystemTime>) -> io::Result<bool> {
-        let mut output = match File::create(dst) {
+    /// cancelled; a partial file is removed. A download from a server is
+    /// resumable (`resume` `Some(offset)`): from an offset above 0 `input`
+    /// is the rest of the file, written after the first `offset` bytes of
+    /// `dst`, and a partial file is kept as [`remote::keeps_partial`] says
+    /// (the error then says so).
+    fn write_out(
+        &mut self,
+        input: &mut dyn Read,
+        dst: &Path,
+        modified: Option<SystemTime>,
+        resume: Option<u64>,
+    ) -> io::Result<bool> {
+        let offset = resume.unwrap_or(0);
+        let open = || match offset {
+            0 => File::create(dst),
+            _ => {
+                let mut f = File::options().write(true).open(dst)?;
+                // Anything past the offset (if the file grew meanwhile) goes.
+                f.set_len(offset)?;
+                io::Seek::seek(&mut f, io::SeekFrom::Start(offset))?;
+                Ok(f)
+            }
+        };
+        let mut output = match open() {
             Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
                 clear_readonly(dst)?;
-                File::create(dst)?
+                open()?
             }
             other => other?,
         };
+        self.progress.done_bytes += offset;
+        let before = self.progress.done_bytes;
         let result = self.pump(input, &mut output).and_then(|complete| {
             if let Some(m) = modified.filter(|_| complete) {
                 output.set_modified(m)?;
@@ -973,8 +1041,16 @@ impl Runner<'_> {
             Ok(complete)
         });
         drop(output);
-        if !matches!(result, Ok(true)) {
-            let _ = fs::remove_file(dst);
+        let written = self.progress.done_bytes - before;
+        match &result {
+            Ok(true) => {}
+            Ok(false) if resume.is_some_and(|o| remote::keeps_partial(o, written, true)) => {}
+            Err(_) if resume.is_some_and(|o| remote::keeps_partial(o, written, false)) => {
+                return result.map_err(|e| kept_partial(e, offset + written));
+            }
+            _ => {
+                let _ = fs::remove_file(dst);
+            }
         }
         result
     }
@@ -1461,14 +1537,19 @@ impl Runner<'_> {
                     }
                     continue;
                 }
+                // An upload from here can be resumed (and a partial one kept);
+                // a copy between servers starts over.
+                let mut resume = (!from_server).then_some(0);
                 if let Some(e) = existing {
                     if e.is_dir() {
                         complete = self.fail_msg(&dst, "A folder with this name already exists");
                         continue;
                     }
                     let src_stat = (item.size, item.modified.map(Into::into));
-                    match self.resolve(&item.path, src_stat, &dst, (e.size, e.modified.map(Into::into))) {
+                    let dst_stat = (e.size, e.modified.map(Into::into));
+                    match self.resolve_resumable(&item.path, src_stat, &dst, dst_stat, !from_server) {
                         Resolution::Overwrite => {}
+                        Resolution::Resume => resume = Some(e.size),
                         Resolution::Cancel => {
                             self.control.cancel();
                             return;
@@ -1484,9 +1565,13 @@ impl Runner<'_> {
                         }
                     }
                 }
+                let offset = resume.unwrap_or(0);
                 let opened = match (&relay, from_server) {
                     (Some(relay), true) => self.download(source.as_ref(), &item.path, &relay.file),
-                    _ => File::open(&item.path).map(Some),
+                    _ => File::open(&item.path).and_then(|mut f| {
+                        io::Seek::seek(&mut f, io::SeekFrom::Start(offset))?;
+                        Ok(Some(f))
+                    }),
                 };
                 let mut input = match opened {
                     Ok(Some(f)) => f,
@@ -1497,11 +1582,25 @@ impl Runner<'_> {
                     }
                 };
                 let modified = item.modified.map(Into::into);
-                let result = server.write_file(&dst, modified, &mut |out| self.pump(&mut input, out));
+                self.progress.done_bytes += offset;
+                let before = self.progress.done_bytes;
+                let result = server.write_file(&dst, resume, modified, &mut |out| self.pump(&mut input, out));
                 drop(input);
                 if let (Some(relay), true) = (&relay, from_server) {
                     let _ = fs::remove_file(&relay.file);
                 }
+                let written = self.progress.done_bytes - before;
+                let result = match result {
+                    // What arrived must be as long as the source.
+                    Ok(true) if offset > 0 => server
+                        .stat(&dst)
+                        .and_then(|e| check_resumed(e.map_or(0, |e| e.size), item.size))
+                        .map(|()| true),
+                    Err(e) if resume.is_some_and(|o| remote::keeps_partial(o, written, false)) => {
+                        Err(kept_partial(e, offset + written))
+                    }
+                    other => other,
+                };
                 match result {
                     Ok(true) => self.item_done(0),
                     Ok(false) => return,
@@ -1528,7 +1627,7 @@ impl Runner<'_> {
         let before = self.progress.done_bytes;
         let mut written = None;
         let result = source.read_files(&[src.to_path_buf()], &mut |_, input| {
-            let r = self.write_out(input, temp, None);
+            let r = self.write_out(input, temp, None, None);
             let go_on = matches!(r, Ok(true));
             written = Some(r);
             Ok(go_on)
@@ -1977,6 +2076,27 @@ fn clear_readonly(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// The check after a resumed transfer: the file must now be `want` bytes
+/// long. A server that ignored the offset (sent or took the whole file
+/// again) leaves a different size; the bytes themselves aren't compared.
+fn check_resumed(got: u64, want: u64) -> io::Result<()> {
+    match got == want {
+        true => Ok(()),
+        false => Err(io::Error::other(format!(
+            "After resuming, the file has {got} bytes instead of {want}: it is damaged (the server may not \
+             support resuming). Copy it again and choose Overwrite"
+        ))),
+    }
+}
+
+/// `e` of a transfer whose partial target (now `bytes` long) was kept.
+fn kept_partial(e: io::Error, bytes: u64) -> io::Error {
+    io::Error::new(
+        e.kind(),
+        format!("{e} (the partial file, {bytes} bytes, was kept: copy again and choose Resume to finish it)"),
+    )
+}
+
 fn remove_file_force(path: &Path) -> io::Result<()> {
     match fs::remove_file(path) {
         Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
@@ -2105,6 +2225,29 @@ mod tests {
         let mut r = Auto { answer, asked: 0 };
         let outcome = run(&job, &Control::default(), &mut r);
         (outcome, r.asked)
+    }
+
+    #[test]
+    fn resumed_size_must_match_the_source() {
+        assert!(check_resumed(10, 10).is_ok());
+        for got in [9, 11, 20] {
+            let e = check_resumed(got, 10).unwrap_err().to_string();
+            assert!(e.contains("After resuming") && e.contains(&format!("{got} bytes instead of 10")), "{e}");
+        }
+    }
+
+    #[test]
+    fn local_copies_never_resume() {
+        let tmp = TempDir::new("no-resume");
+        fs::write(tmp.0.join("a.txt"), b"abcdef").unwrap();
+        fs::create_dir_all(tmp.0.join("out")).unwrap();
+        fs::write(tmp.0.join("out/a.txt"), b"ab").unwrap();
+        let ts = plan_transfer(&[tmp.0.join("a.txt")], &tmp.0.join("out")).unwrap();
+        let mut r = Auto { answer: Resolution::ResumeAll, asked: 0 };
+        let outcome = run(&Job::Copy(ts), &Control::default(), &mut r);
+        // Not offered, so the answer counts as Skip.
+        assert_eq!((r.asked, outcome.skipped), (1, 1));
+        assert_eq!(fs::read(tmp.0.join("out/a.txt")).unwrap(), b"ab");
     }
 
     struct TempDir(PathBuf);

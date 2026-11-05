@@ -50,6 +50,23 @@ pub trait Vfs: Send + Sync {
     /// returns `Ok(false)` to stop early.
     fn read_files(&self, files: &[PathBuf], each: &mut dyn FnMut(usize, &mut dyn Read) -> io::Result<bool>)
         -> io::Result<()>;
+    /// [`Vfs::read_files`], each file from byte `offsets[i]` on (0 where
+    /// `offsets` is shorter). Only servers can start past 0; the others fail
+    /// with `Unsupported` if any offset isn't 0.
+    fn read_files_from(
+        &self,
+        files: &[PathBuf],
+        offsets: &[u64],
+        each: &mut dyn FnMut(usize, &mut dyn Read) -> io::Result<bool>,
+    ) -> io::Result<()> {
+        match offsets.iter().position(|&o| o > 0) {
+            Some(i) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("Can't resume reading here: {}", files[i].display()),
+            )),
+            None => self.read_files(files, each),
+        }
+    }
     /// `path` itself (not followed into a folder); `None` if it doesn't exist.
     fn stat(&self, path: &Path) -> io::Result<Option<Entry>>;
     /// Whether files can be created, changed or deleted here.
@@ -74,14 +91,17 @@ pub trait Vfs: Send + Sync {
     }
     /// Creates or replaces the file `path` with what `fill` writes (Ok(false)
     /// from `fill` cancels: the partial file is removed) and gives it the
-    /// date `modified` where possible.
+    /// date `modified` where possible. `resume` `Some(offset)`: resumable,
+    /// the data goes after the first `offset` bytes of the existing file and
+    /// a partial file may stay (see `remote::keeps_partial`).
     fn write_file(
         &self,
         path: &Path,
+        resume: Option<u64>,
         modified: Option<SystemTime>,
         fill: &mut dyn FnMut(&mut dyn io::Write) -> io::Result<bool>,
     ) -> io::Result<bool> {
-        let _ = (modified, fill);
+        let _ = (resume, modified, fill);
         Err(unsupported(path))
     }
 }

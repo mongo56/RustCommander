@@ -293,6 +293,13 @@ mod sftp_server {
     pub const PASSWORD: &str = "secret";
     /// A file of this name in the served folder turns the statvfs extension off.
     pub const NO_STATVFS: &str = ".no-statvfs";
+    /// With a file of this name in the served folder, reads and writes of a
+    /// file start at its beginning whatever offset the client asks for first
+    /// (like an FTP server that ignores `REST`).
+    pub const IGNORE_OFFSET: &str = ".ignore-offset";
+    /// A file of this name holding a number makes reads and writes at or past
+    /// that offset fail (a transfer that breaks off).
+    pub const FAIL_AT: &str = ".fail-at";
 
     pub fn host_key(seed: u8) -> russh::keys::PrivateKey {
         let pair = russh::keys::ssh_key::private::Ed25519Keypair::from_seed(&[seed; 32]);
@@ -345,7 +352,13 @@ mod sftp_server {
             match self.channels.remove(&id).filter(|_| name == "sftp") {
                 Some(channel) => {
                     session.channel_success(id)?;
-                    let sftp = Sftp { root: self.root.clone(), files: HashMap::new(), dirs: HashMap::new(), next: 0 };
+                    let sftp = Sftp {
+                        root: self.root.clone(),
+                        files: HashMap::new(),
+                        skew: HashMap::new(),
+                        dirs: HashMap::new(),
+                        next: 0,
+                    };
                     russh_sftp::server::run(channel.into_stream(), sftp).await;
                 }
                 None => session.channel_failure(id)?,
@@ -358,6 +371,9 @@ mod sftp_server {
     struct Sftp {
         root: PathBuf,
         files: HashMap<String, File>,
+        /// With [`IGNORE_OFFSET`]: per open file, the offset of its first read
+        /// or write, taken off all of them.
+        skew: HashMap<String, u64>,
         /// Open folders: Some(path) until read once.
         dirs: HashMap<String, Option<String>>,
         next: u32,
@@ -393,6 +409,20 @@ mod sftp_server {
         fn handle(&mut self) -> String {
             self.next += 1;
             format!("h{}", self.next)
+        }
+
+        /// Where a read or write at `offset` of `handle` really goes (see
+        /// [`IGNORE_OFFSET`]); fails at [`FAIL_AT`].
+        fn position(&mut self, handle: &str, offset: u64) -> Result<u64, StatusCode> {
+            let fail_at = fs::read_to_string(self.root.join(FAIL_AT)).ok().and_then(|t| t.trim().parse::<u64>().ok());
+            if fail_at.is_some_and(|at| offset >= at) {
+                return Err(StatusCode::Failure);
+            }
+            if !self.root.join(IGNORE_OFFSET).exists() {
+                return Ok(offset);
+            }
+            let skew = *self.skew.entry(handle.to_owned()).or_insert(offset);
+            Ok(offset.saturating_sub(skew))
         }
     }
 
@@ -472,6 +502,7 @@ mod sftp_server {
         }
 
         async fn read(&mut self, id: u32, handle: String, offset: u64, len: u32) -> Result<Data, Self::Error> {
+            let offset = self.position(&handle, offset)?;
             let file = self.files.get_mut(&handle).ok_or(StatusCode::Failure)?;
             file.seek(SeekFrom::Start(offset)).map_err(code)?;
             let mut data = vec![0; len as usize];
@@ -484,6 +515,7 @@ mod sftp_server {
         }
 
         async fn write(&mut self, id: u32, handle: String, offset: u64, data: Vec<u8>) -> Result<Status, Self::Error> {
+            let offset = self.position(&handle, offset)?;
             let file = self.files.get_mut(&handle).ok_or(StatusCode::Failure)?;
             file.seek(SeekFrom::Start(offset)).map_err(code)?;
             file.write_all(&data).map_err(code)?;
@@ -492,6 +524,7 @@ mod sftp_server {
 
         async fn close(&mut self, id: u32, handle: String) -> Result<Status, Self::Error> {
             self.files.remove(&handle);
+            self.skew.remove(&handle);
             self.dirs.remove(&handle);
             Ok(status(id))
         }
@@ -1001,8 +1034,9 @@ fn keep_alive_drops_dead_sessions_and_next_use_reconnects() {
 
 // ---- Between servers -------------------------------------------------------------
 
-/// Serves plain FTP over `root` on `listener` (non-blocking).
-fn start_ftp_on(listener: TcpListener, root: PathBuf) {
+/// Serves plain FTP over `root` on `listener` (non-blocking), with data
+/// connections on the ports `passive`.
+fn start_ftp_on(listener: TcpListener, root: PathBuf, passive: std::ops::RangeInclusive<u16>) {
     serve(move || async move {
         let listener = tokio::net::TcpListener::from_std(listener).unwrap();
         loop {
@@ -1010,7 +1044,7 @@ fn start_ftp_on(listener: TcpListener, root: PathBuf) {
             let root = root.clone();
             let server =
                 libunftp::ServerBuilder::new(Box::new(move || unftp_sbe_fs::Filesystem::new(root.clone()).unwrap()))
-                    .passive_ports(44000..=44999)
+                    .passive_ports(passive.clone())
                     .build()
                     .unwrap();
             tokio::spawn(async move {
@@ -1063,7 +1097,7 @@ fn copy_between_servers() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port();
-    start_ftp_on(listener, ftp_disk.0.clone());
+    start_ftp_on(listener, ftp_disk.0.clone(), 44000..=44999);
     let ftp = connect_retrying(&Login {
         protocol: Protocol::Ftp,
         host: "127.0.0.1".into(),
@@ -1179,6 +1213,212 @@ fn copy_between_servers() {
     disconnect(&sftp);
 }
 
+// ---- Resuming transfers ----------------------------------------------------------
+
+/// Answers every question with `answer` and keeps the questions.
+struct Asked {
+    answer: Resolution,
+    conflicts: Vec<Conflict>,
+}
+
+impl Reporter for Asked {
+    fn progress(&mut self, _: &Progress) {}
+    fn conflict(&mut self, c: Conflict) -> Resolution {
+        self.conflicts.push(c);
+        self.answer
+    }
+}
+
+fn run_asked(job: Job, answer: Resolution) -> (Outcome, Vec<Conflict>) {
+    let mut reporter = Asked { answer, conflicts: Vec::new() };
+    let outcome = ops::run(&job, &Control::default(), &mut reporter);
+    (outcome, reporter.conflicts)
+}
+
+/// 3 MB that differ from the other tests' data.
+fn resume_data() -> Vec<u8> {
+    (0..3_000_000u32).map(|i| (i.wrapping_mul(7) % 253) as u8).collect()
+}
+
+/// Downloads and uploads that resume from a shorter target, on a connected
+/// server whose root `root` is the folder `disk`; local files go in `local`.
+fn exercise_resume(root: &Path, disk: &Path, local: &Path) {
+    let data = resume_data();
+    let small: Vec<u8> = data[..20_000].to_vec();
+    fs::create_dir_all(disk.join("res")).unwrap();
+    fs::write(disk.join("res/big.bin"), &data).unwrap();
+    fs::write(disk.join("res/b.bin"), &small).unwrap();
+    let res = root.join("res");
+    let down = local.join("down");
+    fs::create_dir_all(&down).unwrap();
+    let get = |files: &[&str]| {
+        let sources: Vec<PathBuf> = files.iter().map(|f| res.join(f)).collect();
+        Job::Copy(ops::plan_transfer(&sources, &down).unwrap())
+    };
+
+    // Download: the existing part stays, the rest is appended; the date is
+    // set as for any copy.
+    fs::write(down.join("big.bin"), &data[..1_234_567]).unwrap();
+    let (outcome, asked) = run_asked(get(&["big.bin"]), Resolution::Resume);
+    assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+    assert_eq!(asked.len(), 1);
+    assert!(asked[0].resumable);
+    assert_eq!((asked[0].src_size, asked[0].dst_size), (data.len() as u64, 1_234_567));
+    assert!(fs::read(down.join("big.bin")).unwrap() == data, "download resumed wrong");
+    let listed = crate::vfs::open(root).unwrap().stat(&res.join("big.bin")).unwrap().unwrap();
+    let local_date = fs::metadata(down.join("big.bin")).unwrap().modified().unwrap();
+    assert_eq!(listed.modified.map(SystemTime::from), Some(local_date));
+
+    // Not offered when the existing file is as large or larger: Resume
+    // then skips, nothing changes.
+    for len in [data.len(), data.len() + 10] {
+        fs::write(down.join("big.bin"), vec![1u8; len]).unwrap();
+        let (outcome, asked) = run_asked(get(&["big.bin"]), Resolution::Resume);
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(asked.len() == 1 && !asked[0].resumable, "{len}");
+        assert_eq!(outcome.skipped, 1);
+        assert_eq!(fs::read(down.join("big.bin")).unwrap(), vec![1u8; len]);
+    }
+
+    // Resume all: asked once; a later file that can't resume is asked.
+    fs::write(down.join("big.bin"), &data[..100]).unwrap();
+    fs::write(down.join("b.bin"), &small[..5]).unwrap();
+    let (outcome, asked) = run_asked(get(&["big.bin", "b.bin"]), Resolution::ResumeAll);
+    assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+    assert_eq!(asked.len(), 1);
+    assert!(fs::read(down.join("big.bin")).unwrap() == data);
+    assert_eq!(fs::read(down.join("b.bin")).unwrap(), small);
+    fs::write(down.join("big.bin"), &data[..100]).unwrap();
+    let (outcome, asked) = run_asked(get(&["big.bin", "b.bin"]), Resolution::ResumeAll);
+    assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+    assert_eq!(asked.iter().map(|c| c.resumable).collect::<Vec<_>>(), [true, false]);
+    assert_eq!(outcome.skipped, 1);
+    assert!(fs::read(down.join("big.bin")).unwrap() == data);
+
+    // Upload: the same the other way.
+    let src = local.join("up.bin");
+    fs::write(&src, &data).unwrap();
+    let put = || Job::Copy(ops::plan_transfer(std::slice::from_ref(&src), &res.join("")).unwrap());
+    fs::write(disk.join("res/up.bin"), &data[..777_777]).unwrap();
+    let (outcome, asked) = run_asked(put(), Resolution::Resume);
+    assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+    assert!(asked.len() == 1 && asked[0].resumable);
+    assert_eq!(asked[0].dst_size, 777_777);
+    assert!(fs::read(disk.join("res/up.bin")).unwrap() == data, "upload resumed wrong");
+    // As large: not offered, skipped.
+    let (outcome, asked) = run_asked(put(), Resolution::Resume);
+    assert!(asked.len() == 1 && !asked[0].resumable);
+    assert_eq!(outcome.skipped, 1);
+    assert!(fs::read(disk.join("res/up.bin")).unwrap() == data);
+    // A copy between folders of the server (through a temp file) can't resume.
+    fs::write(disk.join("res/copy.bin"), &data[..10]).unwrap();
+    let relay = Job::Copy(vec![Transfer { src: res.join("big.bin"), dst: res.join("copy.bin") }]);
+    let (outcome, asked) = run_asked(relay, Resolution::Resume);
+    assert!(asked.len() == 1 && !asked[0].resumable);
+    assert_eq!(outcome.skipped, 1);
+    assert_eq!(fs::read(disk.join("res/copy.bin")).unwrap(), &data[..10]);
+}
+
+#[test]
+fn ftp_resumes_downloads_and_uploads() {
+    let disk = TempDir::new("resume-ftp");
+    let local = TempDir::new("resume-ftp-local");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    start_ftp_on(listener, disk.0.clone(), 45000..=45999);
+    let root = connect_retrying(&Login {
+        protocol: Protocol::Ftp,
+        host: "127.0.0.1".into(),
+        port,
+        user: "tester".into(),
+        password: Some("secret".into()),
+        key_file: None,
+    });
+    exercise_resume(&root, &disk.0, &local.0);
+    disconnect(&root);
+}
+
+#[test]
+fn sftp_resumes_downloads_and_uploads() {
+    let _settings = settings();
+    let disk = TempDir::new("resume-sftp");
+    let local = TempDir::new("resume-sftp-local");
+    let port = start_sftp(disk.0.clone(), 9);
+    let login = sftp_login(port, sftp_server::PASSWORD);
+    assert!(connect(login.clone(), "").is_err());
+    trust_host_key(&login).unwrap();
+    let root = connect(login, "").unwrap();
+    exercise_resume(&root, &disk.0, &local.0);
+
+    let data = resume_data();
+    let res = root.join("res");
+    let down = local.0.join("down");
+    let get = || Job::Copy(ops::plan_transfer(&[res.join("big.bin")], &down).unwrap());
+    let src = local.0.join("up.bin");
+    let put = || Job::Copy(ops::plan_transfer(std::slice::from_ref(&src), &res.join("")).unwrap());
+    let flag = |name: &str, text: Option<&str>| match text {
+        Some(t) => fs::write(disk.0.join(name), t).unwrap(),
+        None => fs::remove_file(disk.0.join(name)).unwrap(),
+    };
+
+    // A server that ignores the offset sends (or takes) the whole file
+    // again: the size check reports the damaged result.
+    flag(sftp_server::IGNORE_OFFSET, Some(""));
+    fs::write(down.join("big.bin"), &data[..1_000_000]).unwrap();
+    let (outcome, _) = run_asked(get(), Resolution::Resume);
+    assert_eq!(outcome.errors.len(), 1, "{:?}", outcome.errors);
+    assert!(outcome.errors[0].1.contains("After resuming"), "{:?}", outcome.errors);
+    fs::write(disk.0.join("res/up.bin"), &data[..1_000_000]).unwrap();
+    let (outcome, _) = run_asked(put(), Resolution::Resume);
+    assert_eq!(outcome.errors.len(), 1, "{:?}", outcome.errors);
+    assert!(outcome.errors[0].1.contains("After resuming"), "{:?}", outcome.errors);
+    flag(sftp_server::IGNORE_OFFSET, None);
+
+    // A download that breaks off past 1 MB keeps its part (and says so);
+    // copying again resumes it.
+    let part = |path: &Path| {
+        let got = fs::read(path).unwrap();
+        assert!(got.len() as u64 >= KEEP_PARTIAL && got.len() < data.len(), "{}", got.len());
+        assert!(data.starts_with(&got));
+    };
+    fs::remove_file(down.join("big.bin")).unwrap();
+    flag(sftp_server::FAIL_AT, Some("2000000"));
+    let (outcome, asked) = run_asked(get(), Resolution::Resume);
+    assert!(asked.is_empty());
+    assert_eq!(outcome.errors.len(), 1, "{:?}", outcome.errors);
+    assert!(outcome.errors[0].1.contains("was kept"), "{:?}", outcome.errors);
+    part(&down.join("big.bin"));
+    // An upload too.
+    fs::remove_file(disk.0.join("res/up.bin")).unwrap();
+    let (outcome, asked) = run_asked(put(), Resolution::Resume);
+    assert!(asked.is_empty());
+    assert_eq!(outcome.errors.len(), 1, "{:?}", outcome.errors);
+    assert!(outcome.errors[0].1.contains("was kept"), "{:?}", outcome.errors);
+    part(&disk.0.join("res/up.bin"));
+    flag(sftp_server::FAIL_AT, None);
+    for job in [get(), put()] {
+        let (outcome, asked) = run_asked(job, Resolution::Resume);
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(asked.len() == 1 && asked[0].resumable);
+    }
+    assert!(fs::read(down.join("big.bin")).unwrap() == data);
+    assert!(fs::read(disk.0.join("res/up.bin")).unwrap() == data);
+
+    // One that breaks off before 1 MB is removed.
+    fs::remove_file(down.join("big.bin")).unwrap();
+    fs::remove_file(disk.0.join("res/up.bin")).unwrap();
+    flag(sftp_server::FAIL_AT, Some("500000"));
+    for job in [get(), put()] {
+        let (outcome, _) = run_asked(job, Resolution::Resume);
+        assert_eq!(outcome.errors.len(), 1, "{:?}", outcome.errors);
+        assert!(!outcome.errors[0].1.contains("was kept"), "{:?}", outcome.errors);
+    }
+    assert!(!down.join("big.bin").exists() && !disk.0.join("res/up.bin").exists());
+    flag(sftp_server::FAIL_AT, None);
+    disconnect(&root);
+}
+
 // ---- Find files on a server ------------------------------------------------------
 
 /// Starts an FTP server over `disk` and connects to its root.
@@ -1288,6 +1528,16 @@ fn find_files_on_sftp_server() {
     trust_host_key(&login).unwrap();
     let root = connect(login, "").unwrap();
     exercise_find(&root, &disk.0);
+}
+
+#[test]
+fn partial_files_kept_only_when_resumable() {
+    // A resumed transfer never removes what was there before.
+    assert!(keeps_partial(10, 0, true) && keeps_partial(10, 0, false));
+    // A new one: only after an error past KEEP_PARTIAL, never when cancelled.
+    assert!(keeps_partial(0, KEEP_PARTIAL, false));
+    assert!(!keeps_partial(0, KEEP_PARTIAL - 1, false));
+    assert!(!keeps_partial(0, KEEP_PARTIAL * 10, true));
 }
 
 #[test]
