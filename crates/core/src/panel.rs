@@ -432,8 +432,13 @@ impl Panel {
         if let Some((server, share)) = vfs::unc_share_parent(&self.path) {
             return Some(Nav::To { path: server, focus: Some(share) });
         }
-        // The share list of a server is the top (its `Path::parent` is `\`).
-        if vfs::unc_server_only(&self.path).is_some() {
+        // A server's share list: up to the Network list, cursor on the
+        // server (its `Path::parent` would be `\`).
+        if let Some(server) = vfs::unc_server_only(&self.path) {
+            return Some(Nav::To { path: vfs::network_path(), focus: Some(server.to_owned()) });
+        }
+        // The Network list is the top.
+        if vfs::is_network(&self.path) {
             return None;
         }
         let parent = self.path.parent()?.to_path_buf();
@@ -445,7 +450,7 @@ impl Panel {
         if let Some((key, remote)) = crate::remote::split(&self.path) {
             return (remote != "/").then(|| Nav::to(crate::remote::path_of(&key, "/")));
         }
-        if vfs::unc_server_only(&self.path).is_some() {
+        if vfs::is_net_listing(&self.path) {
             return None;
         }
         let root = self.path.ancestors().last()?;
@@ -569,9 +574,14 @@ impl Panel {
         self.focus_name(Some(name));
     }
 
-    /// Moves the cursor to `name`; if not found the cursor keeps its row.
+    /// Moves the cursor to `name` (else to a name differing only in case,
+    /// as `\\NAS` typed `\\nas`); if not found the cursor keeps its row.
     fn focus_name(&mut self, name: Option<&str>) {
-        if let Some(i) = name.and_then(|n| self.entries.iter().position(|e| e.name == n)) {
+        let at = |n: &str| {
+            let entries = &self.entries;
+            entries.iter().position(|e| e.name == n).or_else(|| entries.iter().position(|e| e.name.eq_ignore_ascii_case(n)))
+        };
+        if let Some(i) = name.and_then(at) {
             self.cursor = i;
         }
         self.set_cursor(self.cursor);
@@ -970,8 +980,10 @@ mod tests {
         };
         assert_eq!(up(r"\\nas\data\"), Some((PathBuf::from(r"\\nas"), Some("data".into()))));
         assert_eq!(up(r"\\nas\data\sub"), Some((PathBuf::from(r"\\nas\data\"), Some("sub".into()))));
-        assert_eq!(up(r"\\nas"), None);
+        assert_eq!(up(r"\\nas"), Some((vfs::network_path(), Some("nas".into()))));
+        assert_eq!(up("net:"), None);
         assert!(Panel::unlisted(r"\\nas").root_nav().is_none());
+        assert!(Panel::unlisted("net:").root_nav().is_none());
     }
 
     #[test]

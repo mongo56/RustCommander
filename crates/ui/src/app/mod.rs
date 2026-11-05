@@ -10,6 +10,7 @@ mod help;
 mod hotlist;
 mod hotlist_tree;
 mod markdown;
+mod network;
 mod palette;
 mod screen;
 mod attrib;
@@ -265,6 +266,8 @@ pub struct App {
     skipped_update: Option<String>,
     /// Quick view: the other panel's area previews the cursor entry (not saved).
     quick_view: Option<quick_view::QuickView>,
+    /// The computers of the Network list (`net:`) and the search running.
+    net: network::NetSearch,
 }
 
 /// A navigation whose target folder is being listed in the background.
@@ -554,6 +557,8 @@ pub enum Message {
     /// tabs had, the one found (it or its closest existing parent) and its
     /// entries.
     Restored(PathBuf, Result<(PathBuf, Vec<Entry>), String>),
+    /// The Network list: its button, the search's progress.
+    Net(network::NetMsg),
     Viewer(viewer::ViewerMsg),
     QuickView(quick_view::QvMsg),
     MultiRename(multi_rename::MrMsg),
@@ -715,6 +720,7 @@ impl App {
             update_notice: None,
             skipped_update: session.as_ref().and_then(|s| s.skipped_update.clone()),
             quick_view: None,
+            net: network::NetSearch::default(),
         };
         app.refresh_config();
         crate::startup::mark("config.toml read");
@@ -728,13 +734,16 @@ impl App {
             }
         }
         let tabs = app.restore_tabs();
+        // A tab restored on the Network list searches at once.
+        let net_shown = (0..2).any(|side| vfs::is_network(&app.panel(side).path));
+        let net = if net_shown { app.start_net_search() } else { Task::none() };
         let show = match app.placement {
             Some(p) if hidden_until_placed(&session) => restore_window(p),
             _ => Task::none(),
         };
         let check = app.startup_update_check();
         crate::startup::mark("App::new done");
-        (app, Task::batch([show, tabs, list_drives(), check]))
+        (app, Task::batch([show, tabs, list_drives(), check, net]))
     }
 
     pub fn theme(&self) -> Theme {
@@ -811,7 +820,7 @@ impl App {
         // (Archives and a server's share list aren't watched.)
         let mut dirs: Vec<PathBuf> = (0..2)
             .map(|side| self.panel(side).path.clone())
-            .filter(|p| !vfs::in_archive(p) && vfs::unc_server_only(p).is_none())
+            .filter(|p| !vfs::in_archive(p) && !vfs::is_net_listing(p))
             .collect();
         dirs.dedup();
         // And the settings folder, to apply `config.toml` edits right away.
@@ -1186,7 +1195,7 @@ impl App {
                 // those keep the Copy dialog.
                 let usable = !vfs::in_archive(&target)
                     && !remote::is_remote(&target)
-                    && vfs::unc_server_only(&target).is_none();
+                    && !vfs::is_net_listing(&target);
                 if drop_right && usable {
                     // Desktop drags can mix folders (the user's Desktop and
                     // the Public Desktop); the shell's data object takes one
@@ -1411,6 +1420,7 @@ impl App {
                 self.disk.borrow_mut().insert(key, (Instant::now(), space));
             }
             Message::Restored(path, result) => self.tab_restored(path, result),
+            Message::Net(msg) => return self.net_update(msg),
             Message::Extracted(result) => {
                 self.status = Some(match result.and_then(|p| launch(&p).map_err(|e| e.to_string())) {
                     Ok(msg) => (msg, Tone::Success),
@@ -1954,8 +1964,11 @@ impl App {
                 self.disk.borrow_mut().clear();
                 let path = self.panel(active).path.clone();
                 let labels = read_drive_labels(self.drives.clone());
-                return Task::batch([self.list_in_background(path.clone()), remote_space(&path), labels]);
+                // The Network list: search the network again.
+                let net = if vfs::is_network(&path) { self.start_net_search() } else { Task::none() };
+                return Task::batch([self.list_in_background(path.clone()), remote_space(&path), labels, net]);
             }
+            Network => return self.open_network(active),
             QuickFilter => {
                 if self.filter_edit == Some(active) {
                     self.filter_edit = None;
@@ -2693,7 +2706,7 @@ impl App {
         // The shell's drop menu can't take files inside archives.
         let in_archive = vfs::in_archive(&self.panel(drag.side).path)
             || vfs::in_archive(&target)
-            || vfs::unc_server_only(&target).is_some();
+            || vfs::is_net_listing(&target);
         if drag.right && !in_archive {
             let (folder, items) = self.shell_items(drag.side, drag.sources.clone());
             return self.right_drop(RightDrop { side: drag.side, sources: drag.sources, folder, items, target });
@@ -3046,8 +3059,8 @@ impl App {
     /// done, says so and returns true. `zip_ok`: it can be done in an archive
     /// that can be changed (rar is read-only).
     fn refuse_in_archive(&mut self, side: usize, what: &str, zip_ok: bool) -> bool {
-        if vfs::unc_server_only(&self.panel(side).path).is_some() {
-            self.info(format!("Can't {what} in a server's list of shares: open a share first"));
+        if let Some(place) = net_listing_name(&self.panel(side).path) {
+            self.info(format!("Can't {what} in {place}: open a share first"));
             return true;
         }
         if remote::is_remote(&self.panel(side).path) {
@@ -3209,6 +3222,10 @@ impl App {
     /// thread, one `Message::DirSize` each. Folders already counted (or
     /// being counted) are skipped.
     fn count_dirs(&mut self, side: usize, names: Vec<String>) -> Task<Message> {
+        // Computers have no size to count.
+        if vfs::is_network(&self.panel(side).path) {
+            return Task::none();
+        }
         let panel = self.panel_mut(side);
         let names: Vec<String> = names.into_iter().filter(|n| panel.start_dir_size(n)).collect();
         if names.is_empty() {
@@ -3341,8 +3358,12 @@ impl App {
             }
             Ok(Listed { file: None, entries }) => {
                 self.share_retry = None;
+                let was_network = vfs::is_network(&self.panel(side).path);
                 self.panel_mut(side).arrive(&nav, entries);
                 self.after_change();
+                if !was_network && vfs::is_network(&self.panel(side).path) {
+                    return self.net_arrived();
+                }
                 // Entering an encrypted archive asks for its password.
                 let path = self.panel(side).path.clone();
                 if self.dialog.is_none() && vfs::needs_password(&path) {
@@ -3604,6 +3625,7 @@ impl App {
     /// Reads the window position, then saves the session and exits
     /// (`Message::Quit`).
     fn quit(&self) -> Task<Message> {
+        self.net.cancel();
         window::get_oldest()
             .then(|id| match id {
                 Some(id) => window::run_with_handle(id, |h| rc_platform::window_placement(native_handle(&h))),
@@ -3657,6 +3679,10 @@ impl App {
         // A server: only what the last navigation fetched (never asks here).
         if let Some((key, _)) = remote::split(path) {
             return self.disk.borrow().get(Path::new(&key)).and_then(|(_, space)| *space);
+        }
+        // The Network list and a server's share list are on no volume.
+        if vfs::is_net_listing(path) {
+            return None;
         }
         let root = path.ancestors().last()?.to_path_buf();
         if let Some((at, space)) = self.disk.borrow().get(&root) {
@@ -3743,6 +3769,16 @@ fn is_modifier_key(key: Named) -> bool {
     )
 }
 
+/// What a listing that is no folder is called in messages: the Network
+/// list or a server's list of shares; `None` for folders.
+fn net_listing_name(path: &Path) -> Option<&'static str> {
+    if vfs::is_network(path) {
+        Some("the Network list")
+    } else {
+        vfs::unc_server_only(path).map(|_| "a server's list of shares")
+    }
+}
+
 /// Transfers involving archives or servers that can't be done: into a
 /// read-only archive, moving out of one, from a server into an archive, ...
 /// (Between servers is fine: each file goes through a temp file.)
@@ -3750,9 +3786,16 @@ fn archive_transfer_problem(is_move: bool, sources: &[PathBuf], target: &Path) -
     if vfs::unc_server_only(target).is_some() {
         return Some("Can't copy into a server's list of shares: open a share first");
     }
+    if vfs::is_network(target) {
+        return Some("Can't copy into the Network list: open a computer's share first");
+    }
     // A whole share (from `\\server`): the root has no name to copy it as, and moving would empty it.
     if sources.iter().any(|p| vfs::unc_share_parent(p).is_some()) {
         return Some("Can't copy or move a whole share: open it and select its files");
+    }
+    // A computer (from the Network list).
+    if sources.iter().any(|p| vfs::is_net_listing(p)) {
+        return Some("Can't copy or move a computer: open one of its shares and select its files");
     }
     let from_server = sources.iter().any(|p| remote::is_remote(p));
     match (from_server, remote::is_remote(target)) {
@@ -3870,6 +3913,9 @@ fn resolve_typed_path(raw: &str, base: &Path) -> PathBuf {
     if let Some(server) = vfs::unc_server_only(&path) {
         return vfs::server_path(server);
     }
+    if vfs::is_network(&path) {
+        return vfs::network_path();
+    }
     if raw.len() == 2 && raw.ends_with(':') {
         path.push(MAIN_SEPARATOR.to_string());
     }
@@ -3910,8 +3956,9 @@ fn list_nav_target(path: &Path, file_ok: bool) -> Listing {
 }
 
 fn list_subfolders(dir: &Path) -> Vec<String> {
-    if vfs::unc_server_only(dir).is_some() {
-        return vfs::list(dir, false).map(|es| es.into_iter().map(|e| e.name).collect()).unwrap_or_default();
+    if vfs::is_net_listing(dir) {
+        let entries = vfs::list(dir, false).unwrap_or_default().into_iter().filter(|e| !e.is_parent());
+        return entries.map(|e| e.name).collect();
     }
     let Ok(read) = std::fs::read_dir(dir) else { return Vec::new() };
     let mut names: Vec<String> = read
@@ -3928,6 +3975,9 @@ fn list_subfolders(dir: &Path) -> Vec<String> {
 fn normalize_lexically(path: &Path) -> PathBuf {
     if let Some(server) = vfs::unc_server_only(path) {
         return vfs::server_path(server);
+    }
+    if vfs::is_network(path) {
+        return vfs::network_path();
     }
     let mut out = PathBuf::new();
     for component in path.components() {
@@ -4000,7 +4050,7 @@ fn summarize(verb: &str, o: &Outcome) -> (String, Tone) {
 fn read_restored(path: &Path) -> Result<(PathBuf, Vec<Entry>), String> {
     let root = PathBuf::from(if cfg!(windows) { "C:\\" } else { "/" });
     path.ancestors()
-        .filter(|p| p.is_dir() || vfs::in_archive(p))
+        .filter(|p| p.is_dir() || vfs::in_archive(p) || vfs::is_net_listing(p))
         .map(Path::to_path_buf)
         .chain(rc_platform::home_dir())
         .chain([root])
@@ -4109,6 +4159,16 @@ mod tests {
         assert_eq!(resolve_typed_path(r"\\nas\", base), PathBuf::from(r"\\nas"));
         assert_eq!(normalize_lexically(Path::new(r"\\nas")), PathBuf::from(r"\\nas"));
         assert_eq!(resolve_typed_path(r"\\nas\data", base), PathBuf::from(r"\\nas\data"));
+        assert_eq!(resolve_typed_path("net:", base), vfs::network_path());
+        assert_eq!(resolve_typed_path(r"NET:\", base), vfs::network_path());
+        assert_eq!(normalize_lexically(Path::new(r"net:\")), vfs::network_path());
+        // Nothing goes into the Network list, and no computer can be copied.
+        let local_file = vec![PathBuf::from(r"C:\work\a.txt")];
+        assert!(archive_transfer_problem(false, &local_file, &vfs::network_path()).is_some());
+        assert!(archive_transfer_problem(false, &[PathBuf::from(r"\\nas")], base).is_some());
+        assert_eq!(net_listing_name(&vfs::network_path()), Some("the Network list"));
+        assert_eq!(net_listing_name(Path::new(r"\\nas")), Some("a server's list of shares"));
+        assert_eq!(net_listing_name(Path::new(r"\\nas\data")), None);
         // Nothing can be copied into the share list, nor a whole share out of it.
         let local = vec![PathBuf::from(r"C:\work\a.txt")];
         assert!(archive_transfer_problem(false, &local, Path::new(r"\\nas")).is_some());

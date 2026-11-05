@@ -329,6 +329,7 @@ impl App {
                 None => button,
             }
         })))
+        .push(self.network_button(side))
         .spacing(2);
 
         let width = self.panel_width(side);
@@ -354,6 +355,22 @@ impl App {
         .width(Length::Fill)
         .clip(true)
         .style(filled(theme::c().header))
+        .into()
+    }
+
+    /// The globe after the drive buttons: the Network list.
+    fn network_button(&self, side: usize) -> Element<'_, Message> {
+        let current = rc_core::vfs::is_net_listing(&self.panel(side).path);
+        let globe = image(super::network::globe_icon()).width(ICON).height(ICON);
+        let button = button(globe)
+            .on_press(Message::Net(super::network::NetMsg::Open(side)))
+            .padding([2, 6])
+            .style(theme::drive(current));
+        tooltip(
+            button,
+            container(text("Network").size(12)).padding([3, 8]).style(theme::drag_label),
+            tooltip::Position::Bottom,
+        )
         .into()
     }
 
@@ -392,6 +409,10 @@ impl App {
                                 format!("{}  \u{2014} branch view (Ctrl+B leaves)", rc_core::remote::display(&panel.path))
                             }
                             Some(what) => format!("{}  \u{2014} search results: {what}", rc_core::remote::display(&panel.path)),
+                            None if rc_core::vfs::is_network(&panel.path) => {
+                                let what = if self.net.searching() { "Searching the network\u{2026}" } else { "Network" };
+                                format!("{}  \u{2014} {what}", rc_core::vfs::NETWORK)
+                            }
                             None => rc_core::remote::display(&panel.path),
                         },
                         self.path_chars(side),

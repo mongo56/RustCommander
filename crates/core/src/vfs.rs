@@ -404,6 +404,53 @@ pub fn server_path(server: &str) -> PathBuf {
     PathBuf::from(format!(r"\\{server}"))
 }
 
+/// The pseudo path of the Network list (the computers found on the
+/// network). No file system path: one letter and a colon would be a drive,
+/// a colon can't be in a file name, and `net` is no server scheme
+/// (`remote::split`), so it can't clash with real, remote or archive paths.
+pub const NETWORK: &str = "net:";
+
+/// The path of the Network list.
+pub fn network_path() -> PathBuf {
+    PathBuf::from(NETWORK)
+}
+
+/// True for the Network list's path (`net:`, also with a trailing `\` or
+/// `/`, any case).
+pub fn is_network(path: &Path) -> bool {
+    path.to_str().is_some_and(|s| s.strip_suffix(['\\', '/']).unwrap_or(s).eq_ignore_ascii_case(NETWORK))
+}
+
+/// True for a listing that is no folder: the Network list or a server's
+/// list of shares (`\\server`). Nothing can be created, copied into or
+/// watched there.
+pub fn is_net_listing(path: &Path) -> bool {
+    is_network(path) || unc_server_only(path).is_some()
+}
+
+/// The computers the Network list shows (by UNC name), set by the UI as a
+/// search finds them.
+static NETWORK_HOSTS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Replaces the computers the Network list shows.
+pub fn set_network_hosts(names: Vec<String>) {
+    *NETWORK_HOSTS.lock().unwrap_or_else(|e| e.into_inner()) = names;
+}
+
+/// The Network list: one folder entry (`\\name`) per known computer.
+fn list_network() -> Vec<Entry> {
+    let names = NETWORK_HOSTS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let entry = |name: String| Entry {
+        path: server_path(&name),
+        name,
+        kind: EntryKind::Dir,
+        size: 0,
+        modified: None,
+        hidden: false,
+    };
+    names.into_iter().map(entry).collect()
+}
+
 /// For the root of a share (`\\server\share`, `\\server\share\`): the
 /// server's share list (`\\server`) and the share's name, which is where `..`
 /// leads (Windows paths see the share root as having no parent).
@@ -442,13 +489,18 @@ fn list_shares(server: &str) -> io::Result<Vec<Entry>> {
 
 /// Lists the folder `path` wherever it lives (local folder or a folder in
 /// an archive), leaving out hidden entries unless `show_hidden`. A server
-/// alone (`\\server`) lists its shares.
+/// alone (`\\server`) lists its shares, with `..` leading to the Network
+/// list (`net:`), which lists the computers known (see [`set_network_hosts`]).
 pub fn list(path: &Path, show_hidden: bool) -> io::Result<Vec<Entry>> {
+    if is_network(path) {
+        return Ok(list_network());
+    }
     if let Some(server) = unc_server_only(path).filter(|_| cfg!(windows)) {
         let mut entries = list_shares(server)?;
         if !show_hidden {
             entries.retain(|e| !e.hidden);
         }
+        entries.insert(0, Entry::parent(network_path()));
         return Ok(entries);
     }
     let vfs = match split_archive(path) {
@@ -1334,6 +1386,34 @@ pub(crate) mod tests {
         assert_eq!(only(r"\nas"), None);
         assert_eq!(only(r"C:\nas"), None);
         assert_eq!(server_path("nas"), PathBuf::from(r"\\nas"));
+    }
+
+    #[test]
+    fn network_list_path() {
+        let net = |s: &str| is_network(Path::new(s));
+        assert!(net("net:") && net("NET:") && net(r"net:\") && net("net:/"));
+        assert!(is_network(&network_path()));
+        assert!(!net("net") && !net(r"net:\x") && !net(r"C:\net:") && !net(r"\\net") && !net("n:"));
+        assert!(!net("sftp://net"));
+        // No server path, archive or share list.
+        assert!(crate::remote::split(&network_path()).is_none());
+        assert!(split_archive(&network_path()).is_none());
+        assert!(unc_server_only(&network_path()).is_none());
+        assert!(is_net_listing(&network_path()) && is_net_listing(Path::new(r"\\nas")));
+        assert!(!is_net_listing(Path::new(r"\\nas\data")) && !is_net_listing(Path::new(r"C:\")));
+        assert!(!is_virtual(&network_path()) && !in_archive(&network_path()));
+    }
+
+    #[test]
+    fn network_list_shows_the_known_hosts() {
+        set_network_hosts(vec!["NAS".into(), "pc".into()]);
+        let listed = list(&network_path(), false).unwrap();
+        let got: Vec<(String, PathBuf, bool)> = listed.into_iter().map(|e| (e.is_dir(), e.name, e.path)).map(|(d, n, p)| (n, p, d)).collect();
+        assert_eq!(
+            got,
+            vec![("NAS".into(), PathBuf::from(r"\\NAS"), true), ("pc".into(), PathBuf::from(r"\\pc"), true)]
+        );
+        set_network_hosts(Vec::new());
     }
 
     #[cfg(windows)]

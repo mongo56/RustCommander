@@ -132,6 +132,8 @@ commands! {
             "Connect to a server (SFTP, FTP, FTPS): saved connections, new, edit, delete", "Connect";
         /// Close the connection of the panel's server (Ctrl+Shift+F).
         Disconnect => "cm_FtpDisconnect", "Close the connection of the server shown in the panel", "Disconn";
+        /// The Network list in this panel (computers found on the network), searching again.
+        Network => "cm_Network", "Show computers and shares on the network", "Network";
         SelectAll => "cm_SelectAll", "Select all entries", "SelAll";
         DeselectAll => "cm_ClearAll", "Clear the selection", "SelNone";
         Refresh => "cm_RereadSource", "Reread the folder", "Refresh";
