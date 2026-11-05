@@ -47,6 +47,9 @@ const PAD: f32 = 6.0;
 const FOOTER_H: f32 = 22.0;
 /// Width of the sidebar (Files, the terminals, +) incl. its separator line.
 const SIDE_W: f32 = 160.0;
+/// Width of the sidebar while the panels are shown: collapsed to short
+/// entries (Files, ">_1", ">_2", ..., +) with the details in tooltips.
+const SIDE_W_COLLAPSED: f32 = 44.0;
 /// Characters a sidebar entry's label is cut to (it is clipped too).
 const LABEL_CHARS: usize = 18;
 /// How often `poll_info` looks at the shells.
@@ -1338,9 +1341,16 @@ impl App {
     }
 
     /// Width taken by the terminal sidebar: only over the panels and the
-    /// terminals, and only while a terminal exists.
+    /// terminals, and only while a terminal exists; collapsed over the panels.
     pub(super) fn term_side_w(&self) -> f32 {
-        if !self.terms.is_empty() && matches!(self.screen, None | Some(Screen::Term(_))) { SIDE_W } else { 0.0 }
+        if self.terms.is_empty() {
+            return 0.0;
+        }
+        match self.screen {
+            None => SIDE_W_COLLAPSED,
+            Some(Screen::Term(_)) => SIDE_W,
+            _ => 0.0,
+        }
     }
 
     /// Window width left of the sidebar: what the panels share.
@@ -1758,20 +1768,23 @@ impl App {
     pub(super) fn term_side_view(&self) -> Element<'_, Message> {
         let c = theme::c();
         let shown = self.screen.term().copied();
+        // Over the panels only short entries fit; the x is left out (middle-click still closes).
+        let collapsed = self.screen.is_none();
         let entry = |label: String, tip: Option<String>, current: bool, press: TermMsg, close: Option<u64>| {
             let files = close.is_none();
             let label = if files {
                 text(label).size(13).font(Font { weight: Weight::Bold, ..Font::DEFAULT })
             } else {
-                text(format!(">_ {label}")).size(12)
+                text(label).size(12)
             };
+            let label = if collapsed { label.width(Length::Fill).center() } else { label };
             let name = button(label.wrapping(Wrapping::None))
                 .on_press(Message::Term(press))
                 .width(Length::Fill)
-                .padding([4, 8])
+                .padding(if collapsed { [4, 0] } else { [4, 8] })
                 .style(theme::drive(current));
             let mut line = Row::new().align_y(iced::Alignment::Center).push(name);
-            if let Some(id) = close {
+            if let Some(id) = close.filter(|_| !collapsed) {
                 line = line.push(
                     button(text("\u{d7}").size(13))
                         .on_press(Message::Term(TermMsg::Close(id)))
@@ -1796,13 +1809,19 @@ impl App {
             line
         };
         let mut list = Column::new().spacing(2).width(Length::Fill);
-        list = list.push(entry("Files".to_owned(), None, shown.is_none(), TermMsg::Show(None), None));
+        let files = if collapsed { "F" } else { "Files" };
+        list = list.push(entry(files.to_owned(), None, shown.is_none(), TermMsg::Show(None), None));
         list = list.push(
             container(Space::new(Length::Fill, Length::Fixed(1.0))).width(Length::Fill).style(filled(c.border)),
         );
-        for t in &self.terms {
-            let label = term_label(&t.dir, t.program.as_deref(), LABEL_CHARS);
+        for (i, t) in self.terms.iter().enumerate() {
+            let full = term_label(&t.dir, t.program.as_deref(), LABEL_CHARS);
+            let label = if collapsed { format!(">_{}", i + 1) } else { format!(">_ {full}") };
             let mut tip = t.dir.display().to_string();
+            if collapsed {
+                tip = format!("{}: {full}
+{tip}", i + 1);
+            }
             if let Some(program) = &t.program {
                 tip.push_str(&format!("\nRunning: {program}"));
             }
@@ -1820,7 +1839,7 @@ impl App {
         );
         let line = container(Space::new(Length::Fixed(1.0), Length::Fill)).style(filled(c.border));
         row![line, container(list).padding(4).width(Length::Fill).height(Length::Fill).style(filled(c.bg))]
-            .width(Length::Fixed(SIDE_W))
+            .width(Length::Fixed(self.term_side_w()))
             .height(Length::Fill)
             .into()
     }
