@@ -6,6 +6,7 @@
 pub mod command;
 pub mod compare;
 pub mod diff;
+pub mod disk_usage;
 pub mod entry;
 pub mod format;
 pub mod fs;
