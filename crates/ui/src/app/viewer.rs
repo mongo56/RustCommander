@@ -14,12 +14,12 @@ use rc_core::viewer::{self, Document, Hit, Mode, Part, Selection, COPY_LIMIT, HE
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-const LINE_H: f32 = 18.0;
+pub(super) const LINE_H: f32 = 18.0;
 const FONT_SIZE: f32 = 13.0;
 /// Width of a monospace character at `FONT_SIZE`, measured once with the
 /// font the system resolves `Font::MONOSPACE` to (Cascadia Mono, Consolas,
 /// Courier New … differ), so columns and mouse positions match the text.
-fn char_w() -> f32 {
+pub(super) fn char_w() -> f32 {
     use iced::advanced::text::Paragraph as _;
     static W: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
     *W.get_or_init(|| {
@@ -71,7 +71,7 @@ enum Step {
 }
 
 /// The file's extension names an image format (`load_sync` tries to decode it).
-fn is_image_name(path: &Path) -> bool {
+pub(super) fn is_image_name(path: &Path) -> bool {
     ::image::ImageFormat::from_path(path).is_ok()
 }
 
@@ -304,7 +304,7 @@ fn load(path: PathBuf, seq: u64) -> Task<Message> {
 }
 
 /// `doc` (read from `path`) is a Markdown file small enough to render.
-fn renders_markdown(path: &Path, doc: &Document) -> bool {
+pub(super) fn renders_markdown(path: &Path, doc: &Document) -> bool {
     markdown::is_markdown(path) && !doc.binary && doc.is_whole() && doc.size <= markdown::MD_LIMIT
 }
 
@@ -313,19 +313,26 @@ fn load_sync(path: &Path) -> Result<Loaded, String> {
     let local = rc_core::vfs::extract_temp(path).map_err(|e| e.to_string())?;
     let path = local.as_path();
     if is_image_name(path) {
-        if let Ok(img) = ::image::open(path) {
-            let img = if img.width() > MAX_IMAGE_SIDE || img.height() > MAX_IMAGE_SIDE {
-                img.resize(MAX_IMAGE_SIDE, MAX_IMAGE_SIDE, ::image::imageops::FilterType::Triangle)
-            } else {
-                img
-            };
-            let rgba = img.into_rgba8();
-            let (width, height) = rgba.dimensions();
-            let handle = image::Handle::from_rgba(width, height, rgba.into_raw());
-            return Ok(Loaded::Image { handle, width, height });
+        if let Some(img) = decode_image(path, MAX_IMAGE_SIDE) {
+            return Ok(img);
         }
     }
     Document::open(path).map(|d| Loaded::Doc(Arc::new(d))).map_err(|e| e.to_string())
+}
+
+/// The image file `path` decoded, scaled down to at most `max_side`
+/// pixels per side; `None` if it doesn't decode.
+pub(super) fn decode_image(path: &Path, max_side: u32) -> Option<Loaded> {
+    let img = ::image::open(path).ok()?;
+    let img = if img.width() > max_side || img.height() > max_side {
+        img.resize(max_side, max_side, ::image::imageops::FilterType::Triangle)
+    } else {
+        img
+    };
+    let rgba = img.into_rgba8();
+    let (width, height) = rgba.dimensions();
+    let handle = image::Handle::from_rgba(width, height, rgba.into_raw());
+    Some(Loaded::Image { handle, width, height })
 }
 
 impl App {
@@ -1675,7 +1682,7 @@ fn text_rows(doc: &Document, v: &Viewer, cols: usize, max: usize) -> Vec<TextRow
 
 /// A monospace viewer row: plain text, or spans when parts are selected or
 /// find hits.
-fn row_text<'a>(shown: String, sel: &[(usize, usize)], hits: &[(usize, usize)]) -> Element<'a, Message> {
+pub(super) fn row_text<'a>(shown: String, sel: &[(usize, usize)], hits: &[(usize, usize)]) -> Element<'a, Message> {
     if sel.is_empty() && hits.is_empty() {
         text(if shown.is_empty() { " ".to_string() } else { shown })
             .font(Font::MONOSPACE)

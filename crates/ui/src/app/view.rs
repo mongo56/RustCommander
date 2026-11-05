@@ -217,6 +217,9 @@ impl App {
     }
 
     fn side_view(&self, side: usize) -> Element<'_, Message> {
+        if let Some(q) = self.quick_view.as_ref().filter(|q| q.side == side) {
+            return self.quick_view_view(q);
+        }
         let panel = self.panel(side);
         let active = self.panel_focused(side);
         let drop_here = self

@@ -128,6 +128,17 @@ impl Document {
         Ok(Self::build(bytes, size, base, want, encoding))
     }
 
+    /// Reads only the first `len` bytes of `path` (quick view): the whole
+    /// file when it is that small, else a window at its start.
+    pub fn open_head(path: &Path, len: u64) -> io::Result<Self> {
+        let file = File::open(path)?;
+        let size = file.metadata()?.len();
+        let mut bytes = Vec::with_capacity(size.min(len) as usize);
+        file.take(len).read_to_end(&mut bytes)?;
+        let size = size.max(bytes.len() as u64);
+        Ok(Self::build(bytes, size, 0, 0, None))
+    }
+
     /// The whole of `bytes` as a file (tests, small buffers).
     pub fn from_bytes(bytes: Vec<u8>) -> Self {
         let size = bytes.len() as u64;
@@ -800,6 +811,24 @@ mod tests {
         assert_eq!(d.encoding, Encoding::Latin1);
         assert_eq!(d.byte_of(d.line_start(1)), 3);
         assert_eq!(d.row_of(Mode::Hex, 3), 0);
+    }
+
+    #[test]
+    fn opens_only_the_head() {
+        let path = std::env::temp_dir().join(format!("rc-viewer-head-{}.txt", std::process::id()));
+        let body: String = (0..1000).map(|i| format!("line {i:07}
+")).collect();
+        std::fs::write(&path, &body).unwrap();
+        let head = Document::open_head(&path, 13 * 10 + 5).unwrap();
+        assert_eq!(head.size, body.len() as u64);
+        assert!(head.has_after() && !head.has_before());
+        // The line cut by the end is left out.
+        assert_eq!(head.rows(Mode::Text), 10);
+        assert_eq!(head.line(9), "line 0000009");
+        let whole = Document::open_head(&path, 1 << 20).unwrap();
+        assert!(whole.is_whole());
+        assert_eq!(whole.rows(Mode::Text), 1000);
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]

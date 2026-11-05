@@ -17,6 +17,7 @@ mod share_login;
 mod checksum;
 mod split;
 mod pack;
+mod quick_view;
 mod find_files;
 mod branch;
 mod git;
@@ -252,6 +253,8 @@ pub struct App {
     update_notice: Option<(String, crate::update::Release)>,
     /// Version the user chose to skip in the update dialog (session).
     skipped_update: Option<String>,
+    /// Quick view: the other panel's area previews the cursor entry (not saved).
+    quick_view: Option<quick_view::QuickView>,
 }
 
 /// A navigation whose target folder is being listed in the background.
@@ -538,6 +541,7 @@ pub enum Message {
     /// entries.
     Restored(PathBuf, Result<(PathBuf, Vec<Entry>), String>),
     Viewer(viewer::ViewerMsg),
+    QuickView(quick_view::QvMsg),
     MultiRename(multi_rename::MrMsg),
     FileDiff(file_diff::DiffMsg),
     Find(find_files::FindMsg),
@@ -692,6 +696,7 @@ impl App {
             archive_edits: archive_edit::ArchiveEdits::default(),
             update_notice: None,
             skipped_update: session.as_ref().and_then(|s| s.skipped_update.clone()),
+            quick_view: None,
         };
         app.refresh_config();
         crate::startup::mark("config.toml read");
@@ -821,10 +826,11 @@ impl App {
         let task = self.handle(message);
         let thumbs = self.pump_thumbs();
         let git = self.git_check(changed.as_deref());
+        let quick = self.quick_view_check();
         if self.deferred.is_empty() {
-            return Task::batch([task, thumbs, git]);
+            return Task::batch([task, thumbs, git, quick]);
         }
-        Task::batch([task, thumbs, git].into_iter().chain(self.deferred.drain(..)))
+        Task::batch([task, thumbs, git, quick].into_iter().chain(self.deferred.drain(..)))
     }
 
     fn handle(&mut self, message: Message) -> Task<Message> {
@@ -1400,6 +1406,7 @@ impl App {
                 Err(e) => self.error(e),
             },
             Message::Viewer(msg) => return self.viewer_update(msg),
+            Message::QuickView(msg) => return self.quick_view_update(msg),
             Message::MultiRename(msg) => return self.multi_rename_update(msg),
             Message::FileDiff(msg) => return self.file_diff_update(msg),
             Message::Find(msg) => return self.find_update(msg),
@@ -1788,6 +1795,7 @@ impl App {
         match cmd {
             Quit => return self.request_quit(),
             View => return self.open_viewer(),
+            QuickView => self.toggle_quick_view(),
             MultiRename => return self.open_multi_rename(),
             CompareFiles => return self.open_file_diff(),
             FindFiles => return self.open_find(),
@@ -1831,6 +1839,13 @@ impl App {
                 return self.open_dialog(Dialog::EditNew { input });
             }
             SwitchPanel => {
+                // Quick view keeps the focus off the preview (only the tree takes it).
+                if self.quick_view.is_some() {
+                    if self.tree_visible() {
+                        self.tree.focused = !self.tree.focused;
+                    }
+                    return Task::none();
+                }
                 self.switch_focus();
                 return Task::none();
             }
