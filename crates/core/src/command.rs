@@ -107,6 +107,10 @@ commands! {
             "Compare folders with options (by content, ignore dates, subfolders)", "CmpDirs";
         /// Side-by-side diff of two files (Alt+F2).
         CompareFiles => "cm_CompareFilesByContent", "Compare two files by content, side by side", "CmpFiles";
+        /// SHA-256 of the selected files, with a dialog to copy or save them.
+        CalcChecksum => "cm_CalcChecksum", "Calculate the SHA-256 checksum of the selected files (copy or save as .sha256)", "Checksum";
+        /// Check the files listed in the .sha256 file under the cursor.
+        VerifyChecksum => "cm_VerifyChecksum", "Verify the files listed in the .sha256 file under the cursor", "Verify";
         /// Find files by name and contents (Ctrl+F).
         FindFiles => "cm_SearchFor", "Find files by name and contents", "Find";
         /// What takes up space in a folder, as a tree (Alt+Shift+F7).

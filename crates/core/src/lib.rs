@@ -3,6 +3,7 @@
 //! Nothing in here knows about iced (or any other UI toolkit). The UI crate
 //! translates input into [`Command`]s and renders [`Panel`] state.
 
+pub mod checksum;
 pub mod command;
 pub mod compare;
 pub mod diff;

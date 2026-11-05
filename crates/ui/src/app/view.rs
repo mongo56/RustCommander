@@ -786,6 +786,7 @@ impl App {
             Dialog::Palette(palette) => return self.palette_view(palette),
             Dialog::Compare { opts } => return compare_view(opts, self.dialog_focus.unwrap_or(1)),
             Dialog::Update(d) => return self.update_view(d),
+            Dialog::Checksum(d) => return self.checksum_view(d),
             Dialog::HotEdit { dir, name, comment, .. } => {
                 return self.hot_edit_view(dir, name, comment, self.dialog_focus.unwrap_or(1));
             }
@@ -872,7 +873,7 @@ impl App {
                 None,
                 "Remove",
             ),
-            Dialog::Hotlist(_) | Dialog::History { .. } | Dialog::Palette(_) | Dialog::Compare { .. } | Dialog::Update(_) | Dialog::HotEdit { .. } => {
+            Dialog::Hotlist(_) | Dialog::History { .. } | Dialog::Palette(_) | Dialog::Compare { .. } | Dialog::Update(_) | Dialog::Checksum(_) | Dialog::HotEdit { .. } => {
                 unreachable!("drawn above")
             }
         };

@@ -12,6 +12,7 @@ mod hotlist_tree;
 mod markdown;
 mod palette;
 mod screen;
+mod checksum;
 mod find_files;
 mod multi_rename;
 mod settings;
@@ -292,6 +293,8 @@ enum Dialog {
     HotEdit { path: Vec<usize>, dir: String, name: String, comment: String, back: Option<(Vec<usize>, usize)>, field: u8 },
     /// Check for updates: result, offer, download progress.
     Update(update::UpdateDialog),
+    /// SHA-256 calculation / verification (`checksum.rs`).
+    Checksum(checksum::ChecksumDialog),
     /// Closing terminal `id` while `program` runs in it.
     CloseTerm { id: u64, program: String },
     /// Quitting while terminals run.
@@ -515,6 +518,7 @@ pub enum Message {
     Connect(connect::ConnectMsg),
     Settings(settings::SettingsMsg),
     Update(update::UpdateMsg),
+    Checksum(checksum::ChecksumMsg),
     /// Background listing for a pending navigation: (side, seq, listing).
     Navigated(usize, u64, Listing),
     /// A file inside an archive was extracted to a temp copy to be opened.
@@ -1357,6 +1361,7 @@ impl App {
             Message::Connect(msg) => return self.connect_update(msg),
             Message::Settings(msg) => return self.settings_update(msg),
             Message::Update(msg) => return self.update_msg(msg),
+            Message::Checksum(msg) => return self.checksum_msg(msg),
             Message::ArchiveEdit(msg) => return self.archive_edit_update(msg),
             Message::Navigated(side, seq, result) => {
                 let current = self.sides[side].current;
@@ -1499,6 +1504,12 @@ impl App {
                 return Task::none();
             }
             return self.update_key(named, mods.shift());
+        }
+        if let Some(Dialog::Checksum(_)) = self.dialog {
+            if named.is_some_and(is_modifier_key) || captured {
+                return Task::none();
+            }
+            return self.checksum_key(named, mods.shift());
         }
         if let Some(Dialog::Compare { opts }) = &mut self.dialog {
             let option = match text.as_deref().map(str::to_ascii_lowercase).as_deref() {
@@ -1700,6 +1711,8 @@ impl App {
             MultiRename => return self.open_multi_rename(),
             CompareFiles => return self.open_file_diff(),
             FindFiles => return self.open_find(),
+            CalcChecksum => return self.calc_checksum(),
+            VerifyChecksum => return self.verify_checksum(),
             DiskUsage => return self.open_disk_usage(),
             Connect => return self.open_connect(),
             Disconnect => return self.disconnect(),
@@ -2468,6 +2481,7 @@ impl App {
             }
             // Its buttons send their own messages.
             Dialog::Update(d) => self.dialog = Some(Dialog::Update(d)),
+            Dialog::Checksum(d) => self.dialog = Some(Dialog::Checksum(d)),
             Dialog::Compare { opts } => {
                 let changed = self.compare_opts != opts;
                 self.compare_opts = opts;

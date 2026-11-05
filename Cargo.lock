@@ -4318,6 +4318,7 @@ dependencies = [
  "rustls",
  "rustls-native-certs",
  "sevenz-rust2",
+ "sha2",
  "similar",
  "suppaftp",
  "tar",
