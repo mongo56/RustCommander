@@ -284,6 +284,13 @@ impl Session for Sftp {
         let sftp = &self.sftp;
         block(IO_TIMEOUT, ".", async { sftp.canonicalize(".").await.map_err(|e| sftp_err(".", e)) })
     }
+
+    fn free_space(&mut self, path: &str) -> io::Result<Option<(u64, u64)>> {
+        let sftp = &self.sftp;
+        let info = block(IO_TIMEOUT, path, async { sftp.fs_info(path).await.map_err(|e| sftp_err(path, e)) })?;
+        // `blocks_avail` is what an unprivileged user can use (like `df`).
+        Ok(info.map(|v| (v.blocks_avail.saturating_mul(v.fragment_size), v.blocks.saturating_mul(v.fragment_size))))
+    }
 }
 
 impl Drop for Sftp {

@@ -278,6 +278,11 @@ trait Session: Send {
     fn rename(&mut self, from: &str, to: &str) -> io::Result<()>;
     /// The folder the server puts us in after logging in.
     fn home(&mut self) -> io::Result<String>;
+    /// (free, total) bytes of the file system holding `path`; `None` if the
+    /// protocol or server can't tell (FTP, SFTP without `statvfs@openssh.com`).
+    fn free_space(&mut self, _path: &str) -> io::Result<Option<(u64, u64)>> {
+        Ok(None)
+    }
 }
 
 fn open_session(login: &Login) -> io::Result<Box<dyn Session>> {
@@ -348,6 +353,15 @@ pub fn is_connected(path: &Path) -> bool {
 /// The login of the connected server of `path` (to reconnect with).
 pub fn login_of(path: &Path) -> Option<Login> {
     connection(path).ok().map(|c| c.login.clone())
+}
+
+/// (free, total) bytes on the server file system holding the remote `path`.
+/// `None` when the server can't tell or anything fails. Blocking (a request
+/// to the server): call it on a worker thread.
+pub fn free_space(path: &Path) -> Option<(u64, u64)> {
+    let conn = connection(path).ok()?;
+    let remote = conn.remote(path).ok()?;
+    conn.with(|s| s.free_space(&remote)).ok().flatten().filter(|&(_, total)| total > 0)
 }
 
 fn connection(path: &Path) -> io::Result<Arc<Connection>> {

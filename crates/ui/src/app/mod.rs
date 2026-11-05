@@ -509,6 +509,9 @@ pub enum Message {
     ArchiveEdit(archive_edit::EditMsg),
     /// Subfolders of a folder, for path bar suggestions.
     Subfolders(PathBuf, Vec<String>),
+    /// Free/total space of a server (its key), read after a navigation;
+    /// `None` when the server can't tell.
+    RemoteSpace(PathBuf, Option<(u64, u64)>),
     /// A folder size: (folder listed, entry name, size).
     DirSize(PathBuf, String, u64),
     /// A background compare finished (`None` = cancelled).
@@ -1255,6 +1258,9 @@ impl App {
                 return self.list_in_background(path);
             }
             Message::Listed(path, seq, result) => self.apply_listing(path, seq, result),
+            Message::RemoteSpace(key, space) => {
+                self.disk.borrow_mut().insert(key, (Instant::now(), space));
+            }
             Message::Restored(path, result) => self.tab_restored(path, result),
             Message::Extracted(result) => {
                 self.status = Some(match result.and_then(|p| launch(&p).map_err(|e| e.to_string())) {
@@ -1727,7 +1733,7 @@ impl App {
                 self.drives = rc_platform::roots();
                 self.disk.borrow_mut().clear();
                 let path = self.panel(active).path.clone();
-                return self.list_in_background(path);
+                return Task::batch([self.list_in_background(path.clone()), remote_space(&path)]);
             }
             QuickFilter => {
                 if self.filter_edit == Some(active) {
@@ -2744,6 +2750,10 @@ impl App {
                     self.panel_mut(side).deselect_all();
                 }
                 self.disk.borrow_mut().clear();
+                for side in 0..2 {
+                    let task = remote_space(&self.panel(side).path);
+                    self.deferred.push(task);
+                }
                 self.reload_panels();
                 if let Some((side, name)) = job.focus.filter(|_| outcome.errors.is_empty()) {
                     if remote::is_remote(&self.panel(side).path) {
@@ -3085,7 +3095,7 @@ impl App {
                 if self.dialog.is_none() && vfs::needs_password(&path) {
                     return self.ask_password(path, None);
                 }
-                Task::none()
+                remote_space(&path)
             }
             Err(e) if e.contains(vfs::PASSWORD_REQUIRED) && self.dialog.is_none() => {
                 match self.panel(side).nav_target(&nav) {
@@ -3355,6 +3365,10 @@ impl App {
 
     /// (free, total) for the volume holding `path`, cached for a few seconds.
     fn disk_space(&self, path: &Path) -> Option<(u64, u64)> {
+        // A server: only what the last navigation fetched (never asks here).
+        if let Some((key, _)) = remote::split(path) {
+            return self.disk.borrow().get(Path::new(&key)).and_then(|(_, space)| *space);
+        }
         let root = path.ancestors().last()?.to_path_buf();
         if let Some((at, space)) = self.disk.borrow().get(&root) {
             if at.elapsed() < Duration::from_secs(5) {
@@ -3365,6 +3379,23 @@ impl App {
         self.disk.borrow_mut().insert(root, (Instant::now(), space));
         space
     }
+}
+
+/// Reads the free space of the server holding `path` on a worker thread
+/// (`Message::RemoteSpace`); nothing to do for a local path.
+fn remote_space(path: &Path) -> Task<Message> {
+    let Some((key, _)) = remote::split(path) else { return Task::none() };
+    let path = path.to_path_buf();
+    Task::perform(
+        async move {
+            let (tx, rx) = iced::futures::channel::oneshot::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(remote::free_space(&path));
+            });
+            rx.await.ok().flatten()
+        },
+        move |space| Message::RemoteSpace(PathBuf::from(&key), space),
+    )
 }
 
 /// Names of the folders directly inside `dir`.

@@ -232,6 +232,8 @@ fn ftp_against_local_server() {
     assert_eq!(display(&root), format!("ftp://tester@127.0.0.1:{port}/"));
     assert!(is_connected(&root));
     exercise(&root, &disk.0);
+    // FTP has no way to ask for free space.
+    assert_eq!(free_space(&root), None);
 
     // Disconnected: listings fail; reconnecting starts in the given folder.
     assert!(disconnect(&root));
@@ -264,7 +266,11 @@ fn ftp_connection_refused_fails_fast() {
 mod sftp_server {
     use russh::server::{Auth, Msg, Session};
     use russh::{Channel, ChannelId};
-    use russh_sftp::protocol::{Attrs, Data, File as SftpFile, FileAttributes, Handle, Name, OpenFlags, Status, StatusCode};
+    use russh_sftp::extensions::{self, Statvfs};
+    use russh_sftp::protocol::{
+        Attrs, Data, ExtendedReply, File as SftpFile, FileAttributes, Handle, Name, OpenFlags, Packet, Status, StatusCode,
+        Version,
+    };
     use std::collections::HashMap;
     use std::fs::{self, File};
     use std::io::{Read, Seek, SeekFrom, Write};
@@ -274,6 +280,8 @@ mod sftp_server {
 
     pub const USER: &str = "tester";
     pub const PASSWORD: &str = "secret";
+    /// A file of this name in the served folder turns the statvfs extension off.
+    pub const NO_STATVFS: &str = ".no-statvfs";
 
     pub fn host_key(seed: u8) -> russh::keys::PrivateKey {
         let pair = russh::keys::ssh_key::private::Ed25519Keypair::from_seed(&[seed; 32]);
@@ -369,6 +377,35 @@ mod sftp_server {
 
         fn unimplemented(&self) -> Self::Error {
             StatusCode::OpUnsupported
+        }
+
+        async fn init(&mut self, _: u32, _: HashMap<String, String>) -> Result<Version, Self::Error> {
+            let mut version = Version::new();
+            if !self.root.join(NO_STATVFS).exists() {
+                version.extensions.insert(extensions::STATVFS.into(), "2".into());
+            }
+            Ok(version)
+        }
+
+        async fn extended(&mut self, id: u32, request: String, _: Vec<u8>) -> Result<Packet, Self::Error> {
+            if request != extensions::STATVFS {
+                return Err(StatusCode::OpUnsupported);
+            }
+            let info = Statvfs {
+                block_size: 4096,
+                fragment_size: 4096,
+                blocks: 1000,
+                blocks_free: 300,
+                blocks_avail: 250,
+                inodes: 0,
+                inodes_free: 0,
+                inodes_avail: 0,
+                fs_id: 1,
+                flags: 0,
+                name_max: 255,
+            };
+            let data = russh_sftp::ser::to_bytes(&info).map_err(|_| StatusCode::Failure)?.to_vec();
+            Ok(Packet::ExtendedReply(ExtendedReply { id, data }))
         }
 
         async fn realpath(&mut self, id: u32, path: String) -> Result<Name, Self::Error> {
@@ -540,6 +577,26 @@ fn sftp_against_local_server() {
     let root = connect(login.clone(), "").unwrap();
     assert_eq!(display(&root), format!("sftp://tester@127.0.0.1:{port}/"));
     exercise(&root, &disk.0);
+    // The test server answers statvfs with fixed numbers: 4096-byte blocks,
+    // 1000 in all, 250 free for users (and 300 free for root).
+    assert_eq!(free_space(&root), Some((250 * 4096, 1000 * 4096)));
+    assert_eq!(free_space(&path_of("sftp://tester@127.0.0.1:1", "/")), None, "not connected");
+    assert!(disconnect(&root));
+}
+
+#[test]
+fn sftp_without_statvfs_shows_no_free_space() {
+    let _settings = settings();
+    let disk = TempDir::new("sftp-nostatvfs");
+    let port = start_sftp(disk.0.clone(), 5);
+    let login = sftp_login(port, sftp_server::PASSWORD);
+    // First contact fails but remembers the key to trust.
+    connect(login.clone(), "").unwrap_err();
+    trust_host_key(&login).unwrap();
+    // This marker file makes the test server leave statvfs out of its extensions.
+    fs::write(disk.0.join(sftp_server::NO_STATVFS), "").unwrap();
+    let root = connect(login, "").unwrap();
+    assert_eq!(free_space(&root), None);
     assert!(disconnect(&root));
 }
 
