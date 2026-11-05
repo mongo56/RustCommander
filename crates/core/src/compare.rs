@@ -161,7 +161,7 @@ fn dirs_differ(a: &Path, b: &Path, opts: &CompareOptions, cancel: &AtomicBool) -
 
 /// Byte-by-byte comparison; read errors count as different, `None` when
 /// cancelled.
-fn same_content(a: &Path, b: &Path, cancel: &AtomicBool) -> Option<bool> {
+pub(crate) fn same_content(a: &Path, b: &Path, cancel: &AtomicBool) -> Option<bool> {
     let compare = || -> io::Result<Option<bool>> {
         let (mut fa, mut fb) = (File::open(a)?, File::open(b)?);
         let mut ba = vec![0u8; 256 * 1024];

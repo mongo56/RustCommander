@@ -63,6 +63,7 @@ impl App {
             Some(Screen::Settings(s)) => self.settings_view(s),
             Some(Screen::Connect(c)) => self.connect_view(c),
             Some(Screen::Find(f)) => self.find_view(f),
+            Some(Screen::Sync(s)) => self.sync_view(s),
             Some(Screen::DiskUsage(d)) => self.disk_usage_view(d),
             Some(Screen::FileDiff(d)) => self.file_diff_view(d),
             Some(Screen::MultiRename(mr)) => self.multi_rename_view(mr),

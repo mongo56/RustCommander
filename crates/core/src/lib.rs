@@ -20,6 +20,7 @@ pub mod remote;
 pub mod rename;
 pub mod search;
 pub mod split;
+pub mod sync;
 pub mod treemap;
 pub mod undo;
 pub mod user_cmd;

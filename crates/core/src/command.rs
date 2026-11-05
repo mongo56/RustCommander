@@ -105,6 +105,9 @@ commands! {
         /// Compare-folders options, then compare (Ctrl+Shift+F2).
         CompareDirsOptions => "cm_CompareDirsOptions",
             "Compare folders with options (by content, ignore dates, subfolders)", "CmpDirs";
+        /// Compare both panels' folders recursively and copy the differences (Alt+Shift+F2).
+        SyncFolders => "cm_SyncDirs",
+            "Synchronize folders: compare the two panels' folders recursively and copy the differences", "Sync";
         /// Side-by-side diff of two files (Alt+F2).
         CompareFiles => "cm_CompareFilesByContent", "Compare two files by content, side by side", "CmpFiles";
         /// SHA-256 of the selected files, with a dialog to copy or save them.

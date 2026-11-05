@@ -64,6 +64,8 @@ pub struct Config {
     /// Compare-folders options (Ctrl+Shift+F2); `None` = no `[compare]`
     /// table (older files kept them in `session.toml`).
     pub compare: Option<CompareState>,
+    /// Synchronize-folders options (Alt+Shift+F2); `None` = no `[sync]` table.
+    pub sync: Option<SyncState>,
     /// `[[user_commands]]`, as written (see [`resolve_user_commands`]).
     pub user_commands: Vec<UserCommand>,
 }
@@ -107,6 +109,25 @@ impl From<rc_core::compare::CompareOptions> for CompareState {
     }
 }
 
+/// The options of the synchronize-folders tool in `[sync]`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, Deserialize)]
+#[serde(default)]
+pub struct SyncState {
+    /// `two-way`, `mirror` or `update` (see [`rc_core::sync::Mode::id`]);
+    /// anything else is two-way.
+    pub mode: String,
+    pub by_content: bool,
+    pub ignore_date: bool,
+    /// Equal files are listed too.
+    pub show_equal: bool,
+}
+
+impl SyncState {
+    pub fn mode(&self) -> rc_core::sync::Mode {
+        rc_core::sync::Mode::from_id(&self.mode).unwrap_or_default()
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -126,6 +147,7 @@ impl Default for Config {
             keys: BTreeMap::new(),
             colors: BTreeMap::new(),
             compare: None,
+            sync: None,
             user_commands: Vec::new(),
         }
     }
@@ -259,6 +281,8 @@ pub enum Edit {
     /// Adds `[compare]` with these values unless the file has one already
     /// (moving the options over from an old `session.toml`).
     CompareIfMissing(CompareState),
+    /// Sets the `[sync]` options.
+    Sync(SyncState),
 }
 
 /// Applies `edits` to the text of `config.toml`; comments, layout and
@@ -363,6 +387,16 @@ pub fn apply(text: &str, edits: &[Edit]) -> Result<String, String> {
                 put(compare, "by_content", Value::from(c.by_content));
                 put(compare, "ignore_date", Value::from(c.ignore_date));
                 put(compare, "subfolders", Value::from(c.subfolders));
+            }
+            Edit::Sync(c) => {
+                if !doc.contains_key("sync") {
+                    add_table_first(&mut doc, "sync");
+                }
+                let sync = table(&mut doc, "sync")?;
+                put(sync, "mode", Value::from(c.mode.as_str()));
+                put(sync, "by_content", Value::from(c.by_content));
+                put(sync, "ignore_date", Value::from(c.ignore_date));
+                put(sync, "show_equal", Value::from(c.show_equal));
             }
         }
     }
@@ -748,6 +782,22 @@ key = \"F7\"
         let config = parse(&template("", CompareState::default())).unwrap();
         assert_eq!(config.builtin_shell, "");
         assert_eq!(parse("builtin_shell = 'pwsh -NoLogo'").unwrap().builtin_shell, "pwsh -NoLogo");
+    }
+
+    #[test]
+    fn sync_options_round_trip() {
+        let text = template("", CompareState::default());
+        assert_eq!(parse(&text).unwrap().sync, None);
+        let state = SyncState { mode: "mirror".into(), by_content: true, ignore_date: false, show_equal: true };
+        let out = apply(&text, &[Edit::Sync(state.clone())]).unwrap();
+        let back = parse(&out).unwrap().sync.unwrap();
+        assert_eq!(back, state);
+        assert_eq!(back.mode(), rc_core::sync::Mode::Mirror);
+        // The rest of the file is untouched.
+        assert!(text.lines().all(|l| out.lines().any(|o| o == l)));
+        let again = apply(&out, &[Edit::Sync(SyncState { mode: "update".into(), ..state })]).unwrap();
+        assert_eq!(parse(&again).unwrap().sync.unwrap().mode(), rc_core::sync::Mode::UpdateRight);
+        assert_eq!(SyncState { mode: "bogus".into(), ..SyncState::default() }.mode(), rc_core::sync::Mode::TwoWay);
     }
 
     const OLD: CompareState = CompareState { by_content: true, ignore_date: false, subfolders: true };

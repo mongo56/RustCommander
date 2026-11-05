@@ -382,6 +382,12 @@ impl std::fmt::Debug for JobHandle {
 /// conflicts (answer them with [`JobHandle::answer`]) and finally
 /// [`JobEvent::Finished`].
 pub fn spawn(job: Job, on_event: impl FnMut(JobEvent) + Send + 'static) -> JobHandle {
+    spawn_with(job, false, on_event)
+}
+
+/// [`spawn`]; with `overwrite` every conflict is answered Overwrite without
+/// asking (synchronising folders: the plan the user confirmed decides).
+pub fn spawn_with(job: Job, overwrite: bool, on_event: impl FnMut(JobEvent) + Send + 'static) -> JobHandle {
     struct ChannelReporter<F> {
         on_event: F,
         answers: mpsc::Receiver<Resolution>,
@@ -401,7 +407,7 @@ pub fn spawn(job: Job, on_event: impl FnMut(JobEvent) + Send + 'static) -> JobHa
     let thread_control = control.clone();
     std::thread::spawn(move || {
         let mut reporter = ChannelReporter { on_event, answers: rx };
-        let outcome = run(&job, &thread_control, &mut reporter);
+        let outcome = run_with(&job, overwrite, &thread_control, &mut reporter);
         (reporter.on_event)(JobEvent::Finished(outcome));
     });
     JobHandle { control, answers: tx }
@@ -409,12 +415,17 @@ pub fn spawn(job: Job, on_event: impl FnMut(JobEvent) + Send + 'static) -> JobHa
 
 /// Runs a job to completion on the current thread.
 pub fn run(job: &Job, control: &Control, reporter: &mut dyn Reporter) -> Outcome {
+    run_with(job, false, control, reporter)
+}
+
+/// [`run`]; with `overwrite` conflicts are answered Overwrite without asking.
+pub fn run_with(job: &Job, overwrite: bool, control: &Control, reporter: &mut dyn Reporter) -> Outcome {
     let mut runner = Runner {
         control,
         reporter,
         progress: Progress::default(),
         outcome: Outcome::default(),
-        sticky: None,
+        sticky: overwrite.then_some(Resolution::OverwriteAll),
         buffer: vec![0; BUFFER_SIZE],
         last_report: Instant::now(),
         staged: Vec::new(),
@@ -2832,6 +2843,23 @@ mod tests {
         let (o, _) = run_job(Job::Copy(ts), Resolution::Overwrite);
         assert!(o.errors.is_empty());
         assert_eq!(fs::read(&b).unwrap(), b"new");
+    }
+
+    #[test]
+    fn overwrite_option_never_asks() {
+        let tmp = TempDir::new("overwrite-option");
+        let (a, b) = (tmp.0.join("a"), tmp.0.join("b"));
+        fs::create_dir_all(a.join("sub")).unwrap();
+        fs::create_dir_all(b.join("sub")).unwrap();
+        fs::write(a.join("sub/x.txt"), b"new").unwrap();
+        fs::write(b.join("sub/x.txt"), b"old").unwrap();
+        let ts = vec![Transfer { src: a.join("sub/x.txt"), dst: b.join("sub/x.txt") }];
+        let mut r = Auto { answer: Resolution::Cancel, asked: 0 };
+        let o = run_with(&Job::Copy(ts), true, &Control::default(), &mut r);
+        assert!(o.errors.is_empty() && !o.cancelled, "{:?}", o.errors);
+        assert_eq!(r.asked, 0);
+        assert_eq!(fs::read(b.join("sub/x.txt")).unwrap(), b"new");
+        assert!(o.undo.is_none()); // what was overwritten is gone
     }
 
     #[test]

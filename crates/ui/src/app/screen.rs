@@ -5,7 +5,7 @@
 //! keymap, the F-key bar or the command palette) and closing it returns to
 //! the panels, so no tool opens over another and a single slot is enough.
 
-use super::{connect, disk_usage, file_diff, find_files, help, multi_rename, settings, viewer};
+use super::{connect, disk_usage, file_diff, find_files, help, multi_rename, settings, sync, viewer};
 
 /// `Term` names the built-in terminal shown (`App::terms` holds them all,
 /// shown or not).
@@ -13,6 +13,7 @@ pub(super) enum Screen {
     Help(help::Help),
     Settings(Box<settings::Settings>),
     Find(Box<find_files::FindFiles>),
+    Sync(Box<sync::SyncTool>),
     DiskUsage(Box<disk_usage::DiskUsage>),
     Connect(Box<connect::ConnectTool>),
     MultiRename(Box<multi_rename::MultiRename>),
@@ -31,6 +32,8 @@ pub(super) trait ScreenSlot {
     fn find(&self) -> Option<&find_files::FindFiles>;
     fn find_mut(&mut self) -> Option<&mut find_files::FindFiles>;
     fn take_find(&mut self) -> Option<find_files::FindFiles>;
+    fn sync_mut(&mut self) -> Option<&mut sync::SyncTool>;
+    fn take_sync(&mut self) -> Option<sync::SyncTool>;
     fn disk_usage(&self) -> Option<&disk_usage::DiskUsage>;
     fn disk_usage_mut(&mut self) -> Option<&mut disk_usage::DiskUsage>;
     fn take_disk_usage(&mut self) -> Option<disk_usage::DiskUsage>;
@@ -91,6 +94,8 @@ impl ScreenSlot for Option<Screen> {
     get!(find, Find, find_files::FindFiles);
     get_mut!(find_mut, Find, find_files::FindFiles);
     take!(take_find, Find, find_files::FindFiles);
+    get_mut!(sync_mut, Sync, sync::SyncTool);
+    take!(take_sync, Sync, sync::SyncTool);
     get!(disk_usage, DiskUsage, disk_usage::DiskUsage);
     get_mut!(disk_usage_mut, DiskUsage, disk_usage::DiskUsage);
     take!(take_disk_usage, DiskUsage, disk_usage::DiskUsage);

@@ -19,6 +19,7 @@ mod split;
 mod pack;
 mod quick_view;
 mod find_files;
+mod sync;
 mod branch;
 mod git;
 mod multi_rename;
@@ -219,6 +220,9 @@ pub struct App {
     screen: Option<Screen>,
     /// The closed find tool (fields and results), kept for the next Ctrl+F.
     find_last: Option<find_files::FindFiles>,
+    /// The jobs a confirmed folder synchronisation still has to start, and
+    /// the id of the one running (`sync.rs`): they run one after another.
+    sync_chain: Option<(u64, Vec<(Job, String)>)>,
     /// A shell menu verb that may still create an item (paste, extract):
     /// the cursor goes to it when the folder watcher's reload shows it.
     focus_new: Option<FocusNew>,
@@ -555,6 +559,7 @@ pub enum Message {
     MultiRename(multi_rename::MrMsg),
     FileDiff(file_diff::DiffMsg),
     Find(find_files::FindMsg),
+    Sync(sync::SyncMsg),
     DiskUsage(disk_usage::DuMsg),
     Term(term::TermMsg),
     Connect(connect::ConnectMsg),
@@ -690,6 +695,7 @@ impl App {
             nav: [None, None],
             screen: None,
             find_last: None,
+            sync_chain: None,
             focus_new: None,
             disk_usage_last: None,
             terms: Vec::new(),
@@ -1424,6 +1430,7 @@ impl App {
             Message::MultiRename(msg) => return self.multi_rename_update(msg),
             Message::FileDiff(msg) => return self.file_diff_update(msg),
             Message::Find(msg) => return self.find_update(msg),
+            Message::Sync(msg) => return self.sync_update(msg),
             Message::Branch(seq, msg) => return self.branch_update(seq, msg),
             Message::DiskUsage(msg) => return self.disk_usage_update(msg),
             Message::Term(msg) => return self.term_update(msg),
@@ -1545,6 +1552,7 @@ impl App {
                 Some(Screen::Settings(_)) => self.settings_key(named, &key, mods, text.as_deref(), captured),
                 Some(Screen::MultiRename(_)) => self.multi_rename_key(named, &key, mods, captured),
                 Some(Screen::Find(_)) => self.find_key(named, &key, mods, captured),
+                Some(Screen::Sync(_)) => self.sync_key(named, &key, mods),
                 Some(Screen::DiskUsage(_)) => self.disk_usage_key(named, &key, mods),
                 Some(Screen::Connect(_)) => self.connect_key(named, &key, mods, captured),
                 Some(Screen::FileDiff(_)) => {
@@ -1781,7 +1789,7 @@ impl App {
         let page = rows.saturating_sub(1).max(1) as isize;
         let active = self.active;
         let other = 1 - active;
-        if self.left_hidden() && matches!(cmd, CompareDirs | CompareDirsOptions | CompareFiles | SyncOtherPanel) {
+        if self.left_hidden() && matches!(cmd, CompareDirs | CompareDirsOptions | CompareFiles | SyncOtherPanel | SyncFolders) {
             self.info("The left panel is hidden: show it first (Show left button / command)");
             return Task::none();
         }
@@ -1814,6 +1822,7 @@ impl App {
             MultiRename => return self.open_multi_rename(),
             CompareFiles => return self.open_file_diff(),
             FindFiles => return self.open_find(),
+            SyncFolders => return self.open_sync(),
             BranchView => return self.branch_view(),
             CalcChecksum => return self.calc_checksum(),
             SetAttrib => return self.open_attrib(),
@@ -2940,19 +2949,26 @@ impl App {
     // ---- jobs -------------------------------------------------------------
 
     fn start_job(&mut self, job: Job, title: String) -> Task<Message> {
+        self.start_job_with(job, title, false)
+    }
+
+    /// [`App::start_job`]; with `overwrite` the job replaces existing files
+    /// without asking (synchronising: the confirmed plan decides) and
+    /// leaves the panels' selections alone.
+    fn start_job_with(&mut self, job: Job, title: String, overwrite: bool) -> Task<Message> {
         let id = self.next_job_id;
         self.next_job_id += 1;
         let done_verb = job.done_verb();
 
         let (tx, rx) = iced::futures::channel::mpsc::unbounded();
-        let handle = ops::spawn(job, move |event| {
+        let handle = ops::spawn_with(job, overwrite, move |event| {
             let _ = tx.unbounded_send(event);
         });
         self.jobs.push(RunningJob {
             id,
             title,
             done_verb,
-            source_side: Some(self.active),
+            source_side: (!overwrite).then_some(self.active),
             handle,
             progress: Progress::default(),
             conflict: None,
@@ -3000,8 +3016,9 @@ impl App {
                 self.status = Some(summarize(job.done_verb, &outcome));
                 let task = self.archive_edit_job_done(id, &outcome);
                 let du = self.du_job_done(id, self.status.clone());
+                let next = self.sync_job_done(id, &outcome);
                 self.after_change();
-                return Task::batch([task, du]);
+                return Task::batch([task, du, next]);
             }
         }
         Task::none()
