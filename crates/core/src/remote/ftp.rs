@@ -1,10 +1,16 @@
 //! FTP and FTPS (explicit TLS) sessions via `suppaftp` (blocking, rustls
-//! with the ring provider and the Windows certificate store).
+//! with the ring provider and the Windows certificate store; certificates
+//! the store doesn't trust may be pinned, see [`PinningVerifier`]).
 
-use super::{err, refused, Item, Login, Protocol, Session, CONNECT_TIMEOUT, IO_TIMEOUT, LOGIN_FAILED};
+use super::{check_cert_pin, err, refused, Item, Login, Protocol, Session, CONNECT_TIMEOUT, IO_TIMEOUT, LOGIN_FAILED};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::client::WebPkiServerVerifier;
+use rustls::crypto::CryptoProvider;
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{CertificateError, DigitallySignedStruct, SignatureScheme};
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 use suppaftp::list::{File as ListedFile, ListParser};
 use suppaftp::types::FileType;
@@ -48,22 +54,127 @@ fn io_err(path: &str, e: FtpError) -> io::Error {
     }
 }
 
-fn tls_connector() -> io::Result<RustlsConnector> {
+/// Extra trusted roots for tests (a test CA), on top of the system store.
+#[cfg(test)]
+pub(super) static TEST_ROOTS: Mutex<Vec<CertificateDer<'static>>> = Mutex::new(Vec::new());
+
+/// Checks server certificates: first as usual against the system's roots
+/// (WebPKI: chain, name, dates); a certificate that fails that only because
+/// it isn't trusted (self-signed, unknown issuer, other name, expired, not
+/// for servers) is accepted if the user pinned exactly it for this
+/// `host:port` ([`check_cert_pin`]). The handshake signatures are always
+/// checked with the provider's algorithms: only the trust decision for the
+/// chain changes.
+#[derive(Debug)]
+struct PinningVerifier {
+    /// `None` if the system has no roots at all (every certificate then
+    /// needs a pin).
+    webpki: Option<Arc<WebPkiServerVerifier>>,
+    provider: Arc<CryptoProvider>,
+    host_id: String,
+    /// Why the last certificate was refused: the message to fail the
+    /// connection with (rustls only reports its own error).
+    refused: Mutex<Option<String>>,
+}
+
+/// Why the system doesn't trust a certificate, if a pin may override it
+/// (not for broken or revoked certificates).
+fn pinnable(e: &rustls::Error) -> Option<String> {
+    use CertificateError::*;
+    let rustls::Error::InvalidCertificate(e) = e else { return None };
+    Some(match e {
+        UnknownIssuer => "not signed by a trusted authority, e.g. self-signed".into(),
+        NotValidForName | NotValidForNameContext { .. } => "made out for another name".into(),
+        Expired | ExpiredContext { .. } => "expired".into(),
+        NotValidYet | NotValidYetContext { .. } => "not valid yet".into(),
+        InvalidPurpose | InvalidPurposeContext { .. } => "not meant for servers".into(),
+        // E.g. a CA certificate used as the server's own (common in
+        // self-signed ones).
+        Other(e) => e.to_string(),
+        _ => return None,
+    })
+}
+
+impl ServerCertVerifier for PinningVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        let reason = match &self.webpki {
+            Some(webpki) => match webpki.verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+            {
+                Ok(ok) => return Ok(ok),
+                Err(e) => match pinnable(&e) {
+                    Some(reason) => reason,
+                    None => return Err(e),
+                },
+            },
+            None => "no trusted root certificates in the system store".into(),
+        };
+        match check_cert_pin(&self.host_id, end_entity.as_ref(), &reason) {
+            Ok(()) => Ok(ServerCertVerified::assertion()),
+            Err(message) => {
+                *self.refused.lock().unwrap_or_else(|e| e.into_inner()) = Some(message);
+                Err(rustls::Error::InvalidCertificate(CertificateError::ApplicationVerificationFailure))
+            }
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+/// The TLS connector for `login` (also used for the data connections) and
+/// its verifier, which tells why a certificate was refused.
+fn tls_connector(login: &Login) -> io::Result<(RustlsConnector, Arc<PinningVerifier>)> {
     let mut roots = rustls::RootCertStore::empty();
     let found = rustls_native_certs::load_native_certs();
     for cert in found.certs {
         let _ = roots.add(cert);
     }
-    if roots.is_empty() {
-        return Err(io::Error::other("No trusted root certificates found in the system store"));
+    #[cfg(test)]
+    for cert in TEST_ROOTS.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        let _ = roots.add(cert.clone());
     }
     let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let webpki = if roots.is_empty() {
+        None
+    } else {
+        let builder = WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider.clone());
+        Some(builder.build().map_err(io::Error::other)?)
+    };
+    let host_id = login.host_id();
+    let verifier = Arc::new(PinningVerifier { webpki, provider: provider.clone(), host_id, refused: Mutex::new(None) });
     let config = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .map_err(io::Error::other)?
-        .with_root_certificates(roots)
+        .dangerous()
+        .with_custom_certificate_verifier(verifier.clone())
         .with_no_client_auth();
-    Ok(RustlsConnector::from(Arc::new(config)))
+    Ok((RustlsConnector::from(Arc::new(config)), verifier))
 }
 
 fn resolve(host: &str, port: u16) -> io::Result<SocketAddr> {
@@ -81,7 +192,16 @@ impl Ftp {
         let mut stream = RustlsFtpStream::connect_timeout(addr, CONNECT_TIMEOUT).map_err(conn)?;
         set_timeouts(&stream.get_ref())?;
         if login.protocol == Protocol::Ftps {
-            stream = stream.into_secure(tls_connector()?, &login.host).map_err(conn)?;
+            let (connector, verifier) = tls_connector(login)?;
+            // The handshake runs on the first command after `AUTH TLS`
+            // (inside `into_secure`): a refused certificate shows up as
+            // rustls' own error there; report ours.
+            stream = stream.into_secure(connector, &login.host).map_err(|e| {
+                match verifier.refused.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                    Some(message) => io::Error::new(io::ErrorKind::PermissionDenied, message),
+                    None => conn(e),
+                }
+            })?;
             set_timeouts(&stream.get_ref())?;
         }
         stream = stream.passive_stream_builder(|addr| {

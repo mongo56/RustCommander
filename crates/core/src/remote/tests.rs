@@ -153,7 +153,14 @@ fn exercise(root: &Path, disk: &Path) {
     assert_eq!(fs::read(down.join("up/sub/big.bin")).unwrap(), big);
     let temp = crate::vfs::extract_temp(&docs.join("readme.txt")).unwrap();
     assert_eq!(fs::read(&temp).unwrap(), b"hello");
-    let _ = fs::remove_dir_all(crate::vfs::temp_path(root).parent().unwrap());
+    // Only this server's temp folder (and its marker): its parent is the
+    // temp root that parallel tests (nested archives) stage in.
+    let key = split(root).unwrap().0;
+    let server_temp = crate::vfs::temp_path(&path_of(&key, "/x")).parent().unwrap().to_path_buf();
+    let _ = fs::remove_dir_all(&server_temp);
+    let mut marker = server_temp.into_os_string();
+    marker.push(".used");
+    let _ = fs::remove_file(marker);
 
     // New folder (with parents), rename, move on the server.
     let (outcome, _) = run_job(Job::MakeDir(root.join("new").join("deeper")), Resolution::Skip);
@@ -688,10 +695,204 @@ fn sftp_refuses_a_changed_host_key() {
     // Trust another key for this server.
     let other = sftp_server::host_key(3).public_key().to_openssh().unwrap();
     let mut known = fs::OpenOptions::new().create(true).append(true).open(settings.0.join("known_hosts")).unwrap();
-    writeln!(known, "127.0.0.1:{port} {other}").unwrap();
+    // One write (see `trust_host_key`): `writeln!` writes in pieces that
+    // parallel tests' appends interleave into broken lines.
+    known.write_all(format!("127.0.0.1:{port} {other}\n").as_bytes()).unwrap();
     let e = connect(sftp_login(port, sftp_server::PASSWORD), "").unwrap_err().to_string();
     assert!(e.contains(HOST_KEY_CHANGED), "{e}");
     assert!(trust_host_key(&sftp_login(port, sftp_server::PASSWORD)).is_err());
+}
+
+// ---- FTPS ------------------------------------------------------------------------
+
+/// A server certificate for 127.0.0.1 as PEM files `<name>.crt` / `.key` in
+/// `dir`: self-signed, or signed by `ca`; made out for `name_in_cert`.
+fn write_cert(
+    dir: &Path,
+    name: &str,
+    name_in_cert: &str,
+    ca: Option<&rcgen::Issuer<'_, rcgen::KeyPair>>,
+) -> (PathBuf, PathBuf, Vec<u8>) {
+    let mut params = rcgen::CertificateParams::new(vec![name_in_cert.to_owned()]).unwrap();
+    params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+    let key = rcgen::KeyPair::generate().unwrap();
+    let cert = match ca {
+        Some(ca) => params.signed_by(&key, ca).unwrap(),
+        None => params.self_signed(&key).unwrap(),
+    };
+    let (crt, key_file) = (dir.join(format!("{name}.crt")), dir.join(format!("{name}.key")));
+    fs::write(&crt, cert.pem()).unwrap();
+    fs::write(&key_file, key.serialize_pem()).unwrap();
+    (crt, key_file, cert.der().to_vec())
+}
+
+/// The certificate (and key) files an FTPS test server uses for new control
+/// connections; replaced to make the server show another certificate.
+type CertFiles = Arc<Mutex<(PathBuf, PathBuf)>>;
+
+/// Starts an FTPS server over `root` (TLS required for logins and data) on
+/// a listener bound here (see [`start_sftp`]); returns its port.
+fn start_ftps(root: PathBuf, cert: CertFiles) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    start_ftps_on(listener, root, cert);
+    port
+}
+
+/// Serves FTPS over `root` on `listener` (non-blocking).
+fn start_ftps_on(listener: TcpListener, root: PathBuf, cert: CertFiles) {
+    serve(move || async move {
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        loop {
+            let Ok((socket, _)) = listener.accept().await else { return };
+            let (crt, key) = cert.lock().unwrap().clone();
+            let root = root.clone();
+            let server =
+                libunftp::ServerBuilder::new(Box::new(move || unftp_sbe_fs::Filesystem::new(root.clone()).unwrap()))
+                    .passive_ports(43000..=43999)
+                    .ftps(crt, key)
+                    .ftps_required(true, true)
+                    .build()
+                    .unwrap();
+            tokio::spawn(async move {
+                let _ = server.service(socket).await;
+            });
+        }
+    });
+}
+
+fn ftps_login(port: u16) -> Login {
+    Login {
+        protocol: Protocol::Ftps,
+        host: "127.0.0.1".into(),
+        port,
+        user: "tester".into(),
+        password: Some("secret".into()),
+        key_file: None,
+    }
+}
+
+/// The lines of `known_hosts` for `127.0.0.1:port`.
+fn known_lines(settings: &Settings, port: u16) -> Vec<String> {
+    let text = fs::read_to_string(settings.0.join("known_hosts")).unwrap_or_default();
+    let prefix = format!("127.0.0.1:{port} ");
+    text.lines().filter(|l| l.starts_with(&prefix)).map(str::to_owned).collect()
+}
+
+fn sha256_hex(der: &[u8]) -> String {
+    ring::digest::digest(&ring::digest::SHA256, der).as_ref().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[test]
+fn ftps_self_signed_certificate_is_pinned() {
+    let settings = settings();
+    let disk = TempDir::new("ftps-server");
+    let certs = TempDir::new("ftps-certs");
+    let (crt, key, der) = write_cert(&certs.0, "first", "127.0.0.1", None);
+    let files: CertFiles = Arc::new(Mutex::new((crt, key)));
+    let port = start_ftps(disk.0.clone(), files.clone());
+    let login = ftps_login(port);
+
+    // First contact: refused, with the reason and the fingerprint.
+    let e = connect(login.clone(), "").unwrap_err();
+    assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{e}");
+    let e = e.to_string();
+    let fingerprint = cert_fingerprint(ring::digest::digest(&ring::digest::SHA256, &der).as_ref());
+    assert!(e.contains(CERT_UNTRUSTED) && e.contains(&format!("SHA-256: {fingerprint}")), "{e}");
+    assert!(e.contains("self-signed"), "{e}");
+    assert!(known_lines(&settings, port).is_empty());
+    // Not an SFTP host key to trust.
+    let mut sftp = login.clone();
+    sftp.protocol = Protocol::Sftp;
+    assert!(trust_host_key(&sftp).is_err());
+
+    // Pinned: browse, upload and download over TLS (control and data).
+    trust_host_key(&login).unwrap();
+    assert_eq!(known_lines(&settings, port), [format!("127.0.0.1:{port} {CERT_PIN_TYPE} {}", sha256_hex(&der))]);
+    let root = connect(login.clone(), "").unwrap();
+    assert_eq!(display(&root), format!("ftps://tester@127.0.0.1:{port}/"));
+    exercise(&root, &disk.0);
+    assert!(disconnect(&root));
+
+    // Another self-signed certificate on the same address: refused, never
+    // pinned on its own, and the old offer can't be trusted again.
+    let (crt, key, _) = write_cert(&certs.0, "second", "127.0.0.1", None);
+    *files.lock().unwrap() = (crt, key);
+    let e = connect(login.clone(), "").unwrap_err().to_string();
+    assert!(e.contains(CERT_CHANGED), "{e}");
+    assert!(trust_host_key(&login).is_err());
+    assert_eq!(known_lines(&settings, port).len(), 1);
+}
+
+#[test]
+fn ftps_pins_and_ssh_host_keys_share_known_hosts() {
+    let settings = settings();
+    let append = |line: String| {
+        let mut out = fs::OpenOptions::new().create(true).append(true).open(settings.0.join("known_hosts")).unwrap();
+        out.write_all(line.as_bytes()).unwrap();
+    };
+
+    // An SSH key line for an FTPS server's address doesn't make its
+    // certificate "changed", nor count as a pin.
+    let disk = TempDir::new("ftps-shared");
+    let certs = TempDir::new("ftps-shared-certs");
+    let (crt, key, _) = write_cert(&certs.0, "cert", "127.0.0.1", None);
+    let port = start_ftps(disk.0.clone(), Arc::new(Mutex::new((crt, key))));
+    let other = sftp_server::host_key(4).public_key().to_openssh().unwrap();
+    append(format!("127.0.0.1:{port} {other}\n"));
+    let e = connect(ftps_login(port), "").unwrap_err().to_string();
+    assert!(e.contains(CERT_UNTRUSTED), "{e}");
+    trust_host_key(&ftps_login(port)).unwrap();
+    let root = connect(ftps_login(port), "").unwrap();
+    assert!(names(&root).is_empty());
+    disconnect(&root);
+    assert_eq!(known_lines(&settings, port).len(), 2);
+
+    // A certificate pin for an SFTP server's address doesn't make its host
+    // key "changed"; its key is trusted next to the pin.
+    let sftp_disk = TempDir::new("sftp-shared");
+    let port = start_sftp(sftp_disk.0.clone(), 5);
+    append(format!("127.0.0.1:{port} {CERT_PIN_TYPE} {}\n", "00".repeat(32)));
+    let login = sftp_login(port, sftp_server::PASSWORD);
+    let e = connect(login.clone(), "").unwrap_err().to_string();
+    assert!(e.contains(HOST_KEY_UNKNOWN), "{e}");
+    // Not an FTPS certificate to trust.
+    assert!(trust_host_key(&ftps_login(port)).is_err());
+    trust_host_key(&login).unwrap();
+    let root = connect(login, "").unwrap();
+    disconnect(&root);
+    assert_eq!(known_lines(&settings, port).len(), 2);
+}
+
+#[test]
+fn ftps_certificate_from_a_trusted_authority_needs_no_pin() {
+    let settings = settings();
+    let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign, rcgen::KeyUsagePurpose::DigitalSignature];
+    params.distinguished_name.push(rcgen::DnType::CommonName, "RustCommander test CA");
+    let ca = rcgen::CertifiedIssuer::self_signed(params, rcgen::KeyPair::generate().unwrap()).unwrap();
+    ftp::TEST_ROOTS.lock().unwrap().push(ca.der().clone());
+
+    // Signed by the CA for this address: connects without asking.
+    let disk = TempDir::new("ftps-ca");
+    let certs = TempDir::new("ftps-ca-certs");
+    let (crt, key, _) = write_cert(&certs.0, "good", "127.0.0.1", Some(&ca));
+    let port = start_ftps(disk.0.clone(), Arc::new(Mutex::new((crt, key))));
+    let root = connect(ftps_login(port), "").unwrap();
+    assert!(names(&root).is_empty());
+    disconnect(&root);
+    assert!(known_lines(&settings, port).is_empty());
+
+    // Signed by the CA but for another name: may be pinned.
+    let (crt, key, _) = write_cert(&certs.0, "other", "files.example.com", Some(&ca));
+    let port = start_ftps(disk.0.clone(), Arc::new(Mutex::new((crt, key))));
+    let e = connect(ftps_login(port), "").unwrap_err().to_string();
+    assert!(e.contains(CERT_UNTRUSTED) && e.contains("another name"), "{e}");
+    trust_host_key(&ftps_login(port)).unwrap();
+    let root = connect(ftps_login(port), "").unwrap();
+    disconnect(&root);
 }
 
 // ---- Keep-alive ------------------------------------------------------------------
@@ -933,9 +1134,12 @@ fn paths() {
     assert!(crate::vfs::split_archive(Path::new("sftp://u@h/a.zip/x")).is_none());
 }
 
-/// Not a test: serves `RC_TEST_ROOT` over FTP on 127.0.0.1:2121 and SFTP on
-/// 127.0.0.1:2222 (user `tester`, password `secret`) until killed, for
+/// Not a test: serves `RC_TEST_ROOT` over FTP on 127.0.0.1:2121, SFTP on
+/// 127.0.0.1:2222 and FTPS (TLS required, self-signed certificate) on
+/// 127.0.0.1:2990 (user `tester`, password `secret`) until killed, for
 /// trying the UI by hand: `cargo test -p rc-core local_servers -- --ignored`.
+/// The certificate is kept in `%TEMP%\rc-manual-ftps` (delete it for a new
+/// one, i.e. a changed certificate).
 #[test]
 #[ignore]
 fn local_servers_for_manual_testing() {
@@ -948,6 +1152,15 @@ fn local_servers_for_manual_testing() {
             .unwrap();
         let _ = server.listen("127.0.0.1:2121").await;
     });
+    let certs = std::env::temp_dir().join("rc-manual-ftps");
+    let (crt, key) = (certs.join("server.crt"), certs.join("server.key"));
+    if !crt.exists() || !key.exists() {
+        fs::create_dir_all(&certs).unwrap();
+        write_cert(&certs, "server", "127.0.0.1", None);
+    }
+    let ftps = TcpListener::bind("127.0.0.1:2990").unwrap();
+    ftps.set_nonblocking(true).unwrap();
+    start_ftps_on(ftps, root.clone(), Arc::new(Mutex::new((crt, key))));
     let sftp = TcpListener::bind("127.0.0.1:2222").unwrap();
     sftp.set_nonblocking(true).unwrap();
     serve(move || sftp_server::run(root, sftp, 9));

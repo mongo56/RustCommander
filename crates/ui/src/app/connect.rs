@@ -4,8 +4,9 @@
 //! was opened from. Logging in runs on a worker thread
 //! (`rc_core::remote::connect`); Esc abandons it. A password is asked for
 //! if none is saved in the Credential Manager (and then kept in memory for
-//! the session); an SFTP server's unknown host key is shown with its
-//! fingerprint and trusted only on Y. Ctrl+Shift+F (`cm_FtpDisconnect`)
+//! the session); an SFTP server's unknown host key, or an FTPS server's
+//! certificate that Windows doesn't trust, is shown with its fingerprint and
+//! trusted (pinned) only on Y. Ctrl+Shift+F (`cm_FtpDisconnect`)
 //! closes the connection of the panel's server.
 
 use super::*;
@@ -105,7 +106,8 @@ pub(super) enum Mode {
     /// Asking the password (or key passphrase) of `site`.
     Password { site: usize, input: String },
     Connecting { seq: u64, site: Site, login: Login, typed: bool },
-    /// Trust the host key (`text`: the server's identity) and connect?
+    /// Trust the host key or FTPS certificate (`text`: the server's
+    /// identity) and connect?
     Trust { site: Site, login: Login, typed: bool, text: String },
 }
 
@@ -151,6 +153,12 @@ impl ConnectTool {
             },
         }
     }
+}
+
+/// What the trust question is about: "host key" (SFTP) or "certificate"
+/// (FTPS).
+fn trusted_what(login: &Login) -> &'static str {
+    if login.protocol == Protocol::Ftps { "certificate" } else { "host key" }
 }
 
 fn protocol_label(p: Protocol) -> &'static str {
@@ -276,7 +284,7 @@ impl App {
                 self.success(format!("Connected to {} (Ctrl+Shift+F disconnects)", site.address()));
                 self.start_nav(side, Nav::to(path))
             }
-            Err(e) if e.contains(remote::HOST_KEY_UNKNOWN) => {
+            Err(e) if e.contains(remote::HOST_KEY_UNKNOWN) || e.contains(remote::CERT_UNTRUSTED) => {
                 c.note = None;
                 c.mode = Mode::Trust { site, login, typed, text: e };
                 Task::none()
@@ -303,7 +311,7 @@ impl App {
             return Task::none();
         };
         if let Err(e) = remote::trust_host_key(&login) {
-            c.note = Some((format!("Can't save the host key: {e}"), Tone::Error));
+            c.note = Some((format!("Can't save the {}: {e}", trusted_what(&login)), Tone::Error));
             return Task::none();
         }
         self.start_connect(site, login, typed)
@@ -491,7 +499,7 @@ impl App {
         ("Tab, Shift+Tab", "Next / previous field (editing)"),
         ("Ctrl+P", "Next protocol: SFTP, FTP, FTPS (editing)"),
         ("Enter (editing)", "Save the connection"),
-        ("Y (host key question)", "Trust the server's host key and connect"),
+        ("Y (host key question)", "Trust the server's host key or certificate and connect"),
         ("Esc", "Back to the list / stop connecting / close"),
     ];
 
@@ -547,11 +555,12 @@ impl App {
                     c.note = Some(("Cancelled".into(), Tone::Info));
                 }
             }
-            Mode::Trust { .. } => match (named, ch.as_deref()) {
+            Mode::Trust { login, .. } => match (named, ch.as_deref()) {
                 (_, Some("y")) => return self.connect_trust(),
                 (Some(Named::Escape), _) | (_, Some("n")) => {
+                    let note = format!("Not connected: the {} wasn't trusted", trusted_what(login));
                     c.mode = Mode::List;
-                    c.note = Some(("Not connected: the host key wasn't trusted".into(), Tone::Info));
+                    c.note = Some((note, Tone::Info));
                 }
                 _ => {}
             },
@@ -616,15 +625,20 @@ impl App {
                 .padding(20)
                 .into()
             }
-            Mode::Trust { text: question, .. } => container(
+            Mode::Trust { text: question, login, .. } => container(
                 column![
-                    text("Unknown server").size(15),
+                    text(if login.protocol == Protocol::Ftps { "Untrusted certificate" } else { "Unknown server" })
+                        .size(15),
                     text(question.clone()).size(13),
-                    text(
+                    text(if login.protocol == Protocol::Ftps {
+                        "Windows doesn't trust this server's certificate (common for self-signed ones). Check the \
+                         SHA-256 fingerprint with the server's administrator. Trusting pins exactly this certificate \
+                         in known_hosts for this address; a different untrusted certificate later is refused."
+                    } else {
                         "This is the first connection to this server (or its address changed). Check the fingerprint \
                          with the server's administrator. Trusting saves the key in known_hosts; a different key later \
                          is refused."
-                    )
+                    })
                     .size(12)
                     .color(colors.muted),
                     row![action("Cancel (N)", ConnectMsg::Back, false), action("Trust and connect (Y)", ConnectMsg::Trust, true)]

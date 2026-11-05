@@ -18,6 +18,14 @@
 //! ([`set_settings_dir`]): an unknown key fails with [`HOST_KEY_UNKNOWN`] in
 //! the error (the UI shows the fingerprint and may call [`trust_host_key`]),
 //! a changed one with [`HOST_KEY_CHANGED`] (never connected).
+//!
+//! FTPS certificates are checked against the Windows certificate store; one
+//! that fails that check (self-signed, unknown issuer, other name, expired)
+//! may be pinned by the user: its SHA-256 goes into the same `known_hosts`
+//! as a line `host:port ftps-cert-sha256 <hex>` ([`CERT_PIN_TYPE`]; SFTP
+//! ignores these lines, FTPS reads only them). An unpinned one fails with
+//! [`CERT_UNTRUSTED`] (the UI may call [`trust_host_key`], which pins it), a
+//! different one than pinned with [`CERT_CHANGED`].
 
 mod ftp;
 mod sftp;
@@ -43,6 +51,15 @@ pub const HOST_KEY_UNKNOWN: &str = "Unknown host key";
 /// In the error of a connection to an SFTP server whose host key differs
 /// from the trusted one.
 pub const HOST_KEY_CHANGED: &str = "HOST KEY CHANGED";
+/// In the error of a connection to an FTPS server whose certificate the
+/// system doesn't trust and the user hasn't pinned yet.
+pub const CERT_UNTRUSTED: &str = "Untrusted certificate";
+/// In the error of a connection to an FTPS server whose untrusted
+/// certificate differs from the pinned one.
+pub const CERT_CHANGED: &str = "CERTIFICATE CHANGED";
+/// The key type of an FTPS certificate pin in `known_hosts` (followed by the
+/// lower-case hex SHA-256 of the certificate's DER).
+pub const CERT_PIN_TYPE: &str = "ftps-cert-sha256";
 /// In the error of a login the server refused.
 pub const LOGIN_FAILED: &str = "Login failed";
 
@@ -51,7 +68,7 @@ pub enum Protocol {
     Sftp,
     Ftp,
     /// FTP with explicit TLS (`AUTH TLS`); the certificate is checked
-    /// against the Windows certificate store.
+    /// against the Windows certificate store, or else against the user's pin.
     Ftps,
 }
 
@@ -186,31 +203,43 @@ fn known_hosts_file() -> io::Result<PathBuf> {
     dir.map(|d| d.join("known_hosts")).ok_or_else(|| io::Error::other("No settings folder for known_hosts"))
 }
 
-/// The trusted keys (`ssh-ed25519 AAAA…`) of `host:port`.
-fn known_keys(host_id: &str) -> Vec<String> {
+/// True for a `known_hosts` key that is an FTPS certificate pin
+/// (`ftps-cert-sha256 <hex>`), not an SSH host key.
+fn is_cert_pin(key: &str) -> bool {
+    key.split_whitespace().next() == Some(CERT_PIN_TYPE)
+}
+
+/// The trusted keys of `host:port`: SSH host keys (`ssh-ed25519 AAAA…`), or
+/// with `pins` the FTPS certificate pins (`ftps-cert-sha256 <hex>`).
+fn known_keys(host_id: &str, pins: bool) -> Vec<String> {
     let Ok(file) = known_hosts_file() else { return Vec::new() };
     let text = std::fs::read_to_string(file).unwrap_or_default();
     text.lines()
         .filter_map(|line| line.trim().split_once(' '))
         .filter(|(host, _)| *host == host_id)
         .map(|(_, key)| key.trim().to_owned())
+        .filter(|key| is_cert_pin(key) == pins)
         .collect()
 }
 
-/// Host keys seen on connections that failed with [`HOST_KEY_UNKNOWN`]:
-/// (`host:port`, key), for [`trust_host_key`].
+/// Host keys and certificate pins seen on connections that failed with
+/// [`HOST_KEY_UNKNOWN`] or [`CERT_UNTRUSTED`]: (`host:port`, key), for
+/// [`trust_host_key`].
 static OFFERED_KEYS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
 
-/// Trusts the host key the server of `login` offered on the last
-/// connection attempt (which failed with [`HOST_KEY_UNKNOWN`]): appends it
-/// to `known_hosts`.
+/// Trusts what the server of `login` offered on the last connection attempt:
+/// the SSH host key (which failed with [`HOST_KEY_UNKNOWN`]) or, for FTPS,
+/// the certificate (which failed with [`CERT_UNTRUSTED`]). Appends it to
+/// `known_hosts` (once: the offer is used up).
 pub fn trust_host_key(login: &Login) -> io::Result<()> {
     let host_id = login.host_id();
+    let pins = login.protocol == Protocol::Ftps;
     let key = {
         let offered = OFFERED_KEYS.lock().unwrap_or_else(|e| e.into_inner());
-        offered.iter().rev().find(|(h, _)| *h == host_id).map(|(_, k)| k.clone())
+        offered.iter().rev().find(|(h, k)| *h == host_id && is_cert_pin(k) == pins).map(|(_, k)| k.clone())
     };
-    let key = key.ok_or_else(|| io::Error::other("No host key to trust: connect first"))?;
+    let what = if pins { "certificate" } else { "host key" };
+    let key = key.ok_or_else(|| io::Error::other(format!("No {what} to trust: connect first")))?;
     let file = known_hosts_file()?;
     if let Some(dir) = file.parent() {
         std::fs::create_dir_all(dir)?;
@@ -218,29 +247,68 @@ pub fn trust_host_key(login: &Login) -> io::Result<()> {
     let mut out = std::fs::OpenOptions::new().create(true).append(true).open(file)?;
     // One write: `writeln!` writes in pieces, which two appends at once
     // (parallel tests, two connects) interleave into broken lines.
-    out.write_all(format!("{host_id} {key}\n").as_bytes())
+    out.write_all(format!("{host_id} {key}\n").as_bytes())?;
+    // Trusted once: a later refusal (e.g. a changed key) can't re-trust it.
+    OFFERED_KEYS.lock().unwrap_or_else(|e| e.into_inner()).retain(|(h, k)| !(*h == host_id && *k == key));
+    Ok(())
 }
 
 /// Checks a host key (`ssh-ed25519 AAAA…`, fingerprint for messages):
 /// Ok if trusted, else the error to fail the connection with.
 fn check_host_key(login: &Login, key: &str, fingerprint: &str) -> Result<(), String> {
     let host_id = login.host_id();
-    let known = known_keys(&host_id);
+    check_known(&host_id, key, |file| {
+        format!(
+            "{HOST_KEY_CHANGED}: the server {host_id} now identifies with {fingerprint}, not the key \
+             trusted before. Someone may be intercepting the connection. Not connected; if the server's key \
+             really changed, remove its line from {file}"
+        )
+    })
+    .map_err(|e| e.unwrap_or_else(|| format!("{HOST_KEY_UNKNOWN}: {host_id} identifies with {fingerprint}")))
+}
+
+/// Checks an FTPS certificate (its DER) that the system's roots don't
+/// trust (`reason`: why) against the pins of `host_id`: Ok if pinned, else
+/// the error to fail the connection with.
+fn check_cert_pin(host_id: &str, der: &[u8], reason: &str) -> Result<(), String> {
+    let hash = ring::digest::digest(&ring::digest::SHA256, der);
+    let hex: String = hash.as_ref().iter().map(|b| format!("{b:02x}")).collect();
+    let fingerprint = cert_fingerprint(hash.as_ref());
+    check_known(host_id, &format!("{CERT_PIN_TYPE} {hex}"), |file| {
+        format!(
+            "{CERT_CHANGED}: the server {host_id} now shows a certificate with SHA-256 {fingerprint} ({reason}), \
+             not the one trusted before. Someone may be intercepting the connection. Not connected; if the \
+             server's certificate really changed, remove its {CERT_PIN_TYPE} line from {file}"
+        )
+    })
+    .map_err(|e| {
+        e.unwrap_or_else(|| {
+            format!("{CERT_UNTRUSTED}: the certificate of {host_id} isn't trusted ({reason}). SHA-256: {fingerprint}")
+        })
+    })
+}
+
+/// `AB:CD:…`: a SHA-256 as browsers show certificate fingerprints.
+fn cert_fingerprint(hash: &[u8]) -> String {
+    hash.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(":")
+}
+
+/// Checks `key` against the trusted keys of its kind for `host_id`: Ok if
+/// trusted; `Err(Some(changed(known_hosts path)))` if others are trusted;
+/// `Err(None)` if none is (the key is kept for [`trust_host_key`]).
+fn check_known(host_id: &str, key: &str, changed: impl FnOnce(&str) -> String) -> Result<(), Option<String>> {
+    let known = known_keys(host_id, is_cert_pin(key));
     if known.iter().any(|k| k == key) {
         return Ok(());
     }
     if !known.is_empty() {
-        return Err(format!(
-            "{HOST_KEY_CHANGED}: the server {host_id} now identifies with {fingerprint}, not the key \
-             trusted before. Someone may be intercepting the connection. Not connected; if the server's key \
-             really changed, remove its line from {}",
-            known_hosts_file().map(|f| f.display().to_string()).unwrap_or_default()
-        ));
+        let file = known_hosts_file().map(|f| f.display().to_string()).unwrap_or_default();
+        return Err(Some(changed(&file)));
     }
     let mut offered = OFFERED_KEYS.lock().unwrap_or_else(|e| e.into_inner());
-    offered.retain(|(h, _)| *h != host_id);
-    offered.push((host_id.clone(), key.to_owned()));
-    Err(format!("{HOST_KEY_UNKNOWN}: {host_id} identifies with {fingerprint}"))
+    offered.retain(|(h, k)| !(h == host_id && is_cert_pin(k) == is_cert_pin(key)));
+    offered.push((host_id.to_owned(), key.to_owned()));
+    Err(None)
 }
 
 // ---- sessions and connections --------------------------------------------------------
