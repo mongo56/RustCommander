@@ -27,24 +27,29 @@ impl Drop for TempDir {
 
 /// The settings folder (known_hosts) shared by all tests of this process. Like
 /// [`TempDir`] it cleans up: the guard deletes the folder once the last test
-/// that asked for it is done (its `Drop` runs even when a test panics).
-static SETTINGS_USERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// that asked for it is done (its `Drop` runs even when a test panics). The
+/// count and the create/delete share one lock: with a plain counter, a test
+/// starting while the last one was deleting the folder lost its known_hosts.
+static SETTINGS_USERS: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
 
 struct Settings(PathBuf);
 
 impl Drop for Settings {
     fn drop(&mut self) {
-        if SETTINGS_USERS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+        let mut users = SETTINGS_USERS.lock().unwrap_or_else(|e| e.into_inner());
+        *users -= 1;
+        if *users == 0 {
             let _ = fs::remove_dir_all(&self.0);
         }
     }
 }
 
 fn settings() -> Settings {
+    let mut users = SETTINGS_USERS.lock().unwrap_or_else(|e| e.into_inner());
     let dir = std::env::temp_dir().join(format!("rc-remote-settings-{}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
     set_settings_dir(dir.clone());
-    SETTINGS_USERS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    *users += 1;
     Settings(dir)
 }
 
@@ -526,15 +531,15 @@ mod sftp_server {
         }
     }
 
-    /// Serves `root` on 127.0.0.1:`port` with the host key from `seed`.
-    pub async fn run(root: PathBuf, port: u16, seed: u8) {
+    /// Serves `root` on `listener` with the host key from `seed`.
+    pub async fn run(root: PathBuf, listener: std::net::TcpListener, seed: u8) {
         let config = Arc::new(russh::server::Config {
             auth_rejection_time: Duration::from_millis(10),
             auth_rejection_time_initial: Some(Duration::ZERO),
             keys: vec![host_key(seed)],
             ..Default::default()
         });
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
         loop {
             let Ok((socket, _)) = listener.accept().await else { return };
             let handler = Ssh { root: root.clone(), channels: HashMap::new() };
@@ -549,8 +554,13 @@ mod sftp_server {
 }
 
 fn start_sftp(root: PathBuf, seed: u8) -> u16 {
-    let port = free_port();
-    serve(move || sftp_server::run(root, port, seed));
+    // Bound here and handed over: a port from `free_port` can be handed out
+    // twice to tests running in parallel, and the second server's bind fails
+    // (its test then talks to another test's server with another host key).
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    serve(move || sftp_server::run(root, listener, seed));
     // Wait for the listener.
     for _ in 0..50 {
         if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
@@ -682,6 +692,111 @@ fn sftp_refuses_a_changed_host_key() {
     let e = connect(sftp_login(port, sftp_server::PASSWORD), "").unwrap_err().to_string();
     assert!(e.contains(HOST_KEY_CHANGED), "{e}");
     assert!(trust_host_key(&sftp_login(port, sftp_server::PASSWORD)).is_err());
+}
+
+// ---- Keep-alive ------------------------------------------------------------------
+
+/// An FTP server over `disk` on `port` that stops (closing its sockets)
+/// when the returned sender is used or dropped.
+fn start_stoppable_ftp(disk: &Path, port: u16, passive: std::ops::RangeInclusive<u16>) -> std::sync::mpsc::Sender<()> {
+    let (stop, wait) = std::sync::mpsc::channel::<()>();
+    let root = disk.to_path_buf();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        rt.spawn(async move {
+            let server = libunftp::ServerBuilder::new(Box::new(move || unftp_sbe_fs::Filesystem::new(root.clone()).unwrap()))
+                .passive_ports(passive)
+                .build()
+                .unwrap();
+            let _ = server.listen(format!("127.0.0.1:{port}")).await;
+        });
+        let _ = wait.recv();
+        rt.shutdown_background();
+    });
+    stop
+}
+
+fn connect_retrying(login: &Login) -> PathBuf {
+    let mut path = Err(io::Error::other("not tried"));
+    for _ in 0..50 {
+        path = connect(login.clone(), "");
+        if path.is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    path.unwrap()
+}
+
+fn idle_count(conn: &Connection) -> usize {
+    conn.idle.lock().unwrap().len()
+}
+
+#[test]
+fn keep_alive_pings_idle_ftp_sessions() {
+    let disk = TempDir::new("ftp-keepalive");
+    std::fs::write(disk.0.join("a.txt"), "x").unwrap();
+    let port = free_port();
+    let _stop = start_stoppable_ftp(&disk.0, port, 43000..=43499);
+    let login = Login {
+        protocol: Protocol::Ftp,
+        host: "127.0.0.1".into(),
+        port,
+        user: "tester".into(),
+        password: Some("secret".into()),
+        key_file: None,
+    };
+    let root = connect_retrying(&login);
+    let conn = connection(&root).unwrap();
+    assert_eq!(idle_count(&conn), 1);
+    // Used a moment ago: left alone. Idle long enough: pinged, kept, usable.
+    conn.ping_idle(Duration::from_secs(3600));
+    assert_eq!(idle_count(&conn), 1);
+    conn.ping_idle(Duration::ZERO);
+    assert_eq!(idle_count(&conn), 1);
+    assert_eq!(names(&root), ["a.txt"]);
+    disconnect(&root);
+    assert!(!is_connected(&root));
+}
+
+#[test]
+fn keep_alive_drops_dead_sessions_and_next_use_reconnects() {
+    let disk = TempDir::new("ftp-keepalive-dead");
+    std::fs::write(disk.0.join("b.txt"), "x").unwrap();
+    let port = free_port();
+    let stop = start_stoppable_ftp(&disk.0, port, 43500..=43749);
+    let login = Login {
+        protocol: Protocol::Ftp,
+        host: "127.0.0.1".into(),
+        port,
+        user: "tester".into(),
+        password: Some("secret".into()),
+        key_file: None,
+    };
+    let root = connect_retrying(&login);
+    let conn = connection(&root).unwrap();
+    assert_eq!(names(&root), ["b.txt"]);
+    assert_eq!(idle_count(&conn), 1);
+
+    // The server goes away: the ping finds the session dead and drops it.
+    drop(stop);
+    std::thread::sleep(Duration::from_millis(500));
+    conn.ping_idle(Duration::ZERO);
+    assert_eq!(idle_count(&conn), 0);
+
+    // It comes back (same address); the next operation opens a new session.
+    let _stop = start_stoppable_ftp(&disk.0, port, 43750..=43999);
+    let mut listed = Err(io::Error::other("not tried"));
+    for _ in 0..50 {
+        listed = crate::vfs::list(&root, true);
+        if listed.is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(listed.unwrap().len(), 1);
+    assert_eq!(idle_count(&conn), 1);
+    disconnect(&root);
 }
 
 // ---- Find files on a server ------------------------------------------------------
@@ -833,7 +948,9 @@ fn local_servers_for_manual_testing() {
             .unwrap();
         let _ = server.listen("127.0.0.1:2121").await;
     });
-    serve(move || sftp_server::run(root, 2222, 9));
+    let sftp = TcpListener::bind("127.0.0.1:2222").unwrap();
+    sftp.set_nonblocking(true).unwrap();
+    serve(move || sftp_server::run(root, sftp, 9));
     loop {
         std::thread::sleep(Duration::from_secs(3600));
     }

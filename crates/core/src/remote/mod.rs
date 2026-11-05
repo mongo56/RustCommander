@@ -27,8 +27,8 @@ use crate::vfs::Vfs;
 use chrono::{DateTime, Local};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 
 /// How long to wait for a server to accept a connection.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -216,7 +216,9 @@ pub fn trust_host_key(login: &Login) -> io::Result<()> {
         std::fs::create_dir_all(dir)?;
     }
     let mut out = std::fs::OpenOptions::new().create(true).append(true).open(file)?;
-    writeln!(out, "{host_id} {key}")
+    // One write: `writeln!` writes in pieces, which two appends at once
+    // (parallel tests, two connects) interleave into broken lines.
+    out.write_all(format!("{host_id} {key}\n").as_bytes())
 }
 
 /// Checks a host key (`ssh-ed25519 AAAA…`, fingerprint for messages):
@@ -283,6 +285,12 @@ trait Session: Send {
     fn free_space(&mut self, _path: &str) -> io::Result<Option<(u64, u64)>> {
         Ok(None)
     }
+    /// Tells the server we're still here (FTP `NOOP`) so it doesn't drop an
+    /// idle session; an error means the session is dead. SFTP keeps itself
+    /// alive with the SSH keep-alive in its config.
+    fn keep_alive(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 fn open_session(login: &Login) -> io::Result<Box<dyn Session>> {
@@ -305,11 +313,46 @@ fn session_survives(e: &io::Error) -> bool {
     ) || e.get_ref().is_some_and(|inner| inner.is::<Refused>())
 }
 
+/// How often the keep-alive thread looks at the idle sessions; a session
+/// unused for this long is pinged (servers drop idle ones after 60-300 s).
+const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(45);
+
+/// A pooled session and when it was last used.
+struct Idle {
+    session: Box<dyn Session>,
+    since: Instant,
+}
+
 /// A connected server: its login and idle sessions.
 pub struct Connection {
     key: String,
     login: Login,
-    idle: Mutex<Vec<Box<dyn Session>>>,
+    idle: Mutex<Vec<Idle>>,
+}
+
+/// Whether the keep-alive thread runs; it ends when no connection is left.
+static KEEPER: Mutex<bool> = Mutex::new(false);
+static KEEPER_WAKE: Condvar = Condvar::new();
+
+fn start_keeper() {
+    let mut running = KEEPER.lock().unwrap_or_else(|e| e.into_inner());
+    if *running {
+        return;
+    }
+    let spawned = std::thread::Builder::new().name("remote-keep-alive".into()).spawn(|| loop {
+        let mut running = KEEPER.lock().unwrap_or_else(|e| e.into_inner());
+        running = KEEPER_WAKE.wait_timeout(running, KEEP_ALIVE_INTERVAL).unwrap_or_else(|e| e.into_inner()).0;
+        let all: Vec<Arc<Connection>> = CONNECTIONS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if all.is_empty() {
+            *running = false;
+            return;
+        }
+        drop(running);
+        for conn in all {
+            conn.ping_idle(KEEP_ALIVE_INTERVAL);
+        }
+    });
+    *running = spawned.is_ok();
 }
 
 static CONNECTIONS: Mutex<Vec<Arc<Connection>>> = Mutex::new(Vec::new());
@@ -323,10 +366,12 @@ pub fn connect(login: Login, folder: &str) -> io::Result<PathBuf> {
     let start = if folder.trim().is_empty() { session.home()? } else { folder.trim().to_owned() };
     let start = if start.starts_with('/') { start } else { format!("/{start}") };
     let key = login.key();
-    let conn = Arc::new(Connection { key: key.clone(), login, idle: Mutex::new(vec![session]) });
+    let conn = Arc::new(Connection { key: key.clone(), login, idle: Mutex::new(vec![Idle { session, since: Instant::now() }]) });
     let mut all = CONNECTIONS.lock().unwrap_or_else(|e| e.into_inner());
     all.retain(|c| c.key != key);
     all.push(conn);
+    drop(all);
+    start_keeper();
     Ok(path_of(&key, &start))
 }
 
@@ -341,6 +386,7 @@ pub fn disconnect(path: &Path) -> bool {
     // Logging out talks to the server: not on the caller's (UI) thread.
     if found {
         std::thread::spawn(move || drop(gone));
+        KEEPER_WAKE.notify_all();
     }
     found
 }
@@ -387,7 +433,7 @@ impl Connection {
         mut op: impl FnMut(&mut dyn Session) -> io::Result<T>,
         retry_ok: impl Fn() -> bool,
     ) -> io::Result<T> {
-        let pooled = self.idle.lock().unwrap_or_else(|e| e.into_inner()).pop();
+        let pooled = self.idle.lock().unwrap_or_else(|e| e.into_inner()).pop().map(|i| i.session);
         let fresh = pooled.is_none();
         let mut session = match pooled {
             Some(s) => s,
@@ -419,7 +465,24 @@ impl Connection {
     fn put_back(&self, session: Box<dyn Session>) {
         let mut idle = self.idle.lock().unwrap_or_else(|e| e.into_inner());
         if idle.len() < IDLE_SESSIONS {
-            idle.push(session);
+            idle.push(Idle { session, since: Instant::now() });
+        }
+    }
+
+    /// Pings the idle sessions unused for `older_than` (taken out of the
+    /// pool meanwhile, so no job gets one mid-ping) and keeps those that
+    /// answer; the others are dropped and the next job opens a new one.
+    fn ping_idle(&self, older_than: Duration) {
+        let stale: Vec<Idle> = {
+            let mut idle = self.idle.lock().unwrap_or_else(|e| e.into_inner());
+            let (stale, fresh): (Vec<_>, Vec<_>) = idle.drain(..).partition(|i| i.since.elapsed() >= older_than);
+            *idle = fresh;
+            stale
+        };
+        for mut i in stale {
+            if i.session.keep_alive().is_ok() {
+                self.put_back(i.session);
+            }
         }
     }
 

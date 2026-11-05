@@ -212,6 +212,10 @@ impl Session for Ftp {
         self.stream.rename(from, to).map_err(|e| io_err(from, e))
     }
 
+    fn keep_alive(&mut self) -> io::Result<()> {
+        self.stream.noop().map_err(|e| io_err("keep-alive", e))
+    }
+
     fn home(&mut self) -> io::Result<String> {
         self.stream.pwd().map_err(|e| io_err("PWD", e))
     }
