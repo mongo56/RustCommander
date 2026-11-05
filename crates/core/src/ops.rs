@@ -58,6 +58,12 @@ pub enum Job {
     /// that file is still as `expect` says (see [`entry_stamp`]); otherwise
     /// it changed in the archive meanwhile and nothing is overwritten.
     Update { src: PathBuf, dst: PathBuf, expect: Stamp },
+    /// Cuts the local file `src` into parts of `part_size` bytes in the folder
+    /// `target` (`name.001`, ... and `name.crc`, see [`crate::split`]).
+    Split { src: PathBuf, target: PathBuf, part_size: u64 },
+    /// Joins the parts `x.001`, `x.002`, ... (`first` is the first) into the file `x`
+    /// in the folder `target`, checking `x.crc` if it exists.
+    Combine { first: PathBuf, target: PathBuf },
 }
 
 /// Size and date of a file inside an archive (`None`: there's no such
@@ -86,6 +92,8 @@ impl Job {
             Job::Pack { .. } => "Packed",
             Job::Unpack { .. } => "Unpacked",
             Job::Update { .. } => "Updated",
+            Job::Split { .. } => "Split",
+            Job::Combine { .. } => "Combined",
         }
     }
 
@@ -100,6 +108,8 @@ impl Job {
             Job::Pack { .. } => "Packing",
             Job::Unpack { .. } => "Unpacking",
             Job::Update { .. } => "Updating",
+            Job::Split { .. } => "Splitting",
+            Job::Combine { .. } => "Combining",
         }
     }
 }
@@ -524,6 +534,8 @@ pub fn run(job: &Job, control: &Control, reporter: &mut dyn Reporter) -> Outcome
             runner.report(true);
             runner.update_entry(src, dst, expect);
         }
+        Job::Split { src, target, part_size } => runner.split(src, target, *part_size),
+        Job::Combine { first, target } => runner.combine(first, target),
         Job::Delete { paths, to_trash: true } => {
             runner.progress.total_items = paths.len() as u64;
             runner.report(true);
@@ -872,6 +884,287 @@ impl Runner<'_> {
                 let _ = fs::remove_file(dst);
                 other
             }
+        }
+    }
+
+    /// Copies up to `limit` bytes from `input` to `output` (if any), feeding
+    /// `hasher`, with progress. Returns the bytes copied (less than `limit`
+    /// at the end of the input), or `None` when cancelled.
+    fn pump_hashed(
+        &mut self,
+        input: &mut dyn Read,
+        mut output: Option<&mut dyn Write>,
+        limit: u64,
+        hasher: &mut crc32fast::Hasher,
+    ) -> io::Result<Option<u64>> {
+        let mut copied = 0u64;
+        while copied < limit {
+            if !self.alive() {
+                return Ok(None);
+            }
+            let want = (limit - copied).min(self.buffer.len() as u64) as usize;
+            let n = match input.read(&mut self.buffer[..want]) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            };
+            hasher.update(&self.buffer[..n]);
+            if let Some(out) = output.as_mut() {
+                out.write_all(&self.buffer[..n])?;
+            }
+            copied += n as u64;
+            self.progress.done_bytes += n as u64;
+            self.report(false);
+        }
+        Ok(Some(copied))
+    }
+
+    /// Asks about an existing `dst` (a file written by Split / Combine).
+    /// Returns None to write it, Some(true) to skip it, Some(false) when the
+    /// job can't go on (a folder is in the way, or cancelled).
+    fn split_conflict(&mut self, src: &Path, src_size: u64, dst: &Path) -> Option<bool> {
+        let Ok(meta) = fs::symlink_metadata(dst) else { return None };
+        if meta.is_dir() {
+            self.fail_msg(dst, "A folder with this name already exists");
+            return Some(false);
+        }
+        match self.resolve(src, (src_size, None), dst, stat_of(&meta)) {
+            Resolution::Overwrite => None,
+            Resolution::Cancel => {
+                self.control.cancel();
+                Some(false)
+            }
+            _ => Some(true),
+        }
+    }
+
+    /// `Job::Split`: parts, then the crc file. What this run wrote is
+    /// removed again if it fails or is cancelled.
+    fn split(&mut self, src: &Path, target: &Path, part_size: u64) {
+        use crate::split as sp;
+        let Some(name) = src.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+            self.fail_msg(src, "Invalid file");
+            return;
+        };
+        let size = match fs::metadata(src) {
+            Ok(m) if m.is_file() => m.len(),
+            Ok(_) => {
+                self.fail_msg(src, "Only files can be split");
+                return;
+            }
+            Err(e) => {
+                self.fail(src, e);
+                return;
+            }
+        };
+        let count = sp::part_count(size, part_size);
+        self.progress.total_bytes = size;
+        self.progress.total_items = count + 1;
+        self.report(true);
+        let mut input = match File::open(src) {
+            Ok(f) => f,
+            Err(e) => {
+                self.fail(src, e);
+                return;
+            }
+        };
+        if let Err(e) = fs::create_dir_all(target) {
+            self.fail(target, e);
+            return;
+        }
+        let mut created: Vec<PathBuf> = Vec::new();
+        let mut hasher = crc32fast::Hasher::new();
+        let mut ok = true;
+        let mut remaining = size;
+        for i in 1..=count {
+            if !self.alive() {
+                ok = false;
+                break;
+            }
+            let dst = target.join(sp::part_name(&name, i, 0));
+            let len = remaining.min(part_size);
+            self.progress.current = Some(dst.clone());
+            let skip = match self.split_conflict(src, len, &dst) {
+                None => false,
+                Some(true) => true,
+                Some(false) => {
+                    ok = false;
+                    break;
+                }
+            };
+            // A skipped part is still read, for the crc of the whole file.
+            let mut out = None;
+            if !skip {
+                match File::create(&dst) {
+                    Ok(f) => {
+                        created.push(dst.clone());
+                        out = Some(f);
+                    }
+                    Err(e) => {
+                        self.fail(&dst, e);
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            let copied = self.pump_hashed(&mut input, out.as_mut().map(|f| f as &mut dyn Write), len, &mut hasher);
+            match copied {
+                Ok(Some(n)) if n == len => {}
+                Ok(Some(_)) => {
+                    self.fail_msg(src, "The file got shorter while it was split");
+                    ok = false;
+                    break;
+                }
+                Ok(None) => {
+                    ok = false;
+                    break;
+                }
+                Err(e) => {
+                    self.fail(&dst, e);
+                    ok = false;
+                    break;
+                }
+            }
+            remaining -= len;
+            if skip {
+                self.outcome.skipped += 1;
+            }
+            self.item_done(0);
+        }
+        if ok {
+            let crc = sp::CrcFile { filename: name.clone(), size, crc32: hasher.finalize() };
+            let text = crc.format();
+            let dst = target.join(sp::crc_name(&name));
+            self.progress.current = Some(dst.clone());
+            match self.split_conflict(src, text.len() as u64, &dst) {
+                None => match fs::write(&dst, text) {
+                    Ok(()) => {
+                        created.push(dst);
+                        self.item_done(0);
+                    }
+                    Err(e) => {
+                        self.fail(&dst, e);
+                        ok = false;
+                    }
+                },
+                Some(true) => {
+                    self.outcome.skipped += 1;
+                    self.item_done(0);
+                }
+                Some(false) => ok = false,
+            }
+        }
+        if !ok {
+            drop(input);
+            for path in created {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+
+    /// `Job::Combine`: joins the parts into `target/<name>` and checks the
+    /// crc file. A cancelled or failed join removes the output; one whose
+    /// crc doesn't match is kept, with an error.
+    fn combine(&mut self, first: &Path, target: &Path) {
+        use crate::split as sp;
+        let parts = match sp::find_parts(first) {
+            Ok(p) => p,
+            Err(e) => {
+                self.fail_msg(first, e);
+                return;
+            }
+        };
+        let first_name = first.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let Some((base, _, _)) = sp::parse_part(&first_name) else { return };
+        let mut total = 0u64;
+        for part in &parts {
+            match fs::metadata(part) {
+                Ok(m) => total += m.len(),
+                Err(e) => {
+                    self.fail(part, e);
+                    return;
+                }
+            }
+        }
+        self.progress.total_bytes = total;
+        self.progress.total_items = parts.len() as u64;
+        self.report(true);
+        let out_path = target.join(base);
+        if parts.iter().any(|p| same_path(p, &out_path)) {
+            self.fail_msg(&out_path, "The joined file would replace a part");
+            return;
+        }
+        if let Err(e) = fs::create_dir_all(target) {
+            self.fail(target, e);
+            return;
+        }
+        self.progress.current = Some(out_path.clone());
+        match self.split_conflict(first, total, &out_path) {
+            None => {}
+            Some(true) => {
+                self.outcome.skipped += parts.len() as u64;
+                self.progress.done_items += parts.len() as u64;
+                return;
+            }
+            Some(false) => return,
+        }
+        let mut out = match File::create(&out_path) {
+            Ok(f) => f,
+            Err(e) => {
+                self.fail(&out_path, e);
+                return;
+            }
+        };
+        let mut hasher = crc32fast::Hasher::new();
+        let mut written = 0u64;
+        let mut ok = true;
+        for part in &parts {
+            self.progress.current = Some(part.clone());
+            let result = File::open(part)
+                .and_then(|mut input| self.pump_hashed(&mut input, Some(&mut out as &mut dyn Write), u64::MAX, &mut hasher));
+            match result {
+                Ok(Some(n)) => written += n,
+                Ok(None) => {
+                    ok = false;
+                    break;
+                }
+                Err(e) => {
+                    self.fail(part, e);
+                    ok = false;
+                    break;
+                }
+            }
+            self.item_done(0);
+        }
+        if let (true, Err(e)) = (ok, out.flush()) {
+            self.fail(&out_path, e);
+            ok = false;
+        }
+        drop(out);
+        if !ok {
+            let _ = fs::remove_file(&out_path);
+            return;
+        }
+        let crc_path = first.with_file_name(sp::crc_name(base));
+        if !crc_path.is_file() {
+            return;
+        }
+        let crc = fs::read(&crc_path)
+            .map_err(|e| e.to_string())
+            .and_then(|bytes| sp::CrcFile::parse(&String::from_utf8_lossy(&bytes)));
+        match crc {
+            Err(e) => {
+                self.fail_msg(&crc_path, format!("Can't check the result: {e}"));
+            }
+            Ok(c) if c.size != written => {
+                let msg = format!("Joined file is damaged: {written} bytes instead of {}", c.size);
+                self.fail_msg(&out_path, msg);
+            }
+            Ok(c) if c.crc32 != hasher.finalize() => {
+                self.fail_msg(&out_path, "Joined file is damaged: the crc32 doesn't match the .crc file");
+            }
+            Ok(_) => {}
         }
     }
 
@@ -2225,6 +2518,88 @@ mod tests {
         let mut r = Auto { answer, asked: 0 };
         let outcome = run(&job, &Control::default(), &mut r);
         (outcome, r.asked)
+    }
+
+    fn split_round_trip(len: usize, part: u64) {
+        use crate::split::CrcFile;
+        let tmp = TempDir::new(&format!("split-{len}-{part}"));
+        let data: Vec<u8> = (0..len).map(|i| (i * 7 % 251) as u8).collect();
+        let src = tmp.0.join("f.bin");
+        fs::write(&src, &data).unwrap();
+        let parts = tmp.0.join("parts");
+        let job = Job::Split { src, target: parts.clone(), part_size: part };
+        let (o, _) = run_job(job, Resolution::Cancel);
+        assert!(o.errors.is_empty() && !o.cancelled, "{:?}", o.errors);
+        let count = len.div_ceil(part as usize);
+        for i in 1..=count {
+            let size = fs::metadata(parts.join(format!("f.bin.{i:03}"))).unwrap().len() as usize;
+            assert_eq!(size, (len - (i - 1) * part as usize).min(part as usize), "part {i}");
+        }
+        assert!(!parts.join(format!("f.bin.{:03}", count + 1)).exists());
+        let crc = CrcFile::parse(&fs::read_to_string(parts.join("f.bin.crc")).unwrap()).unwrap();
+        assert_eq!((crc.filename.as_str(), crc.size, crc.crc32), ("f.bin", len as u64, crc32fast::hash(&data)));
+
+        let out = tmp.0.join("out");
+        let job = Job::Combine { first: parts.join("f.bin.001"), target: out.clone() };
+        let (o, _) = run_job(job, Resolution::Cancel);
+        assert!(o.errors.is_empty() && !o.cancelled, "{:?}", o.errors);
+        assert_eq!(fs::read(out.join("f.bin")).unwrap(), data);
+    }
+
+    #[test]
+    fn split_and_combine_round_trip() {
+        split_round_trip(100, 25); // exact multiple
+        split_round_trip(100, 30); // not a multiple
+        split_round_trip(20, 1); // one byte per part
+        split_round_trip(5, 100); // one part
+    }
+
+    #[test]
+    fn combine_reports_a_missing_part_and_a_damaged_result() {
+        let tmp = TempDir::new("combine-bad");
+        fs::write(tmp.0.join("f.bin"), vec![7u8; 90]).unwrap();
+        let parts = tmp.0.join("parts");
+        let job = Job::Split { src: tmp.0.join("f.bin"), target: parts.clone(), part_size: 30 };
+        assert!(run_job(job, Resolution::Cancel).0.errors.is_empty());
+        // Damage the middle part (same size): the join is kept, with an error.
+        fs::write(parts.join("f.bin.002"), vec![8u8; 30]).unwrap();
+        let job = Job::Combine { first: parts.join("f.bin.001"), target: tmp.0.join("out") };
+        let (o, _) = run_job(job, Resolution::Cancel);
+        assert_eq!(o.errors.len(), 1);
+        assert!(o.errors[0].1.contains("damaged"), "{:?}", o.errors);
+        assert_eq!(fs::metadata(tmp.0.join("out/f.bin")).unwrap().len(), 90);
+        // Without the crc file there is no check.
+        fs::remove_file(parts.join("f.bin.crc")).unwrap();
+        let job = Job::Combine { first: parts.join("f.bin.001"), target: tmp.0.join("out2") };
+        assert!(run_job(job, Resolution::Cancel).0.errors.is_empty());
+        // A missing middle part is named, and nothing is written.
+        fs::remove_file(parts.join("f.bin.002")).unwrap();
+        let job = Job::Combine { first: parts.join("f.bin.001"), target: tmp.0.join("out3") };
+        let (o, _) = run_job(job, Resolution::Cancel);
+        assert_eq!(o.errors.len(), 1);
+        assert!(o.errors[0].1.contains("f.bin.002"), "{:?}", o.errors);
+        assert!(!tmp.0.join("out3/f.bin").exists());
+    }
+
+    #[test]
+    fn split_asks_about_existing_parts_and_cancel_removes_the_output() {
+        let tmp = TempDir::new("split-exists");
+        fs::write(tmp.0.join("f.bin"), vec![1u8; 60]).unwrap();
+        let parts = tmp.0.join("parts");
+        fs::create_dir_all(&parts).unwrap();
+        fs::write(parts.join("f.bin.002"), b"old").unwrap();
+        let job = Job::Split { src: tmp.0.join("f.bin"), target: parts.clone(), part_size: 20 };
+        let (o, asked) = run_job(job.clone(), Resolution::Cancel);
+        assert!(o.cancelled && asked == 1);
+        // The part written before the question is gone; the old one stays.
+        assert!(!parts.join("f.bin.001").exists() && !parts.join("f.bin.003").exists());
+        assert_eq!(fs::read(parts.join("f.bin.002")).unwrap(), b"old");
+        let (o, asked) = run_job(job, Resolution::SkipAll);
+        assert!(o.errors.is_empty() && asked == 1 && o.skipped == 1);
+        assert_eq!(fs::read(parts.join("f.bin.002")).unwrap(), b"old");
+        assert_eq!(fs::metadata(parts.join("f.bin.003")).unwrap().len(), 20);
+        let crc = crate::split::CrcFile::parse(&fs::read_to_string(parts.join("f.bin.crc")).unwrap()).unwrap();
+        assert_eq!(crc.crc32, crc32fast::hash(&[1u8; 60]));
     }
 
     #[test]

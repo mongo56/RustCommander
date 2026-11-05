@@ -111,6 +111,10 @@ commands! {
         CalcChecksum => "cm_CalcChecksum", "Calculate the SHA-256 checksum of the selected files (copy or save as .sha256)", "Checksum";
         /// Check the files listed in the .sha256 file under the cursor.
         VerifyChecksum => "cm_VerifyChecksum", "Verify the files listed in the .sha256 file under the cursor", "Verify";
+        /// Cut the file under the cursor into parts (name.001, name.002, ...) in the other panel.
+        SplitFile => "cm_SplitFile", "Split the file under the cursor into parts (name.001, ...) in the other panel's folder", "Split";
+        /// Join the parts name.001, name.002, ... into the other panel's folder.
+        CombineFiles => "cm_CombineFiles", "Join the parts (name.001, name.002, ...) from the file under the cursor into the other panel's folder", "Combine";
         /// Find files by name and contents (Ctrl+F).
         FindFiles => "cm_SearchFor", "Find files by name and contents", "Find";
         /// What takes up space in a folder, as a tree (Alt+Shift+F7).

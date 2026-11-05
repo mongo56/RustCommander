@@ -16,6 +16,7 @@ pub mod panel;
 pub mod remote;
 pub mod rename;
 pub mod search;
+pub mod split;
 pub mod treemap;
 pub mod vfs;
 mod gz_edit;

@@ -13,6 +13,7 @@ mod markdown;
 mod palette;
 mod screen;
 mod checksum;
+mod split;
 mod find_files;
 mod multi_rename;
 mod settings;
@@ -295,6 +296,8 @@ enum Dialog {
     Update(update::UpdateDialog),
     /// SHA-256 calculation / verification (`checksum.rs`).
     Checksum(checksum::ChecksumDialog),
+    /// Split `src` (`size` bytes) into parts in `target` (`split.rs`); `input`: the part size.
+    Split { src: PathBuf, size: u64, target: PathBuf, input: String },
     /// Closing terminal `id` while `program` runs in it.
     CloseTerm { id: u64, program: String },
     /// Quitting while terminals run.
@@ -1279,6 +1282,7 @@ impl App {
                     | Dialog::MakeDir { input }
                     | Dialog::EditNew { input }
                     | Dialog::Pack { input, .. }
+                    | Dialog::Split { input, .. }
                     | Dialog::Unpack { input, .. }
                     | Dialog::Password { input, .. },
                 ) = &mut self.dialog
@@ -1545,6 +1549,11 @@ impl App {
                 Some(Named::ArrowRight) if !has_input => Some(false),
                 _ => None,
             };
+            if let (Some(Named::ArrowUp | Named::ArrowDown), Some(Dialog::Split { input, .. })) = (named, &mut self.dialog) {
+                // Up/Down step through the preset sizes.
+                *input = split::step_preset(input, named == Some(Named::ArrowDown));
+                return Task::none();
+            }
             if escape {
                 self.dialog = None;
                 self.dialog_focus = None;
@@ -1713,6 +1722,8 @@ impl App {
             FindFiles => return self.open_find(),
             CalcChecksum => return self.calc_checksum(),
             VerifyChecksum => return self.verify_checksum(),
+            SplitFile => return self.open_split(),
+            CombineFiles => return self.combine_files(),
             DiskUsage => return self.open_disk_usage(),
             Connect => return self.open_connect(),
             Disconnect => return self.disconnect(),
@@ -2423,6 +2434,7 @@ impl App {
                 }
                 return task;
             }
+            Dialog::Split { src, size, target, input } => return self.split_submit(src, size, target, input),
             Dialog::Unpack { archives, base, input } => {
                 let target = resolve_typed_path(input.trim().trim_matches('"'), &base);
                 if vfs::in_archive(&target) {

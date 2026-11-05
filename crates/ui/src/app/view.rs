@@ -819,6 +819,16 @@ impl App {
                 Some(input_field(input)),
                 "Pack",
             ),
+            Dialog::Split { src, size, input, .. } => (
+                "Split".into(),
+                format!(
+                    "Split {} ({}) into parts in the other panel's folder. Part size (a plain number is in MB; units B, KB, MB, GB):",
+                    src.file_name().unwrap_or_default().to_string_lossy(),
+                    rc_core::format::size(*size)
+                ),
+                Some(input_field(input)),
+                "Split",
+            ),
             Dialog::Unpack { archives, input, .. } => (
                 "Unpack".into(),
                 format!("Unpack {} to:", describe(archives)),
@@ -895,6 +905,14 @@ impl App {
         }
         if let Some(field) = field {
             content = content.push(field);
+        }
+        if let Dialog::Split { .. } = dialog {
+            let mut presets = row![text("Presets (Up/Down)").size(12).color(theme::c().muted), Space::with_width(Length::Fill)].spacing(6);
+            for (label, _) in rc_core::split::PRESETS {
+                let value = label.split(" (").next().unwrap_or_default().to_string();
+                presets = presets.push(small_button(label, Message::DialogInput(value)));
+            }
+            content = content.push(presets.align_y(Alignment::Center));
         }
         content = content.push(
             row![
