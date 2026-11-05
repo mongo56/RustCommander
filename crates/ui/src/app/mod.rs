@@ -1818,7 +1818,10 @@ impl App {
         match cmd {
             Quit => return self.request_quit(),
             View => return self.open_viewer(),
-            QuickView => self.toggle_quick_view(),
+            QuickView => {
+                self.toggle_quick_view();
+                return Task::none();
+            }
             MultiRename => return self.open_multi_rename(),
             CompareFiles => return self.open_file_diff(),
             FindFiles => return self.open_find(),

@@ -624,7 +624,8 @@ impl App {
 
         let roots = row![
             container(text(remote::display(&t.left)).size(13).wrapping(Wrapping::None)).width(Length::Fill).clip(true),
-            text("\u{21c4}").size(14).color(colors.accent),
+            // "←→": the UI font has no U+21C4 (drawn as a box).
+            text("\u{2190}\u{2192}").size(14).color(colors.accent),
             container(text(remote::display(&t.right)).size(13).wrapping(Wrapping::None)).width(Length::Fill).clip(true),
         ]
         .spacing(10)
