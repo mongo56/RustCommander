@@ -551,6 +551,14 @@ fn script_run(shell: &str, kind: Script, dir: &Path, name: &str) -> (String, Str
         (ShellFamily::Other, Script::Batch) => ("cmd.exe".to_owned(), ShellFamily::Cmd),
         (family, _) => (shell.to_owned(), family),
     };
+    // A .ps1 in PowerShell: the shell starts with the execution policy
+    // bypassed for its own process only (what Explorer's "Run with
+    // PowerShell" does too), so the typed line can stay short.
+    let shell = match (family, kind) {
+        (ShellFamily::Cmd, _) | (_, Script::Batch) => shell,
+        _ if !takes_policy(&shell) => shell,
+        _ => format!("{shell} -ExecutionPolicy Bypass"),
+    };
     let line = match family {
         ShellFamily::Cmd => {
             let target = cmd_target(dir, name);
@@ -559,25 +567,22 @@ fn script_run(shell: &str, kind: Script, dir: &Path, name: &str) -> (String, Str
                 Script::PowerShell => format!("powershell -NoProfile -ExecutionPolicy Bypass -File \"{target}\""),
             }
         }
-        _ => {
-            let path = ps_quote(&format!(".\\{name}"));
-            match kind {
-                Script::Batch => format!("& {path}"),
-                // In the shell itself, so it sees the session; when the
-                // execution policy blocks scripts, once more in a child of
-                // the same PowerShell with the policy bypassed for that
-                // child only (the configured policy stays as it is).
-                Script::PowerShell => {
-                    let exe = if family == ShellFamily::Pwsh { "pwsh.exe" } else { "powershell.exe" };
-                    format!(
-                        "try {{ & {path} }} catch [Management.Automation.PSSecurityException] \
-                         {{ & \"$PSHOME\\{exe}\" -NoProfile -ExecutionPolicy Bypass -File {path} }}"
-                    )
-                }
-            }
-        }
+        // `.\x.ps1`, or `& '.\x y.ps1'` when the name needs quoting.
+        _ if name.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c)) => format!(".\\{name}"),
+        _ => format!("& {}", ps_quote(&format!(".\\{name}"))),
     };
     (shell, line)
+}
+
+/// Whether `-ExecutionPolicy Bypass` can be appended to the PowerShell
+/// command line `shell`: not when it sets a policy itself or ends in a
+/// command or file (later arguments would go to those).
+fn takes_policy(shell: &str) -> bool {
+    const STOP: [&str; 10] = ["executionpolicy", "ep", "ex", "command", "c", "file", "f", "encodedcommand", "e", "ec"];
+    !shell.split_whitespace().skip(1).any(|arg| {
+        let arg = arg.to_ascii_lowercase();
+        arg.starts_with(['-', '/']) && STOP.contains(&arg.trim_start_matches(['-', '/']))
+    })
 }
 
 /// Program and raw arguments that run the script `name` (in `dir`) in a new
@@ -2093,15 +2098,15 @@ mod tests {
     fn script_lines() {
         let dir = Path::new(r"C:\Scripts");
         let (shell, line) = script_run("powershell.exe -NoLogo", Script::PowerShell, dir, "it's.ps1");
-        assert_eq!(shell, "powershell.exe -NoLogo");
-        assert_eq!(
-            line,
-            "try { & '.\\it''s.ps1' } catch [Management.Automation.PSSecurityException] \
-             { & \"$PSHOME\\powershell.exe\" -NoProfile -ExecutionPolicy Bypass -File '.\\it''s.ps1' }"
-        );
-        let (_, line) = script_run("pwsh -NoLogo", Script::PowerShell, dir, "a b.ps1");
-        assert!(line.contains("\"$PSHOME\\pwsh.exe\""), "{line}");
-        assert!(line.starts_with("try { & '.\\a b.ps1' }"), "{line}");
+        assert_eq!(shell, "powershell.exe -NoLogo -ExecutionPolicy Bypass");
+        assert_eq!(line, "& '.\\it''s.ps1'");
+        let (shell, line) = script_run("pwsh -NoLogo", Script::PowerShell, dir, "build-all_2.ps1");
+        assert_eq!((shell.as_str(), line.as_str()), ("pwsh -NoLogo -ExecutionPolicy Bypass", ".\\build-all_2.ps1"));
+        // A policy of its own or a trailing command: left as it is.
+        assert_eq!(script_run("pwsh -ep RemoteSigned", Script::PowerShell, dir, "a.ps1").0, "pwsh -ep RemoteSigned");
+        assert_eq!(script_run("pwsh -NoExit -Command x", Script::PowerShell, dir, "a.ps1").0, "pwsh -NoExit -Command x");
+        // Batch files need no policy.
+        assert_eq!(script_run("pwsh", Script::Batch, dir, "go.cmd"), ("pwsh".into(), ".\\go.cmd".into()));
         assert_eq!(script_run("pwsh", Script::Batch, dir, "x & y.cmd").1, "& '.\\x & y.cmd'");
         assert_eq!(script_run("pwsh", Script::Batch, dir, "\u{2019}q.bat").1, "& '.\\\u{2019}\u{2019}q.bat'");
         assert_eq!(script_run("cmd.exe", Script::Batch, dir, "x & y.cmd"), ("cmd.exe".into(), "\"x & y.cmd\"".into()));
@@ -2115,8 +2120,8 @@ mod tests {
         // Another shell: one that runs the script.
         assert_eq!(script_run("bash -l", Script::Batch, dir, "go.bat"), ("cmd.exe".into(), "\"go.bat\"".into()));
         let (shell, line) = script_run("bash -l", Script::PowerShell, dir, "go.ps1");
-        assert_eq!(shell, crate::config::DEFAULT_BUILTIN_SHELL);
-        assert!(line.starts_with("try { & '.\\go.ps1' }"), "{line}");
+        assert_eq!(shell, format!("{} -ExecutionPolicy Bypass", crate::config::DEFAULT_BUILTIN_SHELL));
+        assert_eq!(line, ".\\go.ps1");
     }
 
     #[test]

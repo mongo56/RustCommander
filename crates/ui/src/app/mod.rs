@@ -1418,7 +1418,7 @@ impl App {
             }
             return match self.screen {
                 Some(Screen::Help(_)) => self.help_key(named, &key, mods, text.as_deref()),
-                Some(Screen::Settings(_)) => self.settings_key(named, &key, mods, captured),
+                Some(Screen::Settings(_)) => self.settings_key(named, &key, mods, text.as_deref(), captured),
                 Some(Screen::MultiRename(_)) => self.multi_rename_key(named, &key, mods, captured),
                 Some(Screen::Find(_)) => self.find_key(named, &key, mods, captured),
                 Some(Screen::Connect(_)) => self.connect_key(named, &key, mods, captured),
@@ -1430,7 +1430,7 @@ impl App {
                 // burst its submit (closing the box) is handled before the
                 // typed letters arrive here.
                 Some(Screen::Viewer(_)) if captured && !escape => Task::none(),
-                Some(Screen::Viewer(_)) => self.viewer_key(&key, mods),
+                Some(Screen::Viewer(_)) => self.viewer_key(&key, mods, text.as_deref()),
                 Some(Screen::Term(_)) => self.term_key(&key, mods, text.as_deref()),
                 None => Task::none(),
             };

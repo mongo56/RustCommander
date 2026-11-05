@@ -1091,14 +1091,16 @@ impl App {
         self.viewer_scroll((-lines * 3.0).round() as isize);
     }
 
-    pub(super) fn viewer_key(&mut self, key: &keyboard::Key, mods: keyboard::Modifiers) -> Task<Message> {
+    pub(super) fn viewer_key(&mut self, key: &keyboard::Key, mods: keyboard::Modifiers, text: Option<&str>) -> Task<Message> {
         let named = match key {
             keyboard::Key::Named(n) => Some(*n),
             _ => None,
         };
         let rows = self.viewer_rows() as isize;
         let ctrl = mods.control();
+        // `key` is the key without Shift; "/" is Shift+7 on many layouts, so it comes from the typed text.
         let ch = match key {
+            keyboard::Key::Character(_) if text == Some("/") && !ctrl => Some("/".to_owned()),
             keyboard::Key::Character(c) => Some(c.to_lowercase()),
             _ => None,
         };

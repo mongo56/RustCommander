@@ -130,7 +130,7 @@ commands! {
             (SortKey::Modified) => "cm_SortByDateTime", "Sort by date", "ByDate";
         /// Make the other panel show the same folder.
         SyncOtherPanel => "cm_TransferPath", "Show this folder in the other panel too", "TransferPath";
-        View => "cm_View", "View the file (text, hex, images)", "View";
+        View => "cm_View", "View the file (text, hex, images, rendered Markdown)", "View";
         Edit => "cm_Edit", "Edit the file in the configured editor", "Edit";
         /// Ask for a file name, create it if missing and edit it (Shift+F4).
         EditNew => "cm_EditNewFile", "Create a new file and edit it", "NewFile";

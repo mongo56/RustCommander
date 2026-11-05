@@ -780,6 +780,7 @@ impl App {
         named: Option<Named>,
         key: &keyboard::Key,
         mods: keyboard::Modifiers,
+        text: Option<&str>,
         captured: bool,
     ) -> Task<Message> {
         let Some(s) = self.screen.settings_mut() else { return Task::none() };
@@ -816,7 +817,9 @@ impl App {
         let page = s.page;
         let rows = Self::rows_of(page, shown_commands(&self.keymap, s).len());
         let row = s.row[page.index()];
+        // `key` is the key without Shift; "/" is Shift+7 on many layouts, so it comes from the typed text.
         let ch = match key {
+            keyboard::Key::Character(_) if text == Some("/") && !mods.control() => Some("/".to_owned()),
             keyboard::Key::Character(c) if !mods.alt() && !mods.logo() => Some(c.to_ascii_lowercase()),
             _ => None,
         };
