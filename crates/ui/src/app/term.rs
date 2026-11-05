@@ -2366,14 +2366,31 @@ impl App {
             let accent = if current { c.accent } else { Color::TRANSPARENT };
             let bar = container(Space::new(Length::Fixed(3.0), Length::Fixed(h - 6.0))).style(filled(accent));
             let mut line = Row::new().spacing(2).align_y(iced::Alignment::Center).push(bar).push(name);
+            let mut hover_x = None;
             if let Some(id) = close.filter(|_| !collapsed) {
-                line = line.push(
-                    button(text("\u{d7}").size(13))
-                        .on_press(Message::Term(TermMsg::Close(id)))
-                        .padding([2, 6])
-                        .style(theme::flat),
-                );
+                let x = button(text("\u{d7}").size(13))
+                    .on_press(Message::Term(TermMsg::Close(id)))
+                    .padding([2, 6])
+                    .style(theme::flat);
+                if current {
+                    line = line.push(x);
+                } else {
+                    // An invisible x of the same size keeps the label in place; the real
+                    // one is laid over it only while the mouse is over the entry.
+                    line = line.push(container(text("\u{d7}").size(13).color(Color::TRANSPARENT)).padding([2, 6]));
+                    hover_x = Some(
+                        container(x)
+                            .width(Length::Fill)
+                            .height(Length::Fill)
+                            .align_x(alignment::Horizontal::Right)
+                            .align_y(alignment::Vertical::Center),
+                    );
+                }
             }
+            let line: Element<'_, Message> = match hover_x {
+                Some(x) => iced::widget::hover(line, x),
+                None => line.into(),
+            };
             let mut line: Element<'_, Message> = container(line).clip(true).width(Length::Fill).into();
             if let Some(tip) = tip {
                 line = tooltip(
@@ -2386,19 +2403,35 @@ impl App {
             let line: Element<'_, Message> = match close {
                 Some(id) => mouse_area(line).on_middle_press(Message::Term(TermMsg::Close(id))).into(),
                 // Files sits in its own band, above a separator line.
-                None => container(line).padding(2).width(Length::Fill).style(filled(c.header)).into(),
+                None => container(line).padding([2, 0]).width(Length::Fill).style(filled(c.header)).into(),
             };
             line
         };
         let mut list = Column::new().spacing(2).width(Length::Fill);
-        let files = if collapsed { "F" } else { "Files" };
-        let files = text(files).size(13).font(Font { weight: Weight::Bold, ..Font::DEFAULT });
-        list = list.push(entry(files.into(), None, shown.is_none(), TermMsg::Show(None), None, line_h));
+        // Files: the system's folder icon (what the panels show for a folder), the word if there is none.
+        let files: Element<'static, Message> = match self.icon(&std::env::temp_dir(), true) {
+            // Centred in its band in both modes.
+            Some(icon) => container(iced::widget::image(icon).width(16.0).height(16.0))
+                .width(Length::Fill)
+                .align_x(alignment::Horizontal::Center)
+                .into(),
+            None => text(if collapsed { "F" } else { "Files" })
+                .size(13)
+                .font(Font { weight: Weight::Bold, ..Font::DEFAULT })
+                .into(),
+        };
+        let files_tip = Some("Files: back to the panels".to_owned());
+        list = list.push(entry(files, files_tip, shown.is_none(), TermMsg::Show(None), None, line_h));
         list = list.push(
             container(Space::new(Length::Fill, Length::Fixed(1.0))).width(Length::Fill).style(filled(c.border)),
         );
+        if !collapsed {
+            // Left edge = bar slot 3 + spacing 2 + button padding 6, like the entry labels.
+            let heading = text("TERMINALS").size(10).color(c.muted).font(Font { weight: Weight::Bold, ..Font::DEFAULT });
+            list = list.push(container(heading).padding([4, 11]));
+        }
         for (i, t) in self.terms.iter().enumerate() {
-            let full = term_label(&t.dir, t.program.as_deref(), LABEL_CHARS);
+            let full =term_label(&t.dir, t.program.as_deref(), LABEL_CHARS);
             // A cue: a dot, in green (finished) or amber (waiting); the label keeps its colour.
             let cue = t.attention.map(|a| match a {
                 Attention::Finished => c.success,
@@ -2406,12 +2439,11 @@ impl App {
             });
             let dot = |color: Color| text("\u{25cf}").size(10).color(color);
             let content: Element<'static, Message> = if collapsed {
-                // The dot takes the place of ">_".
-                let mark: Element<'static, Message> = match cue {
-                    Some(color) => dot(color).into(),
-                    None => text(">_").size(12).into(),
-                };
-                row![mark, text(format!("{}", i + 1)).size(12)].align_y(iced::Alignment::Center).into()
+                // A number badge; the cue colours its border and fill.
+                container(text(format!("{}", i + 1)).size(12))
+                    .padding([0, 5])
+                    .style(theme::badge(cue))
+                    .into()
             } else {
                 // Folder name, the running program below it in a dimmer, smaller font.
                 let folder = text(cut(&folder_title(&t.dir), LABEL_CHARS)).size(12).wrapping(Wrapping::None);
@@ -2446,12 +2478,37 @@ impl App {
             let (current, press) = (shown == Some(t.id), TermMsg::Show(Some(t.id)));
             list = list.push(entry(content, Some(tip), current, press, Some(t.id), term_h));
         }
+        let new_content: Element<'static, Message> = if collapsed {
+            text("+").size(13).into()
+        } else {
+            let bindings = self.keymap.bindings();
+            let key = keymap::Keymap::keys_for(&bindings, Command::NewTerminal).first().map(|k| k.to_string());
+            let mut r = Row::new()
+                .spacing(8)
+                .align_y(iced::Alignment::Center)
+                // "+ New terminal" plus "Ctrl+Shift+T" don't both fit in the sidebar: the key got clipped.
+                .push(text(if key.is_some() { "+ New" } else { "+ New terminal" }).size(12).wrapping(Wrapping::None));
+            if let Some(key) = key {
+                r = r.push(Space::with_width(Length::Fill));
+                r = r.push(text(key).size(11).color(c.muted).wrapping(Wrapping::None));
+            }
+            r.into()
+        };
+        let content = container(new_content).width(Length::Fill).height(Length::Fill).align_y(alignment::Vertical::Center);
+        let content = if collapsed { content.align_x(alignment::Horizontal::Center) } else { content.clip(true) };
+        let new_button = button(content)
+            .on_press(Message::Term(TermMsg::New))
+            .width(Length::Fill)
+            .height(Length::Fixed(line_h))
+            .padding(if collapsed { [0, 0] } else { [0, 6] })
+            .style(theme::side_entry(false));
+        // The same 3px bar slot + spacing as the entries, so the label lines up with theirs.
         list = list.push(
-            button(text("+").size(13))
-                .on_press(Message::Term(TermMsg::New))
-                .width(Length::Fill)
-                .padding([2, 8])
-                .style(theme::drive(false)),
+            Row::new()
+                .spacing(2)
+                .align_y(iced::Alignment::Center)
+                .push(Space::with_width(Length::Fixed(3.0)))
+                .push(new_button),
         );
         let line = container(Space::new(Length::Fixed(1.0), Length::Fill)).style(filled(c.border));
         row![line, container(list).padding(4).width(Length::Fill).height(Length::Fill).style(filled(c.bg))]

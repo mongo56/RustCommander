@@ -436,6 +436,17 @@ pub fn side_entry(current: bool) -> impl Fn(&Theme, button::Status) -> button::S
     }
 }
 
+/// Small rounded number badge of a collapsed terminal sidebar entry. With an
+/// attention cue its border is that colour and its fill the same colour, faint.
+pub fn badge(cue: Option<Color>) -> impl Fn(&Theme) -> container::Style {
+    move |_| container::Style {
+        background: cue.map(|color| Background::Color(Color { a: 0.25, ..color })),
+        text_color: Some(c().text),
+        border: Border { color: cue.unwrap_or(c().border), width: 1.0, radius: 4.0.into() },
+        ..container::Style::default()
+    }
+}
+
 /// Floating label that follows the mouse while dragging.
 pub fn drag_label(_theme: &Theme) -> container::Style {
     container::Style {
