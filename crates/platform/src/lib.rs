@@ -40,6 +40,29 @@ pub enum MenuAction {
     Rename,
     /// "Delete" — handled by the app so it goes through the job queue.
     Delete,
+    /// Our own "Run in terminal" on a script (or its "Run with PowerShell"
+    /// when [`ScriptMenu::take_run_with_powershell`]): the app runs it in
+    /// the built-in terminal.
+    RunInTerminal,
+    /// Our own "Run in external terminal" on a script.
+    RunExternal,
+}
+
+/// The context menu is for one script file (.ps1, .cmd, .bat): our own
+/// "Run in terminal" and "Run in external terminal" go at the top.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScriptMenu {
+    /// The shell's "Run with PowerShell" gives [`MenuAction::RunInTerminal`]
+    /// instead of starting a PowerShell window.
+    pub take_run_with_powershell: bool,
+}
+
+/// Whether a picked context-menu command is "Run with PowerShell": the
+/// `.ps1` verb `0` (what Windows registers it as), or, for a handler that
+/// names it differently, its English text (`&` mnemonics ignored).
+pub fn is_run_with_powershell(verb: &str, text: &str) -> bool {
+    let text = text.replace('&', "").trim().to_ascii_lowercase();
+    verb == "0" || text.starts_with("run with powershell")
 }
 
 /// How a drag to another application ended.
@@ -109,6 +132,25 @@ pub fn spawn_detached(program: &str, args: &[std::ffi::OsString], dir: &Path) ->
     #[cfg(windows)]
     win::allow_foreground();
     std::process::Command::new(program).args(args).current_dir(dir).spawn()
+}
+
+/// Starts `program` in a new console window (Windows: CREATE_NEW_CONSOLE,
+/// also when we have a console ourselves) in `dir`, with `raw_args` put on
+/// its command line as they are (cmd.exe's quoting isn't the usual one).
+/// Doesn't wait for it.
+pub fn spawn_console(program: &str, raw_args: &str, dir: &Path) -> io::Result<()> {
+    let mut command = std::process::Command::new(program);
+    command.current_dir(dir);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+        win::allow_foreground();
+        command.raw_arg(raw_args).creation_flags(CREATE_NEW_CONSOLE);
+    }
+    #[cfg(not(windows))]
+    command.args(raw_args.split_whitespace());
+    command.spawn().map(|_| ())
 }
 
 /// Starts the program `path` with the command line `args` through the
@@ -263,19 +305,21 @@ pub fn large_icon(path: &Path, is_dir: bool) -> Option<Icon> {
 /// Shows the native context menu at the mouse position for `items` (all
 /// inside `folder`), or the folder's background menu when `items` is empty.
 /// Must run on the UI thread; `window` is the native window handle.
+/// `script`: the one item is a script (own items at the top, see [`ScriptMenu`]).
 pub fn show_context_menu(
     window: isize,
     folder: &Path,
     items: &[PathBuf],
     extended: bool,
+    script: Option<ScriptMenu>,
 ) -> Result<MenuAction, String> {
     #[cfg(windows)]
     {
-        win::show_context_menu(window, folder, items, extended)
+        win::show_context_menu(window, folder, items, extended, script)
     }
     #[cfg(not(windows))]
     {
-        let _ = (window, folder, items, extended);
+        let _ = (window, folder, items, extended, script);
         Err("Context menu is not available on this platform yet".into())
     }
 }
@@ -416,4 +460,21 @@ pub fn restore_placement(window: isize, placement: &Placement) {
     win::restore_placement(window, placement);
     #[cfg(not(windows))]
     let _ = (window, placement);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_run_with_powershell;
+
+    #[test]
+    fn run_with_powershell_is_recognised() {
+        assert!(is_run_with_powershell("0", "Run with PowerShell"));
+        assert!(is_run_with_powershell("0", "Mit PowerShell ausführen"));
+        assert!(is_run_with_powershell("", "&Run with PowerShell"));
+        assert!(is_run_with_powershell("runps", " Run with PowerShell 7 "));
+        assert!(!is_run_with_powershell("open", "Open"));
+        assert!(!is_run_with_powershell("edit", "Edit"));
+        assert!(!is_run_with_powershell("", "Windows PowerShell"));
+        assert!(!is_run_with_powershell("runas", "Run as administrator"));
+    }
 }

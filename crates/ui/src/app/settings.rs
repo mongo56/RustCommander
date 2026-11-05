@@ -95,19 +95,20 @@ impl Page {
 }
 
 /// Rows of the General page.
-const GENERAL_ROWS: usize = 13;
+const GENERAL_ROWS: usize = 14;
 const ROW_EDITOR: usize = 0;
 const ROW_TERMINAL: usize = 1;
 const ROW_SHELL: usize = 2;
 const ROW_MARKDOWN: usize = 3;
-const ROW_HIDDEN: usize = 4;
-const ROW_FKEYS: usize = 5;
-const ROW_TREE: usize = 6;
-const ROW_UPDATES: usize = 7;
-const ROW_RENDER: usize = 8;
-/// Compare options 0..3 (`toggle_compare_option`) are rows 9..12.
-const ROW_COMPARE: usize = 9;
-const ROW_CONFIG: usize = 12;
+const ROW_SCRIPTS: usize = 4;
+const ROW_HIDDEN: usize = 5;
+const ROW_FKEYS: usize = 6;
+const ROW_TREE: usize = 7;
+const ROW_UPDATES: usize = 8;
+const ROW_RENDER: usize = 9;
+/// Compare options 0..3 (`toggle_compare_option`) are rows 10..13.
+const ROW_COMPARE: usize = 10;
+const ROW_CONFIG: usize = 13;
 
 /// General rows that are text boxes (Enter there saves instead of toggling).
 fn text_row(row: usize) -> bool {
@@ -144,6 +145,7 @@ pub enum SettingsMsg {
     Filter(String),
     ShowHidden(bool),
     MarkdownViewer(bool),
+    ScriptsInTerminal(bool),
     ShowFkeys(bool),
     HotlistTree(bool),
     CheckUpdates(bool),
@@ -382,6 +384,9 @@ impl App {
                 }
                 ROW_SHELL => Task::batch([text_input::focus(shell_id()), text_input::move_cursor_to_end(shell_id())]),
                 ROW_MARKDOWN => self.settings_update(SettingsMsg::MarkdownViewer(!self.config.markdown_in_viewer)),
+                ROW_SCRIPTS => {
+                    self.settings_update(SettingsMsg::ScriptsInTerminal(!self.config.run_scripts_in_terminal))
+                }
                 ROW_HIDDEN => self.settings_update(SettingsMsg::ShowHidden(!self.config.show_hidden)),
                 ROW_FKEYS => self.settings_update(SettingsMsg::ShowFkeys(!self.config.show_fkeys)),
                 ROW_TREE => self.settings_update(SettingsMsg::HotlistTree(!self.config.hotlist_tree)),
@@ -527,6 +532,11 @@ impl App {
                 s.row[0] = ROW_MARKDOWN;
                 let state = if on { "open in the viewer" } else { "open in the default app" };
                 self.settings_write(&[Edit::Flag("markdown_in_viewer", on)], format!("Markdown files {state}"));
+            }
+            SettingsMsg::ScriptsInTerminal(on) => {
+                s.row[0] = ROW_SCRIPTS;
+                let state = if on { "run in the built-in terminal" } else { "open with the default app" };
+                self.settings_write(&[Edit::Flag("run_scripts_in_terminal", on)], format!("Scripts {state}"));
             }
             SettingsMsg::ShowFkeys(on) => {
                 s.row[0] = ROW_FKEYS;
@@ -1011,6 +1021,20 @@ impl App {
                                 SettingsMsg::MarkdownViewer(!self.config.markdown_in_viewer)
                             ),
                             hint("Open Markdown files (.md) in the internal viewer, shown rendered; off = the default app".into()),
+                        ]
+                        .spacing(8)
+                        .align_y(Alignment::Center)
+                        .into()
+                    ),
+                    line(
+                        ROW_SCRIPTS,
+                        row![
+                            label("Run scripts in terminal"),
+                            switch(
+                                self.config.run_scripts_in_terminal,
+                                SettingsMsg::ScriptsInTerminal(!self.config.run_scripts_in_terminal)
+                            ),
+                            hint("Enter on a .ps1, .cmd or .bat file runs it in a new built-in terminal (F9) in its folder; off = the default app".into()),
                         ]
                         .spacing(8)
                         .align_y(Alignment::Center)

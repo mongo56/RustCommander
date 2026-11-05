@@ -31,6 +31,11 @@ pub struct Config {
     /// the internal viewer, rendered, instead of the default app. On unless
     /// set to false (also when the key is missing).
     pub markdown_in_viewer: bool,
+    /// Enter / double-click on a local script (.ps1, .cmd, .bat) runs it in a
+    /// new built-in terminal instead of the default app, and the context
+    /// menu's "Run with PowerShell" does too. On unless set to false (also
+    /// when the key is missing).
+    pub run_scripts_in_terminal: bool,
     /// The function-key bar (F1-F10 buttons) under the panels; off = a
     /// one-line hint instead.
     pub show_fkeys: bool,
@@ -88,6 +93,7 @@ impl Default for Config {
             theme: String::new(),
             show_hidden: false,
             markdown_in_viewer: true,
+            run_scripts_in_terminal: true,
             show_fkeys: false,
             hotlist_tree: false,
             check_updates_at_startup: false,
@@ -394,6 +400,12 @@ fn template(editor: &str, compare: CompareState) -> String {
          # (shown rendered) instead of the default app. F3 always uses the viewer.\n\
          markdown_in_viewer = true\n\
          \n\
+         # Run scripts (.ps1, .cmd, .bat) with Enter / double-click in a new built-in\n\
+         # terminal (F9) in their folder instead of the default app; the context\n\
+         # menu's Run with PowerShell does too. The context menu also offers Run in\n\
+         # terminal and Run in external terminal.\n\
+         run_scripts_in_terminal = true\n\
+         \n\
          # Show the function-key bar (F1-F10 buttons) under the panels. Off = only a\n\
          # one-line hint (F1 help, command palette, F10 settings).\n\
          show_fkeys = false\n\
@@ -495,6 +507,11 @@ mod tests {
         assert!(parse(&template("", CompareState::default())).unwrap().markdown_in_viewer);
         let off = apply(&out, &[Edit::Flag("markdown_in_viewer", false)]).unwrap();
         assert!(!parse(&off).unwrap().markdown_in_viewer);
+        assert!(Config::default().run_scripts_in_terminal);
+        assert!(parse("").unwrap().run_scripts_in_terminal, "on when the key is missing");
+        assert!(parse(&template("", CompareState::default())).unwrap().run_scripts_in_terminal);
+        let off = apply(&out, &[Edit::Flag("run_scripts_in_terminal", false)]).unwrap();
+        assert!(!parse(&off).unwrap().run_scripts_in_terminal);
         assert!(!parse(&template("", CompareState::default())).unwrap().hotlist_tree);
         assert!(parse(&apply(&out, &[Edit::Flag("hotlist_tree", true)]).unwrap()).unwrap().hotlist_tree);
         assert!(!parse(&template("", CompareState::default())).unwrap().check_updates_at_startup);

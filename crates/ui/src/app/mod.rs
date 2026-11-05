@@ -420,6 +420,8 @@ pub enum Message {
     RightPress(usize, usize),
     RightClickBackground(usize),
     ClickBackground(usize),
+    /// The context menu closed: what was picked, and the folder it made
+    /// (New > Folder) or, for the script items, the script.
     ContextDone(usize, Result<MenuAction, String>, Option<PathBuf>),
     Hover(usize, usize),
     HoverEnd(usize),
@@ -876,6 +878,16 @@ impl App {
                 Ok(MenuAction::Delete) => {
                     self.focus_panel(side);
                     return self.run(Command::Delete);
+                }
+                Ok(MenuAction::RunInTerminal) => {
+                    if let Some(script) = made {
+                        return self.run_script(&script);
+                    }
+                }
+                Ok(MenuAction::RunExternal) => {
+                    if let Some(script) = made {
+                        self.run_script_external(&script);
+                    }
                 }
                 Ok(MenuAction::Invoked(_verb)) => {
                     // "New > Folder" made "New folder" without asking: take
@@ -1838,6 +1850,10 @@ impl App {
                 if vfs::is_virtual(&path) {
                     return open_extracted(path);
                 }
+                // A script (setting): run in a new built-in terminal.
+                if self.config.run_scripts_in_terminal && term::script_kind(&path).is_some() {
+                    return self.run_script(&path);
+                }
                 // A disk image mounts instead of opening, like Explorer.
                 if is_disk_image(&path) {
                     return mount_disk_image(path, active);
@@ -2680,6 +2696,16 @@ impl App {
             return Task::none();
         }
         let items = if background { Vec::new() } else { self.target_paths(side) };
+        // One local script: our own Run items at the top (and with the
+        // setting, "Run with PowerShell" goes to the built-in terminal).
+        self.refresh_config();
+        let script = match items.as_slice() {
+            [one] if !vfs::is_virtual(one) && term::script_kind(one).is_some() => {
+                Some(rc_platform::ScriptMenu { take_run_with_powershell: self.config.run_scripts_in_terminal })
+            }
+            _ => None,
+        };
+        let script_path = script.and(items.first().cloned());
         // Items in archives: the menu acts on temp copies.
         let Some((folder, items)) = self.shell_items_extracted(side, items) else { return Task::none() };
         let extended = self.modifiers.shift();
@@ -2689,7 +2715,8 @@ impl App {
             .and_then(move |id| {
                 let (folder, items, before) = (folder.clone(), items.clone(), before.clone());
                 window::run_with_handle(id, move |handle| {
-                    let result = rc_platform::show_context_menu(native_handle(&handle), &folder, &items, extended);
+                    let result =
+                        rc_platform::show_context_menu(native_handle(&handle), &folder, &items, extended, script);
                     // A folder the menu created in the background (New > Folder).
                     let made = match (&result, items.is_empty()) {
                         (Ok(MenuAction::Invoked(_)), true) => {
@@ -2704,7 +2731,12 @@ impl App {
                     (result, made)
                 })
             })
-            .map(move |(result, made)| Message::ContextDone(side, result, made))
+            .map(move |(result, made)| match result {
+                Ok(MenuAction::RunInTerminal | MenuAction::RunExternal) => {
+                    Message::ContextDone(side, result, script_path.clone())
+                }
+                _ => Message::ContextDone(side, result, made),
+            })
     }
 
     /// The shell menu of a drive root (right-click on a drive button): the
@@ -2720,7 +2752,7 @@ impl App {
             .and_then(move |id| {
                 let (folder, items) = (folder.clone(), items.clone());
                 window::run_with_handle(id, move |handle| {
-                    rc_platform::show_context_menu(native_handle(&handle), &folder, &items, extended)
+                    rc_platform::show_context_menu(native_handle(&handle), &folder, &items, extended, None)
                 })
             })
             .map(move |result| Message::ContextDone(side, result, None))

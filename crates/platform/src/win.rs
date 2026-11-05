@@ -1,6 +1,6 @@
 //! Windows implementation (shell icons, context menu, disk space).
 
-use crate::{DragOutcome, Icon, MenuAction};
+use crate::{DragOutcome, Icon, MenuAction, ScriptMenu};
 use std::cell::RefCell;
 use std::ffi::{c_void, OsStr};
 use std::mem::size_of;
@@ -33,8 +33,8 @@ use windows::Win32::UI::Shell::{
     SHGFI_ICON, SHGFI_SMALLICON, SHGFI_USEFILEATTRIBUTES,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AllowSetForegroundWindow, CreatePopupMenu, DestroyIcon, DestroyMenu, GetCursorPos,
-    GetIconInfo, TrackPopupMenuEx, ASFW_ANY, HICON, ICONINFO, SW_SHOWNORMAL, TPM_RETURNCMD,
+    AllowSetForegroundWindow, AppendMenuW, CreatePopupMenu, DestroyIcon, DestroyMenu, GetCursorPos,
+    GetIconInfo, GetMenuStringW, TrackPopupMenuEx, MF_BYCOMMAND, MF_SEPARATOR, MF_STRING, ASFW_ANY, HICON, ICONINFO, SW_SHOWNORMAL, TPM_RETURNCMD,
     TPM_RIGHTBUTTON, WM_DRAWITEM, WM_INITMENUPOPUP, WM_MEASUREITEM, WM_MENUCHAR,
 };
 
@@ -174,6 +174,9 @@ const FIRST_ID: u32 = 1;
 /// Same value as SEE_MASK_UNICODE; not exported by windows-rs.
 const CMIC_MASK_UNICODE: u32 = 0x4000;
 const LAST_ID: u32 = 0x7FFF;
+/// Our own items for a script (`ScriptMenu`), above the shell's id range.
+const RUN_IN_TERMINAL_ID: u32 = LAST_ID + 1;
+const RUN_EXTERNAL_ID: u32 = LAST_ID + 2;
 const SUBCLASS_ID: usize = 0x5243_4D4E; // "RCMN"
 
 thread_local! {
@@ -188,6 +191,7 @@ pub fn show_context_menu(
     folder: &Path,
     items: &[PathBuf],
     extended: bool,
+    script: Option<ScriptMenu>,
 ) -> Result<MenuAction, String> {
     let hwnd = HWND(window as *mut c_void);
     unsafe {
@@ -198,11 +202,24 @@ pub fn show_context_menu(
         let menu = context_menu_for(hwnd, folder, items).map_err(|e| e.message())?;
         let hmenu = CreatePopupMenu().map_err(|e| e.message())?;
 
+        // A script: our two items and a separator first, the shell's below.
+        let mut first = 0;
+        if script.is_some() {
+            let ok = AppendMenuW(hmenu, MF_STRING, RUN_IN_TERMINAL_ID as usize, windows::core::w!("Run in terminal"))
+                .and_then(|_| {
+                    AppendMenuW(hmenu, MF_STRING, RUN_EXTERNAL_ID as usize, windows::core::w!("Run in external terminal"))
+                })
+                .and_then(|_| AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR::null()));
+            if ok.is_ok() {
+                first = 3;
+            }
+        }
+
         let mut flags = CMF_NORMAL | CMF_CANRENAME;
         if extended {
             flags |= CMF_EXTENDEDVERBS;
         }
-        let hr = menu.QueryContextMenu(hmenu, 0, FIRST_ID, LAST_ID, flags);
+        let hr = menu.QueryContextMenu(hmenu, first, FIRST_ID, LAST_ID, flags);
         if hr.is_err() {
             let _ = DestroyMenu(hmenu);
             return Err(hr.message());
@@ -222,12 +239,20 @@ pub fn show_context_menu(
         let picked = picked.0 as u32;
         let result = if picked < FIRST_ID {
             Ok(MenuAction::Nothing)
+        } else if picked == RUN_IN_TERMINAL_ID {
+            Ok(MenuAction::RunInTerminal)
+        } else if picked == RUN_EXTERNAL_ID {
+            Ok(MenuAction::RunExternal)
         } else {
             let offset = (picked - FIRST_ID) as usize;
             let verb = command_verb(&menu, offset);
+            let take = script.is_some_and(|s| s.take_run_with_powershell);
             match verb.as_str() {
                 "rename" => Ok(MenuAction::Rename),
                 "delete" => Ok(MenuAction::Delete),
+                _ if take && crate::is_run_with_powershell(&verb, &menu_text(hmenu, picked)) => {
+                    Ok(MenuAction::RunInTerminal)
+                }
                 _ => invoke(&menu, hwnd, offset, folder, pt)
                     .map(|_| MenuAction::Invoked(verb))
                     .map_err(|e| e.message()),
@@ -298,6 +323,14 @@ unsafe fn ui_object<T: Interface>(
         }
         menu
     }
+}
+
+/// The text of the menu item `id` (searched in submenus too), or empty.
+fn menu_text(hmenu: windows::Win32::UI::WindowsAndMessaging::HMENU, id: u32) -> String {
+    let mut buf = [0u16; 256];
+    // SAFETY: the buffer outlives the call; its length is passed.
+    let len = unsafe { GetMenuStringW(hmenu, id, Some(&mut buf), MF_BYCOMMAND) };
+    String::from_utf16_lossy(&buf[..(len.max(0) as usize).min(buf.len())])
 }
 
 unsafe fn command_verb(menu: &IContextMenu, offset: usize) -> String {

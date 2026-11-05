@@ -119,6 +119,9 @@ pub enum TermMsg {
     ScrollTo(u64, f32),
     /// The clipboard text to paste into terminal `id` (`None`: no text).
     Paste(u64, Option<String>),
+    /// Type terminal `id`'s pending script line now, if no prompt was seen
+    /// in time (`SCRIPT_WAIT`).
+    SendPending(u64),
 }
 
 /// What the mouse did in the grid; cells are viewport positions.
@@ -189,6 +192,9 @@ pub(super) struct TermSession {
     exit_code: Option<i32>,
     /// What the widget draws; rebuilt on output while shown.
     frame: Frame,
+    /// A line to type once the shell shows its prompt (running a script,
+    /// `App::run_script`); sent once.
+    pending: Option<String>,
 }
 
 impl TermSession {
@@ -238,6 +244,7 @@ impl TermSession {
             pid,
             exit_code: None,
             frame: Frame::default(),
+            pending: None,
         };
         session.refresh();
         Ok(session)
@@ -352,6 +359,13 @@ impl TermSession {
         copy
     }
 
+    /// Types the pending line (if any) and Enter.
+    fn send_pending(&mut self) {
+        if let Some(line) = self.pending.take() {
+            self.write(format!("{line}\r").into_bytes());
+        }
+    }
+
     /// Sends `bytes` without touching the view or the selection.
     fn write_raw(&self, bytes: Vec<u8>) {
         if !bytes.is_empty() {
@@ -456,6 +470,124 @@ fn shell_command(command: &str) -> Option<(String, Vec<String>)> {
     let program = words.next()?;
     let program = if cfg!(windows) && program.contains(' ') { format!("\"{program}\"") } else { program };
     Some((program, words.collect()))
+}
+
+/// How long a script's terminal waits for the shell's prompt before typing
+/// the script's line anyway (a custom prompt `parse_prompt` doesn't know).
+const SCRIPT_WAIT: Duration = Duration::from_secs(4);
+
+/// A script that Enter / the context menu runs in a terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Script {
+    /// `.ps1`
+    PowerShell,
+    /// `.cmd`, `.bat`
+    Batch,
+}
+
+/// The kind of script `path` is, by its extension (any case).
+pub(super) fn script_kind(path: &Path) -> Option<Script> {
+    match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
+        "ps1" => Some(Script::PowerShell),
+        "cmd" | "bat" => Some(Script::Batch),
+        _ => None,
+    }
+}
+
+/// What a `builtin_shell` command line starts, by its program's name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShellFamily {
+    /// Windows PowerShell 5 (`powershell.exe`).
+    WindowsPowerShell,
+    /// PowerShell 7 (`pwsh.exe`).
+    Pwsh,
+    Cmd,
+    /// Anything else (bash, nu, ...): not typed into, see `script_run`.
+    Other,
+}
+
+fn shell_family(command: &str) -> ShellFamily {
+    let Some((program, _)) = shell_command(command) else { return ShellFamily::Other };
+    let program = program.trim_matches('"');
+    let name = program.rsplit(['\\', '/']).next().unwrap_or(program).to_ascii_lowercase();
+    match name.strip_suffix(".exe").unwrap_or(&name) {
+        "powershell" => ShellFamily::WindowsPowerShell,
+        "pwsh" => ShellFamily::Pwsh,
+        "cmd" => ShellFamily::Cmd,
+        _ => ShellFamily::Other,
+    }
+}
+
+/// `s` as a PowerShell single-quoted string: `'` (and the typographic
+/// quotes PowerShell also takes for it) doubled.
+fn ps_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201a}' | '\u{201b}') {
+            out.push(c);
+        }
+        out.push(c);
+    }
+    out.push('\'');
+    out
+}
+
+/// How cmd.exe names the script `name` in `dir`: the bare name, or the full
+/// path in a UNC folder (cmd can't be in one and starts in Windows instead).
+fn cmd_target(dir: &Path, name: &str) -> String {
+    if dir.as_os_str().to_string_lossy().starts_with(r"\\") { dir.join(name).display().to_string() } else { name.to_owned() }
+}
+
+/// The shell command line to start in `dir` for running the script `name`
+/// (in `dir`) of `kind`, and the line to type into it at its prompt. The
+/// configured `shell` when it is PowerShell or cmd; otherwise one of those
+/// (the script needs it anyway).
+fn script_run(shell: &str, kind: Script, dir: &Path, name: &str) -> (String, String) {
+    let (shell, family) = match (shell_family(shell), kind) {
+        (ShellFamily::Other, Script::PowerShell) => {
+            (crate::config::DEFAULT_BUILTIN_SHELL.to_owned(), ShellFamily::WindowsPowerShell)
+        }
+        (ShellFamily::Other, Script::Batch) => ("cmd.exe".to_owned(), ShellFamily::Cmd),
+        (family, _) => (shell.to_owned(), family),
+    };
+    let line = match family {
+        ShellFamily::Cmd => {
+            let target = cmd_target(dir, name);
+            match kind {
+                Script::Batch => format!("\"{target}\""),
+                Script::PowerShell => format!("powershell -NoProfile -ExecutionPolicy Bypass -File \"{target}\""),
+            }
+        }
+        _ => {
+            let path = ps_quote(&format!(".\\{name}"));
+            match kind {
+                Script::Batch => format!("& {path}"),
+                // In the shell itself, so it sees the session; when the
+                // execution policy blocks scripts, once more in a child of
+                // the same PowerShell with the policy bypassed for that
+                // child only (the configured policy stays as it is).
+                Script::PowerShell => {
+                    let exe = if family == ShellFamily::Pwsh { "pwsh.exe" } else { "powershell.exe" };
+                    format!(
+                        "try {{ & {path} }} catch [Management.Automation.PSSecurityException] \
+                         {{ & \"$PSHOME\\{exe}\" -NoProfile -ExecutionPolicy Bypass -File {path} }}"
+                    )
+                }
+            }
+        }
+    };
+    (shell, line)
+}
+
+/// Program and raw arguments that run the script `name` (in `dir`) in a new
+/// console window that stays open afterwards.
+fn external_script_command(kind: Script, dir: &Path, name: &str) -> (&'static str, String) {
+    match kind {
+        Script::PowerShell => ("powershell.exe", format!("-NoExit -ExecutionPolicy Bypass -File \"{name}\"")),
+        // `/k ""x""`: cmd drops the outer quotes and keeps the inner ones.
+        Script::Batch => ("cmd.exe", format!("/k \"\"{}\"\"", cmd_target(dir, name))),
+    }
 }
 
 /// Keeps `LoadLibraryW("conpty.dll")` in `tty::new` from loading a DLL from
@@ -1386,17 +1518,71 @@ impl App {
             self.error(format!("Can't open a terminal in {}: not a folder", dir.display()));
             return Task::none();
         }
+        let shell = self.config.builtin_shell();
+        self.start_term(&dir, &shell);
+        Task::none()
+    }
+
+    /// Starts `shell` in `dir` as a new terminal and shows it; its id, or
+    /// `None` (with an error) if it didn't start.
+    fn start_term(&mut self, dir: &Path, shell: &str) -> Option<u64> {
         let id = self.next_term_id;
         self.next_term_id += 1;
         let (cols, lines) = grid_size(Size::new(self.window_width - SIDE_W, self.window_height - FOOTER_H));
-        match TermSession::spawn(id, &self.config.builtin_shell(), &dir, cols, lines) {
+        match TermSession::spawn(id, shell, dir, cols, lines) {
             Ok(session) => {
                 self.terms.push(session);
                 self.show_term(id);
+                Some(id)
             }
-            Err(e) => self.error(format!("Can't start the shell \"{}\": {e}", self.config.builtin_shell())),
+            Err(e) => {
+                self.error(format!("Can't start the shell \"{shell}\": {e}"));
+                None
+            }
         }
-        Task::none()
+    }
+
+    /// Enter on a script (setting `run_scripts_in_terminal`) or the context
+    /// menu's "Run in terminal": a new terminal in the script's folder,
+    /// which types the line that runs it once the shell's prompt is up and
+    /// stays open afterwards. Only for local files.
+    pub(super) fn run_script(&mut self, path: &Path) -> Task<Message> {
+        self.leave_edits();
+        self.refresh_config();
+        let Some((kind, dir, name)) = self.script_parts(path) else { return Task::none() };
+        let (shell, line) = script_run(&self.config.builtin_shell(), kind, &dir, &name);
+        let Some(id) = self.start_term(&dir, &shell) else { return Task::none() };
+        if let Some(t) = self.term_mut(id) {
+            t.pending = Some(line);
+        }
+        delayed(SCRIPT_WAIT, Message::Term(TermMsg::SendPending(id)))
+    }
+
+    /// The context menu's "Run in external terminal": a new console window
+    /// in the script's folder that runs it and stays open.
+    pub(super) fn run_script_external(&mut self, path: &Path) {
+        let Some((kind, dir, name)) = self.script_parts(path) else { return };
+        let (program, args) = external_script_command(kind, &dir, &name);
+        match rc_platform::spawn_console(program, &args, &dir) {
+            Ok(()) => self.success(format!("Running {name} in a new console window")),
+            Err(e) => self.error(format!("Can't start {program}: {e}")),
+        }
+    }
+
+    /// Kind, folder and file name of a local script (else an error).
+    fn script_parts(&mut self, path: &Path) -> Option<(Script, PathBuf, String)> {
+        if vfs::is_virtual(path) {
+            self.error("Scripts only run from local folders: copy it to one first (F5)");
+            return None;
+        }
+        let parts = script_kind(path).zip(path.parent().filter(|d| d.is_dir())).zip(path.file_name());
+        match parts {
+            Some(((kind, dir), name)) => Some((kind, dir.to_owned(), name.to_string_lossy().into_owned())),
+            None => {
+                self.error(format!("Not a script that can run in a terminal: {}", path.display()));
+                None
+            }
+        }
     }
 
     /// Shows terminal `id` (hiding the one shown).
@@ -1590,6 +1776,11 @@ impl App {
                     t.paste(&text);
                 }
             }
+            TermMsg::SendPending(id) => {
+                if let Some(t) = self.term_mut(id) {
+                    t.send_pending();
+                }
+            }
             TermMsg::Info(id, info) => {
                 if let Some(t) = self.term_mut(id) {
                     if let Some(dir) = info.dir {
@@ -1610,6 +1801,10 @@ impl App {
                     // (A late one for a terminal just hidden is dropped: showing
                     // it rebuilds the frame anyway.)
                     TermEvent::Wakeup => {
+                        // A script waits for the shell's prompt.
+                        if t.pending.is_some() && prompt_dir(&t.term.lock()).is_some() {
+                            t.send_pending();
+                        }
                         if shown == Some(id) {
                             t.refresh();
                         }
@@ -1872,6 +2067,77 @@ mod tests {
     use super::*;
     use iced::keyboard::Key;
     use iced::keyboard::Modifiers as M;
+
+    #[test]
+    fn scripts_are_known_by_extension() {
+        assert_eq!(script_kind(Path::new(r"C:\a\b.ps1")), Some(Script::PowerShell));
+        assert_eq!(script_kind(Path::new(r"C:\a\B.PS1")), Some(Script::PowerShell));
+        assert_eq!(script_kind(Path::new("run.Cmd")), Some(Script::Batch));
+        assert_eq!(script_kind(Path::new("run.BAT")), Some(Script::Batch));
+        for no in ["a.psm1", "a.ps1.txt", "ps1", "a.exe", "cmd", "a."] {
+            assert_eq!(script_kind(Path::new(no)), None, "{no}");
+        }
+    }
+
+    #[test]
+    fn shell_families() {
+        assert_eq!(shell_family("powershell.exe -NoLogo"), ShellFamily::WindowsPowerShell);
+        assert_eq!(shell_family(r#""C:\Program Files\PowerShell\7\pwsh.exe" -NoLogo"#), ShellFamily::Pwsh);
+        assert_eq!(shell_family("PWSH"), ShellFamily::Pwsh);
+        assert_eq!(shell_family(r"C:\Windows\System32\CMD.EXE /k"), ShellFamily::Cmd);
+        assert_eq!(shell_family("bash.exe -l"), ShellFamily::Other);
+        assert_eq!(shell_family(""), ShellFamily::Other);
+    }
+
+    #[test]
+    fn script_lines() {
+        let dir = Path::new(r"C:\Scripts");
+        let (shell, line) = script_run("powershell.exe -NoLogo", Script::PowerShell, dir, "it's.ps1");
+        assert_eq!(shell, "powershell.exe -NoLogo");
+        assert_eq!(
+            line,
+            "try { & '.\\it''s.ps1' } catch [Management.Automation.PSSecurityException] \
+             { & \"$PSHOME\\powershell.exe\" -NoProfile -ExecutionPolicy Bypass -File '.\\it''s.ps1' }"
+        );
+        let (_, line) = script_run("pwsh -NoLogo", Script::PowerShell, dir, "a b.ps1");
+        assert!(line.contains("\"$PSHOME\\pwsh.exe\""), "{line}");
+        assert!(line.starts_with("try { & '.\\a b.ps1' }"), "{line}");
+        assert_eq!(script_run("pwsh", Script::Batch, dir, "x & y.cmd").1, "& '.\\x & y.cmd'");
+        assert_eq!(script_run("pwsh", Script::Batch, dir, "\u{2019}q.bat").1, "& '.\\\u{2019}\u{2019}q.bat'");
+        assert_eq!(script_run("cmd.exe", Script::Batch, dir, "x & y.cmd"), ("cmd.exe".into(), "\"x & y.cmd\"".into()));
+        assert_eq!(
+            script_run("cmd.exe", Script::PowerShell, dir, "a b.ps1").1,
+            "powershell -NoProfile -ExecutionPolicy Bypass -File \"a b.ps1\""
+        );
+        // cmd can't be in a UNC folder: the full path.
+        let unc = Path::new(r"\\server\share\tools");
+        assert_eq!(script_run("cmd", Script::Batch, unc, "go.bat").1, r#""\\server\share\tools\go.bat""#);
+        // Another shell: one that runs the script.
+        assert_eq!(script_run("bash -l", Script::Batch, dir, "go.bat"), ("cmd.exe".into(), "\"go.bat\"".into()));
+        let (shell, line) = script_run("bash -l", Script::PowerShell, dir, "go.ps1");
+        assert_eq!(shell, crate::config::DEFAULT_BUILTIN_SHELL);
+        assert!(line.starts_with("try { & '.\\go.ps1' }"), "{line}");
+    }
+
+    #[test]
+    fn external_script_commands() {
+        let dir = Path::new(r"C:\Scripts");
+        assert_eq!(
+            external_script_command(Script::PowerShell, dir, "a b.ps1"),
+            ("powershell.exe", "-NoExit -ExecutionPolicy Bypass -File \"a b.ps1\"".to_owned())
+        );
+        assert_eq!(external_script_command(Script::Batch, dir, "x&y.cmd"), ("cmd.exe", "/k \"\"x&y.cmd\"\"".to_owned()));
+        let unc = Path::new(r"\\srv\s");
+        assert_eq!(external_script_command(Script::Batch, unc, "a.bat").1, r#"/k ""\\srv\s\a.bat"""#);
+    }
+
+    #[test]
+    fn powershell_quoting() {
+        assert_eq!(ps_quote("a"), "'a'");
+        assert_eq!(ps_quote("it's"), "'it''s'");
+        assert_eq!(ps_quote("\u{2018}x\u{201b}"), "'\u{2018}\u{2018}x\u{201b}\u{201b}'");
+        assert_eq!(ps_quote("$a `b\""), "'$a `b\"'");
+    }
 
     fn named(n: Named, m: M) -> Option<Vec<u8>> {
         key_bytes(&Key::Named(n), m, None, false)
