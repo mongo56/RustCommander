@@ -4,6 +4,7 @@ mod view;
 mod button_focus;
 mod archive_edit;
 mod connect;
+mod disk_usage;
 mod file_diff;
 mod help;
 mod hotlist;
@@ -193,6 +194,8 @@ pub struct App {
     screen: Option<Screen>,
     /// The closed find tool (fields and results), kept for the next Ctrl+F.
     find_last: Option<find_files::FindFiles>,
+    /// The closed disk usage tool with its last tree, for reopening the same folder.
+    disk_usage_last: Option<disk_usage::DiskUsage>,
     /// Built-in terminals (F9), running whether shown or not; `Screen::Term`
     /// names the one shown.
     terms: Vec<term::TermSession>,
@@ -503,6 +506,7 @@ pub enum Message {
     MultiRename(multi_rename::MrMsg),
     FileDiff(file_diff::DiffMsg),
     Find(find_files::FindMsg),
+    DiskUsage(disk_usage::DuMsg),
     Term(term::TermMsg),
     Connect(connect::ConnectMsg),
     Settings(settings::SettingsMsg),
@@ -624,6 +628,7 @@ impl App {
             nav: [None, None],
             screen: None,
             find_last: None,
+            disk_usage_last: None,
             terms: Vec::new(),
             next_term_id: 1,
             term_last: None,
@@ -1307,6 +1312,7 @@ impl App {
             Message::MultiRename(msg) => return self.multi_rename_update(msg),
             Message::FileDiff(msg) => return self.file_diff_update(msg),
             Message::Find(msg) => return self.find_update(msg),
+            Message::DiskUsage(msg) => return self.disk_usage_update(msg),
             Message::Term(msg) => return self.term_update(msg),
             Message::Connect(msg) => return self.connect_update(msg),
             Message::Settings(msg) => return self.settings_update(msg),
@@ -1421,6 +1427,7 @@ impl App {
                 Some(Screen::Settings(_)) => self.settings_key(named, &key, mods, text.as_deref(), captured),
                 Some(Screen::MultiRename(_)) => self.multi_rename_key(named, &key, mods, captured),
                 Some(Screen::Find(_)) => self.find_key(named, &key, mods, captured),
+                Some(Screen::DiskUsage(_)) => self.disk_usage_key(named, &key, mods),
                 Some(Screen::Connect(_)) => self.connect_key(named, &key, mods, captured),
                 Some(Screen::FileDiff(_)) => {
                     self.file_diff_key(named, &key, mods);
@@ -1652,6 +1659,7 @@ impl App {
             MultiRename => return self.open_multi_rename(),
             CompareFiles => return self.open_file_diff(),
             FindFiles => return self.open_find(),
+            DiskUsage => return self.open_disk_usage(),
             Connect => return self.open_connect(),
             Disconnect => return self.disconnect(),
             Help => return self.open_help(),

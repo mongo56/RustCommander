@@ -109,6 +109,9 @@ commands! {
         CompareFiles => "cm_CompareFilesByContent", "Compare two files by content, side by side", "CmpFiles";
         /// Find files by name and contents (Ctrl+F).
         FindFiles => "cm_SearchFor", "Find files by name and contents", "Find";
+        /// What takes up space in a folder, as a tree (Alt+Shift+F7).
+        DiskUsage => "cm_DiskUsage",
+            "Show what takes up space in the folder under the cursor (or the current folder)", "DiskUse";
         /// Saved server connections; connect one in this panel (Ctrl+F7).
         Connect => "cm_FtpConnect",
             "Connect to a server (SFTP, FTP, FTPS): saved connections, new, edit, delete", "Connect";
