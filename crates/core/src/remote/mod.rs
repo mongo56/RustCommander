@@ -250,6 +250,8 @@ fn check_host_key(login: &Login, key: &str, fingerprint: &str) -> Result<(), Str
 struct Item {
     name: String,
     dir: bool,
+    /// A symlink (`dir` says whether it leads to a folder). Only FTP sets it.
+    link: bool,
     size: u64,
     modified: Option<SystemTime>,
 }
@@ -527,15 +529,23 @@ impl Vfs for Connection {
             io::Error::new(io::ErrorKind::NotFound, format!("Not found: {}", display(path)))
         })?;
         let mut out = vec![first];
+        // Linked folders (FTP) are listed but not entered: a link to a parent
+        // would never end, so a copy or delete treats them as empty folders.
+        let mut linked = vec![false];
         let mut i = 0;
         while i < out.len() {
-            if out[i].kind == EntryKind::Dir {
+            if out[i].kind == EntryKind::Dir && !linked[i] {
                 let dir = self.remote(&out[i].path)?;
                 // A subfolder that is forbidden or gone is skipped instead of
                 // failing the whole walk (other errors, e.g. a lost
                 // connection, still fail it).
-                match self.list_remote(&dir) {
-                    Ok(children) => out.extend(children),
+                match self.with(|s| s.list(&dir)) {
+                    Ok(children) => {
+                        for item in children {
+                            linked.push(item.link);
+                            out.push(self.entry(&dir, item));
+                        }
+                    }
                     Err(e) if i > 0 && matches!(e.kind(), io::ErrorKind::PermissionDenied | io::ErrorKind::NotFound) => {}
                     Err(e) => return Err(e),
                 }

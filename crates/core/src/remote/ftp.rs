@@ -102,25 +102,74 @@ impl Ftp {
         let mlsd = stream.feat().is_ok_and(|f| f.contains_key("MLSD") || f.contains_key("MLST"));
         Ok(Ftp { stream, mlsd })
     }
+}
 
-    fn parse(&self, lines: &[String]) -> Vec<Item> {
-        lines
-            .iter()
-            .filter_map(|line| {
-                let file = if self.mlsd { ListParser::parse_mlsd(line).ok() } else { ListedFile::try_from(line.as_str()).ok() };
-                let file = file?;
-                let name = file.name().rsplit('/').next().unwrap_or(file.name()).to_owned();
-                if name.is_empty() || name == "." || name == ".." {
-                    return None;
+/// suppaftp knows `type=link` only; servers send `type=OS.unix=slink:<target>`
+/// (or `OS.unix=symlink`) for symlinks, which it would drop from the listing.
+fn mlsd_link_type(line: &str) -> std::borrow::Cow<'_, str> {
+    let (facts, name) = match line.find("; ") {
+        Some(i) => line.split_at(i),
+        None => return line.into(),
+    };
+    let mut out = String::with_capacity(line.len());
+    let mut changed = false;
+    for (n, fact) in facts.split(';').enumerate() {
+        if n > 0 {
+            out.push(';');
+        }
+        let lower = fact.to_ascii_lowercase();
+        if lower.starts_with("type=os.unix=slink") || lower.starts_with("type=os.unix=symlink") {
+            out.push_str("type=link");
+            changed = true;
+        } else {
+            out.push_str(fact);
+        }
+    }
+    if !changed {
+        return line.into();
+    }
+    out.push_str(name);
+    out.into()
+}
+
+/// Turns LIST / MLSD lines into items. A symlink is reported as a link
+/// (`link`) and, until its target is checked, as a file.
+fn parse_lines(mlsd: bool, lines: &[String]) -> Vec<Item> {
+    lines
+        .iter()
+        .filter_map(|line| {
+            let file = if mlsd { ListParser::parse_mlsd(&mlsd_link_type(line)).ok() } else { ListedFile::try_from(line.as_str()).ok() };
+            let file = file?;
+            let link = file.is_symlink();
+            let mut name = file.name().to_owned();
+            if link {
+                // Some parsers leave " -> target" on the name.
+                if let Some(target) = file.symlink().and_then(|t| t.to_str()).filter(|t| !t.is_empty()) {
+                    if let Some(stripped) = name.strip_suffix(&format!(" -> {target}")) {
+                        name = stripped.to_owned();
+                    }
                 }
-                Some(Item {
-                    dir: file.is_directory(),
-                    size: file.size() as u64,
-                    modified: Some(file.modified()).filter(|m| *m > SystemTime::UNIX_EPOCH),
-                    name,
-                })
+            }
+            let name = name.rsplit('/').next().unwrap_or(&name).to_owned();
+            if name.is_empty() || name == "." || name == ".." {
+                return None;
+            }
+            Some(Item {
+                dir: file.is_directory(),
+                link,
+                size: file.size() as u64,
+                modified: Some(file.modified()).filter(|m| *m > SystemTime::UNIX_EPOCH),
+                name,
             })
-            .collect()
+        })
+        .collect()
+}
+
+/// Marks the links that lead to a folder as folders; `is_folder` is given
+/// the link's absolute path. A broken link or one to a file stays a file.
+fn resolve_links(dir: &str, items: &mut [Item], mut is_folder: impl FnMut(&str) -> bool) {
+    for item in items.iter_mut().filter(|i| i.link && !i.dir) {
+        item.dir = is_folder(&super::remote_join(dir, &item.name));
     }
 }
 
@@ -133,7 +182,17 @@ impl Session for Ftp {
     fn list(&mut self, dir: &str) -> io::Result<Vec<Item>> {
         let lines = if self.mlsd { self.stream.mlsd(Some(dir)) } else { self.stream.list(Some(dir)) };
         let lines = lines.map_err(|e| io_err(dir, e))?;
-        Ok(self.parse(&lines))
+        let mut items = parse_lines(self.mlsd, &lines);
+        if items.iter().any(|i| i.link) {
+            // Tell linked folders from linked files by trying CWD, then go back.
+            let back = self.stream.pwd().ok();
+            let stream = &mut self.stream;
+            resolve_links(dir, &mut items, |path| stream.cwd(path).is_ok());
+            if let Some(back) = back {
+                let _ = self.stream.cwd(back);
+            }
+        }
+        Ok(items)
     }
 
     fn stat(&mut self, path: &str) -> io::Result<Option<Item>> {
@@ -143,7 +202,7 @@ impl Session for Ftp {
             None => ("/", path),
         };
         if name.is_empty() {
-            return Ok(Some(Item { name: "/".into(), dir: true, size: 0, modified: None }));
+            return Ok(Some(Item { name: "/".into(), dir: true, link: false, size: 0, modified: None }));
         }
         match self.list(parent) {
             Ok(items) => Ok(items.into_iter().find(|i| i.name == name)),
@@ -224,5 +283,70 @@ impl Session for Ftp {
 impl Drop for Ftp {
     fn drop(&mut self) {
         let _ = self.stream.quit();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lines(l: &[&str]) -> Vec<String> {
+        l.iter().map(|s| s.to_string()).collect()
+    }
+
+    const LIST: &[&str] = &[
+        "drwxr-xr-x   2 ftp ftp   4096 Jan 10  2024 docs",
+        "-rw-r--r--   1 ftp ftp    120 Jan 10  2024 a.txt",
+        "lrwxrwxrwx   1 ftp ftp      4 Jan 10  2024 to-docs -> docs",
+        "lrwxrwxrwx   1 ftp ftp      7 Jan 10  2024 to-file -> a.txt",
+        "lrwxrwxrwx   1 ftp ftp      9 Jan 10  2024 broken -> nowhere",
+        "lrwxrwxrwx   1 ftp ftp     12 Jan 10  2024 my link -> /srv/a -> b",
+    ];
+
+    #[test]
+    fn list_symlinks_keep_their_name_and_are_flagged() {
+        let items = parse_lines(false, &lines(LIST));
+        let got: Vec<_> = items.iter().map(|i| (i.name.as_str(), i.dir, i.link)).collect();
+        assert_eq!(
+            got,
+            vec![
+                ("docs", true, false),
+                ("a.txt", false, false),
+                ("to-docs", false, true),
+                ("to-file", false, true),
+                ("broken", false, true),
+                ("my link", false, true),
+            ]
+        );
+    }
+
+    #[test]
+    fn mlsd_symlinks_are_flagged() {
+        let l = lines(&[
+            "type=dir;modify=20240110120000;perm=el; docs",
+            "type=OS.unix=slink:docs;size=4;modify=20240110120000; to-docs",
+            "type=OS.unix=slink:/x/y;size=4;modify=20240110120000; with space",
+            "type=file;size=3;modify=20240110120000; f.txt",
+        ]);
+        let items = parse_lines(true, &l);
+        let got: Vec<_> = items.iter().map(|i| (i.name.as_str(), i.dir, i.link)).collect();
+        assert_eq!(
+            got,
+            vec![("docs", true, false), ("to-docs", false, true), ("with space", false, true), ("f.txt", false, false)]
+        );
+    }
+
+    #[test]
+    fn links_become_folders_only_when_cwd_works() {
+        let mut items = parse_lines(false, &lines(LIST));
+        let mut tried = Vec::new();
+        resolve_links("/home", &mut items, |p| {
+            tried.push(p.to_owned());
+            p == "/home/to-docs"
+        });
+        // Only links are tried; plain folders and files are not.
+        assert_eq!(tried, ["/home/to-docs", "/home/to-file", "/home/broken", "/home/my link"]);
+        let dirs: Vec<_> = items.iter().filter(|i| i.dir).map(|i| i.name.as_str()).collect();
+        assert_eq!(dirs, ["docs", "to-docs"]);
     }
 }

@@ -163,6 +163,7 @@ impl Sftp {
     fn item(name: String, attrs: &FileAttributes) -> Item {
         Item {
             dir: attrs.is_dir(),
+            link: false,
             size: attrs.size.unwrap_or(0),
             modified: attrs.mtime.map(|t| SystemTime::UNIX_EPOCH + Duration::from_secs(u64::from(t))),
             name,
