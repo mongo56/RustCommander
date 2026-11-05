@@ -902,10 +902,25 @@ impl App {
                     // "New > Folder" made "New folder" without asking: take
                     // it back (it is empty and was just created) and ask for
                     // the name like F7 does.
-                    if made.is_some_and(|dir| std::fs::remove_dir(dir).is_ok()) {
+                    if made.as_ref().is_some_and(|p| p.is_dir() && std::fs::remove_dir(p).is_ok()) {
                         self.focus_panel(side);
                         self.reload_panels();
                         return self.run(Command::MakeDir);
+                    }
+                    // "New > Text Document" etc. made a file with a default
+                    // name (it may hold a template, so keep it): put the
+                    // cursor on it and rename it inline, like Explorer does.
+                    if let Some(file) = made.filter(|p| p.is_file()) {
+                        self.focus_panel(side);
+                        self.reload_panels();
+                        if self.panel(side).path.as_path() == file.parent().unwrap_or(&file) {
+                            let name = file.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                            self.panel_mut(side).focus(&name);
+                            if self.panel(side).current().is_some_and(|e| e.path == file) {
+                                return self.run(Command::Rename);
+                            }
+                        }
+                        return Task::none();
                     }
                     // Verbs that finish later (paste, extract, ...) are
                     // picked up by the folder watcher.
@@ -2725,7 +2740,7 @@ impl App {
         // Items in archives: the menu acts on temp copies.
         let Some((folder, items)) = self.shell_items_extracted(side, items) else { return Task::none() };
         let extended = self.modifiers.shift();
-        let before = if background { subfolders(&folder) } else { Default::default() };
+        let before = if background { entry_names(&folder) } else { Default::default() };
 
         window::get_oldest()
             .and_then(move |id| {
@@ -2733,10 +2748,11 @@ impl App {
                 window::run_with_handle(id, move |handle| {
                     let result =
                         rc_platform::show_context_menu(native_handle(&handle), &folder, &items, extended, script);
-                    // A folder the menu created in the background (New > Folder).
+                    // What the menu created in the background (New > Folder,
+                    // New > Text Document, ...).
                     let made = match (&result, items.is_empty()) {
                         (Ok(MenuAction::Invoked(_)), true) => {
-                            let new: Vec<_> = subfolders(&folder).difference(&before).cloned().collect();
+                            let new: Vec<_> = entry_names(&folder).difference(&before).cloned().collect();
                             match new.as_slice() {
                                 [one] => Some(folder.join(one)),
                                 _ => None,
@@ -3469,9 +3485,10 @@ fn remote_space(path: &Path) -> Task<Message> {
 }
 
 /// Names of the folders directly inside `dir`.
-fn subfolders(dir: &Path) -> std::collections::HashSet<std::ffi::OsString> {
+/// The names of everything in `dir` (files and folders).
+fn entry_names(dir: &Path) -> std::collections::HashSet<std::ffi::OsString> {
     let Ok(rd) = std::fs::read_dir(dir) else { return Default::default() };
-    rd.flatten().filter(|e| e.file_type().is_ok_and(|t| t.is_dir())).map(|e| e.file_name()).collect()
+    rd.flatten().map(|e| e.file_name()).collect()
 }
 
 fn is_modifier_key(key: Named) -> bool {
