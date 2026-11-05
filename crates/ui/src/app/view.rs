@@ -808,7 +808,7 @@ impl App {
             }
             Dialog::MakeDir { input } => (
                 "New folder".into(),
-                format!("Create folder in {}:", rc_core::remote::display(&self.panel(self.active).path)),
+                "Create folder in:".into(),
                 Some(input_field(input)),
                 "Create",
             ),
@@ -832,7 +832,7 @@ impl App {
             ),
             Dialog::EditNew { input } => (
                 "Edit file".into(),
-                format!("File to edit (created if missing) in {}:", self.panel(self.active).path.display()),
+                "File to edit (created if missing) in:".into(),
                 Some(input_field(input)),
                 "Edit",
             ),
@@ -877,8 +877,21 @@ impl App {
             }
         };
 
+        // The folder a new item goes into: on its own line, its start elided
+        // so a long path stays on one line and its end (the folder) shows.
+        let place = match dialog {
+            Dialog::MakeDir { .. } | Dialog::EditNew { .. } => {
+                Some(rc_core::remote::display(&self.panel(self.active).path).to_string())
+            }
+            _ => None,
+        };
+
         let focus = self.dialog_focus.unwrap_or(1);
         let mut content = column![text(title).size(16), text(body).size(13).color(theme::c().muted)].spacing(12);
+        if let Some(place) = place {
+            let line = text(elide_path(&place, DIALOG_PATH_CHARS)).size(13).wrapping(Wrapping::None);
+            content = content.push(container(line).width(Length::Fill).clip(true));
+        }
         if let Some(field) = field {
             content = content.push(field);
         }
@@ -1190,6 +1203,23 @@ pub(super) fn elide_left(s: &str, max_chars: usize) -> String {
     format!("…{tail}")
 }
 
+/// About how many characters of a path fit on one line of a 520 px dialog.
+const DIALOG_PATH_CHARS: usize = 64;
+
+/// `path` cut to `max_chars` from the start, at a separator when one is
+/// left: `…\deep\folder`. A last component longer than that is elided too.
+fn elide_path(path: &str, max_chars: usize) -> String {
+    let short = elide_left(path, max_chars);
+    if short.len() == path.len() {
+        return short;
+    }
+    let tail = &short["…".len()..];
+    match tail.find(['\\', '/']) {
+        Some(i) if i + 1 < tail.len() => format!("…{}", &tail[i..]),
+        _ => short,
+    }
+}
+
 pub(super) fn dialog_button(label: &str, message: Message, primary: bool, focused: bool) -> Element<'_, Message> {
     let b = button(text(label).size(13)).on_press(message).padding([6, 14]);
     if focused {
@@ -1277,6 +1307,15 @@ mod drag_edge_tests {
     use super::*;
 
     const ALL: [usize; 3] = [0, 1, 2];
+
+    #[test]
+    fn long_paths_are_cut_at_a_separator() {
+        assert_eq!(elide_path(r"C:\short", 20), r"C:\short");
+        assert_eq!(elide_path(r"C:\Users\someone\Documents\deep\folder", 16), r"…\deep\folder");
+        // Nothing to cut at: plain elision.
+        assert_eq!(elide_path(r"C:\averyveryverylongname", 10), "…ylongname");
+        assert!(elide_path(r"C:\a\bcdefghijkl", 8).chars().count() <= 8);
+    }
 
     #[test]
     fn widening_the_name_column_takes_from_every_column_on_the_right() {
