@@ -238,6 +238,11 @@ pub struct Outcome {
     pub skipped: u64,
     pub errors: Vec<(PathBuf, String)>,
     pub cancelled: bool,
+    /// How to undo what the job did (Ctrl+Z): local renames, same-volume
+    /// moves, copies to free places and recycling, of the items that
+    /// completed. `None` when nothing can be undone, or the job overwrote
+    /// anything (what was overwritten is gone).
+    pub undo: Option<crate::undo::UndoStep>,
 }
 
 #[derive(Debug, Clone)]
@@ -415,7 +420,9 @@ pub fn run(job: &Job, control: &Control, reporter: &mut dyn Reporter) -> Outcome
         staged: Vec::new(),
         relayed: 0,
         password: None,
+        overwrote: false,
     };
+    let mut undo = None;
 
     match job {
         Job::Copy(transfers) | Job::Move(transfers) => {
@@ -469,6 +476,8 @@ pub fn run(job: &Job, control: &Control, reporter: &mut dyn Reporter) -> Outcome
             } else {
                 // Moved out of archives: deleted there once extracted.
                 let mut extracted = Vec::new();
+                // Local items renamed into place / copied to a free place (for undo).
+                let mut undoable = Vec::new();
                 for (t, size) in transfers.iter().zip(sizes) {
                     if !runner.alive() {
                         break;
@@ -486,11 +495,20 @@ pub fn run(job: &Job, control: &Control, reporter: &mut dyn Reporter) -> Outcome
                             extracted.push(t.src.clone());
                         }
                     } else if is_move {
-                        runner.move_item(t, size);
+                        if runner.move_item(t, size) {
+                            undoable.push((t.src.clone(), t.dst.clone()));
+                        }
                     } else {
-                        runner.copy(&t.src, &t.dst, false);
+                        let free = fs::symlink_metadata(&t.dst).is_err();
+                        if runner.copy(&t.src, &t.dst, false) && free {
+                            undoable.push((t.src.clone(), t.dst.clone()));
+                        }
                     }
                 }
+                undo = match is_move {
+                    true => crate::undo::UndoStep::moved(undoable),
+                    false => crate::undo::UndoStep::copied(undoable),
+                };
                 if !extracted.is_empty() && runner.alive() {
                     runner.delete_in_archives(&extracted);
                 }
@@ -516,12 +534,21 @@ pub fn run(job: &Job, control: &Control, reporter: &mut dyn Reporter) -> Outcome
                 Some((archive, _)) => {
                     runner.relocate(&archive, &[Transfer { src: from.clone(), dst: to.clone() }], false);
                 }
-                None => match fs::rename(from, to) {
-                    Ok(()) => runner.item_done(0),
-                    Err(e) => {
-                        runner.fail(from, e);
+                None => {
+                    // (`fs::rename` replaces a file: then it's not undoable.)
+                    let free = fs::symlink_metadata(to).is_err() || same_path(from, to);
+                    match fs::rename(from, to) {
+                        Ok(()) => {
+                            if free {
+                                undo = crate::undo::UndoStep::renamed(from.clone(), to.clone());
+                            }
+                            runner.item_done(0)
+                        }
+                        Err(e) => {
+                            runner.fail(from, e);
+                        }
                     }
-                },
+                }
             }
         }
         Job::Pack { sources, archive, password } => match password.as_ref().and_then(|p| pack_password_problem(archive, p)) {
@@ -587,6 +614,7 @@ pub fn run(job: &Job, control: &Control, reporter: &mut dyn Reporter) -> Outcome
             }
         }
         Job::Delete { paths, to_trash: true } => {
+            let mut recycled = Vec::new();
             runner.progress.total_items = paths.len() as u64;
             runner.report(true);
             for path in paths {
@@ -594,13 +622,18 @@ pub fn run(job: &Job, control: &Control, reporter: &mut dyn Reporter) -> Outcome
                     break;
                 }
                 runner.progress.current = Some(path.clone());
+                let from = crate::undo::unix_now();
                 match trash::delete(path) {
-                    Ok(()) => runner.item_done(0),
+                    Ok(()) => {
+                        recycled.push(crate::undo::Recycled { path: path.clone(), from, to: crate::undo::unix_now() });
+                        runner.item_done(0)
+                    }
                     Err(e) => {
                         runner.fail_msg(path, e.to_string());
                     }
                 }
             }
+            undo = crate::undo::UndoStep::recycled(recycled);
         }
         Job::Delete { paths, to_trash: false } => {
             for path in paths {
@@ -623,6 +656,7 @@ pub fn run(job: &Job, control: &Control, reporter: &mut dyn Reporter) -> Outcome
     runner.outcome.cancelled = control.is_cancelled();
     runner.outcome.done_items = runner.progress.done_items - runner.outcome.skipped.min(runner.progress.done_items);
     runner.outcome.done_bytes = runner.progress.done_bytes - runner.relayed.min(runner.progress.done_bytes);
+    runner.outcome.undo = undo.filter(|_| !runner.overwrote);
     runner.outcome
 }
 
@@ -644,6 +678,9 @@ struct Runner<'a> {
     relayed: u64,
     /// [`Job::Pack`]'s password, taken by the one archive write it does.
     password: Option<Secret>,
+    /// Some conflict was answered with Overwrite or Resume (the job can't
+    /// be undone then).
+    overwrote: bool,
 }
 
 impl Runner<'_> {
@@ -893,13 +930,15 @@ impl Runner<'_> {
             }
             _ => {}
         }
-        match answer {
+        let result = match answer {
             Resolution::Overwrite | Resolution::OverwriteAll => Resolution::Overwrite,
             Resolution::OverwriteOlder if target_older => Resolution::Overwrite,
             Resolution::Resume | Resolution::ResumeAll if resumable => Resolution::Resume,
             Resolution::Cancel => Resolution::Cancel,
             _ => Resolution::Skip,
-        }
+        };
+        self.overwrote |= matches!(result, Resolution::Overwrite | Resolution::Resume);
+        result
     }
 
     /// Copies file contents with progress. Ok(false) means cancelled. Any
@@ -1402,15 +1441,18 @@ impl Runner<'_> {
 
     /// Tries a cheap rename first; falls back to copy + delete (e.g. across
     /// drives, or when merging into an existing folder).
-    fn move_item(&mut self, t: &Transfer, (bytes, items): (u64, u64)) {
+    /// Returns true if it was a rename (same volume, nothing at the target):
+    /// the move that can be undone.
+    fn move_item(&mut self, t: &Transfer, (bytes, items): (u64, u64)) -> bool {
         self.progress.current = Some(t.src.clone());
         if fs::symlink_metadata(&t.dst).is_err() && fs::rename(&t.src, &t.dst).is_ok() {
             self.progress.done_items += items;
             self.progress.done_bytes += bytes;
             self.report(false);
-            return;
+            return true;
         }
         self.copy(&t.src, &t.dst, true);
+        false
     }
 
     // ---- archives ---------------------------------------------------------
@@ -3850,5 +3892,69 @@ mod tests {
         assert!(o.errors.is_empty(), "{:?}", o.errors);
         assert!(!dest.exists() && !src.exists());
         assert_eq!(fs::read(target.join("inside.txt")).unwrap(), b"keep me");
+    }
+
+    #[test]
+    fn records_undo_for_completed_items_only() {
+        use crate::undo::UndoStep;
+        let tmp = TempDir::new("undo-record");
+        let (src, dst) = (tmp.0.join("src"), tmp.0.join("dst"));
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+        for n in ["a", "b"] {
+            fs::write(src.join(n), n).unwrap();
+        }
+        fs::write(dst.join("b"), b"old").unwrap();
+        let ts = plan_transfer(&[src.join("a"), src.join("b")], &dst).unwrap();
+        // b is there already and skipped: only a is recorded.
+        let (o, _) = run_job(Job::Copy(ts.clone()), Resolution::Skip);
+        match o.undo {
+            Some(UndoStep::Copy(v)) => assert_eq!(v.iter().map(|c| c.dst.clone()).collect::<Vec<_>>(), [dst.join("a")]),
+            other => panic!("{other:?}"),
+        }
+        // b overwritten: nothing can be undone.
+        fs::remove_file(dst.join("a")).unwrap();
+        let (o, _) = run_job(Job::Copy(ts.clone()), Resolution::Overwrite);
+        assert!(o.errors.is_empty() && o.undo.is_none(), "{:?}", o.undo);
+        // Move: a renamed into place is recorded, the skipped b isn't.
+        fs::remove_file(dst.join("a")).unwrap();
+        fs::write(dst.join("b"), b"old").unwrap();
+        let (o, _) = run_job(Job::Move(ts), Resolution::Skip);
+        match &o.undo {
+            Some(UndoStep::Move(v)) => {
+                assert_eq!(v.iter().map(|m| (m.from.clone(), m.to.clone())).collect::<Vec<_>>(), [(src.join("a"), dst.join("a"))])
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(src.join("b").exists());
+        // And it undoes.
+        o.undo.unwrap().undo_with(&crate::undo::RecycleBin).unwrap();
+        assert_eq!(fs::read(src.join("a")).unwrap(), b"a");
+        assert!(!dst.join("a").exists());
+    }
+
+    #[test]
+    fn copy_merged_into_an_existing_folder_is_not_recorded() {
+        let tmp = TempDir::new("undo-merge");
+        let src = tree(&tmp.0);
+        let dst = tmp.0.join("dst");
+        fs::create_dir_all(dst.join("src")).unwrap();
+        fs::write(dst.join("src").join("mine.txt"), b"mine").unwrap();
+        let (o, _) = run_job(Job::Copy(plan_transfer(&[src], &dst).unwrap()), Resolution::Skip);
+        assert!(o.errors.is_empty(), "{:?}", o.errors);
+        assert!(o.undo.is_none(), "{:?}", o.undo);
+    }
+
+    #[test]
+    fn records_local_rename_job() {
+        let tmp = TempDir::new("undo-rename");
+        let (a, b) = (tmp.0.join("a"), tmp.0.join("b"));
+        fs::write(&a, b"a").unwrap();
+        let (o, _) = run_job(Job::Rename { from: a.clone(), to: b.clone() }, Resolution::Skip);
+        assert!(matches!(o.undo, Some(crate::undo::UndoStep::Rename(_))), "{:?}", o.undo);
+        // Renamed over an existing file: not undoable.
+        fs::write(&a, b"a2").unwrap();
+        let (o, _) = run_job(Job::Rename { from: a, to: b }, Resolution::Skip);
+        assert!(o.undo.is_none());
     }
 }

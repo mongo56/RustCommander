@@ -21,6 +21,7 @@ pub mod rename;
 pub mod search;
 pub mod split;
 pub mod treemap;
+pub mod undo;
 pub mod user_cmd;
 pub mod vfs;
 mod gz_edit;

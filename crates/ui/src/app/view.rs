@@ -892,6 +892,7 @@ impl App {
                 "Close",
             ),
             Dialog::QuitTerms => ("Quit".into(), self.quit_text(), None, "Quit"),
+            Dialog::Undo { what } => ("Undo".into(), format!("Undo: {what}?"), None, "Undo"),
             Dialog::RemoveGroup { name, count, .. } => (
                 "Remove group".into(),
                 format!(

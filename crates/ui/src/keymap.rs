@@ -421,6 +421,7 @@ const DEFAULTS: &[(&str, Command)] = {
         ("ctrl+v", PasteFromClipboard),
         ("ctrl+w", CloseTab),
         ("ctrl+x", CutToClipboard),
+        ("ctrl+z", Undo),
         ("ctrl+\\", GoRoot),
         ("ctrl+,", EditConfig),
         ("alt+shift+enter", CountDirSizes),

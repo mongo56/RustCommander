@@ -14,6 +14,7 @@ use iced::widget::{
 };
 use iced::{Alignment, Element, Length};
 use rc_core::rename::{self, Case, Options, Preview};
+use rc_core::undo::UndoStep;
 use std::collections::{HashMap, HashSet};
 
 /// Rows drawn in the preview list; the rest are summarised.
@@ -315,6 +316,9 @@ impl App {
                     return Task::none();
                 }
                 mr.undo = mr.rename(&pairs, "Renamed");
+                // Ctrl+Z on the panels can undo it too (after closing).
+                let done = mr.undo.iter().map(|(to, from)| (from.clone(), to.clone())).collect();
+                self.push_undo(UndoStep::multi_renamed(done));
                 self.reload_panels();
                 self.sync_rename_panel();
             }
@@ -325,6 +329,12 @@ impl App {
                 }
                 let pairs = std::mem::take(&mut mr.undo);
                 mr.rename(&pairs, "Undone:");
+                // Undone here: the panels' step for it is done with.
+                let last_is_this = matches!(self.undo.last(), Some(UndoStep::MultiRename(v))
+                    if v.len() == pairs.len() && v.iter().zip(&pairs).all(|(m, (to, from))| m.to == *to && m.from == *from));
+                if last_is_this {
+                    self.undo.pop();
+                }
                 self.reload_panels();
                 self.sync_rename_panel();
             }

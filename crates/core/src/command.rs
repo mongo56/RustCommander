@@ -164,6 +164,8 @@ commands! {
         /// Rename the selected files by mask (Ctrl+M).
         MultiRename => "cm_MultiRenameFiles", "Multi-rename the selected files by mask", "MultiRen";
         MakeDir => "cm_MkDir", "Create a folder", "MkDir";
+        /// Undo the last file operation, if nothing changed since (Ctrl+Z).
+        Undo => "cm_Undo", "Undo the last file operation (rename, move, copy, new folder/file, recycle)", "Undo";
         /// Pack the selected files into a zip in the other panel (Alt+F5).
         Pack => "cm_PackFiles", "Pack the selected files into a zip archive in the other panel", "Pack";
         /// Unpack the selected archives into the other panel (Alt+F9).

@@ -26,6 +26,7 @@ mod settings;
 mod term;
 mod term_activity;
 mod thumbs;
+mod undo;
 mod update;
 mod user_cmds;
 mod viewer;
@@ -123,6 +124,11 @@ pub struct App {
     recent_commands: Vec<Command>,
     jobs: Vec<RunningJob>,
     next_job_id: u64,
+    /// Finished operations Ctrl+Z can undo, newest last (`undo.rs`; not
+    /// saved with the session).
+    undo: Vec<rc_core::undo::UndoStep>,
+    /// An undo runs in the background.
+    undo_running: bool,
     /// Tasks started where none can be returned (an archive rename committed
     /// by `leave_edits`); `update` runs them.
     deferred: Vec<Task<Message>>,
@@ -329,6 +335,8 @@ enum Dialog {
     CloseTerm { id: u64, program: String },
     /// Quitting while terminals run.
     QuitTerms,
+    /// Ctrl+Z: "Undo: `what`?" (the newest undo step).
+    Undo { what: String },
 }
 
 /// The path bar of one side being edited, with folder suggestions.
@@ -528,6 +536,8 @@ pub enum Message {
     /// Run the palette's `n`th shown command (a click).
     PalettePick(usize),
     Job(u64, JobEvent),
+    /// An undo (Ctrl+Z) finished.
+    UndoDone(Result<rc_core::undo::Undone, String>),
     JobPause(u64),
     JobCancel(u64),
     Answer(u64, Resolution),
@@ -639,6 +649,8 @@ impl App {
                 .unwrap_or_default(),
             jobs: Vec::new(),
             next_job_id: 1,
+            undo: Vec::new(),
+            undo_running: false,
             deferred: Vec::new(),
             counts: Vec::new(),
             // `config.toml` `[compare]` replaces these in `refresh_config`.
@@ -972,6 +984,7 @@ impl App {
                     // name (it may hold a template, so keep it): put the
                     // cursor on it and rename it inline, like Explorer does.
                     if let Some(file) = made.clone().filter(|p| background && p.is_file()) {
+                        self.push_undo(rc_core::undo::UndoStep::new_file(file.clone()));
                         self.focus_panel(side);
                         self.reload_panels();
                         if self.panel(side).path.as_path() == file.parent().unwrap_or(&file) {
@@ -1353,6 +1366,7 @@ impl App {
             Message::HistoryPick(i) => return self.history_pick(i),
             Message::PalettePick(i) => return self.palette_pick(i),
             Message::Job(id, event) => return self.on_job_event(id, event),
+            Message::UndoDone(result) => self.undo_done(result),
             Message::JobPause(id) => {
                 if let Some(job) = self.job(id) {
                     let control = &job.handle.control;
@@ -1608,6 +1622,7 @@ impl App {
                         | Dialog::RemoveGroup { .. }
                         | Dialog::CloseTerm { .. }
                         | Dialog::QuitTerms
+                        | Dialog::Undo { .. }
                 ));
             if let (Some(Named::Tab), Some(Dialog::HotEdit { field, .. })) = (named, &mut self.dialog) {
                 // Tab flips between the name and comment boxes.
@@ -1812,6 +1827,7 @@ impl App {
             CheckForUpdates => return self.check_for_updates(),
             Configuration => return self.open_settings(),
             CommandPalette => return self.open_palette(),
+            Undo => return self.ask_undo(),
             Edit => {
                 if let Some(e) = self.panel(active).current().filter(|e| e.kind == EntryKind::File) {
                     let (path, name) = (e.path.clone(), e.name.clone());
@@ -2274,6 +2290,9 @@ impl App {
             std::fs::rename(&src, &dst)
         };
         let ok = result.is_ok();
+        if ok {
+            self.push_undo(rc_core::undo::UndoStep::renamed(src.clone(), dst.clone()));
+        }
         self.report(result);
         // Search results show the hit under its new name (before the
         // refresh would drop the old path).
@@ -2468,8 +2487,13 @@ impl App {
                     }
                     return task;
                 }
+                let made = rc_core::undo::missing_dirs(&dir.join(name));
                 let panel = self.panel_mut(self.active);
                 let result = std::fs::create_dir_all(panel.path.join(name)).and_then(|_| panel.reload());
+                if result.is_ok() {
+                    self.push_undo(rc_core::undo::UndoStep::made_dirs(made));
+                }
+                let panel = self.panel_mut(self.active);
                 // Focus the first component of what was created ("a\b" → "a").
                 if let Some(first) = Path::new(name).components().next() {
                     panel.focus(&first.as_os_str().to_string_lossy());
@@ -2496,6 +2520,7 @@ impl App {
                         self.error(format!("Can't create {name}: {e}"));
                         return Task::none();
                     }
+                    self.push_undo(rc_core::undo::UndoStep::new_file(path.clone()));
                     let panel = self.panel_mut(self.active);
                     let _ = panel.reload();
                     if let Some(first) = Path::new(name).components().next() {
@@ -2553,6 +2578,7 @@ impl App {
             Dialog::RemoveGroup { path, .. } => self.tree_remove_now(&path),
             Dialog::CloseTerm { id, .. } => self.close_term_now(id),
             Dialog::QuitTerms => return self.quit(),
+            Dialog::Undo { .. } => return self.run_undo(),
             Dialog::HotEdit { path, name, comment, back, .. } => {
                 if let Some(item) = crate::hotlist::get_mut(&mut self.hotlist, &path) {
                     item.set_note(&name, &comment);
@@ -2952,6 +2978,8 @@ impl App {
             JobEvent::Finished(outcome) => {
                 let Some(pos) = self.jobs.iter().position(|j| j.id == id) else { return Task::none() };
                 let job = self.jobs.remove(pos);
+                let mut outcome = outcome;
+                self.push_undo(outcome.undo.take());
                 if let Some(side) = job.source_side.filter(|_| outcome.errors.is_empty() && !outcome.cancelled && outcome.skipped == 0) {
                     self.panel_mut(side).deselect_all();
                 }
