@@ -172,19 +172,51 @@ pub enum TermMsg {
 /// What the mouse did in the grid; cells are viewport positions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mouse {
-    /// Left press: `clicks` 1 (character selection), 2 (word) or 3 (line);
-    /// `right`: the press was on the right half of the cell.
-    Down { line: u16, col: u16, right: bool, clicks: u8 },
-    /// Moved with the left button down.
-    Drag { line: u16, col: u16, right: bool },
-    /// Left button released.
-    Up,
+    /// A button pressed over the grid. Left: `clicks` 1 (character
+    /// selection), 2 (word) or 3 (line); `right`: the press was on the right
+    /// half of the cell. `mods`: the keyboard modifiers held. The session
+    /// decides whether it goes to the program (`reports_mouse`) or is ours:
+    /// left selects, right copies the selection (Shift: as one line,
+    /// `join_lines`) or pastes.
+    Down { button: Btn, line: u16, col: u16, right: bool, clicks: u8, mods: keyboard::Modifiers },
+    /// Moved to another cell with a button down.
+    Drag { line: u16, col: u16, right: bool, mods: keyboard::Modifiers },
+    /// A button pressed in the grid was released.
+    Up { button: Btn, line: u16, col: u16, mods: keyboard::Modifiers },
+    /// Moved to another cell with no button down; only sent while the
+    /// program asked for all motion (`Frame::hover`).
+    Hover { line: u16, col: u16, mods: keyboard::Modifiers },
     /// Wheel: lines, positive scrolls back into the history; the cell
     /// under the mouse.
-    Wheel { lines: i32, line: u16, col: u16 },
-    /// Right press: copy the selection (`one_line`: Shift was down, as one
-    /// line, `join_lines`), or paste.
-    Context { one_line: bool },
+    Wheel { lines: i32, line: u16, col: u16, mods: keyboard::Modifiers },
+}
+
+/// A mouse button of the grid; `code` is its number in mouse reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Btn {
+    Left,
+    Middle,
+    Right,
+}
+
+impl Btn {
+    fn code(self) -> u8 {
+        match self {
+            Btn::Left => 0,
+            Btn::Middle => 1,
+            Btn::Right => 2,
+        }
+    }
+}
+
+/// What a mouse action on the grid leaves to the app.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MouseOutcome {
+    None,
+    /// Copy this text (right click on a selection).
+    Copy(String),
+    /// Paste the clipboard (right click with no selection).
+    Paste,
 }
 
 /// A terminal shell's folder (`None`: not known, keep the last one) and the
@@ -245,6 +277,11 @@ pub(super) struct TermSession {
     /// Wheel lines not yet reported to a program that tracks the mouse
     /// (one report per `WHEEL_LINES`).
     wheel_rest: i32,
+    /// The held button whose press went to the program (its drags and
+    /// release go there too, whatever the mode or Shift does meanwhile).
+    reported: Option<Btn>,
+    /// A left press started a selection (its drags and release extend it).
+    selecting: bool,
 }
 
 impl TermSession {
@@ -297,6 +334,8 @@ impl TermSession {
             frame: Frame::default(),
             pending: None,
             wheel_rest: 0,
+            reported: None,
+            selecting: false,
         };
         session.refresh();
         Ok(session)
@@ -356,70 +395,117 @@ impl TermSession {
         self.write(paste_bytes(text, bracketed));
     }
 
-    /// Applies a mouse action on the grid; returns the text to copy (right
-    /// click on a selection).
-    fn mouse(&mut self, mouse: Mouse) -> Option<String> {
-        let mut copy = None;
-        {
-            let mut term = self.term.lock();
-            let offset = term.grid().display_offset();
-            let cols = term.columns().max(1);
-            let point = |line: u16, col: u16| {
-                GridPoint::new(Line(line as i32 - offset as i32), GridColumn((col as usize).min(cols - 1)))
-            };
-            let side = |right: bool| if right { Side::Right } else { Side::Left };
-            match mouse {
-                Mouse::Down { line, col, right, clicks } => {
-                    let ty = match clicks {
-                        1 => SelectionType::Simple,
-                        2 => SelectionType::Semantic,
-                        _ => SelectionType::Lines,
-                    };
-                    term.selection = Some(Selection::new(ty, point(line, col), side(right)));
-                }
-                Mouse::Drag { line, col, right } => {
-                    let to = point(line, col);
-                    if let Some(selection) = &mut term.selection {
-                        selection.update(to, side(right));
-                    }
-                }
-                Mouse::Up => {
-                    if term.selection.as_ref().is_some_and(Selection::is_empty) {
-                        term.selection = None;
-                    }
-                }
-                Mouse::Wheel { lines, line, col } => {
-                    let mode = *term.mode();
-                    if mode.intersects(TermMode::MOUSE_MODE) {
-                        // The program handles the wheel itself (Claude Code, vim
-                        // with mouse=a, htop, ...): report wheel buttons.
-                        drop(term);
-                        let total = self.wheel_rest + lines;
-                        self.wheel_rest = total % WHEEL_LINES;
-                        self.write_raw(wheel_reports(mode, total / WHEEL_LINES, line, col));
-                        return None;
-                    } else if !mode.contains(TermMode::ALT_SCREEN) {
-                        term.scroll_display(Scroll::Delta(lines));
-                    } else if mode.contains(TermMode::ALTERNATE_SCROLL) {
-                        drop(term);
-                        self.write_raw(wheel_arrows(mode.contains(TermMode::APP_CURSOR), lines));
-                        self.refresh();
-                        return None;
-                    }
-                }
-                Mouse::Context { one_line } => {
+    /// Applies a mouse action on the grid: reported to a program that tracks
+    /// the mouse (`reports_mouse`), else our selection, history scroll, copy
+    /// and paste.
+    fn mouse(&mut self, mouse: Mouse) -> MouseOutcome {
+        let mut term = self.term.lock();
+        let mode = *term.mode();
+        let offset = term.grid().display_offset();
+        let cols = term.columns().max(1);
+        let point = |line: u16, col: u16| {
+            GridPoint::new(Line(line as i32 - offset as i32), GridColumn((col as usize).min(cols - 1)))
+        };
+        let side = |right: bool| if right { Side::Right } else { Side::Left };
+        match mouse {
+            Mouse::Down { button, line, col, right, clicks, mods } => {
+                if reports_mouse(mode, mods) {
                     drop(term);
-                    copy = self.selected_text(one_line);
-                    if copy.is_some() {
-                        self.term.lock().selection = None;
+                    self.reported = Some(button);
+                    self.selecting = false;
+                    self.write_raw(mouse_report(mode, button.code(), true, line, col, mods));
+                    return MouseOutcome::None;
+                }
+                match button {
+                    Btn::Left => {
+                        let ty = match clicks {
+                            1 => SelectionType::Simple,
+                            2 => SelectionType::Semantic,
+                            _ => SelectionType::Lines,
+                        };
+                        term.selection = Some(Selection::new(ty, point(line, col), side(right)));
+                        self.selecting = true;
                     }
+                    Btn::Middle => return MouseOutcome::None,
+                    Btn::Right => {
+                        drop(term);
+                        let outcome = match self.selected_text(mods.shift()) {
+                            Some(text) => {
+                                self.term.lock().selection = None;
+                                MouseOutcome::Copy(text)
+                            }
+                            None => MouseOutcome::Paste,
+                        };
+                        self.refresh();
+                        return outcome;
+                    }
+                }
+            }
+            Mouse::Drag { line, col, right, mods } => {
+                if let Some(button) = self.reported {
+                    // 1002 and 1003 report moves with a button held (+32).
+                    if mode.intersects(TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION) {
+                        drop(term);
+                        self.write_raw(mouse_report(mode, button.code() + 32, true, line, col, mods));
+                    }
+                    return MouseOutcome::None;
+                }
+                if !self.selecting {
+                    return MouseOutcome::None;
+                }
+                let to = point(line, col);
+                if let Some(selection) = &mut term.selection {
+                    selection.update(to, side(right));
+                }
+            }
+            Mouse::Up { button, line, col, mods } => {
+                if self.reported == Some(button) {
+                    self.reported = None;
+                    if mode.intersects(TermMode::MOUSE_MODE) {
+                        drop(term);
+                        self.write_raw(mouse_report(mode, button.code(), false, line, col, mods));
+                    }
+                    return MouseOutcome::None;
+                }
+                if button != Btn::Left || !self.selecting {
+                    return MouseOutcome::None;
+                }
+                self.selecting = false;
+                if term.selection.as_ref().is_some_and(Selection::is_empty) {
+                    term.selection = None;
+                }
+            }
+            Mouse::Hover { line, col, mods } => {
+                // 1003: moves with no button are reported too (button 3, +32).
+                if self.reported.is_none() && mode.contains(TermMode::MOUSE_MOTION) {
+                    drop(term);
+                    self.write_raw(mouse_report(mode, 3 + 32, true, line, col, mods));
+                }
+                return MouseOutcome::None;
+            }
+            Mouse::Wheel { lines, line, col, mods } => {
+                if reports_mouse(mode, mods) {
+                    // The program handles the wheel itself (Claude Code, vim
+                    // with mouse=a, htop, ...): report wheel buttons.
+                    drop(term);
+                    let total = self.wheel_rest + lines;
+                    self.wheel_rest = total % WHEEL_LINES;
+                    self.write_raw(wheel_reports(mode, total / WHEEL_LINES, line, col, mods));
+                    return MouseOutcome::None;
+                } else if !mode.contains(TermMode::ALT_SCREEN) {
+                    // Also Shift+wheel while a program tracks the mouse.
+                    term.scroll_display(Scroll::Delta(lines));
+                } else if mode.contains(TermMode::ALTERNATE_SCROLL) && !mode.intersects(TermMode::MOUSE_MODE) {
+                    drop(term);
+                    self.write_raw(wheel_arrows(mode.contains(TermMode::APP_CURSOR), lines));
                     self.refresh();
-                    return copy;
+                    return MouseOutcome::None;
                 }
             }
         }
+        drop(term);
         self.refresh();
-        copy
+        MouseOutcome::None
     }
 
     /// Types the pending line (if any) and Enter.
@@ -959,6 +1045,9 @@ struct Frame {
     /// Lines of history, and how many the view is scrolled back.
     history: usize,
     offset: usize,
+    /// The program asked for every mouse move (1003): the grid reports
+    /// moves with no button down too (`Mouse::Hover`).
+    hover: bool,
 }
 
 /// Text of one style on one line, starting at a cell.
@@ -1082,6 +1171,7 @@ impl Frame {
                 .unwrap_or_default(),
             history: term.history_size(),
             offset: content.display_offset,
+            hover: term.mode().contains(TermMode::MOUSE_MOTION),
             ..Frame::default()
         };
         let cursor_point = content.cursor.point;
@@ -1250,16 +1340,17 @@ fn cell_rect(origin: Point, line: u16, col: u16, cells: u16) -> Rectangle {
 /// Mouse state of the grid widget.
 #[derive(Debug, Default)]
 struct GridState {
-    /// The left button is down (a selection is being dragged).
-    dragging: bool,
-    /// The last drag position sent, to send changes only.
+    /// The button pressed in the grid and still down (its moves are drags).
+    held: Option<Btn>,
+    /// The last drag or hover position sent, to send changes only.
     last: Option<(u16, u16, bool)>,
     /// The last left press: when, where, and in a row how many.
     click: Option<(Instant, u16, u16, u8)>,
     /// Pixels of wheel movement not yet worth a line.
     wheel: f32,
-    /// Shift is down (Shift+right-click copies as one line).
-    shift: bool,
+    /// The keyboard modifiers held (Shift+click bypasses mouse reporting,
+    /// Shift+right-click copies as one line).
+    mods: keyboard::Modifiers,
 }
 
 /// Longest time between presses of a double or triple click.
@@ -1325,45 +1416,67 @@ impl Widget<Message, Theme, iced::Renderer> for Grid<'_> {
         }
         let state = tree.state.downcast_mut::<GridState>();
         if let Event::Keyboard(keyboard::Event::ModifiersChanged(mods)) = event {
-            state.shift = mods.shift();
+            state.mods = mods;
             return event::Status::Ignored;
         }
         let bounds = layout.bounds();
         let (cols, lines) = (self.frame.cols, self.frame.lines);
+        let mods = state.mods;
         let mut send = |m: Mouse| shell.publish(Message::Term(TermMsg::Mouse(self.id, m)));
+        let button = |b: mouse::Button| match b {
+            mouse::Button::Left => Some(Btn::Left),
+            mouse::Button::Middle => Some(Btn::Middle),
+            mouse::Button::Right => Some(Btn::Right),
+            _ => None,
+        };
         match event {
-            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+            Event::Mouse(mouse::Event::ButtonPressed(b)) => {
+                let Some(b) = button(b) else { return event::Status::Ignored };
                 let Some(at) = cursor.position_in(bounds) else { return event::Status::Ignored };
+                if state.held.is_some() {
+                    // A second button while one is down: ignored.
+                    return event::Status::Captured;
+                }
                 let (line, col, right) = cell_at(at, cols, lines);
-                let now = Instant::now();
-                let clicks = match state.click {
-                    Some((when, l, c, n)) if (l, c) == (line, col) && now.duration_since(when) < MULTI_CLICK => {
-                        n % 3 + 1
-                    }
-                    _ => 1,
-                };
-                state.click = Some((now, line, col, clicks));
-                state.dragging = true;
+                let mut clicks = 1;
+                if b == Btn::Left {
+                    let now = Instant::now();
+                    clicks = match state.click {
+                        Some((when, l, c, n)) if (l, c) == (line, col) && now.duration_since(when) < MULTI_CLICK => {
+                            n % 3 + 1
+                        }
+                        _ => 1,
+                    };
+                    state.click = Some((now, line, col, clicks));
+                }
+                state.held = Some(b);
                 state.last = Some((line, col, right));
-                send(Mouse::Down { line, col, right, clicks });
+                send(Mouse::Down { button: b, line, col, right, clicks, mods });
                 event::Status::Captured
             }
-            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) if cursor.is_over(bounds) => {
-                send(Mouse::Context { one_line: state.shift });
-                event::Status::Captured
-            }
-            Event::Mouse(mouse::Event::CursorMoved { position }) if state.dragging => {
+            Event::Mouse(mouse::Event::CursorMoved { position }) if state.held.is_some() => {
                 let at = Point::new(position.x - bounds.x, position.y - bounds.y);
                 let (line, col, right) = cell_at(at, cols, lines);
                 if state.last != Some((line, col, right)) {
                     state.last = Some((line, col, right));
-                    send(Mouse::Drag { line, col, right });
+                    send(Mouse::Drag { line, col, right, mods });
                 }
                 event::Status::Captured
             }
-            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) if state.dragging => {
-                state.dragging = false;
-                send(Mouse::Up);
+            Event::Mouse(mouse::Event::CursorMoved { .. }) if self.frame.hover => {
+                let Some(at) = cursor.position_in(bounds) else { return event::Status::Ignored };
+                let (line, col, _) = cell_at(at, cols, lines);
+                if state.last != Some((line, col, false)) {
+                    state.last = Some((line, col, false));
+                    send(Mouse::Hover { line, col, mods });
+                }
+                event::Status::Ignored
+            }
+            Event::Mouse(mouse::Event::ButtonReleased(b)) if state.held.is_some() && button(b) == state.held => {
+                let Some(b) = state.held.take() else { return event::Status::Ignored };
+                let at = cursor.position().map(|p| Point::new(p.x - bounds.x, p.y - bounds.y)).unwrap_or(Point::ORIGIN);
+                let (line, col, _) = cell_at(at, cols, lines);
+                send(Mouse::Up { button: b, line, col, mods });
                 event::Status::Captured
             }
             Event::Mouse(mouse::Event::WheelScrolled { delta }) if cursor.is_over(bounds) => {
@@ -1379,7 +1492,7 @@ impl Widget<Message, Theme, iced::Renderer> for Grid<'_> {
                 if amount != 0 {
                     let at = cursor.position_in(bounds).unwrap_or(Point::ORIGIN);
                     let (line, col, _) = cell_at(at, cols, lines);
-                    send(Mouse::Wheel { lines: amount, line, col });
+                    send(Mouse::Wheel { lines: amount, line, col, mods });
                 }
                 event::Status::Captured
             }
@@ -1468,19 +1581,44 @@ fn wheel_arrows(app_cursor: bool, lines: i32) -> Vec<u8> {
 /// notch; programs scroll a few lines per report themselves).
 const WHEEL_LINES: i32 = 3;
 
-/// Wheel reports (buttons 4/5) for a program that turned on mouse tracking:
-/// `notches` reports up (positive) or down, at viewport cell `line`, `col`,
-/// in SGR form if the program asked for it, else the legacy X10 form (cells
-/// past 223 can't be sent that way and are clamped).
-fn wheel_reports(mode: TermMode, notches: i32, line: u16, col: u16) -> Vec<u8> {
-    let button = if notches > 0 { 64 } else { 65 };
-    let one = if mode.contains(TermMode::SGR_MOUSE) {
-        format!("\x1b[<{button};{};{}M", col as u32 + 1, line as u32 + 1).into_bytes()
-    } else {
-        let pos = |v: u16| (32 + 1 + v.min(222)) as u8;
-        vec![0x1b, b'[', b'M', 32 + button, pos(col), pos(line)]
-    };
-    one.repeat(notches.unsigned_abs() as usize)
+/// Whether a mouse action goes to the program: it turned on mouse tracking
+/// (1000, 1002 or 1003) and Shift isn't held (Shift+click, drag and wheel
+/// stay ours: selection, copy/paste, history; the xterm convention).
+fn reports_mouse(mode: TermMode, mods: keyboard::Modifiers) -> bool {
+    mode.intersects(TermMode::MOUSE_MODE) && !mods.shift()
+}
+
+/// One mouse report for a program that turned on mouse tracking. `code`:
+/// button 0 left, 1 middle, 2 right, 3 none, 64/65 wheel up/down, plus 32
+/// for a move; the modifiers add Shift 4, Alt 8, Ctrl 16. At viewport cell
+/// `line`, `col`. In SGR form (`ESC [ < b ; col ; row M`, `m` for a
+/// release) if the program asked for it, else the legacy X10 form
+/// (`ESC [ M` and three bytes, a release is button 3), where cells past 222
+/// are clamped (past 2014 in UTF-8 mode, 1005).
+fn mouse_report(mode: TermMode, code: u8, pressed: bool, line: u16, col: u16, mods: keyboard::Modifiers) -> Vec<u8> {
+    let mods = 4 * mods.shift() as u8 + 8 * mods.alt() as u8 + 16 * mods.control() as u8;
+    if mode.contains(TermMode::SGR_MOUSE) {
+        let end = if pressed { 'M' } else { 'm' };
+        return format!("[<{};{};{}{end}", code + mods, col as u32 + 1, line as u32 + 1).into_bytes();
+    }
+    let code = if pressed { code } else { 3 };
+    let mut bytes = vec![0x1b, b'[', b'M', 32 + code + mods];
+    for v in [col, line] {
+        if mode.contains(TermMode::UTF8_MOUSE) {
+            let c = char::from_u32(32 + 1 + v.min(2014) as u32).unwrap_or(' ');
+            bytes.extend(c.to_string().into_bytes());
+        } else {
+            bytes.push((32 + 1 + v.min(222)) as u8);
+        }
+    }
+    bytes
+}
+
+/// Wheel reports (buttons 64/65): `notches` reports up (positive) or down,
+/// at viewport cell `line`, `col` (`mouse_report`).
+fn wheel_reports(mode: TermMode, notches: i32, line: u16, col: u16, mods: keyboard::Modifiers) -> Vec<u8> {
+    let code = if notches > 0 { 64 } else { 65 };
+    mouse_report(mode, code, true, line, col, mods).repeat(notches.unsigned_abs() as usize)
 }
 
 /// Whether closing a terminal asks first: a program other than the idle
@@ -1604,9 +1742,10 @@ impl App {
         ("Ctrl+Shift+C or Ctrl+Insert", "Copy the selected text (select with the mouse: drag, double-click a word, triple-click a line)"),
         ("Ctrl+Shift+J", "Copy the selected text as one line: line breaks and the indentation after them removed (paths, URLs, commands a program wrapped)"),
         ("Right-click", "Copies the selection and clears it; with no selection pastes the clipboard"),
-        ("Shift+Right-click", "Copies the selection as one line (like Ctrl+Shift+J) and clears it"),
+        ("Shift+Right-click", "Copies the selection as one line (like Ctrl+Shift+J) and clears it; with no selection pastes"),
         ("Ctrl+Shift+V or Shift+Insert", "Paste the clipboard (bracketed when the program asks for it)"),
         ("Mouse wheel, Shift+PgUp/PgDn, Shift+Home/End", "Scroll the history (programs that use the mouse get wheel events, other full-screen programs arrow keys); typing jumps back to the bottom"),
+        ("Mouse in programs that use it", "Programs that track the mouse (Claude Code, vim with mouse=a, htop, ...) get the clicks, drags and wheel instead; hold Shift to select, copy/paste with Shift+Right-click, or scroll the history with Shift+wheel as usual"),
         ("Every other key", "Goes to the shell (Esc, Tab, Ctrl+C, arrows, F1-F12, ...)"),
         ("exit", "Ends the shell and closes the terminal"),
     ];
@@ -1901,11 +2040,12 @@ impl App {
             TermMsg::Close(id) => self.request_close_term(id),
             TermMsg::Mouse(id, mouse) => {
                 let Some(t) = self.term_mut(id) else { return Task::none() };
-                if let Some(text) = t.mouse(mouse) {
-                    return iced::clipboard::write(text);
-                }
-                if matches!(mouse, Mouse::Context { .. }) && t.selected_text(false).is_none() {
-                    return iced::clipboard::read().map(move |text| Message::Term(TermMsg::Paste(id, text)));
+                match t.mouse(mouse) {
+                    MouseOutcome::None => {}
+                    MouseOutcome::Copy(text) => return iced::clipboard::write(text),
+                    MouseOutcome::Paste => {
+                        return iced::clipboard::read().map(move |text| Message::Term(TermMsg::Paste(id, text)));
+                    }
                 }
             }
             TermMsg::ScrollTo(id, top) => {
@@ -2385,11 +2525,54 @@ mod tests {
     #[test]
     fn wheel_reports_for_mouse_tracking_programs() {
         let sgr = TermMode::MOUSE_REPORT_CLICK | TermMode::SGR_MOUSE;
-        assert_eq!(wheel_reports(sgr, 2, 4, 9), b"\x1b[<64;10;5M\x1b[<64;10;5M");
-        assert_eq!(wheel_reports(sgr, -1, 0, 0), b"\x1b[<65;1;1M");
-        assert_eq!(wheel_reports(sgr, 0, 0, 0), b"");
+        let none = M::empty();
+        assert_eq!(wheel_reports(sgr, 2, 4, 9, none), b"\x1b[<64;10;5M\x1b[<64;10;5M");
+        assert_eq!(wheel_reports(sgr, -1, 0, 0, none), b"\x1b[<65;1;1M");
+        assert_eq!(wheel_reports(sgr, 0, 0, 0, none), b"");
+        assert_eq!(wheel_reports(sgr, 1, 0, 0, M::CTRL), b"\x1b[<80;1;1M");
         let x10 = TermMode::MOUSE_DRAG;
-        assert_eq!(wheel_reports(x10, 1, 0, 300), [0x1b, b'[', b'M', 96, 255, 33]);
+        assert_eq!(wheel_reports(x10, 1, 0, 300, none), [0x1b, b'[', b'M', 96, 255, 33]);
+    }
+
+    #[test]
+    fn mouse_reports_sgr_and_x10() {
+        let none = M::empty();
+        let sgr = TermMode::MOUSE_REPORT_CLICK | TermMode::SGR_MOUSE;
+        // Press and release, left/middle/right; columns then rows, from 1.
+        assert_eq!(mouse_report(sgr, 0, true, 4, 9, none), b"\x1b[<0;10;5M");
+        assert_eq!(mouse_report(sgr, 0, false, 4, 9, none), b"\x1b[<0;10;5m");
+        assert_eq!(mouse_report(sgr, 1, true, 0, 0, none), b"\x1b[<1;1;1M");
+        assert_eq!(mouse_report(sgr, 2, false, 0, 0, none), b"\x1b[<2;1;1m");
+        // Drag (+32), a move with no button (35), modifiers.
+        assert_eq!(mouse_report(sgr, 32, true, 1, 2, none), b"\x1b[<32;3;2M");
+        assert_eq!(mouse_report(sgr, 35, true, 1, 2, none), b"\x1b[<35;3;2M");
+        assert_eq!(mouse_report(sgr, 0, true, 0, 0, M::SHIFT), b"\x1b[<4;1;1M");
+        assert_eq!(mouse_report(sgr, 0, true, 0, 0, M::ALT | M::CTRL), b"\x1b[<24;1;1M");
+        // SGR doesn't clamp.
+        assert_eq!(mouse_report(sgr, 0, true, 0, 499, none), b"\x1b[<0;500;1M");
+        // X10: 32 + button, 32 + 1 + cell; a release is button 3.
+        let x10 = TermMode::MOUSE_REPORT_CLICK;
+        assert_eq!(mouse_report(x10, 0, true, 4, 9, none), [0x1b, b'[', b'M', 32, 42, 37]);
+        assert_eq!(mouse_report(x10, 2, false, 4, 9, none), [0x1b, b'[', b'M', 35, 42, 37]);
+        assert_eq!(mouse_report(x10, 32, true, 0, 0, M::CTRL), [0x1b, b'[', b'M', 80, 33, 33]);
+        assert_eq!(mouse_report(x10, 0, true, 300, 300, none), [0x1b, b'[', b'M', 32, 255, 255]);
+        // UTF-8 (1005): cells past 94 as two-byte characters (300 -> U+014D).
+        let utf8 = TermMode::MOUSE_REPORT_CLICK | TermMode::UTF8_MOUSE;
+        assert_eq!(mouse_report(utf8, 0, true, 0, 300, none), [0x1b, b'[', b'M', 32, 0xc5, 0x8d, 33]);
+    }
+
+    #[test]
+    fn shift_keeps_the_mouse_ours_while_a_program_tracks_it() {
+        for tracking in [TermMode::MOUSE_REPORT_CLICK, TermMode::MOUSE_DRAG, TermMode::MOUSE_MOTION] {
+            let mode = tracking | TermMode::SGR_MOUSE | TermMode::ALT_SCREEN;
+            assert!(reports_mouse(mode, M::empty()));
+            assert!(reports_mouse(mode, M::CTRL | M::ALT));
+            assert!(!reports_mouse(mode, M::SHIFT));
+        }
+        // No tracking: always ours.
+        let plain = TermMode::SGR_MOUSE | TermMode::ALT_SCREEN;
+        assert!(!reports_mouse(plain, M::empty()));
+        assert!(!reports_mouse(TermMode::empty(), M::empty()));
     }
 
     #[test]
