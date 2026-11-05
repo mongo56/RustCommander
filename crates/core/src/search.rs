@@ -348,6 +348,118 @@ pub fn search(query: &Query, cancel: &AtomicBool, mut report: impl FnMut(Batch) 
     Ok(summary)
 }
 
+/// Files listed by [`list_branch`] at most (the list is then incomplete).
+pub const BRANCH_MAX: usize = 200_000;
+
+/// Branch view: every file under `root` and its subfolders (folders
+/// themselves are not listed, links and junctions are not followed), named
+/// relative to `root`. Reports batches like [`search`]; `cap` limits the
+/// files (`Summary::truncated`), unreadable folders count in
+/// `Summary::errors`. A root inside an archive is listed through its `Vfs`.
+pub fn list_branch(
+    root: &Path,
+    hidden: bool,
+    cap: usize,
+    cancel: &AtomicBool,
+    mut report: impl FnMut(Batch) -> bool,
+) -> Summary {
+    let mut summary = Summary::default();
+    let mut batch = Batch { folder: root.to_path_buf(), ..Batch::default() };
+    if vfs::in_archive(root) {
+        match vfs::open(root).and_then(|v| v.walk(root)) {
+            Ok(items) => {
+                for item in items {
+                    if item.path == root || item.is_dir() || (item.hidden && !hidden) {
+                        continue;
+                    }
+                    if summary.hits >= cap {
+                        summary.truncated = true;
+                        break;
+                    }
+                    let mut item = item;
+                    item.name = item.path.strip_prefix(root).unwrap_or(&item.path).to_string_lossy().into_owned();
+                    batch.hits.push(item);
+                    summary.hits += 1;
+                }
+            }
+            Err(_) => summary.errors += 1,
+        }
+        summary.files = summary.hits as u64;
+        batch.checked = summary.files;
+        report(batch);
+        return summary;
+    }
+    let mut last_report = Instant::now();
+    let mut stack = vec![root.to_path_buf()];
+    'walk: while let Some(dir) = stack.pop() {
+        summary.folders += 1;
+        batch.folder = dir.clone();
+        let Ok(items) = fs::read_dir(&dir) else {
+            summary.errors += 1;
+            continue;
+        };
+        for item in items {
+            if cancel.load(Ordering::Relaxed) {
+                summary.cancelled = true;
+                break 'walk;
+            }
+            if batch.hits.len() >= BATCH_HITS || last_report.elapsed() >= BATCH_TIME {
+                last_report = Instant::now();
+                summary.files = summary.hits as u64;
+                let hits = std::mem::take(&mut batch.hits);
+                if !report(Batch { hits, folder: dir.clone(), checked: summary.files }) {
+                    summary.cancelled = true;
+                    break 'walk;
+                }
+            }
+            let Ok(item) = item else {
+                summary.errors += 1;
+                continue;
+            };
+            let Ok(own) = item.metadata() else {
+                summary.errors += 1;
+                continue;
+            };
+            let name = item.file_name().to_string_lossy().into_owned();
+            let is_hidden = is_hidden(&name, &own);
+            if is_hidden && !hidden {
+                continue;
+            }
+            let path = item.path();
+            let is_link = item.file_type().is_ok_and(|t| t.is_symlink());
+            if is_link {
+                // A link to a file is listed as that file; links to folders are skipped.
+                match fs::metadata(&path) {
+                    Ok(m) if !m.is_dir() => {}
+                    _ => continue,
+                }
+            } else if own.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let meta = if is_link { fs::metadata(&path).unwrap_or(own) } else { own };
+            if summary.hits >= cap {
+                summary.truncated = true;
+                break 'walk;
+            }
+            let rel = path.strip_prefix(root).unwrap_or(&path);
+            batch.hits.push(Entry {
+                name: rel.to_string_lossy().into_owned(),
+                path: path.clone(),
+                kind: EntryKind::File,
+                size: meta.len(),
+                modified: meta.modified().ok().map(DateTime::<Local>::from),
+                hidden: is_hidden,
+            });
+            summary.hits += 1;
+        }
+    }
+    summary.files = summary.hits as u64;
+    batch.checked = summary.files;
+    report(batch);
+    summary
+}
+
 /// Searches the archive (or the folder in one) `dir` through its `Vfs`:
 /// names, then the contents of the files whose names match. Hits go to
 /// `batch`.
@@ -474,6 +586,33 @@ mod tests {
         let m = TextMatcher::new("grüße", false, false).unwrap();
         assert!(m.file_matches(&root.join("u16.txt"), &never).unwrap());
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn branch_lists_files_only_and_respects_cap() {
+        let root = temp("branch");
+        fs::create_dir_all(root.join("a/b")).unwrap();
+        fs::create_dir_all(root.join("empty")).unwrap();
+        fs::write(root.join("one.txt"), "1").unwrap();
+        fs::write(root.join("a/two.txt"), "22").unwrap();
+        fs::write(root.join("a/b/three.txt"), "333").unwrap();
+        let never = AtomicBool::new(false);
+        let list = |cap: usize| {
+            let mut names = Vec::new();
+            let s = list_branch(&root, true, cap, &never, |b| {
+                names.extend(b.hits.into_iter().map(|e| e.name.replace('\\', "/")));
+                true
+            });
+            names.sort();
+            (s, names)
+        };
+        let (s, names) = list(BRANCH_MAX);
+        assert_eq!(names, ["a/b/three.txt", "a/two.txt", "one.txt"]);
+        assert_eq!((s.hits, s.errors, s.truncated), (3, 0, false));
+        let (s, names) = list(2);
+        assert_eq!(names.len(), 2);
+        assert!(s.truncated);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

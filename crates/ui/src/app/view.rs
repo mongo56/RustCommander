@@ -384,6 +384,9 @@ impl App {
                     .wrapping(Wrapping::None),
                     None => text(elide_left(
                         &match panel.results() {
+                            Some(rc_core::panel::BRANCH_LABEL) => {
+                                format!("{}  \u{2014} branch view (Ctrl+B leaves)", rc_core::remote::display(&panel.path))
+                            }
                             Some(what) => format!("{}  \u{2014} search results: {what}", rc_core::remote::display(&panel.path)),
                             None => rc_core::remote::display(&panel.path),
                         },

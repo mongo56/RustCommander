@@ -410,6 +410,7 @@ const DEFAULTS: &[(&str, Command)] = {
         ("ctrl+c", CopyToClipboard),
         ("ctrl+d", Hotlist),
         ("ctrl+f", FindFiles),
+        ("ctrl+b", BranchView),
         ("ctrl+h", ToggleHidden),
         ("ctrl+m", MultiRename),
         ("alt+o", SyncOtherPanel),

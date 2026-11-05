@@ -104,6 +104,9 @@ struct Visit {
     focus: Option<String>,
 }
 
+/// The results label of the branch view (all files of a folder tree).
+pub const BRANCH_LABEL: &str = "branch view";
+
 /// Most folders kept in each history direction.
 const HISTORY_LIMIT: usize = 100;
 
@@ -588,8 +591,8 @@ impl Panel {
 
     /// Short label for a tab: the folder name, or the whole path for roots.
     pub fn title(&self) -> String {
-        if self.results.is_some() {
-            return "Search results".into();
+        if let Some(label) = &self.results {
+            return if label == BRANCH_LABEL { "Branch view" } else { "Search results" }.into();
         }
         if let Some((key, remote)) = crate::remote::split(&self.path) {
             return if remote == "/" { key.split_once("://").map_or(key.clone(), |(_, server)| server.to_owned()) } else {

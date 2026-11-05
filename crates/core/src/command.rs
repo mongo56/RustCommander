@@ -119,6 +119,8 @@ commands! {
         SetAttrib => "cm_SetAttrib", "Change attributes and dates of the selected files", "Attrib";
         /// Find files by name and contents (Ctrl+F).
         FindFiles => "cm_SearchFor", "Find files by name and contents", "Find";
+        /// Every file of the folder and its subfolders in one list (Ctrl+B).
+        BranchView => "cm_BranchView", "Branch view: every file in this folder and its subfolders in one list", "Branch";
         /// What takes up space in a folder, as a tree (Alt+Shift+F7).
         DiskUsage => "cm_DiskUsage",
             "Show what takes up space in the folder under the cursor (or the current folder)", "DiskUse";

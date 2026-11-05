@@ -17,6 +17,7 @@ mod share_login;
 mod checksum;
 mod split;
 mod find_files;
+mod branch;
 mod git;
 mod multi_rename;
 mod settings;
@@ -135,6 +136,8 @@ pub struct App {
     /// A compare running on a worker: its cancel flag and the folders
     /// compared (results for other folders are dropped).
     comparing: Option<(Arc<AtomicBool>, PathBuf, PathBuf)>,
+    /// A branch view listing running on a worker (Ctrl+B).
+    branching: Option<branch::Branching>,
     path_edit: Option<PathEdit>,
     rename: Option<InlineRename>,
     quick_search: Option<QuickSearch>,
@@ -562,6 +565,8 @@ pub enum Message {
     DirSize(PathBuf, String, u64),
     /// A background compare finished (`None` = cancelled).
     Compared(Arc<AtomicBool>, Option<Differences>),
+    /// Progress of the branch view listing with that sequence number.
+    Branch(u64, branch::BranchMsg),
     /// Compare dialog option clicked: 0 content, 1 ignore date, 2 subfolders.
     CompareToggle(u8),
     /// A thumbnail was decoded (`None`: the file has none).
@@ -634,6 +639,7 @@ impl App {
             compare_opts: session.as_ref().and_then(|s| s.compare).map(Into::into).unwrap_or_default(),
             compare_unsaved: session.as_ref().and_then(|s| s.compare),
             comparing: None,
+            branching: None,
             path_edit: None,
             rename: None,
             quick_search: None,
@@ -1396,6 +1402,7 @@ impl App {
             Message::MultiRename(msg) => return self.multi_rename_update(msg),
             Message::FileDiff(msg) => return self.file_diff_update(msg),
             Message::Find(msg) => return self.find_update(msg),
+            Message::Branch(seq, msg) => return self.branch_update(seq, msg),
             Message::DiskUsage(msg) => return self.disk_usage_update(msg),
             Message::Term(msg) => return self.term_update(msg),
             Message::Connect(msg) => return self.connect_update(msg),
@@ -1776,6 +1783,7 @@ impl App {
             MultiRename => return self.open_multi_rename(),
             CompareFiles => return self.open_file_diff(),
             FindFiles => return self.open_find(),
+            BranchView => return self.branch_view(),
             CalcChecksum => return self.calc_checksum(),
             SetAttrib => return self.open_attrib(),
             VerifyChecksum => return self.verify_checksum(),
@@ -1960,6 +1968,10 @@ impl App {
             if let Some((cancel, ..)) = self.comparing.take() {
                 cancel.store(true, Ordering::Relaxed);
                 self.info("Compare cancelled");
+            }
+            if let Some(b) = self.branching.take() {
+                b.stop();
+                self.info("Listing cancelled");
             }
             self.cancel_counts();
         }
