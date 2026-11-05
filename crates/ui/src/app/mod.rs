@@ -1417,8 +1417,9 @@ impl App {
             }
             return Task::none();
         }
-        // (A dialog over a terminal gets the keys itself.)
-        if self.screen.is_some() && !(self.dialog.is_some() && self.screen.term().is_some()) {
+        // (A dialog over a terminal or the disk usage tool gets the keys itself.)
+        let dialog_over = self.dialog.is_some() && (self.screen.term().is_some() || self.screen.disk_usage().is_some());
+        if self.screen.is_some() && !dialog_over {
             if named.is_some_and(is_modifier_key) {
                 return Task::none();
             }
@@ -2397,7 +2398,10 @@ impl App {
                 let to_trash = to_trash && !paths.iter().any(|p| vfs::is_virtual(p));
                 let verb = if to_trash { "Recycling" } else { "Deleting" };
                 let title = format!("{verb} {}", describe(&paths));
-                return self.start_job(Job::Delete { paths, to_trash }, title);
+                let id = self.next_job_id;
+                let task = self.start_job(Job::Delete { paths: paths.clone(), to_trash }, title);
+                self.du_delete_started(id, &paths);
+                return task;
             }
             Dialog::Hotlist(menu) => {
                 let selected = menu.selected;
@@ -2826,8 +2830,9 @@ impl App {
                 }
                 self.status = Some(summarize(job.done_verb, &outcome));
                 let task = self.archive_edit_job_done(id, &outcome);
+                let du = self.du_job_done(id, self.status.clone());
                 self.after_change();
-                return task;
+                return Task::batch([task, du]);
             }
         }
         Task::none()

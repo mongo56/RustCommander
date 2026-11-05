@@ -105,6 +105,92 @@ impl Tree {
         let id = self.node(index).ext_id;
         (id != EXT_DIR).then(|| &*self.exts[id as usize].0)
     }
+
+    /// Takes node `index` (and everything under it) out of the tree, after it
+    /// was deleted from disk: unlinks it from its folder, takes its size and
+    /// counts off every folder above it, takes its files off the extension
+    /// table and sorts the children of the changed folders again. The nodes
+    /// stay in [`Tree::nodes`] (indices don't move) but can't be reached from
+    /// the root any more. Returns false (and changes nothing) for the root, a
+    /// node out of range, or one already removed.
+    pub fn remove(&mut self, index: u32) -> bool {
+        if index == ROOT || index as usize >= self.nodes.len() {
+            return false;
+        }
+        let parent = self.node(index).parent;
+        let Some(pos) = self.nodes[parent as usize].children.iter().position(|&c| c == index) else {
+            return false;
+        };
+        self.nodes[parent as usize].children.remove(pos);
+        let node = self.node(index);
+        let (size, files, dirs) = match node.kind {
+            NodeKind::File => (node.size, 1, 0),
+            NodeKind::Dir => (node.size, node.files, node.dirs + 1),
+        };
+        // Its files leave the extension table.
+        let mut stack = vec![index];
+        while let Some(i) = stack.pop() {
+            let n = &self.nodes[i as usize];
+            match n.kind {
+                NodeKind::File => {
+                    if let Some(e) = self.exts.get_mut(n.ext_id as usize) {
+                        e.1 = e.1.saturating_sub(n.size);
+                        e.2 = e.2.saturating_sub(1);
+                    }
+                }
+                NodeKind::Dir => stack.extend(n.children.iter().copied()),
+            }
+        }
+        // Up the chain: smaller folders, which may move down in their own folder.
+        let mut i = parent;
+        loop {
+            let p = &mut self.nodes[i as usize];
+            p.size = p.size.saturating_sub(size);
+            p.files = p.files.saturating_sub(files);
+            p.dirs = p.dirs.saturating_sub(dirs);
+            self.sort_children(i);
+            if i == ROOT {
+                break;
+            }
+            i = self.nodes[i as usize].parent;
+        }
+        true
+    }
+
+    /// `index` if it can still be reached from the root, else the nearest
+    /// folder above it that can (after [`Tree::remove`]).
+    pub fn surviving(&self, index: u32) -> u32 {
+        if index as usize >= self.nodes.len() {
+            return ROOT;
+        }
+        let mut chain = vec![index];
+        let mut i = index;
+        while i != ROOT {
+            i = self.node(i).parent;
+            chain.push(i);
+        }
+        // From the root down: the last node still linked to its folder.
+        let mut found = ROOT;
+        for pair in chain.windows(2).rev() {
+            let (child, parent) = (pair[0], pair[1]);
+            if !self.node(parent).children.contains(&child) {
+                break;
+            }
+            found = child;
+        }
+        found
+    }
+
+    /// Sorts the children of `index` largest first (ties by name).
+    fn sort_children(&mut self, index: u32) {
+        let mut children = std::mem::take(&mut self.nodes[index as usize].children);
+        let nodes = &self.nodes;
+        children.sort_by(|&a, &b| {
+            let (a, b) = (&nodes[a as usize], &nodes[b as usize]);
+            b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name))
+        });
+        self.nodes[index as usize].children = children;
+    }
 }
 
 /// Lower-case extension of a file name, without the dot ("" for none; a
@@ -242,16 +328,9 @@ pub fn scan(root: &Path, cancel: &AtomicBool, mut progress: impl FnMut(Progress)
         p.dirs = p.dirs.saturating_add(dirs);
     }
     for i in 0..tree.nodes.len() {
-        if tree.nodes[i].children.len() < 2 {
-            continue;
+        if tree.nodes[i].children.len() >= 2 {
+            tree.sort_children(i as u32);
         }
-        let mut children = std::mem::take(&mut tree.nodes[i].children);
-        let nodes = &tree.nodes;
-        children.sort_by(|&a, &b| {
-            let (a, b) = (&nodes[a as usize], &nodes[b as usize]);
-            b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name))
-        });
-        tree.nodes[i].children = children;
     }
     Some(tree)
 }
@@ -305,6 +384,72 @@ mod tests {
         assert_eq!(ext("rs"), Some((30, 1)));
         assert_eq!(ext(""), Some((6, 2)));
         assert_eq!(tree.exts[EXT_OTHER as usize].2, 0);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn removing_a_file_updates_the_folders_above_and_the_extensions() {
+        let root = temp("rm-file");
+        fs::create_dir_all(root.join("a/b")).unwrap();
+        fs::create_dir_all(root.join("c")).unwrap();
+        fs::write(root.join("a/b/big.rs"), [0u8; 40]).unwrap();
+        fs::write(root.join("a/small.txt"), [0u8; 5]).unwrap();
+        fs::write(root.join("c/mid.txt"), [0u8; 30]).unwrap();
+        let mut tree = scan(&root, &AtomicBool::new(false), |_| {}).unwrap();
+        let names =
+            |t: &Tree, i: u32| t.node(i).children.iter().map(|&c| t.node(c).name.to_string()).collect::<Vec<_>>();
+        assert_eq!(names(&tree, ROOT), ["a", "c"]);
+        let (ai, _) = child(&tree, ROOT, "a");
+        let (bi, _) = child(&tree, ai, "b");
+        let (fi, _) = child(&tree, bi, "big.rs");
+        assert!(tree.remove(fi));
+        let r = tree.root();
+        assert_eq!((r.size, r.files, r.dirs), (35, 2, 3));
+        let a = tree.node(ai);
+        assert_eq!((a.size, a.files, a.dirs), (5, 1, 1));
+        assert_eq!((tree.node(bi).size, tree.node(bi).files, tree.node(bi).children.len()), (0, 0, 0));
+        // "a" shrank below "c"; inside "a" the empty "b" went below the file.
+        assert_eq!(names(&tree, ROOT), ["c", "a"]);
+        assert_eq!(names(&tree, ai), ["small.txt", "b"]);
+        let ext = |t: &Tree, name: &str| t.exts.iter().find(|e| &*e.0 == name).map(|e| (e.1, e.2));
+        assert_eq!(ext(&tree, "rs"), Some((0, 0)));
+        assert_eq!(ext(&tree, "txt"), Some((35, 2)));
+        // Again: already gone.
+        assert!(!tree.remove(fi));
+        assert_eq!((tree.surviving(fi), tree.surviving(bi)), (bi, bi));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn removing_a_folder_takes_its_whole_subtree() {
+        let root = temp("rm-dir");
+        fs::create_dir_all(root.join("a/b")).unwrap();
+        fs::write(root.join("a/b/z.rs"), [0u8; 30]).unwrap();
+        fs::write(root.join("a/y.txt"), [0u8; 20]).unwrap();
+        fs::write(root.join("x.txt"), [0u8; 10]).unwrap();
+        let mut tree = scan(&root, &AtomicBool::new(false), |_| {}).unwrap();
+        let (ai, _) = child(&tree, ROOT, "a");
+        let (bi, _) = child(&tree, ai, "b");
+        let (zi, _) = child(&tree, bi, "z.rs");
+        assert!(tree.remove(ai));
+        assert_eq!((tree.surviving(zi), tree.surviving(bi), tree.surviving(ai)), (ROOT, ROOT, ROOT));
+        let r = tree.root();
+        assert_eq!((r.size, r.files, r.dirs), (10, 1, 0));
+        assert_eq!(r.children.iter().map(|&c| &*tree.node(c).name).collect::<Vec<_>>(), ["x.txt"]);
+        let ext = |name: &str| tree.exts.iter().find(|e| &*e.0 == name).map(|e| (e.1, e.2));
+        assert_eq!(ext("txt"), Some((10, 1)));
+        assert_eq!(ext("rs"), Some((0, 0)));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn the_root_is_never_removed() {
+        let root = temp("rm-root");
+        fs::write(root.join("f"), [0u8; 3]).unwrap();
+        let mut tree = scan(&root, &AtomicBool::new(false), |_| {}).unwrap();
+        assert!(!tree.remove(ROOT));
+        assert!(!tree.remove(99));
+        assert_eq!((tree.root().size, tree.root().files), (3, 1));
         fs::remove_dir_all(&root).unwrap();
     }
 
