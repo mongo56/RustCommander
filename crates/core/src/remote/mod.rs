@@ -454,8 +454,14 @@ impl Vfs for Connection {
         while i < out.len() {
             if out[i].kind == EntryKind::Dir {
                 let dir = self.remote(&out[i].path)?;
-                let children = self.list_remote(&dir)?;
-                out.extend(children);
+                // A subfolder that is forbidden or gone is skipped instead of
+                // failing the whole walk (other errors, e.g. a lost
+                // connection, still fail it).
+                match self.list_remote(&dir) {
+                    Ok(children) => out.extend(children),
+                    Err(e) if i > 0 && matches!(e.kind(), io::ErrorKind::PermissionDenied | io::ErrorKind::NotFound) => {}
+                    Err(e) => return Err(e),
+                }
             }
             i += 1;
         }

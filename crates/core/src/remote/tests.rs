@@ -557,6 +557,117 @@ fn sftp_refuses_a_changed_host_key() {
     assert!(trust_host_key(&sftp_login(port, sftp_server::PASSWORD)).is_err());
 }
 
+// ---- Find files on a server ------------------------------------------------------
+
+/// Starts an FTP server over `disk` and connects to its root.
+fn start_ftp(disk: &Path) -> PathBuf {
+    let port = free_port();
+    let root = disk.to_path_buf();
+    serve(move || async move {
+        let server = libunftp::ServerBuilder::new(Box::new(move || unftp_sbe_fs::Filesystem::new(root.clone()).unwrap()))
+            .passive_ports(42000..=42999)
+            .build()
+            .unwrap();
+        let _ = server.listen(format!("127.0.0.1:{port}")).await;
+    });
+    let login = Login {
+        protocol: Protocol::Ftp,
+        host: "127.0.0.1".into(),
+        port,
+        user: "tester".into(),
+        password: Some("secret".into()),
+        key_file: None,
+    };
+    let mut path = Err(io::Error::other("not tried"));
+    for _ in 0..50 {
+        path = connect(login.clone(), "");
+        if path.is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    path.unwrap()
+}
+
+/// Runs a find on `root`; returns the hit names (sorted, `/`-separated) and the summary.
+fn find(root: &Path, name: &str, regex: bool, text: &str, subfolders: bool) -> (Vec<String>, crate::search::Summary) {
+    let query = crate::search::Query {
+        root: root.to_path_buf(),
+        name: name.into(),
+        name_regex: regex,
+        text: text.into(),
+        subfolders,
+        ..Default::default()
+    };
+    let mut hits = Vec::new();
+    let summary = crate::search::search(&query, &std::sync::atomic::AtomicBool::new(false), |b| {
+        hits.extend(b.hits.into_iter().map(|e| e.name.replace('\\', "/")));
+        true
+    })
+    .unwrap();
+    hits.sort();
+    (hits, summary)
+}
+
+/// Find files over a small tree on a connected server whose files live in `disk`.
+fn exercise_find(root: &Path, disk: &Path) {
+    fs::create_dir_all(disk.join("sub/deep")).unwrap();
+    fs::create_dir_all(disk.join("empty")).unwrap();
+    fs::write(disk.join("a.txt"), b"hello world").unwrap();
+    fs::write(disk.join("b.log"), b"hello").unwrap();
+    fs::write(disk.join("sub/c.txt"), b"a needle here").unwrap();
+    fs::write(disk.join("sub/deep/d.TXT"), b"NEEDLE").unwrap();
+
+    // Name mask, all levels, case-insensitive.
+    let (hits, summary) = find(root, "*.txt", false, "", true);
+    assert_eq!(hits, ["a.txt", "sub/c.txt", "sub/deep/d.TXT"]);
+    assert_eq!((summary.errors, summary.cancelled), (0, false));
+    // Without subfolders only the top level.
+    assert_eq!(find(root, "*.txt", false, "", false).0, ["a.txt"]);
+    // Regex; folders match by name too.
+    assert_eq!(find(root, r"^[ab]\.", true, "", true).0, ["a.txt", "b.log"]);
+    assert_eq!(find(root, "deep", false, "", true).0, ["sub/deep"]);
+    // Everything.
+    assert_eq!(find(root, "", false, "", true).0.len(), 7);
+    // Content: case-insensitive by default, files only.
+    assert_eq!(find(root, "", false, "needle", true).0, ["sub/c.txt", "sub/deep/d.TXT"]);
+    assert_eq!(find(root, "*.log", false, "hello", true).0, ["b.log"]);
+    assert_eq!(find(root, "*.txt", false, "hello", true).0, ["a.txt"]);
+    assert!(find(root, "", false, "absent", true).0.is_empty());
+
+    // Cancelled before reading: stops at once, reports it, no hits.
+    let query = crate::search::Query { root: root.to_path_buf(), text: "hello".into(), subfolders: true, ..Default::default() };
+    let summary = crate::search::search(&query, &std::sync::atomic::AtomicBool::new(true), |_| true).unwrap();
+    assert!(summary.cancelled);
+    assert_eq!(summary.hits, 0);
+
+    // A folder that cannot be read: reported, not a hang or a panic.
+    let sub = root.join("sub");
+    disconnect(root);
+    let query = crate::search::Query { root: sub, subfolders: true, ..Default::default() };
+    let summary = crate::search::search(&query, &std::sync::atomic::AtomicBool::new(false), |_| true).unwrap();
+    assert_eq!((summary.hits, summary.errors), (0, 1));
+}
+
+#[test]
+fn find_files_on_ftp_server() {
+    let disk = TempDir::new("ftp-find");
+    let root = start_ftp(&disk.0);
+    exercise_find(&root, &disk.0);
+}
+
+#[test]
+fn find_files_on_sftp_server() {
+    let _settings = settings();
+    let disk = TempDir::new("sftp-find");
+    let port = start_sftp(disk.0.clone(), 4);
+    let login = sftp_login(port, sftp_server::PASSWORD);
+    assert!(connect(login.clone(), "").is_err());
+    trust_host_key(&login).unwrap();
+    let root = connect(login, "").unwrap();
+    exercise_find(&root, &disk.0);
+}
+
 #[test]
 fn paths() {
     let p = path_of("sftp://me@host", "/home/me");
