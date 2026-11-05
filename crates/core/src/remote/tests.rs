@@ -288,6 +288,11 @@ mod sftp_server {
         russh::keys::PrivateKey::from(pair)
     }
 
+    /// The only public key the server accepts (for `USER`).
+    pub fn user_key() -> russh::keys::PrivateKey {
+        host_key(77)
+    }
+
     pub struct Ssh {
         pub root: PathBuf,
         channels: HashMap<ChannelId, Channel<Msg>>,
@@ -298,6 +303,14 @@ mod sftp_server {
 
         async fn auth_password(&mut self, user: &str, password: &str) -> Result<Auth, Self::Error> {
             Ok(if user == USER && password == PASSWORD { Auth::Accept } else { Auth::reject() })
+        }
+
+        async fn auth_publickey(
+            &mut self,
+            user: &str,
+            key: russh::server::VerifiedPublicKey<'_>,
+        ) -> Result<Auth, Self::Error> {
+            Ok(if user == USER && *key.public_key == *user_key().public_key() { Auth::Accept } else { Auth::reject() })
         }
 
         async fn channel_open_session(
@@ -582,6 +595,63 @@ fn sftp_against_local_server() {
     assert_eq!(free_space(&root), Some((250 * 4096, 1000 * 4096)));
     assert_eq!(free_space(&path_of("sftp://tester@127.0.0.1:1", "/")), None, "not connected");
     assert!(disconnect(&root));
+}
+
+#[test]
+fn sftp_key_file_login() {
+    use russh::keys::ssh_key::LineEnding;
+    let _settings = settings();
+    let disk = TempDir::new("sftp-keys");
+    let keys = TempDir::new("sftp-keyfiles");
+    fs::write(disk.0.join("hello.txt"), "hi").unwrap();
+    let port = start_sftp(disk.0.clone(), 6);
+    let mut login = sftp_login(port, "");
+    login.password = None;
+    connect(login.clone(), "").unwrap_err();
+    trust_host_key(&login).unwrap();
+
+    let good = sftp_server::user_key();
+    let plain = keys.0.join("id_plain");
+    fs::write(&plain, good.to_openssh(LineEnding::LF).unwrap().as_bytes()).unwrap();
+    let wrong = keys.0.join("id_wrong");
+    fs::write(&wrong, sftp_server::host_key(78).to_openssh(LineEnding::LF).unwrap().as_bytes()).unwrap();
+    let encrypted = keys.0.join("id_encrypted");
+    let locked = good
+        .encrypt_with(
+            russh::keys::ssh_key::Cipher::Aes256Ctr,
+            russh::keys::ssh_key::Kdf::Bcrypt { salt: vec![9; 16], rounds: 4 },
+            7,
+            "pass phrase",
+        )
+        .unwrap();
+    fs::write(&encrypted, locked.to_openssh(LineEnding::LF).unwrap().as_bytes()).unwrap();
+
+    // The right key logs in and lists files.
+    login.key_file = Some(plain.clone());
+    let root = connect(login.clone(), "").unwrap();
+    assert!(crate::vfs::list(&root, true).unwrap().iter().any(|e| e.name == "hello.txt"));
+    assert!(disconnect(&root));
+
+    // A key the server doesn't know is refused.
+    login.key_file = Some(wrong);
+    let e = connect(login.clone(), "").unwrap_err().to_string();
+    assert!(e.contains(LOGIN_FAILED), "{e}");
+
+    // An encrypted key: right passphrase works, missing or wrong ones say "private key".
+    login.key_file = Some(encrypted);
+    login.password = Some("pass phrase".into());
+    let root = connect(login.clone(), "").unwrap();
+    assert!(disconnect(&root));
+    for pass in [None, Some("nope".to_string())] {
+        login.password = pass;
+        let e = connect(login.clone(), "").unwrap_err().to_string();
+        assert!(e.contains("private key"), "{e}");
+    }
+
+    // A key file that doesn't exist.
+    login.key_file = Some(keys.0.join("missing"));
+    let e = connect(login, "").unwrap_err().to_string();
+    assert!(e.contains("private key") && e.contains("missing"), "{e}");
 }
 
 #[test]
