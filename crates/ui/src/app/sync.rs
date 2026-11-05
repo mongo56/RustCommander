@@ -197,7 +197,7 @@ fn summary_line(s: &Summary) -> String {
 /// Whether deleting under `root` is permanent (archives and servers have
 /// no Recycle Bin).
 fn deletes_permanently(root: &Path) -> bool {
-    vfs::in_archive(root)
+    vfs::in_archive(root) || remote::is_remote(root)
 }
 
 impl App {
