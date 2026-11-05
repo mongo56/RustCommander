@@ -9,6 +9,7 @@ mod attrib;
 pub mod credentials;
 mod editors;
 mod fileid;
+pub mod net_discover;
 mod netuse;
 mod process_info;
 mod rename;

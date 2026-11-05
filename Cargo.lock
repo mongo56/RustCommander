@@ -4337,6 +4337,7 @@ version = "0.8.0"
 dependencies = [
  "open",
  "windows 0.62.2",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
