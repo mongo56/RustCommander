@@ -8,7 +8,7 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Config {
     /// Editor for F4: a program, optionally with arguments; `%1` stands for
@@ -27,6 +27,10 @@ pub struct Config {
     /// Hidden files shown at the first start (no session yet); the
     /// settings view also applies a change to every open tab.
     pub show_hidden: bool,
+    /// Enter / double-click on a Markdown file (.md, .markdown) opens it in
+    /// the internal viewer, rendered, instead of the default app. On unless
+    /// set to false (also when the key is missing).
+    pub markdown_in_viewer: bool,
     /// The function-key bar (F1-F10 buttons) under the panels; off = a
     /// one-line hint instead.
     pub show_fkeys: bool,
@@ -72,6 +76,27 @@ impl From<CompareState> for rc_core::compare::CompareOptions {
 impl From<rc_core::compare::CompareOptions> for CompareState {
     fn from(o: rc_core::compare::CompareOptions) -> Self {
         Self { by_content: o.by_content, ignore_date: o.ignore_date, subfolders: o.subfolders }
+    }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            editor: String::new(),
+            terminal: String::new(),
+            builtin_shell: String::new(),
+            theme: String::new(),
+            show_hidden: false,
+            markdown_in_viewer: true,
+            show_fkeys: false,
+            hotlist_tree: false,
+            check_updates_at_startup: false,
+            software_rendering: false,
+            thumbnail_size: 0,
+            keys: BTreeMap::new(),
+            colors: BTreeMap::new(),
+            compare: None,
+        }
     }
 }
 
@@ -365,6 +390,10 @@ fn template(editor: &str, compare: CompareState) -> String {
          # Show hidden files at the first start (Ctrl+H toggles them per tab).\n\
          show_hidden = false\n\
          \n\
+         # Open Markdown files (.md) with Enter / double-click in the internal viewer\n\
+         # (shown rendered) instead of the default app. F3 always uses the viewer.\n\
+         markdown_in_viewer = true\n\
+         \n\
          # Show the function-key bar (F1-F10 buttons) under the panels. Off = only a\n\
          # one-line hint (F1 help, command palette, F10 settings).\n\
          show_fkeys = false\n\
@@ -461,6 +490,11 @@ mod tests {
         assert_eq!(config.theme, "light");
         assert!(config.show_hidden && config.show_fkeys);
         assert!(!parse(&template("", CompareState::default())).unwrap().show_fkeys);
+        assert!(Config::default().markdown_in_viewer);
+        assert!(parse("").unwrap().markdown_in_viewer, "on when the key is missing");
+        assert!(parse(&template("", CompareState::default())).unwrap().markdown_in_viewer);
+        let off = apply(&out, &[Edit::Flag("markdown_in_viewer", false)]).unwrap();
+        assert!(!parse(&off).unwrap().markdown_in_viewer);
         assert!(!parse(&template("", CompareState::default())).unwrap().hotlist_tree);
         assert!(parse(&apply(&out, &[Edit::Flag("hotlist_tree", true)]).unwrap()).unwrap().hotlist_tree);
         assert!(!parse(&template("", CompareState::default())).unwrap().check_updates_at_startup);

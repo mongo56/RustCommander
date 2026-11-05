@@ -95,18 +95,19 @@ impl Page {
 }
 
 /// Rows of the General page.
-const GENERAL_ROWS: usize = 12;
+const GENERAL_ROWS: usize = 13;
 const ROW_EDITOR: usize = 0;
 const ROW_TERMINAL: usize = 1;
 const ROW_SHELL: usize = 2;
-const ROW_HIDDEN: usize = 3;
-const ROW_FKEYS: usize = 4;
-const ROW_TREE: usize = 5;
-const ROW_UPDATES: usize = 6;
-const ROW_RENDER: usize = 7;
-/// Compare options 0..3 (`toggle_compare_option`) are rows 8..11.
-const ROW_COMPARE: usize = 8;
-const ROW_CONFIG: usize = 11;
+const ROW_MARKDOWN: usize = 3;
+const ROW_HIDDEN: usize = 4;
+const ROW_FKEYS: usize = 5;
+const ROW_TREE: usize = 6;
+const ROW_UPDATES: usize = 7;
+const ROW_RENDER: usize = 8;
+/// Compare options 0..3 (`toggle_compare_option`) are rows 9..12.
+const ROW_COMPARE: usize = 9;
+const ROW_CONFIG: usize = 12;
 
 /// General rows that are text boxes (Enter there saves instead of toggling).
 fn text_row(row: usize) -> bool {
@@ -142,6 +143,7 @@ pub enum SettingsMsg {
     /// The key bindings filter being typed.
     Filter(String),
     ShowHidden(bool),
+    MarkdownViewer(bool),
     ShowFkeys(bool),
     HotlistTree(bool),
     CheckUpdates(bool),
@@ -379,6 +381,7 @@ impl App {
                     Task::batch([text_input::focus(terminal_id()), text_input::move_cursor_to_end(terminal_id())])
                 }
                 ROW_SHELL => Task::batch([text_input::focus(shell_id()), text_input::move_cursor_to_end(shell_id())]),
+                ROW_MARKDOWN => self.settings_update(SettingsMsg::MarkdownViewer(!self.config.markdown_in_viewer)),
                 ROW_HIDDEN => self.settings_update(SettingsMsg::ShowHidden(!self.config.show_hidden)),
                 ROW_FKEYS => self.settings_update(SettingsMsg::ShowFkeys(!self.config.show_fkeys)),
                 ROW_TREE => self.settings_update(SettingsMsg::HotlistTree(!self.config.hotlist_tree)),
@@ -519,6 +522,11 @@ impl App {
                 }
                 let paths: Vec<PathBuf> = (0..2).map(|side| self.panel(side).path.clone()).collect();
                 return Task::batch(paths.into_iter().map(|p| self.list_in_background(p)).collect::<Vec<_>>());
+            }
+            SettingsMsg::MarkdownViewer(on) => {
+                s.row[0] = ROW_MARKDOWN;
+                let state = if on { "open in the viewer" } else { "open in the default app" };
+                self.settings_write(&[Edit::Flag("markdown_in_viewer", on)], format!("Markdown files {state}"));
             }
             SettingsMsg::ShowFkeys(on) => {
                 s.row[0] = ROW_FKEYS;
@@ -994,6 +1002,20 @@ impl App {
                     ),
                     container(hint("A program and arguments, started in the panel's folder; for new terminals. Enter saves.".into()))
                         .padding([0, 14 + LABEL_W as u16 + 8]),
+                    line(
+                        ROW_MARKDOWN,
+                        row![
+                            label("Markdown in the viewer"),
+                            switch(
+                                self.config.markdown_in_viewer,
+                                SettingsMsg::MarkdownViewer(!self.config.markdown_in_viewer)
+                            ),
+                            hint("Open Markdown files (.md) in the internal viewer, shown rendered; off = the default app".into()),
+                        ]
+                        .spacing(8)
+                        .align_y(Alignment::Center)
+                        .into()
+                    ),
                     line(
                         ROW_HIDDEN,
                         row![

@@ -8,6 +8,7 @@ mod file_diff;
 mod help;
 mod hotlist;
 mod hotlist_tree;
+mod markdown;
 mod palette;
 mod screen;
 mod find_files;
@@ -1817,6 +1818,11 @@ impl App {
         // the drive bar and navigation.
         if cmd == Open {
             if let Activated::File(path) = panel.activate() {
+                // Markdown (setting): the viewer, rendered, like F3 (also in
+                // archives and on servers, where the viewer reads the file itself).
+                if self.config.markdown_in_viewer && markdown::is_markdown(&path) {
+                    return self.open_viewer();
+                }
                 // Inside an archive: extract to a temp copy first.
                 if vfs::is_virtual(&path) {
                     return open_extracted(path);

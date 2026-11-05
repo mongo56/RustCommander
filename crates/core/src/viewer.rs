@@ -299,6 +299,11 @@ impl Document {
         hex_line(self.base + start as u64, chunk)
     }
 
+    /// The decoded text of this document (the whole file or this window's whole lines).
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
     /// The raw bytes of this document (the whole file or this window).
     pub fn bytes(&self) -> &[u8] {
         &self.bytes

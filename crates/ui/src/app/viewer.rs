@@ -5,9 +5,10 @@
 use super::*;
 use crate::theme::filled;
 use iced::widget::text::{Span, Wrapping};
-use iced::widget::scrollable::{self, AbsoluteOffset, Direction};
+use iced::widget::scrollable::{self, AbsoluteOffset, Direction, RelativeOffset};
 use iced::{Point, Size};
-use iced::widget::{center, column, container, mouse_area, responsive, rich_text, row, text, Column, Space};
+use super::markdown::{self, Block};
+use iced::widget::{center, column, container, lazy, mouse_area, responsive, rich_text, row, text, Column, Space};
 use iced::{Alignment, ContentFit, Element, Font, Length};
 use rc_core::viewer::{self, Document, Hit, Mode, Part, Selection, COPY_LIMIT, HEX_WIDTH, WINDOW};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -78,6 +79,13 @@ fn image_scroll_id() -> scrollable::Id {
     scrollable::Id::new("viewer-image")
 }
 
+fn markdown_scroll_id() -> scrollable::Id {
+    scrollable::Id::new("viewer-markdown")
+}
+
+/// Pixels Up/Down scroll the rendered Markdown by.
+const MD_STEP: f32 = 40.0;
+
 fn search_input_id() -> text_input::Id {
     text_input::Id::new("viewer-search")
 }
@@ -85,6 +93,9 @@ fn search_input_id() -> text_input::Id {
 /// A match found in a large file: the window holding it, the match in
 /// that window, and whether the search wrapped around.
 pub type Found = (Arc<Document>, Hit, bool);
+
+/// The parsed blocks of a Markdown file, if it is rendered.
+pub type Rendered = Option<Arc<[Block]>>;
 
 /// What a file was loaded as.
 #[derive(Debug, Clone)]
@@ -95,7 +106,7 @@ pub enum Loaded {
 
 #[derive(Debug, Clone)]
 pub enum ViewerMsg {
-    Loaded(u64, Result<Loaded, String>),
+    Loaded(u64, Result<Loaded, String>, Rendered),
     /// Search result in a large file: the window holding the match, the
     /// match, and whether the search wrapped around.
     Found(u64, Result<Option<Found>, String>, Arc<AtomicBool>),
@@ -112,6 +123,8 @@ pub enum ViewerMsg {
     Find,
     /// Left button pressed while the viewer shows a document (starts a selection over the body).
     Press,
+    /// A link in rendered Markdown was clicked (its target).
+    Link(String),
 }
 
 #[derive(Debug)]
@@ -132,6 +145,10 @@ pub(super) struct Viewer {
     seq: u64,
     content: Content,
     mode: Mode,
+    /// Parsed Markdown of the shown file, and whether it is shown rendered
+    /// (key 5) instead of `mode`.
+    md: Rendered,
+    rendered: bool,
     wrap: bool,
     /// First row shown, and the first column when not wrapping.
     top: usize,
@@ -242,12 +259,22 @@ fn load(path: PathBuf, seq: u64) -> Task<Message> {
         async move {
             let (tx, rx) = iced::futures::channel::oneshot::channel();
             std::thread::spawn(move || {
-                let _ = tx.send(load_sync(&path));
+                let result = load_sync(&path);
+                let md = match &result {
+                    Ok(Loaded::Doc(doc)) if renders_markdown(&path, doc) => Some(markdown::parse(doc.text()).into()),
+                    _ => None,
+                };
+                let _ = tx.send((result, md));
             });
-            rx.await.unwrap_or_else(|_| Err("viewer thread failed".into()))
+            rx.await.unwrap_or_else(|_| (Err("viewer thread failed".into()), None))
         },
-        move |result| Message::Viewer(ViewerMsg::Loaded(seq, result)),
+        move |(result, md)| Message::Viewer(ViewerMsg::Loaded(seq, result, md)),
     )
+}
+
+/// `doc` (read from `path`) is a Markdown file small enough to render.
+fn renders_markdown(path: &Path, doc: &Document) -> bool {
+    markdown::is_markdown(path) && !doc.binary && doc.is_whole() && doc.size <= markdown::MD_LIMIT
 }
 
 fn load_sync(path: &Path) -> Result<Loaded, String> {
@@ -273,7 +300,7 @@ fn load_sync(path: &Path) -> Result<Loaded, String> {
 impl App {
     pub(super) fn viewer_update(&mut self, msg: ViewerMsg) -> Task<Message> {
         match msg {
-            ViewerMsg::Loaded(seq, result) => return self.viewer_loaded(seq, result),
+            ViewerMsg::Loaded(seq, result, md) => return self.viewer_loaded(seq, result, md),
             ViewerMsg::Found(seq, result, cancel) => self.viewer_found(seq, result, &cancel),
             ViewerMsg::Wheel(lines) => self.viewer_wheel(lines),
             ViewerMsg::Seek(at) => self.viewer_seek(at),
@@ -283,6 +310,7 @@ impl App {
             ViewerMsg::Search(text) => self.viewer_search_input(text),
             ViewerMsg::Find => return self.viewer_submit(),
             ViewerMsg::Press => self.viewer_press(),
+            ViewerMsg::Link(target) => return self.viewer_link(&target),
         }
         Task::none()
     }
@@ -305,6 +333,8 @@ impl App {
             seq: 0,
             content: Content::Loading,
             mode: Mode::Text,
+            md: None,
+            rendered: false,
             wrap: false,
             top: 0,
             left: 0,
@@ -333,6 +363,8 @@ impl App {
         v.index = index;
         v.seq = seq;
         v.content = Content::Loading;
+        v.md = None;
+        v.rendered = false;
         v.top = 0;
         v.left = 0;
         v.hit = None;
@@ -345,18 +377,110 @@ impl App {
         load(v.path().to_path_buf(), seq)
     }
 
-    fn viewer_loaded(&mut self, seq: u64, result: Result<Loaded, String>) -> Task<Message> {
+    fn viewer_loaded(&mut self, seq: u64, result: Result<Loaded, String>, md: Rendered) -> Task<Message> {
         let Some(v) = self.screen.viewer_mut().filter(|v| v.seq == seq) else { return Task::none() };
         match result {
             Ok(loaded) => {
                 if let Loaded::Doc(doc) = &loaded {
                     v.mode = doc.default_mode();
+                    if md.is_none() && !doc.binary && markdown::is_markdown(v.path()) {
+                        v.note = Some(("Markdown file over 2 MB: shown as text".into(), Tone::Info));
+                    }
                 }
                 v.content = Content::Loaded(loaded);
             }
             Err(e) => v.content = Content::Failed(e),
         }
+        // Markdown files open rendered.
+        v.rendered = md.is_some();
+        v.md = md;
+        if v.rendered {
+            return scrollable::snap_to(markdown_scroll_id(), RelativeOffset::START);
+        }
         Task::none()
+    }
+
+    /// Key 5: the rendered view of a Markdown file.
+    fn viewer_markdown(&mut self) {
+        let Some(v) = self.screen.viewer_mut() else { return };
+        if v.md.is_some() {
+            v.rendered = true;
+            v.sel = None;
+            v.selecting = false;
+            v.hit = None;
+        } else if v.doc().is_some_and(|d| !d.binary) && markdown::is_markdown(v.path()) {
+            v.note = Some(("Markdown file over 2 MB: only the text view".into(), Tone::Info));
+        }
+    }
+
+    /// Keys of the rendered Markdown view; `None` leaves the key to the
+    /// text view's handling (after switching to it for find).
+    fn viewer_markdown_key(
+        &mut self,
+        named: Option<Named>,
+        ch: Option<&str>,
+        mods: keyboard::Modifiers,
+    ) -> Option<Task<Message>> {
+        let page = (self.viewer_body_size().height - MD_STEP).max(MD_STEP);
+        let v = self.screen.viewer_mut()?;
+        let ctrl = mods.control();
+        let typed = ch.filter(|_| !ctrl && !mods.alt());
+        let by = |dy: f32| scrollable::scroll_by(markdown_scroll_id(), AbsoluteOffset { x: 0.0, y: dy });
+        Some(match (named, typed) {
+            _ if ctrl && (matches!(ch, Some("c" | "a")) || named == Some(Named::Insert)) => {
+                v.note = Some(("Copy works in the source view: press 1, select, then Ctrl+C".into(), Tone::Info));
+                Task::none()
+            }
+            // Find searches the source: switch to it and let the text view
+            // open the find box (or find the next match).
+            _ if ctrl && ch == Some("f") => {
+                v.rendered = false;
+                return None;
+            }
+            (Some(Named::F7 | Named::F3), _) | (_, Some("f" | "/")) => {
+                v.rendered = false;
+                v.note = Some(("Find works in the source view (5 shows the rendered view again)".into(), Tone::Info));
+                return None;
+            }
+            (Some(Named::ArrowDown), _) => by(MD_STEP),
+            (Some(Named::ArrowUp), _) => by(-MD_STEP),
+            (Some(Named::PageDown), _) => by(page),
+            (Some(Named::PageUp), _) => by(-page),
+            (Some(Named::Home), _) => scrollable::snap_to(markdown_scroll_id(), RelativeOffset::START),
+            (Some(Named::End), _) => scrollable::snap_to(markdown_scroll_id(), RelativeOffset::END),
+            (Some(Named::ArrowLeft | Named::ArrowRight), _) => Task::none(),
+            _ => return None,
+        })
+    }
+
+    /// A clicked Markdown link: web links open in the browser, relative
+    /// links to other Markdown files open in the viewer.
+    fn viewer_link(&mut self, target: &str) -> Task<Message> {
+        let Some(v) = self.screen.viewer_mut() else { return Task::none() };
+        let lower = target.to_ascii_lowercase();
+        if lower.starts_with("http://") || lower.starts_with("https://") {
+            v.note = Some(match rc_platform::open_default(Path::new(target)) {
+                Ok(()) => (format!("Opened {target}"), Tone::Info),
+                Err(e) => (format!("Can't open {target}: {e}"), Tone::Error),
+            });
+            return Task::none();
+        }
+        let Some(path) = link_path(v.path(), target) else {
+            v.note = Some((format!("Link not followed: {target}"), Tone::Info));
+            return Task::none();
+        };
+        if !markdown::is_markdown(&path) || !path.is_file() {
+            v.note = Some((format!("Only links to other Markdown files open here: {target}"), Tone::Info));
+            return Task::none();
+        }
+        let index = match v.files.iter().position(|p| *p == path) {
+            Some(i) => i,
+            None => {
+                v.files.insert(v.index + 1, path);
+                v.index + 1
+            }
+        };
+        self.viewer_show(index)
     }
 
     pub(super) fn close_viewer(&mut self) {
@@ -458,6 +582,7 @@ impl App {
         ("P, Backspace", "Previous file in the panel"),
         ("1", "Text mode (images: actual size)"),
         ("3", "Hex mode"),
+        ("5", "Markdown files: rendered view (the default for .md; 1 shows the source, where copy and find work)"),
         ("W", "Wrap long lines on / off"),
         ("F7, F, /, Ctrl+F", "Find text"),
         ("F3, Shift+F3", "Find next / previous"),
@@ -541,7 +666,7 @@ impl App {
     /// document is shown (to learn the body's position for selection drags
     /// past its edges), or a zoomed image (drag panning).
     pub(super) fn viewer_tracks_mouse(&self) -> bool {
-        self.screen.viewer().is_some_and(|v| v.doc().is_some() || (v.is_image() && v.zoom.is_some()))
+        self.screen.viewer().is_some_and(|v| (v.doc().is_some() && !v.rendered) || (v.is_image() && v.zoom.is_some()))
     }
 
     /// A zoomed image larger than the view on some axis, so dragging pans it.
@@ -792,6 +917,10 @@ impl App {
     }
 
     fn viewer_wheel(&mut self, lines: f32) {
+        // The rendered view scrolls itself.
+        if self.screen.viewer().is_some_and(|v| v.rendered) {
+            return;
+        }
         self.viewer_scroll((-lines * 3.0).round() as isize);
     }
 
@@ -802,6 +931,15 @@ impl App {
         };
         let rows = self.viewer_rows() as isize;
         let ctrl = mods.control();
+        let ch = match key {
+            keyboard::Key::Character(c) => Some(c.to_lowercase()),
+            _ => None,
+        };
+        if self.screen.viewer().is_some_and(|v| v.rendered && v.search.is_none()) {
+            if let Some(task) = self.viewer_markdown_key(named, ch.as_deref(), mods) {
+                return task;
+            }
+        }
         let Some(v) = self.screen.viewer_mut() else { return Task::none() };
 
         if v.search.is_some() {
@@ -813,10 +951,6 @@ impl App {
             return Task::none();
         }
 
-        let ch = match key {
-            keyboard::Key::Character(c) => Some(c.to_lowercase()),
-            _ => None,
-        };
         if ctrl && (ch.as_deref() == Some("c") || named == Some(Named::Insert)) {
             return self.viewer_copy();
         }
@@ -858,8 +992,15 @@ impl App {
                     return self.viewer_show(prev);
                 }
             }
-            (_, Some("1")) => self.viewer_mode(Mode::Text),
-            (_, Some("3")) => self.viewer_mode(Mode::Hex),
+            (_, Some("1")) => {
+                v.rendered = false;
+                self.viewer_mode(Mode::Text);
+            }
+            (_, Some("3")) => {
+                v.rendered = false;
+                self.viewer_mode(Mode::Hex);
+            }
+            (_, Some("5")) => self.viewer_markdown(),
             (_, Some("w")) => {
                 v.wrap = !v.wrap;
                 v.left = 0;
@@ -1028,6 +1169,10 @@ impl App {
         let name = v.path().file_name().map_or_else(|| v.path().display().to_string(), |n| n.to_string_lossy().into_owned());
         let mut info = vec![format!("{} / {}", v.index + 1, v.files.len())];
         match &v.content {
+            Content::Loaded(Loaded::Doc(doc)) if v.rendered => {
+                info.push(rc_core::format::size(doc.size));
+                info.push("Markdown".into());
+            }
             Content::Loaded(Loaded::Doc(doc)) => {
                 info.push(rc_core::format::size(doc.size));
                 info.push(match v.mode {
@@ -1077,6 +1222,7 @@ impl App {
                 .into(),
                 Some(zoom) => zoomed_image(handle, *width as f32 * zoom, *height as f32 * zoom, zoom),
             },
+            Content::Loaded(Loaded::Doc(_)) if v.rendered && v.md.is_some() => markdown_body(v),
             Content::Loaded(Loaded::Doc(doc)) => self.text_body(v, doc),
         };
         let mut body = mouse_area(container(body).width(Length::Fill).height(Length::Fill).style(filled(theme::c().panel)));
@@ -1120,6 +1266,10 @@ impl App {
         }
         let help = if v.image_size().is_some() {
             "Esc close · ←/→ prev/next image · N/P next/prev file · +/- or Ctrl+wheel zoom · 0 fit · 1 actual size · drag to pan"
+        } else if v.rendered {
+            "Esc close · N/P next/prev file · 1 source · 3 hex · F7 find (in the source) · click a link to open it · copy: in the source"
+        } else if v.md.is_some() {
+            "Esc close · N/P next/prev file · 1 text · 3 hex · 5 Markdown · W wrap · F7 find · F3/Shift+F3 next/prev · C match case · drag select · Ctrl+C copy"
         } else {
             "Esc close · N/P next/prev file · 1 text · 3 hex · W wrap · F7 find · F3/Shift+F3 next/prev · C match case · drag select · Ctrl+C copy"
         };
@@ -1218,6 +1368,66 @@ impl App {
         })
         .into()
     }
+}
+
+/// The rendered Markdown of `v`, scrolling vertically. The widgets are
+/// built once per load (and theme), not on every redraw.
+fn markdown_body(v: &Viewer) -> Element<'_, Message> {
+    let Some(md) = &v.md else { return Space::new(Length::Fill, Length::Fill).into() };
+    let blocks: &[Block] = md;
+    let key = (v.seq, blocks.as_ptr() as usize, markdown::theme_key());
+    scrollable::Scrollable::new(lazy(key, move |_| markdown::view(blocks)))
+        .id(markdown_scroll_id())
+        .direction(Direction::Vertical(scrollbar::bar()))
+        .style(scrollbar::style)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+}
+
+/// The file a relative link `target` in the file `from` points at
+/// (`#anchor` and `?query` dropped, `%xx` decoded, `..` resolved); `None`
+/// for links with a scheme or to a place in the same file.
+fn link_path(from: &Path, target: &str) -> Option<PathBuf> {
+    let target = target.split(['#', '?']).next().unwrap_or("");
+    // A scheme (mailto:, ftp:, ...), but not a drive letter.
+    let scheme = target.find(':').is_some_and(|i| i > 1);
+    if target.is_empty() || scheme {
+        return None;
+    }
+    let target = percent_decode(target);
+    let mut path = PathBuf::new();
+    for part in from.parent()?.join(&target).components() {
+        match part {
+            std::path::Component::ParentDir => {
+                path.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => path.push(other),
+        }
+    }
+    Some(path)
+}
+
+/// `%xx` escapes decoded (invalid ones kept as they are).
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = |b: u8| (b as char).to_digit(16);
+        match (bytes[i], bytes.get(i + 1).copied().and_then(hex), bytes.get(i + 2).copied().and_then(hex)) {
+            (b'%', Some(a), Some(b)) => {
+                out.push((a * 16 + b) as u8);
+                i += 3;
+            }
+            (b, _, _) => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// An image drawn at `w` x `h` pixels, centred when smaller than the view
@@ -1339,7 +1549,19 @@ fn zoom_offset(size: f32, view: f32, old: f32, new: f32, offset: f32, p: f32) ->
 
 #[cfg(test)]
 mod tests {
-    use super::zoom_offset;
+    use super::{link_path, percent_decode, zoom_offset};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn markdown_link_paths() {
+        let from = Path::new(r"C:\docs\guide\README.md");
+        assert_eq!(link_path(from, "other.md"), Some(PathBuf::from(r"C:\docs\guide\other.md")));
+        assert_eq!(link_path(from, "../up/My%20File.md#part"), Some(PathBuf::from(r"C:\docs\up\My File.md")));
+        assert_eq!(link_path(from, "./a/b.md?x=1"), Some(PathBuf::from(r"C:\docs\guide\a\b.md")));
+        assert_eq!(link_path(from, "#section"), None);
+        assert_eq!(link_path(from, "mailto:me@x.org"), None);
+        assert_eq!(percent_decode("100%"), "100%");
+    }
 
     #[test]
     fn zoom_keeps_point_under_pointer() {
