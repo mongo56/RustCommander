@@ -188,9 +188,9 @@ impl App {
         let count: usize = shown.iter().map(|(_, items)| items.len()).sum();
 
         let query: Element<'a, Message> = if h.query.is_empty() {
-            text("Type to filter").size(13).color(colors.muted).wrapping(Wrapping::None).into()
+            text("Type to filter").size(theme::SIZE_BODY).color(colors.muted).wrapping(Wrapping::None).into()
         } else {
-            text(format!("{}|", h.query)).size(13).wrapping(Wrapping::None).into()
+            text(format!("{}|", h.query)).size(theme::SIZE_BODY).wrapping(Wrapping::None).into()
         };
         let search = container(query)
             .padding([5, 8])
@@ -208,15 +208,15 @@ impl App {
             });
         let header = container(
             row![
-                text("Help: keys and features").size(16).wrapping(Wrapping::None),
+                text("Help: keys and features").size(theme::SIZE_TITLE).wrapping(Wrapping::None),
                 search,
                 Space::with_width(Length::Fill),
-                text(format!("{count} shown")).size(12).color(colors.muted).wrapping(Wrapping::None),
+                text(format!("{count} shown")).size(theme::SIZE_SMALL).color(colors.muted).wrapping(Wrapping::None),
             ]
-            .spacing(16)
+            .spacing(theme::SPACING_LOOSE)
             .align_y(Alignment::Center),
         )
-        .padding([10, 14])
+        .padding(theme::PAD_LOOSE)
         .style(filled(colors.header));
 
         let query_text = h.query.as_str();
@@ -224,16 +224,16 @@ impl App {
             let wide = size.width >= HIDE_ID_BELOW;
             let stacked = size.width < STACK_BELOW;
             let keys_w = if size.width >= NARROW_KEYS_BELOW { KEYS_W } else { KEYS_W_NARROW };
-            let mut list = Column::new().spacing(2).padding([8, 14]);
+            let mut list = Column::new().spacing(theme::SPACING_TIGHT).padding(theme::PAD_NORMAL);
             if shown.is_empty() {
                 list = list.push(
                     text(format!("Nothing matches \"{query_text}\""))
-                        .size(13)
+                        .size(theme::SIZE_BODY)
                         .color(colors.muted),
                 );
             }
             for &(title, ref items) in &shown {
-                list = list.push(container(text(title).size(14).color(colors.accent)).padding([10, 0]));
+                list = list.push(container(text(title).size(theme::SIZE_HEAD).color(colors.accent)).padding([10, 0]));
                 for &item in items.iter() {
                     let keys = if item.keys.is_empty() {
                         "(no key)"
@@ -244,22 +244,22 @@ impl App {
                     if stacked {
                         list = list.push(
                             column![
-                                text(keys).size(13).color(keys_color).wrapping(Wrapping::None),
-                                container(text(item.text.as_str()).size(13).width(Length::Fill)).padding([0, 12]),
+                                text(keys).size(theme::SIZE_BODY).color(keys_color).wrapping(Wrapping::None),
+                                container(text(item.text.as_str()).size(theme::SIZE_BODY).width(Length::Fill)).padding([0, 12]),
                             ]
                             .padding([2, 0]),
                         );
                         continue;
                     }
                     let mut line = row![
-                        text(keys).size(13).color(keys_color).width(Length::Fixed(keys_w)),
-                        text(item.text.as_str()).size(13).width(Length::Fill),
+                        text(keys).size(theme::SIZE_BODY).color(keys_color).width(Length::Fixed(keys_w)),
+                        text(item.text.as_str()).size(theme::SIZE_BODY).width(Length::Fill),
                     ]
                     .spacing(12)
                     .padding([2, 0])
                     .align_y(Alignment::Center);
                     if wide {
-                        line = line.push(text(item.id).size(12).color(colors.muted).wrapping(Wrapping::None));
+                        line = line.push(text(item.id).size(theme::SIZE_SMALL).color(colors.muted).wrapping(Wrapping::None));
                     }
                     list = list.push(line);
                 }
@@ -271,28 +271,17 @@ impl App {
             .height(Length::Fill)
             .style(filled(colors.panel));
 
-        let footer = container(
-            row![
-                container(
-                    text("Type to filter · Backspace edit · Esc clear filter / close · Up/Down/PgUp/PgDn/Home/End scroll")
-                        .size(12)
-                        .color(colors.muted)
-                        .wrapping(Wrapping::None),
-                )
-                .width(Length::Fill)
-                .clip(true),
-                text(concat!("RustCommander ", env!("CARGO_PKG_VERSION")))
-                    .size(12)
-                    .color(colors.accent)
-                    .wrapping(Wrapping::None),
-            ]
-            .spacing(16)
-            .align_y(Alignment::Center),
-        )
-        .padding([4, 12])
-        .width(Length::Fill)
-        .clip(true)
-        .style(filled(colors.header));
+        let version = text(concat!("RustCommander ", env!("CARGO_PKG_VERSION")))
+            .size(theme::SIZE_SMALL)
+            .color(colors.accent)
+            .wrapping(Wrapping::None);
+        let footer = theme::hint_footer(
+            "Type to filter · Backspace edit · Esc clear filter / close · Up/Down/PgUp/PgDn/Home/End scroll",
+            colors.muted,
+            theme::PAD_TIGHT,
+            theme::SPACING_LOOSE,
+            Some(version.into()),
+        );
 
         container(column![header, body, footer])
             .width(Length::Fill)

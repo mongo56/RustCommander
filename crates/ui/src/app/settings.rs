@@ -924,27 +924,27 @@ impl App {
         let colors = theme::c();
         let msg = Message::Settings;
         let action = |label: &'a str, m: SettingsMsg, primary: bool| {
-            button(text(label).size(13).wrapping(Wrapping::None)).on_press(msg(m)).padding([6, 14]).style(if primary { theme::primary } else { theme::fkey })
+            button(text(label).size(theme::SIZE_BODY).wrapping(Wrapping::None)).on_press(msg(m)).padding([6, 14]).style(if primary { theme::primary } else { theme::fkey })
         };
         let tabs = Page::ALL.iter().fold(Row::new().spacing(4), |r, &p| {
-            r.push(button(text(p.title()).size(13).wrapping(Wrapping::None)).on_press(msg(SettingsMsg::Page(p))).padding([5, 14]).style(theme::tab(p == s.page)))
+            r.push(button(text(p.title()).size(theme::SIZE_BODY).wrapping(Wrapping::None)).on_press(msg(SettingsMsg::Page(p))).padding([5, 14]).style(theme::tab(p == s.page)))
         });
         let path = crate::config::file().map(|p| p.display().to_string()).unwrap_or_default();
         let path_budget = ((width - HEADER_FIXED_W) / (HEADER_PATH_SIZE * CHAR_W)).max(0.0) as usize;
         let path = if path_budget < 12 { String::new() } else { super::view::elide_left(&path, path_budget) };
         let header = container(
             row![
-                text("Settings").size(16).wrapping(Wrapping::None),
+                text("Settings").size(theme::SIZE_TITLE).wrapping(Wrapping::None),
                 tabs,
                 container(text(path).size(HEADER_PATH_SIZE).color(colors.muted).wrapping(Wrapping::None))
                     .width(Length::Fill)
                     .align_x(iced::alignment::Horizontal::Right)
                     .clip(true),
             ]
-            .spacing(16)
+            .spacing(theme::SPACING_LOOSE)
             .align_y(Alignment::Center),
         )
-        .padding([8, 14])
+        .padding(theme::PAD_NORMAL)
         .style(filled(colors.header));
 
         let selected = s.row[s.page.index()];
@@ -962,20 +962,20 @@ impl App {
                 .on_press(msg(SettingsMsg::Click(i)))
                 .into()
         };
-        let heading = |t: &'a str| container(text(t).size(14).color(colors.accent)).padding([10, 14]);
-        let label = move |t: &'a str| text(t).size(13).width(Length::Fixed(lw));
-        let hint = |t: String| text(t).size(12).color(colors.muted).width(Length::Fill);
+        let heading = |t: &'a str| container(text(t).size(theme::SIZE_HEAD).color(colors.accent)).padding(theme::PAD_LOOSE);
+        let label = move |t: &'a str| text(t).size(theme::SIZE_BODY).width(Length::Fixed(lw));
+        let hint = |t: String| text(t).size(theme::SIZE_SMALL).color(colors.muted).width(Length::Fill);
         // Label, control and description: the description is a third column, or under the control when narrow.
         let described = move |label: iced::widget::Text<'a>, control: Element<'a, Message>, about: String| -> Element<'a, Message> {
             if narrow {
                 column![
-                    row![label, control].spacing(8).align_y(Alignment::Center),
+                    row![label, control].spacing(theme::SPACING_NORMAL).align_y(Alignment::Center),
                     row![Space::with_width(Length::Fixed(lw + 8.0)), hint(about)],
                 ]
-                .spacing(2)
+                .spacing(theme::SPACING_TIGHT)
                 .into()
             } else {
-                row![label, control, hint(about)].spacing(8).align_y(Alignment::Center).into()
+                row![label, control, hint(about)].spacing(theme::SPACING_NORMAL).align_y(Alignment::Center).into()
             }
         };
         // Row with a checkbox: the description stays on the line, cut with "…" at the right edge.
@@ -983,8 +983,8 @@ impl App {
             let avail = width - 2.0 * 14.0 - lw - TOGGLE_FIXED_W;
             let budget = (avail / (12.0 * CHAR_W)).max(0.0) as usize;
             let about = elide_right(&about, budget);
-            row![label, control, container(text(about).size(12).color(colors.muted).wrapping(Wrapping::None)).width(Length::Fill).clip(true)]
-                .spacing(8)
+            row![label, control, container(text(about).size(theme::SIZE_SMALL).color(colors.muted).wrapping(Wrapping::None)).width(Length::Fill).clip(true)]
+                .spacing(theme::SPACING_NORMAL)
                 .align_y(Alignment::Center)
                 .into()
         };
@@ -997,27 +997,27 @@ impl App {
                     .on_input(move |v| msg(SettingsMsg::Editor(v)))
                     .on_submit(msg(SettingsMsg::SaveEditor))
                     .padding(5)
-                    .size(13)
+                    .size(theme::SIZE_BODY)
                     .style(theme::input);
                 let terminal = text_input("Empty: Windows Terminal / PowerShell", &s.terminal)
                     .id(terminal_id())
                     .on_input(move |v| msg(SettingsMsg::Terminal(v)))
                     .on_submit(msg(SettingsMsg::SaveEditor))
                     .padding(5)
-                    .size(13)
+                    .size(theme::SIZE_BODY)
                     .style(theme::input);
                 let shell = text_input("Empty: PowerShell 7 if installed, else Windows PowerShell", &s.shell)
                     .id(shell_id())
                     .on_input(move |v| msg(SettingsMsg::Shell(v)))
                     .on_submit(msg(SettingsMsg::SaveEditor))
                     .padding(5)
-                    .size(13)
+                    .size(theme::SIZE_BODY)
                     .style(theme::input);
-                let browse = button(text("Browse...").size(13).wrapping(Wrapping::None))
+                let browse = button(text("Browse...").size(theme::SIZE_BODY).wrapping(Wrapping::None))
                     .on_press(msg(SettingsMsg::Browse))
                     .padding([3, 12])
                     .style(theme::fkey);
-                let browse_terminal = button(text("Browse...").size(13).wrapping(Wrapping::None))
+                let browse_terminal = button(text("Browse...").size(theme::SIZE_BODY).wrapping(Wrapping::None))
                     .on_press(msg(SettingsMsg::BrowseTerminal))
                     .padding([3, 12])
                     .style(theme::fkey);
@@ -1028,7 +1028,7 @@ impl App {
                     let buttons = s.terminals.iter().enumerate().map(|(i, t)| {
                         let on = current == t.command();
                         Element::from(
-                            button(text(t.name.as_str()).size(13))
+                            button(text(t.name.as_str()).size(theme::SIZE_BODY))
                                 .on_press(msg(SettingsMsg::UseTerminal(i)))
                                 .padding([3, 12])
                                 .style(theme::drive(on)),
@@ -1042,7 +1042,7 @@ impl App {
                     let buttons = s.editors.iter().enumerate().map(|(i, e)| {
                         let on = s.editor.trim_matches('"').starts_with(&e.path.display().to_string());
                         Element::from(
-                            button(text(e.name.as_str()).size(13))
+                            button(text(e.name.as_str()).size(theme::SIZE_BODY))
                                 .on_press(msg(SettingsMsg::UseEditor(i)))
                                 .padding([3, 12])
                                 .style(theme::drive(on)),
@@ -1061,24 +1061,24 @@ impl App {
                     heading("Programs"),
                     line(
                         ROW_EDITOR,
-                        row![label("Editor for F4"), editor, browse].spacing(8).align_y(Alignment::Center).into()
+                        row![label("Editor for F4"), editor, browse].spacing(theme::SPACING_NORMAL).align_y(Alignment::Center).into()
                     ),
                     container(hint("A program and arguments; %1 is the file (added when missing). Enter saves.".into()))
                         .padding([0, 14 + lw as u16 + 8]),
-                    row![label("Installed editors"), detected].spacing(8).padding([3, 14]),
+                    row![label("Installed editors"), detected].spacing(theme::SPACING_NORMAL).padding([3, 14]),
                     line(
                         ROW_TERMINAL,
                         row![label("External terminal (Ctrl+F9)"), terminal, browse_terminal]
-                            .spacing(8)
+                            .spacing(theme::SPACING_NORMAL)
                             .align_y(Alignment::Center)
                             .into()
                     ),
                     container(hint("Starts in the panel's folder; %1 is that folder (optional). Enter saves.".into()))
                         .padding([0, 14 + lw as u16 + 8]),
-                    row![label("Installed terminals"), detected_terminals].spacing(8).padding([3, 14]),
+                    row![label("Installed terminals"), detected_terminals].spacing(theme::SPACING_NORMAL).padding([3, 14]),
                     line(
                         ROW_SHELL,
-                        row![label("Built-in terminal shell (F9)"), shell].spacing(8).align_y(Alignment::Center).into()
+                        row![label("Built-in terminal shell (F9)"), shell].spacing(theme::SPACING_NORMAL).align_y(Alignment::Center).into()
                     ),
                     container(hint("A program and arguments, started in the panel's folder; for new terminals. Enter saves.".into()))
                         .padding([0, 14 + lw as u16 + 8]),
@@ -1138,7 +1138,7 @@ impl App {
                         ROW_CONFIG,
                         described(
                             label("config.toml"),
-                            button(text("Open in the editor (Ctrl+,)").size(13).wrapping(Wrapping::None))
+                            button(text("Open in the editor (Ctrl+,)").size(theme::SIZE_BODY).wrapping(Wrapping::None))
                                 .on_press(msg(SettingsMsg::EditConfig))
                                 .padding([3, 12])
                                 .style(theme::fkey)
@@ -1157,7 +1157,7 @@ impl App {
                         .collect();
                     let tail = if keys.is_empty() { String::new() } else { format!("   [{}]", keys.join(", ")) };
                     let term = if c.terminal { " (terminal)" } else { "" };
-                    container(text(format!("{}: {}{term}{tail}", c.name, c.run)).size(13)).padding([2, 14]).into()
+                    container(text(format!("{}: {}{term}{tail}", c.name, c.run)).size(theme::SIZE_BODY)).padding([2, 14]).into()
                 }))
                 .push_maybe(self.user_cmds.is_empty().then(|| {
                     container(hint("None. Add [[user_commands]] entries (name, run, key) to config.toml".into()))
@@ -1179,12 +1179,12 @@ impl App {
                     line(
                         i,
                         row![
-                            text(keys).size(13).color(color).width(Length::Fixed(if narrow { KEYS_W_NARROW } else { KEYS_W })).wrapping(Wrapping::None),
-                            text(cmd.description()).size(13).width(Length::Fill).wrapping(Wrapping::None),
+                            text(keys).size(theme::SIZE_BODY).color(color).width(Length::Fixed(if narrow { KEYS_W_NARROW } else { KEYS_W })).wrapping(Wrapping::None),
+                            text(cmd.description()).size(theme::SIZE_BODY).width(Length::Fill).wrapping(Wrapping::None),
                             text(changed).size(11).color(colors.selected).width(Length::Fixed(60.0)),
                         ]
                         .push_maybe((!narrow).then(|| {
-                            text(cmd.id()).size(12).color(colors.muted).width(Length::Fixed(200.0)).wrapping(Wrapping::None)
+                            text(cmd.id()).size(theme::SIZE_SMALL).color(colors.muted).width(Length::Fixed(200.0)).wrapping(Wrapping::None)
                         }))
                         .spacing(10)
                         .height(Length::Fixed(ROW_H - 6.0))
@@ -1193,7 +1193,7 @@ impl App {
                     )
                 });
                 if shown.is_empty() {
-                    container(text("No command matches").size(13).color(colors.muted)).padding([8, 14]).into()
+                    container(text("No command matches").size(theme::SIZE_BODY).color(colors.muted)).padding(theme::PAD_NORMAL).into()
                 } else {
                     Column::with_children(rows).into()
                 }
@@ -1223,22 +1223,22 @@ impl App {
                     let swatch = |c: iced::Color| container(Space::new(10, 10)).style(filled(c));
                     let content = row![
                         row![swatch(p.colors.bg), swatch(p.colors.panel), swatch(p.colors.text), swatch(p.colors.accent)],
-                        text(p.name).size(13).wrapping(Wrapping::None)
+                        text(p.name).size(theme::SIZE_BODY).wrapping(Wrapping::None)
                     ]
                     .spacing(6)
                     .align_y(Alignment::Center);
-                    r.push(button(content).on_press(msg(SettingsMsg::Theme(p.id))).padding([4, 12]).style(theme::drive(on)))
+                    r.push(button(content).on_press(msg(SettingsMsg::Theme(p.id))).padding(theme::PAD_TIGHT).style(theme::drive(on)))
                 })));
                 let mut list = Column::new().push(heading("Theme")).push(line(
                     0,
                     if narrow {
-                        let mut c = Column::new().spacing(2).push(row![label("Theme (Left / Right)"), presets].spacing(8));
+                        let mut c = Column::new().spacing(theme::SPACING_TIGHT).push(row![label("Theme (Left / Right)"), presets].spacing(theme::SPACING_NORMAL));
                         if !custom.is_empty() {
                             c = c.push(row![Space::with_width(Length::Fixed(lw + 8.0)), hint(custom)]);
                         }
                         c.into()
                     } else {
-                        row![label("Theme (Left / Right)"), presets, hint(custom)].spacing(8).align_y(Alignment::Center).into()
+                        row![label("Theme (Left / Right)"), presets, hint(custom)].spacing(theme::SPACING_NORMAL).align_y(Alignment::Center).into()
                     },
                 ));
                 list = list.push(heading("Colours (#rrggbb; applied as you type)"));
@@ -1261,7 +1261,7 @@ impl App {
                         .id(hex_id(i))
                         .on_input(move |v| msg(SettingsMsg::Hex(i, v)))
                         .padding(3)
-                        .size(13)
+                        .size(theme::SIZE_BODY)
                         .width(Length::Fixed(90.0))
                         .style(theme::input);
                     let changed: Element<'a, Message> = if preset.get(name) == Some(value) {
@@ -1276,16 +1276,16 @@ impl App {
                     };
                     let content: Element<'a, Message> = if narrow {
                         column![
-                            row![text(*name).size(13).width(Length::Fixed(140.0)), swatch, input, changed]
+                            row![text(*name).size(theme::SIZE_BODY).width(Length::Fixed(140.0)), swatch, input, changed]
                                 .spacing(10)
                                 .align_y(Alignment::Center),
                             hint(theme::PURPOSES[i].into()),
                         ]
-                        .spacing(2)
+                        .spacing(theme::SPACING_TIGHT)
                         .into()
                     } else {
                         row![
-                            text(*name).size(13).width(Length::Fixed(140.0)),
+                            text(*name).size(theme::SIZE_BODY).width(Length::Fixed(140.0)),
                             swatch,
                             input,
                             changed,
@@ -1306,10 +1306,10 @@ impl App {
                 .id(filter_id())
                 .on_input(move |v| msg(SettingsMsg::Filter(v)))
                 .padding(5)
-                .size(13)
+                .size(theme::SIZE_BODY)
                 .style(theme::input);
             let count = format!("{} of {}", shown.len(), Command::ALL.len());
-            let bar = row![filter, text(count).size(12).color(colors.muted)].spacing(10).align_y(Alignment::Center);
+            let bar = row![filter, text(count).size(theme::SIZE_SMALL).color(colors.muted)].spacing(10).align_y(Alignment::Center);
             column![container(bar).padding([6, 14]).style(filled(colors.header)), list].height(Length::Fill).into()
         } else {
             list
@@ -1338,7 +1338,7 @@ impl App {
                 colors.muted,
             ),
         };
-        let mut buttons = Row::new().spacing(8);
+        let mut buttons = Row::new().spacing(theme::SPACING_NORMAL);
         match (s.page, &s.capture) {
             (Page::Keys, Some(c)) => {
                 if c.taken.is_some() {
@@ -1358,30 +1358,22 @@ impl App {
         }
         buttons = buttons.push(action("Close", SettingsMsg::Close, s.capture.is_none()));
         let footer: Element<'a, Message> = if width < FOOTER_STACK_BELOW && s.page == Page::Keys {
-            column![text(note).size(12).color(color).width(Length::Fill), buttons.wrap()].spacing(6).into()
+            let stacked = column![text(note).size(theme::SIZE_SMALL).color(color).width(Length::Fill), buttons.wrap()].spacing(6);
+            container(stacked).padding(theme::PAD_NORMAL).style(filled(colors.header)).into()
         } else {
-            row![
-                container(text(note).size(12).color(color).wrapping(Wrapping::None)).width(Length::Fill).clip(true),
-                Space::with_width(Length::Fixed(8.0)),
-                buttons
-            ]
-            .align_y(Alignment::Center)
-            .into()
+            theme::hint_footer(note, color, theme::PAD_NORMAL, theme::SPACING_NORMAL, Some(buttons.into()))
         };
-        let footer = container(footer)
-        .padding([8, 14])
-        .style(filled(colors.header));
 
         let mut page = Column::new().push(header).push(body);
         if let Some(p) = &s.picker {
             let value = p.color();
             let slider_row = |name: &'static str, max: f32, v: f32, make: fn(f32) -> SettingsMsg| {
                 row![
-                    text(name).size(12).width(Length::Fixed(70.0)),
+                    text(name).size(theme::SIZE_SMALL).width(Length::Fixed(70.0)),
                     iced::widget::slider(0.0..=max, v, move |x| msg(make(x))).step(1.0_f32).width(Length::Fixed(260.0)),
-                    text(format!("{}", v.round() as i32)).size(12).width(Length::Fixed(36.0)),
+                    text(format!("{}", v.round() as i32)).size(theme::SIZE_SMALL).width(Length::Fixed(36.0)),
                 ]
-                .spacing(8)
+                .spacing(theme::SPACING_NORMAL)
                 .align_y(Alignment::Center)
             };
             let preview = container(Space::new(90, 54)).style(move |_: &Theme| container::Style {
@@ -1392,27 +1384,27 @@ impl App {
             let input = text_input("#rrggbb", &p.hex)
                 .on_input(move |v| msg(SettingsMsg::PickHex(v)))
                 .padding(3)
-                .size(13)
+                .size(theme::SIZE_BODY)
                 .width(Length::Fixed(90.0))
                 .style(theme::input);
             let panel = row![
                 column![
-                    text(format!("Colour: {}", theme::NAMES[p.i])).size(13),
+                    text(format!("Colour: {}", theme::NAMES[p.i])).size(theme::SIZE_BODY),
                     slider_row("Hue", 360.0, p.h, SettingsMsg::PickHue),
                     slider_row("Saturation", 100.0, p.s, SettingsMsg::PickSat),
                     slider_row("Value", 100.0, p.v, SettingsMsg::PickVal),
                 ]
                 .spacing(6),
-                column![preview, input].spacing(8),
+                column![preview, input].spacing(theme::SPACING_NORMAL),
                 column![
                     action("OK (Enter)", SettingsMsg::PickOk, true),
                     action("Cancel (Esc)", SettingsMsg::PickCancel, false),
                 ]
-                .spacing(8),
+                .spacing(theme::SPACING_NORMAL),
             ]
             .spacing(24)
             .align_y(Alignment::Center);
-            page = page.push(container(panel).width(Length::Fill).padding([8, 14]).style(filled(colors.header)));
+            page = page.push(container(panel).width(Length::Fill).padding(theme::PAD_NORMAL).style(filled(colors.header)));
         }
         container(page.push(footer)).width(Length::Fill).height(Length::Fill).style(filled(colors.bg)).into()
     }

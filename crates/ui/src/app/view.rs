@@ -229,7 +229,8 @@ impl App {
             .is_some_and(|d| d.active && self.side_under_mouse() == side && self.drop_target(d).is_some())
             || self.tree_drop_side() == Some(side);
 
-        // Thin strip marks the active panel (green while it's a drop target).
+        // Thin strip on top of the path bar marks the active panel (green while it's a drop target). Always 2 px,
+        // header-coloured when inactive, so switching focus doesn't shift the layout.
         let strip = if drop_here {
             theme::c().success
         } else if active {
@@ -245,7 +246,7 @@ impl App {
             list = list.push(dropdown);
         }
 
-        column![accent, self.tab_bar(side), self.drive_bar(side), self.path_bar(side), list, self.footer(side, panel)]
+        column![self.tab_bar(side), self.drive_bar(side), accent, self.path_bar(side), list, self.footer(side, panel)]
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
@@ -520,7 +521,7 @@ impl App {
         let room = ((self.panel_width(side) - 2.0 * FOOTER_PAD) / (12.0 * FOOTER_CHAR_WIDTH)).max(1.0) as usize;
         container(
             text(summary_text(sel, total, sel_bytes, total_bytes, room))
-            .size(12)
+            .size(theme::SIZE_SMALL)
             .wrapping(Wrapping::None)
             .color(theme::c().muted),
         )
@@ -542,7 +543,7 @@ impl App {
             // Right-aligned by the container, not the text: iced_tiny_skia
             // 0.13 gets the redraw area of right-aligned text wrong, so the
             // label vanished when hovering recoloured it.
-            let label = text(format!("{label}{arrow}")).size(12);
+            let label = text(format!("{label}{arrow}")).size(theme::SIZE_SMALL);
             let label = container(label).width(Length::Fill);
             let label = if right { label.align_x(Alignment::End) } else { label };
             button(label)
@@ -644,9 +645,12 @@ impl App {
 
         let (stem, ext) = entry.split_name();
         // Narrow panels ellipsize the name instead of just clipping it.
-        let name_chars = (Columns::name_room(self.panel_width(side), &self.columns, cols.shown()) / 7.0).max(4.0) as usize;
-        let narrow = !cols.date;
-        let fit = |s: &str| if narrow { elide_end(s, name_chars) } else { s.to_string() };
+        let git_w = if self.git[side].marks_for(&panel.path).is_some_and(|v| v.branch.is_some()) { 9.0 + 10.0 } else { 0.0 };
+        let room = Columns::name_room(self.panel_width(side), &self.columns, cols.shown()) - git_w;
+        // One char of slack so a name never runs under the next column.
+        let name_chars = ((room / (13.0 * NAME_CHAR_WIDTH)) as usize).saturating_sub(1).max(4);
+        // With a separate extension column the stem is cut at its end; a whole name keeps its extension.
+        let fit_stem = |s: &str| if s.chars().count() <= name_chars { s.to_string() } else { elide_end(s, name_chars) };
         let size = match entry.kind {
             EntryKind::Parent => String::new(),
             EntryKind::Dir => match panel.dir_size(&entry.name) {
@@ -684,9 +688,9 @@ impl App {
                 r.selection(),
             )),
             None if cols.ext => content
-                .push(cell(fit(stem), Length::Fill))
+                .push(cell(fit_stem(stem), Length::Fill))
                 .push(cell(ext.to_string(), Length::Fixed(self.columns[0]))),
-            None => content.push(cell(fit(&entry.name), Length::Fill)),
+            None => content.push(cell(elide_middle(&entry.name, name_chars), Length::Fill)),
         };
         // Git status letter; every row of a work tree folder reserves the room.
         if let Some(view) = self.git[side].marks_for(&panel.path).filter(|v| v.branch.is_some()) {
@@ -1195,7 +1199,7 @@ impl App {
                 if shown != flat || msg.contains('\n') {
                     full_msg = Some(msg.clone());
                 }
-                text(shown).size(12).color(match tone {
+                text(shown).size(theme::SIZE_SMALL).color(match tone {
                     Tone::Info => theme::c().text,
                     Tone::Success => theme::c().success,
                     Tone::Error => theme::c().error,
@@ -1208,7 +1212,10 @@ impl App {
             match full_msg {
                 Some(msg) => tooltip(
                     el,
-                    container(text(msg).size(12)).padding([4, 8]).max_width(tip_w).style(theme::drag_label),
+                    container(text(msg).size(theme::SIZE_SMALL))
+                        .padding([4, 8])
+                        .max_width(tip_w)
+                        .style(theme::drag_label),
                     tooltip::Position::Top,
                 )
                 .gap(4)
@@ -1219,9 +1226,9 @@ impl App {
 
         if !self.config.show_fkeys {
             // Just a status line with a quiet hint on the right.
-            let hint = text(hint).size(12).color(theme::c().muted).wrapping(Wrapping::None);
+            let hint = text(hint).size(theme::SIZE_SMALL).color(theme::c().muted).wrapping(Wrapping::None);
             let status = self.status_clickable(with_tip(container(status.wrapping(Wrapping::None)).clip(true).into()));
-            return container(row![status, Space::with_width(Length::Fill), hint].spacing(16))
+            return container(row![status, Space::with_width(Length::Fill), hint].spacing(theme::SPACING_LOOSE))
                 .padding([3, 10])
                 .width(Length::Fill)
                 .clip(true)
@@ -1231,8 +1238,11 @@ impl App {
         let fkeys = Row::with_children(self.keymap.fkey_bar().into_iter().map(|(key, cmd)| {
             let label = cmd.map_or("", Command::short_label);
             button(
-                container(row![text(key).size(12).color(theme::c().accent), text(label).size(12)].spacing(6))
-                    .center_x(Length::Fill),
+                container(
+                    row![text(key).size(theme::SIZE_SMALL).color(theme::c().accent), text(label).size(theme::SIZE_SMALL)]
+                        .spacing(6),
+                )
+                .center_x(Length::Fill),
             )
             .on_press_maybe(cmd.map(Message::Run))
             .padding([4, 10])
@@ -1273,6 +1283,27 @@ pub(super) fn elide_end(s: &str, max_chars: usize) -> String {
     format!("{head}…")
 }
 
+/// Estimated glyph width of the name column as a fraction of the font size.
+const NAME_CHAR_WIDTH: f32 = 0.55;
+
+/// `name` cut to `max_chars` in the middle, keeping the start and the end
+/// (the extension and a little before it): `verylongna…me.txt`.
+pub(super) fn elide_middle(name: &str, max_chars: usize) -> String {
+    let count = name.chars().count();
+    if count <= max_chars {
+        return name.to_string();
+    }
+    if max_chars < 4 {
+        return elide_end(name, max_chars);
+    }
+    let ext = name.rfind('.').filter(|&i| i > 0).map_or(0, |i| name[i..].chars().count());
+    let tail = if ext > 0 && ext + 2 <= max_chars / 2 { ext + 2 } else { (max_chars / 3).max(1) };
+    let head = max_chars - 1 - tail;
+    let start: String = name.chars().take(head).collect();
+    let end: String = name.chars().skip(count - tail).collect();
+    format!("{start}…{end}")
+}
+
 pub(super) fn elide_left(s: &str, max_chars: usize) -> String {
     let count = s.chars().count();
     if count <= max_chars {
@@ -1309,7 +1340,7 @@ pub(super) fn dialog_button(label: &str, message: Message, primary: bool, focuse
 }
 
 fn small_button(label: &str, message: Message) -> Element<'_, Message> {
-    button(text(label).size(12)).on_press(message).padding([2, 10]).style(theme::fkey).into()
+    button(text(label).size(theme::SIZE_SMALL)).on_press(message).padding([2, 10]).style(theme::fkey).into()
 }
 
 fn hline<'a>() -> Element<'a, Message> {
@@ -1412,6 +1443,30 @@ fn summary_text(sel: usize, total: usize, sel_bytes: u64, total_bytes: u64, room
 #[cfg(test)]
 mod drag_edge_tests {
     use super::*;
+
+    #[test]
+    fn elide_middle_keeps_the_extension() {
+        assert_eq!(elide_middle("short.txt", 20), "short.txt");
+        assert_eq!(elide_middle("exactly10c", 10), "exactly10c");
+        let s = elide_middle("verylongfilename.txt", 14);
+        assert_eq!(s, "verylon…me.txt");
+        assert_eq!(s.chars().count(), 14);
+        // No extension: both ends kept.
+        let s = elide_middle("averyveryverylongfoldername", 12);
+        assert_eq!(s.chars().count(), 12);
+        assert!(s.starts_with("averyve") && s.contains('…') && s.ends_with("name"));
+        // Extension too long for the budget: falls back to a plain split.
+        let s = elide_middle("a.verylongextensionhere", 10);
+        assert_eq!(s.chars().count(), 10);
+        assert!(s.contains('…'));
+        // Multibyte characters count as one.
+        let s = elide_middle("ünïcödé_nämé_längér.txt", 12);
+        assert_eq!(s.chars().count(), 12);
+        assert!(s.ends_with("ér.txt") && s.starts_with('ü'));
+        // Tiny budgets.
+        assert_eq!(elide_middle("abcdef", 3).chars().count(), 3);
+        assert_eq!(elide_middle("abcdef", 0), "…");
+    }
 
     #[test]
     fn summary_text_shrinks_to_fit() {

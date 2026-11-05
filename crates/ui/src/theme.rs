@@ -257,6 +257,18 @@ pub fn to_hex(c: Color) -> String {
 static COLORS: RwLock<Colors> = RwLock::new(DARK);
 
 /// The colours in use.
+// Shared text sizes, paddings and spacings for the screens that use them (values are the ones the screens had before).
+pub const SIZE_SMALL: u16 = 12;
+pub const SIZE_BODY: u16 = 13;
+pub const SIZE_HEAD: u16 = 14;
+pub const SIZE_TITLE: u16 = 16;
+pub const PAD_TIGHT: [u16; 2] = [4, 12];
+pub const PAD_NORMAL: [u16; 2] = [8, 14];
+pub const PAD_LOOSE: [u16; 2] = [10, 14];
+pub const SPACING_TIGHT: u16 = 2;
+pub const SPACING_NORMAL: u16 = 8;
+pub const SPACING_LOOSE: u16 = 16;
+
 pub fn c() -> Colors {
     *COLORS.read().unwrap_or_else(|e| e.into_inner())
 }
@@ -288,6 +300,25 @@ pub fn filled(color: Color) -> impl Fn(&Theme) -> container::Style {
         background: Some(Background::Color(color)),
         ..container::Style::default()
     }
+}
+
+/// Footer with a muted single-line hint (clipped, not wrapped) on the header background and an optional
+/// element on the right (version text, Close button). `color` lets the caller tint notes.
+pub fn hint_footer<'a, M: 'a>(
+    hint: impl iced::widget::text::IntoFragment<'a>,
+    color: Color,
+    padding: [u16; 2],
+    spacing: u16,
+    trailing: Option<iced::Element<'a, M>>,
+) -> iced::Element<'a, M> {
+    let hint = container(iced::widget::text(hint).size(SIZE_SMALL).color(color).wrapping(iced::widget::text::Wrapping::None))
+        .width(iced::Length::Fill)
+        .clip(true);
+    let mut line = iced::widget::Row::new().push(hint).spacing(spacing).align_y(iced::Alignment::Center);
+    if let Some(t) = trailing {
+        line = line.push(t);
+    }
+    container(line).padding(padding).width(iced::Length::Fill).clip(true).style(filled(c().header)).into()
 }
 
 /// Flat text-only button (column headers).
