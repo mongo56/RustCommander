@@ -803,6 +803,7 @@ impl App {
             Dialog::Update(d) => return self.update_view(d),
             Dialog::Checksum(d) => return self.checksum_view(d),
             Dialog::Attrib(d) => return self.attrib_view(d),
+            Dialog::ShareLogin(d) => return self.share_view(d),
             Dialog::HotEdit { dir, name, comment, .. } => {
                 return self.hot_edit_view(dir, name, comment, self.dialog_focus.unwrap_or(1));
             }
@@ -899,7 +900,7 @@ impl App {
                 None,
                 "Remove",
             ),
-            Dialog::Hotlist(_) | Dialog::History { .. } | Dialog::Palette(_) | Dialog::Compare { .. } | Dialog::Update(_) | Dialog::Checksum(_) | Dialog::Attrib(_) | Dialog::HotEdit { .. } => {
+            Dialog::Hotlist(_) | Dialog::History { .. } | Dialog::Palette(_) | Dialog::Compare { .. } | Dialog::Update(_) | Dialog::Checksum(_) | Dialog::Attrib(_) | Dialog::ShareLogin(_) | Dialog::HotEdit { .. } => {
                 unreachable!("drawn above")
             }
         };

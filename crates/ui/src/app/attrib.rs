@@ -89,7 +89,7 @@ impl AttribDialog {
 }
 
 /// Moves the text focus away from every box (for focus on a button).
-fn unfocus_boxes() -> Task<Message> {
+pub(super) fn unfocus_boxes() -> Task<Message> {
     use iced::advanced::widget::{self, operation};
     widget::operate(operation::focusable::focus::<()>(widget::Id::new("attrib-none"))).discard()
 }

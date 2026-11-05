@@ -8,10 +8,12 @@ use std::path::{Path, PathBuf};
 mod attrib;
 pub mod credentials;
 mod editors;
+mod netuse;
 mod process_info;
 mod terminals;
 pub use attrib::set_file_attributes;
 pub use editors::{detect_editors, pick_program, FoundEditor};
+pub use netuse::{connect_share, is_logon_code, share_error, share_root, ShareError};
 pub use process_info::{foreground_child, process_cwd};
 pub use terminals::{detect_terminals, find_pwsh, FoundTerminal};
 #[cfg(windows)]

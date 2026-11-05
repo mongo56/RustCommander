@@ -13,6 +13,7 @@ mod markdown;
 mod palette;
 mod screen;
 mod attrib;
+mod share_login;
 mod checksum;
 mod split;
 mod find_files;
@@ -106,6 +107,8 @@ pub struct App {
     dialog: Option<Dialog>,
     /// Focused button of the open dialog (`None` = the default, the last one).
     dialog_focus: Option<usize>,
+    /// Share we just connected with new credentials (no second login prompt for it).
+    share_retry: Option<String>,
     /// Focused button of the overwrite question (`None` = none yet).
     conflict_focus: Option<usize>,
     /// Favourite folders (Ctrl+D), saved with the session.
@@ -311,6 +314,8 @@ enum Dialog {
     Checksum(checksum::ChecksumDialog),
     /// Attributes and dates of files (`attrib.rs`).
     Attrib(Box<attrib::AttribDialog>),
+    /// Login for a network share (`share_login.rs`).
+    ShareLogin(Box<share_login::ShareLogin>),
     /// Split `src` (`size` bytes) into parts in `target` (`split.rs`); `input`: the part size.
     Split { src: PathBuf, size: u64, target: PathBuf, input: String },
     /// Closing terminal `id` while `program` runs in it.
@@ -539,6 +544,7 @@ pub enum Message {
     Update(update::UpdateMsg),
     Checksum(checksum::ChecksumMsg),
     Attrib(attrib::AttribMsg),
+    Share(share_login::ShareMsg),
     /// Background listing for a pending navigation: (side, seq, listing).
     Navigated(usize, u64, Listing),
     /// A file inside an archive was extracted to a temp copy to be opened.
@@ -608,6 +614,7 @@ impl App {
             last_tab_bar_click: None,
             dialog: None,
             dialog_focus: None,
+            share_retry: None,
             conflict_focus: None,
             hotlist: session.as_ref().map(|s| s.hotlist.clone()).unwrap_or_default(),
             tree: hotlist_tree::HotTree::new(
@@ -1396,6 +1403,7 @@ impl App {
             Message::Update(msg) => return self.update_msg(msg),
             Message::Checksum(msg) => return self.checksum_msg(msg),
             Message::Attrib(msg) => return self.attrib_msg(msg),
+            Message::Share(msg) => return self.share_msg(msg),
             Message::ArchiveEdit(msg) => return self.archive_edit_update(msg),
             Message::Navigated(side, seq, result) => {
                 let current = self.sides[side].current;
@@ -1538,6 +1546,12 @@ impl App {
                 return Task::none();
             }
             return self.update_key(named, mods.shift());
+        }
+        if let Some(Dialog::ShareLogin(_)) = self.dialog {
+            if named.is_some_and(is_modifier_key) {
+                return Task::none();
+            }
+            return self.share_key(named, mods.shift(), captured);
         }
         if let Some(Dialog::Attrib(_)) = self.dialog {
             if named.is_some_and(is_modifier_key) {
@@ -2538,6 +2552,7 @@ impl App {
             Dialog::Update(d) => self.dialog = Some(Dialog::Update(d)),
             Dialog::Checksum(d) => self.dialog = Some(Dialog::Checksum(d)),
             Dialog::Attrib(d) => self.dialog = Some(Dialog::Attrib(d)),
+            Dialog::ShareLogin(d) => self.dialog = Some(Dialog::ShareLogin(d)),
             Dialog::Compare { opts } => {
                 let changed = self.compare_opts != opts;
                 self.compare_opts = opts;
@@ -3253,6 +3268,13 @@ impl App {
     }
 
     fn finish_nav(&mut self, side: usize, nav: Nav, result: Listing) -> Task<Message> {
+        // A share that wants a login: ask for it.
+        if result.as_ref().is_err_and(|e| share_login::is_logon_error(e)) {
+            let target = self.panel(side).nav_target(&nav);
+            if let Some(task) = target.and_then(|t| self.ask_share_login(side, &t)) {
+                return task;
+            }
+        }
         match result {
             Ok(Listed { file: Some(name), entries }) => {
                 // The target was a file: show its folder, cursor on it.
@@ -3265,6 +3287,7 @@ impl App {
                 Task::none()
             }
             Ok(Listed { file: None, entries }) => {
+                self.share_retry = None;
                 self.panel_mut(side).arrive(&nav, entries);
                 self.after_change();
                 // Entering an encrypted archive asks for its password.
