@@ -122,6 +122,63 @@ pub const GRUVBOX: Colors = Colors {
     drop: rgb(0x3d4a2a),
 };
 
+/// Dark plum with a sunset orange accent and warm sand folders.
+pub const SUNSET: Colors = Colors {
+    bg: rgb(0x1a1220),
+    panel: rgb(0x201726),
+    zebra: rgb(0x251b2c),
+    header: rgb(0x2b1f32),
+    border: rgb(0x45324f),
+    text: rgb(0xf3e3d3),
+    muted: rgb(0x9a8496),
+    dir: rgb(0xf2c38b),
+    accent: rgb(0xff7a45),
+    selected: rgb(0xffd166),
+    error: rgb(0xff4f6d),
+    cursor: rgb(0x4a2a3a),
+    cursor_inactive: rgb(0x33253a),
+    success: rgb(0x9bd17a),
+    drop: rgb(0x3a4a2a),
+};
+
+/// Seventies browns: burnt orange, mustard and avocado.
+pub const SEVENTIES: Colors = Colors {
+    bg: rgb(0x1b1410),
+    panel: rgb(0x221a14),
+    zebra: rgb(0x271e17),
+    header: rgb(0x2d231b),
+    border: rgb(0x4a3a2c),
+    text: rgb(0xf0e2c8),
+    muted: rgb(0x9c8a72),
+    dir: rgb(0xb5c25e),
+    accent: rgb(0xe0712c),
+    selected: rgb(0xf6c344),
+    error: rgb(0xd9482b),
+    cursor: rgb(0x553623),
+    cursor_inactive: rgb(0x3a2d22),
+    success: rgb(0xa8c256),
+    drop: rgb(0x3c4524),
+};
+
+/// Drum-machine black and grey with a signal orange accent.
+pub const EIGHT_O_EIGHT: Colors = Colors {
+    bg: rgb(0x111111),
+    panel: rgb(0x161616),
+    zebra: rgb(0x1a1a1a),
+    header: rgb(0x202020),
+    border: rgb(0x333333),
+    text: rgb(0xe8e4dc),
+    muted: rgb(0x8a8580),
+    dir: rgb(0xf59e42),
+    accent: rgb(0xff6b1a),
+    selected: rgb(0xffe14d),
+    error: rgb(0xff4040),
+    cursor: rgb(0x3d2a1c),
+    cursor_inactive: rgb(0x2a2622),
+    success: rgb(0x8fd16a),
+    drop: rgb(0x2e4224),
+};
+
 /// A built-in colour set, chosen with `theme = "<id>"` in `config.toml`;
 /// `[colors]` overrides apply on top.
 #[derive(Debug)]
@@ -136,6 +193,9 @@ pub const PRESETS: &[Preset] = &[
     Preset { id: "light", name: "Light", colors: LIGHT },
     Preset { id: "nord", name: "Nord", colors: NORD },
     Preset { id: "gruvbox", name: "Gruvbox", colors: GRUVBOX },
+    Preset { id: "sunset", name: "Sunset", colors: SUNSET },
+    Preset { id: "seventies", name: "Seventies", colors: SEVENTIES },
+    Preset { id: "808", name: "808", colors: EIGHT_O_EIGHT },
 ];
 
 /// The preset with this id (case-insensitive); empty = the dark default.
@@ -278,8 +338,22 @@ pub fn set(colors: Colors) {
 }
 
 /// `a` moved towards `b` by `t` (0..1).
-fn mix(a: Color, b: Color, t: f32) -> Color {
+pub fn mix(a: Color, b: Color, t: f32) -> Color {
     Color { r: a.r + (b.r - a.r) * t, g: a.g + (b.g - a.g) * t, b: a.b + (b.b - a.b) * t, a: 1.0 }
+}
+
+/// Clickable list row (Settings): `bg` normally, a soft step towards the inactive cursor colour while hovered.
+/// The selected row passes `hover: false` and keeps its colour.
+pub fn list_row(bg: Color, hover: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_, status| {
+        let hovered = hover && matches!(status, button::Status::Hovered | button::Status::Pressed);
+        button::Style {
+            background: Some(Background::Color(if hovered { mix(bg, c().cursor_inactive, 0.5) } else { bg })),
+            text_color: c().text,
+            border: Border::default(),
+            ..button::Style::default()
+        }
+    }
 }
 
 pub fn theme() -> Theme {
@@ -319,6 +393,77 @@ pub fn hint_footer<'a, M: 'a>(
         line = line.push(t);
     }
     container(line).padding(padding).width(iced::Length::Fill).clip(true).style(filled(c().header)).into()
+}
+
+/// One key combo as a small boxed key cap with background `bg`.
+pub fn key_chip<'a, M: 'a>(label: &'a str, colors: Colors, bg: Color) -> iced::Element<'a, M> {
+    container(iced::widget::text(label).size(SIZE_SMALL).color(colors.dir).wrapping(iced::widget::text::Wrapping::None))
+        .padding([1, 5])
+        .style(move |_: &Theme| container::Style {
+            background: Some(Background::Color(bg)),
+            border: Border { color: colors.border, width: 1.0, radius: 3.0.into() },
+            ..container::Style::default()
+        })
+        .into()
+}
+
+/// A footer hint: the keys (one chip each) and what they do.
+pub type Hint = (&'static [&'static str], &'static str);
+
+const HINT_GAP: f32 = 8.0;
+/// Left/right padding inside a hint's pill.
+const HINT_PAD_X: u16 = 8;
+
+/// Estimated width of a hint pair (chips, gap, action text, gap to the next pair).
+fn hint_width(h: &Hint) -> f32 {
+    let char_w = SIZE_SMALL as f32 * 0.55;
+    let keys: f32 = h.0.iter().map(|k| k.chars().count() as f32 * char_w + 12.0).sum::<f32>() + 3.0 * h.0.len().saturating_sub(1) as f32;
+    keys + 6.0 + h.1.chars().count() as f32 * char_w + 2.0 * HINT_PAD_X as f32 + HINT_GAP
+}
+
+/// The hint pairs as one row of key caps and muted action text; pairs that don't fit in `room` px are dropped
+/// from the end.
+pub fn key_hints_row<'a, M: 'a>(hints: &[Hint], mut room: f32) -> iced::Element<'a, M> {
+    let colors = c();
+    let mut line = iced::widget::Row::new().spacing(HINT_GAP).align_y(iced::Alignment::Center);
+    for h in hints {
+        room -= hint_width(h);
+        if room < 0.0 {
+            break;
+        }
+        let mut chips = iced::widget::Row::new().spacing(3).align_y(iced::Alignment::Center);
+        for k in h.0 {
+            chips = chips.push(key_chip::<M>(k, colors, colors.panel));
+        }
+        // Each key group and its action sit in one pill, so it's clear what belongs together.
+        let action = iced::widget::text(h.1).size(SIZE_SMALL).color(colors.text).wrapping(iced::widget::text::Wrapping::None);
+        let pair = iced::widget::Row::new().push(chips).push(action).spacing(6).align_y(iced::Alignment::Center);
+        let pill_bg = mix(colors.header, colors.border, 0.45);
+        line = line.push(container(pair).padding([2, HINT_PAD_X]).style(move |_: &Theme| container::Style {
+            background: Some(Background::Color(pill_bg)),
+            border: Border { radius: 4.0.into(), ..Border::default() },
+            ..container::Style::default()
+        }));
+    }
+    container(line).width(iced::Length::Fill).clip(true).into()
+}
+
+/// Footer with key hints drawn as key caps plus muted action text. `width` is the window/page width, `reserved`
+/// the width taken by `trailing` (Close button, version text); pairs that don't fit are dropped from the end.
+pub fn key_hints_footer<'a, M: 'a>(
+    hints: &[Hint],
+    width: f32,
+    reserved: f32,
+    padding: [u16; 2],
+    spacing: u16,
+    trailing: Option<iced::Element<'a, M>>,
+) -> iced::Element<'a, M> {
+    let room = width - reserved - 2.0 * padding[1] as f32 - spacing as f32;
+    let mut row = iced::widget::Row::new().push(key_hints_row(hints, room)).spacing(spacing).align_y(iced::Alignment::Center);
+    if let Some(t) = trailing {
+        row = row.push(t);
+    }
+    container(row).padding(padding).width(iced::Length::Fill).clip(true).style(filled(c().header)).into()
 }
 
 /// Flat text-only button (column headers).

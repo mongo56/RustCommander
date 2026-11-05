@@ -8,7 +8,7 @@ use super::*;
 use crate::theme::filled;
 use iced::widget::scrollable::{AbsoluteOffset, RelativeOffset};
 use iced::widget::text::Wrapping;
-use iced::widget::{column, container, responsive, row, scrollable, text, Column, Space};
+use iced::widget::{column, container, responsive, row, scrollable, text, Column, Row, Space};
 use iced::{Alignment, Element, Length};
 
 const LINE: f32 = 40.0;
@@ -21,6 +21,11 @@ const NARROW_KEYS_BELOW: f32 = 760.0;
 const STACK_BELOW: f32 = 560.0;
 /// Header and footer around the list (for paging).
 const HELP_CHROME_H: f32 = 110.0;
+
+/// One key combo as a small boxed key cap.
+fn key_chip<'a>(label: &'a str, colors: theme::Colors) -> Element<'a, Message> {
+    theme::key_chip(label, colors, colors.header)
+}
 
 fn list_id() -> scrollable::Id {
     scrollable::Id::new("help-list")
@@ -235,16 +240,25 @@ impl App {
             for &(title, ref items) in &shown {
                 list = list.push(container(text(title).size(theme::SIZE_HEAD).color(colors.accent)).padding([10, 0]));
                 for &item in items.iter() {
-                    let keys = if item.keys.is_empty() {
-                        "(no key)"
-                    } else {
-                        item.keys.as_str()
+                    let keys_el = |width: Length| -> Element<'_, Message> {
+                        if item.keys.is_empty() {
+                            text("(no key)").size(theme::SIZE_BODY).color(colors.muted).width(width).into()
+                        } else {
+                            let chips = item.keys.split(", ").map(|k| key_chip(k, colors));
+                            container(
+                                Row::with_children(chips)
+                                    .spacing(theme::SPACING_TIGHT * 2)
+                                    .align_y(Alignment::Center)
+                                    .wrap(),
+                            )
+                            .width(width)
+                            .into()
+                        }
                     };
-                    let keys_color = if item.keys.is_empty() { colors.muted } else { colors.dir };
                     if stacked {
                         list = list.push(
                             column![
-                                text(keys).size(theme::SIZE_BODY).color(keys_color).wrapping(Wrapping::None),
+                                keys_el(Length::Shrink),
                                 container(text(item.text.as_str()).size(theme::SIZE_BODY).width(Length::Fill)).padding([0, 12]),
                             ]
                             .padding([2, 0]),
@@ -252,7 +266,7 @@ impl App {
                         continue;
                     }
                     let mut line = row![
-                        text(keys).size(theme::SIZE_BODY).color(keys_color).width(Length::Fixed(keys_w)),
+                        keys_el(Length::Fixed(keys_w)),
                         text(item.text.as_str()).size(theme::SIZE_BODY).width(Length::Fill),
                     ]
                     .spacing(12)
@@ -275,9 +289,16 @@ impl App {
             .size(theme::SIZE_SMALL)
             .color(colors.accent)
             .wrapping(Wrapping::None);
-        let footer = theme::hint_footer(
-            "Type to filter · Backspace edit · Esc clear filter / close · Up/Down/PgUp/PgDn/Home/End scroll",
-            colors.muted,
+        const HINTS: &[theme::Hint] = &[
+            (&[], "Type to filter"),
+            (&["Backspace"], "edit"),
+            (&["Esc"], "clear filter / close"),
+            (&["↑↓", "PgUp", "PgDn", "Home", "End"], "scroll"),
+        ];
+        let footer = theme::key_hints_footer(
+            HINTS,
+            self.window_width,
+            170.0,
             theme::PAD_TIGHT,
             theme::SPACING_LOOSE,
             Some(version.into()),

@@ -1449,7 +1449,11 @@ impl App {
             Message::DiskUsage(msg) => return self.disk_usage_update(msg),
             Message::Term(msg) => return self.term_update(msg),
             Message::Connect(msg) => return self.connect_update(msg),
-            Message::Settings(msg) => return self.settings_update(msg),
+            Message::Settings(msg) => {
+                let mark = self.settings_mark();
+                let task = self.settings_update(msg);
+                return self.settings_after(mark, task);
+            }
             Message::Update(msg) => return self.update_msg(msg),
             Message::Checksum(msg) => return self.checksum_msg(msg),
             Message::Attrib(msg) => return self.attrib_msg(msg),
@@ -1563,7 +1567,11 @@ impl App {
             }
             return match self.screen {
                 Some(Screen::Help(_)) => self.help_key(named, &key, mods, text.as_deref()),
-                Some(Screen::Settings(_)) => self.settings_key(named, &key, mods, text.as_deref(), captured),
+                Some(Screen::Settings(_)) => {
+                    let mark = self.settings_mark();
+                    let task = self.settings_key(named, &key, mods, text.as_deref(), captured);
+                    self.settings_after(mark, task)
+                }
                 Some(Screen::MultiRename(_)) => self.multi_rename_key(named, &key, mods, captured),
                 Some(Screen::Find(_)) => self.find_key(named, &key, mods, captured),
                 Some(Screen::Sync(_)) => self.sync_key(named, &key, mods),
