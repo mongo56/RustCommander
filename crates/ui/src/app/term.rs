@@ -204,6 +204,7 @@ impl TermSession {
         let (program, args) = shell_command(command)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "the builtin_shell setting is empty"))?;
         safe_dll_search();
+        allow_ctrl_c();
         let (tx, rx) = std_mpsc::channel();
         let wakeup = Arc::new(AtomicBool::new(false));
         let proxy = Proxy { tx, wakeup: wakeup.clone() };
@@ -608,6 +609,19 @@ fn safe_dll_search() {
             // SAFETY: a valid, NUL-terminated (empty) wide string.
             unsafe { windows_sys::Win32::System::LibraryLoader::SetDllDirectoryW(empty.as_ptr()) };
         });
+    }
+}
+
+/// Clears the "ignore Ctrl+C" flag of our own process before a shell starts:
+/// children inherit it, and with it set Ctrl+C (0x03 into the ConPTY) can't
+/// stop a running command. It is set when we were started by a process that
+/// ignores Ctrl+C itself (some launchers, `start /b`, ...). We have no
+/// console of our own, so this changes nothing for us.
+fn allow_ctrl_c() {
+    #[cfg(windows)]
+    // SAFETY: a NULL handler with FALSE only resets the process's ignore flag.
+    unsafe {
+        windows_sys::Win32::System::Console::SetConsoleCtrlHandler(None, 0);
     }
 }
 
@@ -2511,5 +2525,32 @@ mod tests {
             .output()
             .unwrap();
         String::from_utf8_lossy(&out.stdout).contains(&format!("\"{pid}\""))
+    }
+}
+
+#[cfg(all(test, windows))]
+mod ctrl_c_tests {
+    use super::*;
+
+    fn alive(pid: u32) -> bool {
+        let out = std::process::Command::new("tasklist").args(["/FI", &format!("PID eq {pid}"), "/NH"]).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).contains(&pid.to_string())
+    }
+
+    /// Even when we were started ignoring Ctrl+C, Ctrl+C stops a running command.
+    #[test]
+    fn ctrl_c_stops_a_command_even_if_we_ignore_it() {
+        // SAFETY: sets this test process's ignore flag (what some launchers hand down).
+        unsafe { windows_sys::Win32::System::Console::SetConsoleCtrlHandler(None, 1) };
+        let s = TermSession::spawn(1, "cmd.exe /d /c ping -t 127.0.0.1", &std::env::temp_dir(), 80, 24).unwrap();
+        let pid = s.pid.unwrap();
+        std::thread::sleep(Duration::from_millis(1500));
+        assert!(alive(pid), "ping should be running");
+        s.write(vec![3]);
+        let stopped = (0..30).any(|_| {
+            std::thread::sleep(Duration::from_millis(100));
+            !alive(pid)
+        });
+        assert!(stopped, "ping still runs after Ctrl+C");
     }
 }

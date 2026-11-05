@@ -28,7 +28,7 @@ pulldown-cmark = { version = "0.13", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 # SetDllDirectoryW for the built-in terminal (same version as alacritty_terminal's).
-windows-sys = { version = "0.59", features = ["Win32_System_LibraryLoader"] }
+windows-sys = { version = "0.59", features = ["Win32_System_Console", "Win32_System_LibraryLoader"] }
 
 [build-dependencies]
 png = "0.17"
