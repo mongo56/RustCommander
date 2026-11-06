@@ -3372,6 +3372,13 @@ impl App {
                 return task;
             }
         }
+        // A found computer not reachable by name: try its address.
+        if let Err(e) = &result {
+            let target = self.panel(side).nav_target(&nav);
+            if let Some(task) = target.and_then(|t| self.net_retry_by_address(side, &t, e)) {
+                return task;
+            }
+        }
         match result {
             Ok(Listed { file: Some(name), entries }) => {
                 // The target was a file: show its folder, cursor on it.

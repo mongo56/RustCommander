@@ -74,25 +74,33 @@ fn first_address(list: &str) -> Option<IpAddr> {
 }
 
 /// Folds hosts as they arrive into one per name (case-insensitive, after
-/// [`unc_name`]); the first one seen keeps its address and source.
+/// [`unc_name`]); the first one seen keeps its source, and its address
+/// unless a later one brings the first IPv4 address for the name.
 #[derive(Default)]
 struct Merger {
-    names: HashSet<String>,
+    /// Lowercased names seen, and whether one of them came with an IPv4 address.
+    names: std::collections::HashMap<String, bool>,
     addresses: HashSet<IpAddr>,
 }
 
 impl Merger {
-    /// `host` with its name normalised if it is new, `None` if it is a
-    /// duplicate (or has no usable name). A host named only by an address
-    /// that an earlier host already had is a duplicate too.
+    /// `host` with its name normalised if it is new or brings the name's
+    /// first IPv4 address, `None` if it is a duplicate (or has no usable
+    /// name). A host named only by an address that an earlier host already
+    /// had is a duplicate too.
     fn add(&mut self, host: Host) -> Option<Host> {
         let name = unc_name(&host.name)?;
-        if !self.names.insert(name.to_lowercase()) {
-            return None;
-        }
-        if let Ok(ip) = name.parse::<IpAddr>() {
-            if self.addresses.contains(&ip) {
-                return None;
+        let v4 = host.address.is_some_and(|a| a.is_ipv4());
+        match self.names.get_mut(&name.to_lowercase()) {
+            Some(had_v4) if *had_v4 || !v4 => return None,
+            Some(had_v4) => *had_v4 = true,
+            None => {
+                if let Ok(ip) = name.parse::<IpAddr>() {
+                    if self.addresses.contains(&ip) {
+                        return None;
+                    }
+                }
+                self.names.insert(name.to_lowercase(), v4);
             }
         }
         if let Some(a) = host.address {
@@ -105,7 +113,14 @@ impl Merger {
 /// The hosts with one entry per name, in the order first seen (see [`Merger`]).
 pub fn merge(hosts: impl IntoIterator<Item = Host>) -> Vec<Host> {
     let mut m = Merger::default();
-    hosts.into_iter().filter_map(|h| m.add(h)).collect()
+    let mut out: Vec<Host> = Vec::new();
+    for h in hosts.into_iter().filter_map(|h| m.add(h)) {
+        match out.iter_mut().find(|o| o.name.eq_ignore_ascii_case(&h.name)) {
+            Some(o) => o.address = h.address,
+            None => out.push(h),
+        }
+    }
+    out
 }
 
 /// Searches the network for about 4 s, calling `found` (on this thread) with
@@ -174,6 +189,14 @@ mod win {
         pid: 5,
     };
 
+    /// The computer name WS-Discovery reports for a Windows PC
+    /// (`NAME/Workgroup:WG`; seen on Windows 10/11 machines that have no
+    /// `PKEY_ComputerName`, only this key, and only an IPv6 link-local address).
+    const PKEY_WSD_COMPUTER_NAME: PROPERTYKEY = PROPERTYKEY {
+        fmtid: windows::core::GUID::from_u128(0x63c6d5b8_f73a_4aca_967e_0cc787e0b559),
+        pid: 20483,
+    };
+
     /// `RESOURCEDISPLAYTYPE_SERVER` (WNet), as the property store shows it.
     const RESOURCEDISPLAYTYPE_SERVER: &str = "2";
 
@@ -198,7 +221,7 @@ mod win {
     fn fd_host(inst: &IFunctionInstance, via: Via) -> Option<Host> {
         let store = unsafe { inst.OpenPropertyStore(STGM_READ) }.ok()?;
         let address = prop(&store, &PKEY_PNPX_IpAddress).and_then(|a| first_address(&a));
-        if let Some(name) = prop(&store, &PKEY_COMPUTER_NAME) {
+        if let Some(name) = prop(&store, &PKEY_COMPUTER_NAME).or_else(|| prop(&store, &PKEY_WSD_COMPUTER_NAME)) {
             return Some(Host { name, address, via });
         }
         if via == Via::NetBios {
@@ -517,10 +540,13 @@ mod tests {
             got,
             vec![
                 host("NAS", Some("192.168.1.5"), Via::Wsd),
-                host("desktop-1", None, Via::Wsd),
+                // The first IPv4 address found later is kept, not a second one.
+                host("desktop-1", Some("192.168.1.7"), Via::Wsd),
                 host("macbook", Some("192.168.1.8"), Via::Mdns),
             ]
         );
+        let v6_first = merge([host("nas", Some("fe80::1"), Via::Mdns), host("NAS", Some("10.0.0.5"), Via::Wsd)]);
+        assert_eq!(v6_first, vec![host("nas", Some("10.0.0.5"), Via::Mdns)]);
     }
 
     #[test]

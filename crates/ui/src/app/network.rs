@@ -63,6 +63,41 @@ impl NetSearch {
     fn names(&self) -> Vec<String> {
         self.hosts.iter().map(|h| h.name.clone()).collect()
     }
+
+    /// The IPv4 address a search found for the computer `name`.
+    fn ipv4_of(&self, name: &str) -> Option<std::net::Ipv4Addr> {
+        let host = self.hosts.iter().find(|h| h.name.eq_ignore_ascii_case(name))?;
+        match host.address? {
+            std::net::IpAddr::V4(a) => Some(a),
+            std::net::IpAddr::V6(_) => None,
+        }
+    }
+}
+
+/// `\\server` or a share root `\\server\share` (trailing `\` allowed) split
+/// into the server and the rest (`""` or `share`).
+fn server_and_share(path: &Path) -> Option<(&str, &str)> {
+    let rest = path.to_str()?.strip_prefix(r"\\")?.trim_end_matches('\\');
+    let (server, share) = rest.split_once('\\').unwrap_or((rest, ""));
+    (!server.is_empty() && !server.starts_with('?') && !share.contains('\\')).then_some((server, share))
+}
+
+/// A listing error that says the server couldn't be reached by its name.
+fn server_not_reached(error: &str) -> bool {
+    error.starts_with("Server not found") || error.starts_with("Path not found")
+        // ERROR_REM_NOT_LIST, ERROR_BAD_NETPATH, ERROR_BAD_NET_NAME.
+        || ["(os error 51)", "(os error 53)", "(os error 67)"].iter().any(|c| error.contains(c))
+}
+
+/// The target to try when opening `target` (a server or share root) by the
+/// computer's name failed with `error` and a search found `ipv4` for it.
+fn by_address(target: &Path, error: &str, ipv4: impl FnOnce(&str) -> Option<std::net::Ipv4Addr>) -> Option<PathBuf> {
+    let (server, share) = server_and_share(target)?;
+    if !server_not_reached(error) || server.parse::<std::net::IpAddr>().is_ok() {
+        return None;
+    }
+    let ip = ipv4(server)?;
+    Some(PathBuf::from(if share.is_empty() { format!(r"\\{ip}") } else { format!(r"\\{ip}\{share}") }))
 }
 
 /// The line shown when a search found nothing.
@@ -142,6 +177,15 @@ impl App {
         Task::none()
     }
 
+    /// Opening `target` in `side` failed with `error`: if that means a
+    /// computer the search found isn't reachable by its name (its name may
+    /// resolve to an IPv6 address its SMB server doesn't listen on), opens it
+    /// by the IPv4 address the search found instead.
+    pub(super) fn net_retry_by_address(&mut self, side: usize, target: &Path, error: &str) -> Option<Task<Message>> {
+        let to = by_address(target, error, |name| self.net.ipv4_of(name))?;
+        Some(self.start_nav(side, Nav::to(to)))
+    }
+
     /// Hands the hosts to `vfs` and re-lists every tab on the Network list
     /// (keeping cursor and selection).
     fn net_relist(&mut self) {
@@ -208,6 +252,35 @@ mod tests {
         assert!(!net.add(host("PC")));
         net.finish();
         assert_eq!(net.names(), ["pc"]);
+    }
+
+    #[test]
+    fn unreachable_names_are_retried_by_address() {
+        let ip = |n: &str| n.eq_ignore_ascii_case("nas").then(|| "10.0.0.5".parse().unwrap());
+        let retry = |t: &str, e: &str| by_address(Path::new(t), e, ip);
+        let not_found = r"Server not found: \\NAS";
+        assert_eq!(retry(r"\\NAS", not_found), Some(PathBuf::from(r"\\10.0.0.5")));
+        assert_eq!(retry(r"\\nas\", not_found), Some(PathBuf::from(r"\\10.0.0.5")));
+        assert_eq!(
+            retry(r"\\NAS\data", "The network path was not found. (os error 53)"),
+            Some(PathBuf::from(r"\\10.0.0.5\data"))
+        );
+        assert_eq!(retry(r"\\NAS\data\", r"Path not found: \\NAS\data"), Some(PathBuf::from(r"\\10.0.0.5\data")));
+        // Not for folders inside a share, other errors, unknown computers or addresses.
+        assert_eq!(retry(r"\\NAS\data\x", r"Path not found: \\NAS\data\x"), None);
+        assert_eq!(retry(r"\\NAS", "Access is denied. (os error 5)"), None);
+        assert_eq!(retry(r"\\pc", r"Server not found: \\pc"), None);
+        assert_eq!(retry(r"\\10.0.0.5", r"Server not found: \\10.0.0.5"), None);
+        assert_eq!(retry(r"C:\x", "Path not found: C:\\x"), None);
+    }
+
+    #[test]
+    fn an_ipv4_address_found_later_is_kept() {
+        let mut net = NetSearch::default();
+        net.add(Host { name: "nas".into(), address: Some("fe80::1".parse().unwrap()), via: Via::Mdns });
+        net.add(Host { name: "NAS".into(), address: Some("10.0.0.5".parse().unwrap()), via: Via::Wsd });
+        assert_eq!(net.names(), ["nas"]);
+        assert_eq!(net.ipv4_of("Nas"), Some("10.0.0.5".parse().unwrap()));
     }
 
     #[test]
