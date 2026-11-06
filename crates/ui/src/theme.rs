@@ -554,6 +554,27 @@ fn wrap_lines(widths: &[f32], room: f32, gap: f32, max_lines: usize) -> Vec<usiz
     lines
 }
 
+/// A "(?) `label`" marker whose tooltip lists `hints`, one pair per line (as the "(?)" in Settings does for
+/// long descriptions): for sidebars where the full hint list is too much to show all the time.
+pub fn key_hints_tip<'a, M: 'a>(label: &'a str, hints: &[Hint]) -> iced::Element<'a, M> {
+    use iced::widget::text::Wrapping;
+    let colors = c();
+    let mut lines = iced::widget::Column::new().spacing(4);
+    for h in hints {
+        let mut line = iced::widget::Row::new().spacing(4).align_y(iced::Alignment::Center);
+        for k in h.0 {
+            line = line.push(chip::<M>(*k, colors, colors.panel, [0, 3]));
+        }
+        lines = lines.push(line.push(iced::widget::text(h.1).size(SIZE_SMALL).color(colors.text).wrapping(Wrapping::None)));
+    }
+    let mark = iced::widget::Row::new()
+        .push(iced::widget::text("(?)").size(SIZE_SMALL).color(colors.accent).wrapping(Wrapping::None))
+        .push(iced::widget::text(label).size(SIZE_SMALL).color(colors.muted).wrapping(Wrapping::None))
+        .spacing(4);
+    iced::widget::tooltip(mark, container(lines).padding([6, 8]).style(drag_label), iced::widget::tooltip::Position::Top)
+        .into()
+}
+
 /// The hint pairs for narrow places (sidebars): small chips without pills, wrapped onto up to three lines of
 /// `room` px; pairs past them are dropped.
 pub fn key_hints_compact<'a, M: 'a>(hints: &[Hint], room: f32) -> iced::Element<'a, M> {

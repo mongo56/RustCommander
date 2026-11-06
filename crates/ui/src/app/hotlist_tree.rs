@@ -1086,7 +1086,7 @@ impl App {
 
         const NAMING: &[theme::Hint] = &[(&[], "Type the name"), (&["Enter"], "OK"), (&["Esc"], "cancel")];
         const DRAGGING: &[theme::Hint] = &[(&[], "Drop between entries or on a group"), (&["Esc"], "cancel")];
-        // Wrapped onto up to three lines (the rest are dropped from the end).
+        // Behind a "(?)" (tooltip), one per line.
         const IDLE: &[theme::Hint] = &[
             (&["Enter"], "open"),
             (&["Shift+Enter"], "new tab"),
@@ -1096,14 +1096,15 @@ impl App {
             (&["Del"], "remove"),
             (&[], "drag to move"),
         ];
+        // While naming or dragging, the few keys that matter then stay in view.
         let hints = if self.tree.naming.is_some() {
-            NAMING
+            theme::key_hints_compact(NAMING, self.tree_width() - 20.0)
         } else if self.tree_dragging() {
-            DRAGGING
+            theme::key_hints_compact(DRAGGING, self.tree_width() - 20.0)
         } else {
-            IDLE
+            theme::key_hints_tip("Shortcuts", IDLE)
         };
-        let footer = container(theme::key_hints_compact(hints, self.tree_width() - 20.0))
+        let footer = container(hints)
             .padding([4, 10])
             .width(Length::Fill)
             .clip(true)
