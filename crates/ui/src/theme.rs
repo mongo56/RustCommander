@@ -186,16 +186,44 @@ pub struct Preset {
     pub id: &'static str,
     pub name: &'static str,
     pub colors: Colors,
+    /// The built-in terminal's 16 ANSI colours (`TERM_NAMES` order).
+    pub ansi: [u32; 16],
 }
 
 pub const PRESETS: &[Preset] = &[
-    Preset { id: "dark", name: "Dark", colors: DARK },
-    Preset { id: "light", name: "Light", colors: LIGHT },
-    Preset { id: "nord", name: "Nord", colors: NORD },
-    Preset { id: "gruvbox", name: "Gruvbox", colors: GRUVBOX },
-    Preset { id: "sunset", name: "Sunset", colors: SUNSET },
-    Preset { id: "seventies", name: "Seventies", colors: SEVENTIES },
-    Preset { id: "808", name: "808", colors: EIGHT_O_EIGHT },
+    Preset { id: "dark", name: "Dark", colors: DARK, ansi: TERM_DARK_ANSI },
+    Preset { id: "light", name: "Light", colors: LIGHT, ansi: TERM_LIGHT_ANSI },
+    Preset { id: "nord", name: "Nord", colors: NORD, ansi: NORD_ANSI },
+    Preset { id: "gruvbox", name: "Gruvbox", colors: GRUVBOX, ansi: GRUVBOX_ANSI },
+    Preset { id: "sunset", name: "Sunset", colors: SUNSET, ansi: SUNSET_ANSI },
+    Preset { id: "seventies", name: "Seventies", colors: SEVENTIES, ansi: SEVENTIES_ANSI },
+    Preset { id: "808", name: "808", colors: EIGHT_O_EIGHT, ansi: EIGHT_O_EIGHT_ANSI },
+];
+
+/// Nord's own terminal colours.
+const NORD_ANSI: [u32; 16] = [
+    0x3b4252, 0xbf616a, 0xa3be8c, 0xebcb8b, 0x81a1c1, 0xb48ead, 0x88c0d0, 0xe5e9f0, 0x616e88, 0xbf616a, 0xa3be8c,
+    0xebcb8b, 0x81a1c1, 0xb48ead, 0x8fbcbb, 0xeceff4,
+];
+/// Gruvbox dark's own terminal colours.
+const GRUVBOX_ANSI: [u32; 16] = [
+    0x282828, 0xcc241d, 0x98971a, 0xd79921, 0x458588, 0xb16286, 0x689d6a, 0xa89984, 0x928374, 0xfb4934, 0xb8bb26,
+    0xfabd2f, 0x83a598, 0xd3869b, 0x8ec07c, 0xebdbb2,
+];
+/// Warm pinks, sand and soft blues on plum.
+const SUNSET_ANSI: [u32; 16] = [
+    0x2b1f32, 0xff4f6d, 0x9bd17a, 0xffd166, 0x7aa2f7, 0xc792ea, 0x7fd4d4, 0xe8d8c8, 0x7a6680, 0xff7a8e, 0xb5e396,
+    0xffe08f, 0x9bb8ff, 0xdcb0f5, 0xa3e6e6, 0xf3e3d3,
+];
+/// Burnt orange, mustard, avocado and faded denim on brown.
+const SEVENTIES_ANSI: [u32; 16] = [
+    0x2d231b, 0xd9482b, 0xa8c256, 0xf6c344, 0x7b9bba, 0xb0708a, 0x6fa89a, 0xe0d2b8, 0x85705a, 0xe0712c, 0xc2d46e,
+    0xffd86b, 0x9bbbd6, 0xc98da5, 0x8cc4b6, 0xf0e2c8,
+];
+/// Signal colours on drum-machine black.
+const EIGHT_O_EIGHT_ANSI: [u32; 16] = [
+    0x202020, 0xff4040, 0x8fd16a, 0xffe14d, 0x5c9ded, 0xc678dd, 0x56c8c8, 0xd8d4cc, 0x75706a, 0xff6b6b, 0xa8e08a,
+    0xfff07a, 0x82b8f5, 0xd899ea, 0x7edcdc, 0xe8e4dc,
 ];
 
 /// The preset with this id (case-insensitive); empty = the dark default.
@@ -315,6 +343,73 @@ pub fn to_hex(c: Color) -> String {
 }
 
 static COLORS: RwLock<Colors> = RwLock::new(DARK);
+
+/// Names in `config.toml`'s `[terminal_colors]`: the 16 ANSI colours, then
+/// the built-in terminal's text, background and cursor.
+pub const TERM_NAMES: [&str; 19] = [
+    "black", "red", "green", "yellow", "blue", "magenta", "cyan", "white", "bright_black", "bright_red",
+    "bright_green", "bright_yellow", "bright_blue", "bright_magenta", "bright_cyan", "bright_white", "foreground",
+    "background", "cursor",
+];
+
+/// The built-in terminal's default ANSI colours: Windows Terminal's
+/// "Campbell" scheme on a dark background...
+pub const TERM_DARK_ANSI: [u32; 16] = [
+    0x0c0c0c, 0xc50f1f, 0x13a10e, 0xc19c00, 0x0037da, 0x881798, 0x3a96dd, 0xcccccc, 0x767676, 0xe74856, 0x16c60c,
+    0xf9f1a5, 0x3b78ff, 0xb4009e, 0x61d6d6, 0xf2f2f2,
+];
+/// ...and "One Half Light" on a light one.
+pub const TERM_LIGHT_ANSI: [u32; 16] = [
+    0x383a42, 0xe45649, 0x50a14f, 0xc18401, 0x0184bc, 0xa626a4, 0x0997b3, 0xfafafa, 0x4f525d, 0xdf6c75, 0x98c379,
+    0xe4c07a, 0x61afef, 0xc577dd, 0x56b5c1, 0xffffff,
+];
+
+/// What each `TERM_NAMES` colour is, for the settings view.
+pub const TERM_PURPOSES: [&str; 19] = [
+    "Terminal: ANSI colour 0", "Terminal: ANSI colour 1", "Terminal: ANSI colour 2", "Terminal: ANSI colour 3",
+    "Terminal: ANSI colour 4", "Terminal: ANSI colour 5", "Terminal: ANSI colour 6", "Terminal: ANSI colour 7",
+    "Terminal: ANSI colour 8", "Terminal: ANSI colour 9", "Terminal: ANSI colour 10", "Terminal: ANSI colour 11",
+    "Terminal: ANSI colour 12", "Terminal: ANSI colour 13", "Terminal: ANSI colour 14", "Terminal: ANSI colour 15",
+    "Terminal: text", "Terminal: background", "Terminal: cursor",
+];
+
+/// The built-in terminal's colours from `[terminal_colors]` (`TERM_NAMES`
+/// order); `None` = the default.
+pub type TermColors = [Option<Color>; 19];
+
+/// `[terminal_colors]` parsed; the first bad entry is an error naming it.
+pub fn term_colors<'a>(entries: impl IntoIterator<Item = (&'a String, &'a String)>) -> Result<TermColors, String> {
+    let mut out = [None; 19];
+    for (name, value) in entries {
+        let i = TERM_NAMES
+            .iter()
+            .position(|n| n.eq_ignore_ascii_case(name.trim()))
+            .ok_or_else(|| format!("unknown colour \"{name}\""))?;
+        out[i] = Some(parse_hex(value).ok_or_else(|| format!("bad colour \"{value}\" for {name} (use \"#rrggbb\")"))?);
+    }
+    Ok(out)
+}
+
+static TERM_COLORS: RwLock<TermColors> = RwLock::new([None; 19]);
+static TERM_ANSI: RwLock<[u32; 16]> = RwLock::new(TERM_DARK_ANSI);
+
+/// The theme's ANSI colours for the built-in terminal (`Preset::ansi`).
+pub fn term_ansi() -> [u32; 16] {
+    *TERM_ANSI.read().unwrap_or_else(|e| e.into_inner())
+}
+
+pub fn set_term_ansi(ansi: [u32; 16]) {
+    *TERM_ANSI.write().unwrap_or_else(|e| e.into_inner()) = ansi;
+}
+
+/// The `[terminal_colors]` in use.
+pub fn term() -> TermColors {
+    *TERM_COLORS.read().unwrap_or_else(|e| e.into_inner())
+}
+
+pub fn set_term(colors: TermColors) {
+    *TERM_COLORS.write().unwrap_or_else(|e| e.into_inner()) = colors;
+}
 
 /// The colours in use.
 // Shared text sizes, paddings and spacings for the screens that use them (values are the ones the screens had before).
@@ -573,6 +668,42 @@ pub fn key_hints_tip<'a, M: 'a>(label: &'a str, hints: &[Hint]) -> iced::Element
         .spacing(4);
     iced::widget::tooltip(mark, container(lines).padding([6, 8]).style(drag_label), iced::widget::tooltip::Position::Top)
         .into()
+}
+
+/// `key_hints_tip` for keys known at runtime (from the keymap): a "(?) `label`" marker whose tooltip lists
+/// `hints`, one pair per line; a pair without keys is a section heading.
+pub fn key_hints_tip_owned<'a, M: 'a>(label: &'a str, hints: &[HintOwned]) -> iced::Element<'a, M> {
+    use iced::widget::text::Wrapping;
+    let colors = c();
+    let mut lines = iced::widget::Column::new().spacing(4);
+    for (i, h) in hints.iter().enumerate() {
+        if h.keys.is_empty() {
+            let title = iced::widget::text(h.action.clone()).size(SIZE_SMALL).color(colors.accent).wrapping(Wrapping::None);
+            lines = lines.push(container(title).padding(iced::Padding { top: if i == 0 { 0.0 } else { 4.0 }, ..Default::default() }));
+            continue;
+        }
+        let mut line = iced::widget::Row::new().spacing(4).align_y(iced::Alignment::Center);
+        for k in &h.keys {
+            line = line.push(chip::<M>(k.clone(), colors, colors.panel, [0, 3]));
+        }
+        let action = iced::widget::text(h.action.clone()).size(SIZE_SMALL).color(colors.text).wrapping(Wrapping::None);
+        lines = lines.push(line.push(action));
+    }
+    let mark = iced::widget::Row::new()
+        .push(iced::widget::text("(?)").size(SIZE_SMALL).color(colors.accent).wrapping(Wrapping::None))
+        .push(iced::widget::text(label).size(SIZE_SMALL).color(colors.muted).wrapping(Wrapping::None))
+        .spacing(4);
+    iced::widget::tooltip(mark, container(lines).padding([6, 8]).style(tip_dark), iced::widget::tooltip::Position::Top)
+        .into()
+}
+
+/// `drag_label` with a darker background, for long tooltips: halfway from the
+/// cursor colour to the window background on dark themes, a little darker on light ones.
+fn tip_dark(theme: &Theme) -> container::Style {
+    let colors = c();
+    let dark = 0.2126 * colors.bg.r + 0.7152 * colors.bg.g + 0.0722 * colors.bg.b < 0.5;
+    let bg = if dark { mix(colors.cursor, colors.bg, 0.5) } else { mix(colors.cursor, Color::BLACK, 0.12) };
+    container::Style { background: Some(Background::Color(bg)), ..drag_label(theme) }
 }
 
 /// The hint pairs for narrow places (sidebars): small chips without pills, wrapped onto up to three lines of

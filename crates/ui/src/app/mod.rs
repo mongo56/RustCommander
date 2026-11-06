@@ -237,6 +237,8 @@ pub struct App {
     /// Built-in terminals (F9), running whether shown or not; `Screen::Term`
     /// names the one shown.
     terms: Vec<term::TermSession>,
+    /// The terminals' blink cycle.
+    term_blink: term::Blink,
     /// The sidebar's entries: each holds one or more of `terms` in split panes.
     term_tabs: Vec<term::TermTab>,
     next_term_id: u64,
@@ -719,6 +721,7 @@ impl App {
             focus_new: None,
             disk_usage_last: None,
             terms: Vec::new(),
+            term_blink: term::Blink::default(),
             term_tabs: Vec::new(),
             next_term_id: 1,
             term_last: None,
@@ -848,6 +851,7 @@ impl App {
         subs.extend(self.terms.iter().map(term::TermSession::events));
         // Their shells' folders and programs, for the sidebar.
         subs.extend(term::poll_info(&self.terms));
+        subs.extend(self.blink_ticks());
         Subscription::batch(subs)
     }
 
@@ -3629,6 +3633,7 @@ impl App {
         let config = crate::config::load()?;
         let keymap = keymap::Keymap::new(&config.keys).map_err(|e| format!("config.toml [keys]: {e}"))?;
         let colors = config.colors().map_err(|e| format!("config.toml: {e}"))?;
+        let term_colors = config.terminal_colors().map_err(|e| format!("config.toml: {e}"))?;
         if let Some(compare) = config.compare {
             self.compare_opts = compare.into();
         }
@@ -3640,6 +3645,9 @@ impl App {
         self.git_missing = false; // look for git again
         self.keymap = keymap;
         theme::set(colors);
+        theme::set_term(term_colors);
+        theme::set_term_ansi(theme::preset(&self.config.theme).map_or(theme::TERM_DARK_ANSI, |p| p.ansi));
+        self.refresh_terms();
         Ok(())
     }
 

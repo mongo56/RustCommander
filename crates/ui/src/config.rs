@@ -53,6 +53,9 @@ pub struct Config {
     /// (wgpu): the window opens much sooner. Off unless set to true. Read
     /// once at startup.
     pub software_rendering: bool,
+    /// The built-in terminal's cursor blinks (unless a program asks for a
+    /// steady one).
+    pub terminal_cursor_blink: bool,
     /// Edge of the thumbnail view's pictures in pixels (Ctrl+Shift+F5);
     /// 0 = the default, see [`Config::thumbnail_size`].
     pub thumbnail_size: u32,
@@ -61,6 +64,8 @@ pub struct Config {
     pub keys: BTreeMap<String, String>,
     /// Colour overrides: name (see `theme::NAMES`) -> `#rrggbb`.
     pub colors: BTreeMap<String, String>,
+    /// Built-in terminal colours: name (see `theme::TERM_NAMES`) -> `#rrggbb`.
+    pub terminal_colors: BTreeMap<String, String>,
     /// Compare-folders options (Ctrl+Shift+F2); `None` = no `[compare]`
     /// table (older files kept them in `session.toml`).
     pub compare: Option<CompareState>,
@@ -143,9 +148,11 @@ impl Default for Config {
             hotlist_tree: false,
             check_updates_at_startup: false,
             software_rendering: false,
+            terminal_cursor_blink: true,
             thumbnail_size: 0,
             keys: BTreeMap::new(),
             colors: BTreeMap::new(),
+            terminal_colors: BTreeMap::new(),
             compare: None,
             sync: None,
             user_commands: Vec::new(),
@@ -236,6 +243,11 @@ impl Config {
         let preset = crate::theme::preset(&self.theme).ok_or_else(|| format!("unknown theme \"{}\"", self.theme))?;
         preset.colors.with(&self.colors).map_err(|e| format!("[colors]: {e}"))
     }
+
+    /// `[terminal_colors]`, parsed.
+    pub fn terminal_colors(&self) -> Result<crate::theme::TermColors, String> {
+        crate::theme::term_colors(&self.terminal_colors).map_err(|e| format!("[terminal_colors]: {e}"))
+    }
 }
 
 fn builtin_shell_or_default(
@@ -274,6 +286,8 @@ pub enum Edit {
     Key(crate::keymap::KeyEdit),
     /// A `[colors]` entry: `Some("#rrggbb")` sets it, `None` drops it.
     Color(String, Option<String>),
+    /// A `[terminal_colors]` entry: `Some("#rrggbb")` sets it, `None` drops it.
+    TermColor(String, Option<String>),
     /// Drops every `[colors]` entry (a theme was picked).
     ClearColors,
     /// Sets the three `[compare]` switches.
@@ -372,6 +386,10 @@ pub fn apply(text: &str, edits: &[Edit]) -> Result<String, String> {
             Edit::Color(name, value) => {
                 let same = |k: &str| k.eq_ignore_ascii_case(name);
                 change(table(&mut doc, "colors")?, same, name.clone(), value.as_deref());
+            }
+            Edit::TermColor(name, value) => {
+                let same = |k: &str| k.eq_ignore_ascii_case(name);
+                change(table(&mut doc, "terminal_colors")?, same, name.clone(), value.as_deref());
             }
             Edit::ClearColors => {
                 if let Some(colors) = doc.get_mut("colors").and_then(Item::as_table_like_mut) {
@@ -489,6 +507,12 @@ fn template(editor: &str, compare: CompareState) -> String {
         let value = crate::theme::GRUVBOX.get(name).map(crate::theme::to_hex).unwrap_or_default();
         colors.push_str(&format!("# {name} = \"{value}\"\n"));
     }
+    let mut term_colors = String::new();
+    for (i, name) in crate::theme::TERM_NAMES.iter().enumerate() {
+        let ansi = crate::theme::preset("gruvbox").map_or(crate::theme::TERM_DARK_ANSI, |p| p.ansi);
+        let value = ansi.get(i).map_or("#rrggbb".to_owned(), |v| format!("#{v:06x}"));
+        term_colors.push_str(&format!("# {name} = \"{value}\"\n"));
+    }
     format!(
         "# RustCommander settings. Changes apply as soon as the file is saved.\n\
          # Ctrl+, opens this file in the editor; F10 opens the settings view, which\n\
@@ -512,6 +536,10 @@ fn template(editor: &str, compare: CompareState) -> String {
          # powershell.exe -NoLogo (elsewhere $SHELL).\n\
          # Examples: builtin_shell = 'pwsh.exe -NoLogo', builtin_shell = 'cmd.exe'\n\
          builtin_shell = \"\"\n\
+         \n\
+         # The built-in terminal's cursor blinks (false = steady). Programs that ask\n\
+         # for a steady cursor get one either way.\n\
+         terminal_cursor_blink = true\n\
          \n\
          # Show hidden and system files at the first start (Ctrl+H toggles them per tab).\n\
          show_hidden = false\n\
@@ -590,7 +618,13 @@ fn template(editor: &str, compare: CompareState) -> String {
          \n\
          # Colours as \"#rrggbb\"; the values below are the gruvbox theme's.\n\
          [colors]\n\
-         {colors}"
+         {colors}\
+         \n\
+         # Colours of the built-in terminal (F9) as \"#rrggbb\". Missing ones follow the\n\
+         # theme: its own 16 colours (the gruvbox ones below), its text as foreground\n\
+         # and cursor, and its file list background.\n\
+         [terminal_colors]\n\
+         {term_colors}"
     )
 }
 

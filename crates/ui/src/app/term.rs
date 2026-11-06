@@ -19,15 +19,16 @@ use crate::theme::{filled, HintOwned};
 use alacritty_terminal::event::{Event as TermEvent, EventListener, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg, State};
 use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Column as GridColumn, Line, Point as GridPoint, Side};
+use alacritty_terminal::index::{Boundary, Column as GridColumn, Direction, Line, Point as GridPoint, Side};
 use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::color::Colors as TermColors;
+use alacritty_terminal::term::search::RegexSearch;
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{Config as TermConfig, Term, TermMode};
 use alacritty_terminal::tty::{self, Pty, Shell};
-use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor, Rgb};
+use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, CursorStyle, NamedColor, Rgb};
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::text::Renderer as _;
 use iced::advanced::widget::{Tree, Widget};
@@ -65,6 +66,70 @@ const POLL: Duration = Duration::from_secs(1);
 const HISTORY: usize = 10_000;
 /// Redraws happen at most this often (output arriving faster is coalesced).
 const FRAME: Duration = Duration::from_millis(16);
+/// Half a blink cycle of the cursor and blinking text.
+const BLINK: Duration = Duration::from_millis(530);
+
+/// A terminal's scrollback find bar.
+#[derive(Debug, Default)]
+struct Find {
+    text: String,
+    /// The text isn't in the scrollback.
+    missing: bool,
+}
+
+/// `text` as a regex that matches it literally.
+fn regex_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if "\\.+*?()|[]{}^$#&-~".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Looks for `text` in the grid and its history: `older` `None` from the
+/// current match (the selection; the bottom of the grid without one)
+/// including it, else the next match older (`Some(true)`) or newer than it.
+/// The match becomes the selection and is scrolled into view; the search
+/// wraps around. False: no match.
+fn search<T: EventListener>(term: &mut Term<T>, text: &str, older: Option<bool>) -> bool {
+    let Ok(mut regex) = RegexSearch::new(&regex_escape(text)) else { return false };
+    let current = term.selection.as_ref().and_then(|s| s.to_range(term)).map(|r| r.start);
+    let bottom = GridPoint::new(Line(term.screen_lines() as i32 - 1), term.last_column());
+    let (origin, direction) = match (current, older) {
+        (None, _) => (bottom, Direction::Left),
+        (Some(start), None) => (start, Direction::Left),
+        (Some(start), Some(true)) => (start.sub(term, Boundary::None, 1), Direction::Left),
+        (Some(start), Some(false)) => (start.add(term, Boundary::None, 1), Direction::Right),
+    };
+    let Some(m) = term.search_next(&mut regex, origin, direction, Side::Left, None) else { return false };
+    let mut selection = Selection::new(SelectionType::Simple, *m.start(), Side::Left);
+    selection.update(*m.end(), Side::Right);
+    term.selection = Some(selection);
+    term.scroll_to_point(*m.start());
+    true
+}
+
+fn find_input_id() -> iced::widget::text_input::Id {
+    iced::widget::text_input::Id::new("terminal-find")
+}
+
+/// The blink cycle shared by the terminals.
+#[derive(Debug)]
+pub(super) struct Blink {
+    /// In the "off" half.
+    off: bool,
+    /// The last key typed: the cursor stays on for `BLINK` after it.
+    input: Instant,
+}
+
+impl Default for Blink {
+    fn default() -> Self {
+        Blink { off: false, input: Instant::now() }
+    }
+}
 
 /// The advance of "0" and the baseline (from the top of the line) of `font` at
 /// the grid's size and line height.
@@ -178,6 +243,10 @@ pub enum TermMsg {
     SendPending(u64),
     /// Whether terminal `id`'s busy title went steady (`Activity::check`).
     IdleCheck(u64),
+    /// The find bar's text of terminal `id` changed.
+    FindInput(u64, String),
+    /// The blink cycle's next half (`blink_ticks`).
+    Blink,
 }
 
 /// What the mouse did in the grid; cells are viewport positions.
@@ -282,6 +351,8 @@ pub(super) struct TermSession {
     exit_code: Option<i32>,
     /// What the widget draws; rebuilt on output while shown.
     frame: Frame,
+    /// The scrollback find bar (Ctrl+Shift+F), while open.
+    find: Option<Find>,
     /// A line to type once the shell shows its prompt (running a script,
     /// `App::run_script`); sent once.
     pending: Option<String>,
@@ -329,7 +400,9 @@ impl TermSession {
         let pid = pty.child_watcher().pid().map(|p| p.get());
         #[cfg(not(windows))]
         let pid = None;
-        let config = TermConfig { scrolling_history: HISTORY, ..TermConfig::default() };
+        // A blinking block by default, like most terminals; programs can ask for another.
+        let default_cursor_style = CursorStyle { shape: CursorShape::Block, blinking: true };
+        let config = TermConfig { scrolling_history: HISTORY, default_cursor_style, ..TermConfig::default() };
         let term = Arc::new(FairMutex::new(Term::new(config, &TermSize::new(cols, lines), proxy.clone())));
         let event_loop = EventLoop::new(term.clone(), proxy, pty, true, false)?;
         let chan = event_loop.channel();
@@ -348,6 +421,7 @@ impl TermSession {
             pid,
             exit_code: None,
             frame: Frame::default(),
+            find: None,
             pending: None,
             wheel_rest: 0,
             reported: None,
@@ -399,6 +473,20 @@ impl TermSession {
         let text = selection_text(&term)?;
         let text = if one_line { join_lines(&text) } else { text };
         Some(text).filter(|s| !s.is_empty())
+    }
+
+    /// Looks for the find bar's text: `None` from the current match (the
+    /// selection; the bottom of the grid without one) including it, else the
+    /// next match older (`Some(true)`) or newer than it. The match becomes
+    /// the selection and is scrolled into view; the search wraps around.
+    fn find(&mut self, older: Option<bool>) {
+        let Some(find) = &mut self.find else { return };
+        find.missing = false;
+        if find.text.is_empty() {
+            return;
+        }
+        find.missing = !search(&mut self.term.lock(), &find.text, older);
+        self.refresh();
     }
 
     /// Scrolls the view and redraws it.
@@ -859,6 +947,73 @@ fn switch_hints(prev: Option<String>, next: Option<String>, new: Option<String>)
     }
 }
 
+/// `keys` for the four arrow directions (Left, Right, Up, Down) of one
+/// command family: `Alt+Shift+arrows` when they share their modifiers, else
+/// the keys there are.
+fn arrow_keys(keys: [Option<String>; 4]) -> Vec<String> {
+    let parts: Vec<Option<(&str, &str)>> = keys.iter().map(|k| k.as_deref().and_then(|k| k.rsplit_once('+'))).collect();
+    if let [Some((m, "Left")), Some((m2, "Right")), Some((m3, "Up")), Some((m4, "Down"))] = parts[..] {
+        if m == m2 && m == m3 && m == m4 {
+            return vec![format!("{m}+arrows")];
+        }
+    }
+    keys.into_iter().flatten().collect()
+}
+
+/// What the terminal footer's "(?)" lists: the keys of the terminal
+/// commands (`key`: a command's first key) and the terminal's own keys.
+fn term_key_tip(key: &dyn Fn(Command) -> Option<String>) -> Vec<HintOwned> {
+    let mut tip = vec![HintOwned::new(Vec::<String>::new(), "Terminals")];
+    let add = |tip: &mut Vec<HintOwned>, keys: Vec<String>, action: &str| {
+        if !keys.is_empty() {
+            tip.push(HintOwned::new(keys, action));
+        }
+    };
+    add(&mut tip, key(Command::ToggleTerminal).into_iter().collect(), "back to the panels");
+    add(&mut tip, [Command::NextTab, Command::PrevTab].into_iter().filter_map(key).collect(), "next / previous terminal");
+    let switch = switch_hints(key(Command::PrevTerminal), key(Command::NextTerminal), None);
+    if let Some(h) = switch.into_iter().find(|h| !h.keys.is_empty()) {
+        add(&mut tip, h.keys, "next / previous sidebar entry (Files too)");
+    }
+    add(&mut tip, key(Command::NewTerminal).into_iter().collect(), "new terminal");
+    add(&mut tip, key(Command::CloseTerminal).into_iter().collect(), "close the terminal");
+    add(&mut tip, key(Command::TerminalFolderToPanel).into_iter().collect(), "its folder in the active panel");
+    add(&mut tip, key(Command::Configuration).into_iter().collect(), "settings (Esc comes back here)");
+    tip.push(HintOwned::new(Vec::<String>::new(), "Split panes"));
+    add(&mut tip, key(Command::SplitTerminalRight).into_iter().collect(), "split: new shell to the right");
+    add(&mut tip, key(Command::SplitTerminalDown).into_iter().collect(), "split: new shell below");
+    let dirs = |l, r, u, d| arrow_keys([key(l), key(r), key(u), key(d)]);
+    use Command as C;
+    add(
+        &mut tip,
+        dirs(C::FocusTerminalLeft, C::FocusTerminalRight, C::FocusTerminalUp, C::FocusTerminalDown),
+        "focus the pane in that direction",
+    );
+    add(
+        &mut tip,
+        dirs(C::MoveTerminalLeft, C::MoveTerminalRight, C::MoveTerminalUp, C::MoveTerminalDown),
+        "move the pane (swap, or to that edge)",
+    );
+    add(&mut tip, key(Command::ZoomTerminalPane).into_iter().collect(), "zoom the pane / all panes");
+    let fixed = |keys: &[&str], action: &str| HintOwned::new(keys.iter().map(|k| k.to_string()), action);
+    tip.extend([
+        HintOwned::new(Vec::<String>::new(), "Scrollback"),
+        fixed(&["Ctrl+Shift+F"], "find text in the scrollback"),
+        fixed(&["Enter", "Up"], "find: older match"),
+        fixed(&["Shift+Enter", "Down"], "find: newer match"),
+        fixed(&["Esc"], "find: close"),
+        fixed(&["Shift+PgUp", "Shift+PgDn"], "scroll a page"),
+        fixed(&["Shift+Home", "Shift+End"], "top / bottom"),
+        fixed(&["Shift+wheel"], "scroll (also in programs that use the mouse)"),
+        HintOwned::new(Vec::<String>::new(), "Clipboard"),
+        fixed(&["Ctrl+Shift+C", "Ctrl+Ins"], "copy the selection"),
+        fixed(&["Ctrl+Shift+J"], "copy as one line"),
+        fixed(&["Ctrl+Shift+V", "Shift+Ins"], "paste"),
+        fixed(&["Shift+Right-click"], "copy as one line, or paste"),
+    ]);
+    tip
+}
+
 /// `switch_hints` as one line of text (`Ctrl+Shift+Up/Down: switch \u{b7} Ctrl+Shift+T: new`).
 #[cfg(test)]
 fn switch_tip(prev: Option<String>, next: Option<String>, new: Option<String>) -> String {
@@ -912,6 +1067,35 @@ fn prompt_dir(term: &Term<Proxy>) -> Option<PathBuf> {
 /// folder it is in and the program it runs, sent as `TermMsg::Info` when
 /// they change. Restarts when the set of terminals changes; none while no
 /// terminal runs.
+impl App {
+    /// Ticks of the blink cycle while the focused terminal's cursor blinks
+    /// (`terminal_cursor_blink`, and the program didn't ask for a steady one).
+    pub(super) fn blink_ticks(&self) -> Option<Subscription<Message>> {
+        let &id = self.screen.term()?;
+        if !self.focused {
+            return None;
+        }
+        let frame = &self.term(id)?.frame;
+        if !(self.config.terminal_cursor_blink && frame.cursor_blinks && frame.cursor.is_some()) {
+            return None;
+        }
+        Some(Subscription::run_with_id(
+            "terminal-blink",
+            iced::stream::channel(1, |mut output| async move {
+                std::thread::spawn(move || loop {
+                    std::thread::sleep(BLINK);
+                    if let Err(e) = output.try_send(Message::Term(TermMsg::Blink)) {
+                        if e.is_disconnected() {
+                            return;
+                        }
+                    }
+                });
+                std::future::pending::<()>().await
+            }),
+        ))
+    }
+}
+
 pub(super) fn poll_info(terms: &[TermSession]) -> Option<Subscription<Message>> {
     let shells: Vec<Polled> =
         terms.iter().filter_map(|t| Some((t.id, t.pid?, t.term.clone(), t.dir.clone()))).collect();
@@ -976,16 +1160,7 @@ struct Palette {
     cursor: Color,
 }
 
-/// Windows Terminal's "Campbell" scheme.
-const DARK_ANSI: [u32; 16] = [
-    0x0c0c0c, 0xc50f1f, 0x13a10e, 0xc19c00, 0x0037da, 0x881798, 0x3a96dd, 0xcccccc, 0x767676, 0xe74856, 0x16c60c,
-    0xf9f1a5, 0x3b78ff, 0xb4009e, 0x61d6d6, 0xf2f2f2,
-];
-/// "One Half Light".
-const LIGHT_ANSI: [u32; 16] = [
-    0x383a42, 0xe45649, 0x50a14f, 0xc18401, 0x0184bc, 0xa626a4, 0x0997b3, 0xfafafa, 0x4f525d, 0xdf6c75, 0x98c379,
-    0xe4c07a, 0x61afef, 0xc577dd, 0x56b5c1, 0xffffff,
-];
+use theme::{TERM_DARK_ANSI as DARK_ANSI, TERM_LIGHT_ANSI as LIGHT_ANSI};
 
 fn hex(v: u32) -> Color {
     Color::from_rgb8((v >> 16) as u8, (v >> 8) as u8, v as u8)
@@ -1016,8 +1191,31 @@ impl Palette {
     }
 
     fn from_theme() -> Palette {
+        Palette::theme_base().with(&theme::term())
+    }
+
+    /// The theme's colours without `[terminal_colors]`: its text, file list
+    /// background and ANSI set (`Preset::ansi`).
+    fn theme_base() -> Palette {
         let c = theme::c();
-        Palette::new(c.panel, c.text)
+        Palette { ansi: theme::term_ansi().map(hex), ..Palette::new(c.panel, c.text) }
+    }
+
+    /// With the `[terminal_colors]` overrides: a background override that
+    /// turns dark into light (or back) brings the generic set for it, then
+    /// single colours replace its entries.
+    fn with(self, o: &theme::TermColors) -> Palette {
+        let fg = o[16].unwrap_or(self.fg);
+        let bg = o[17].unwrap_or(self.bg);
+        let flipped = (luminance(bg) > 0.5) != (luminance(self.bg) > 0.5);
+        let mut pal = if flipped { Palette::new(bg, fg) } else { Palette { bg, fg, ..self } };
+        for (slot, color) in pal.ansi.iter_mut().zip(o) {
+            if let Some(color) = color {
+                *slot = *color;
+            }
+        }
+        pal.cursor = o[18].unwrap_or(fg);
+        pal
     }
 
     /// Colour `index` (0-255 the indexed colours, 256 and up `NamedColor`s)
@@ -1059,6 +1257,22 @@ impl Palette {
     }
 }
 
+/// Colour `j` of `theme::TERM_NAMES` the built-in terminal draws with now;
+/// `default`: what it would be without its own `[terminal_colors]` entry.
+pub(super) fn term_color(j: usize, default: bool) -> Color {
+    let mut o = theme::term();
+    if default {
+        o[j] = None;
+    }
+    let pal = Palette::theme_base().with(&o);
+    match j {
+        0..=15 => pal.ansi[j],
+        16 => pal.fg,
+        17 => pal.bg,
+        _ => pal.cursor,
+    }
+}
+
 /// What the grid widget draws, built from the terminal under its lock
 /// (the lock is not held while drawing). Coordinates are in cells.
 #[derive(Debug, Default)]
@@ -1078,6 +1292,9 @@ struct Frame {
     /// The program asked for every mouse move (1003): the grid reports
     /// moves with no button down too (`Mouse::Hover`).
     hover: bool,
+    /// The cursor blinks: the default, unless the program asked for a
+    /// steady one (DECSCUSR, DECRST 12).
+    cursor_blinks: bool,
 }
 
 /// Text of one style on one line, starting at a cell.
@@ -1202,6 +1419,7 @@ impl Frame {
             history: term.history_size(),
             offset: content.display_offset,
             hover: term.mode().contains(TermMode::MOUSE_MOTION),
+            cursor_blinks: term.cursor_style().blinking,
             ..Frame::default()
         };
         let cursor_point = content.cursor.point;
@@ -1321,6 +1539,8 @@ struct Grid<'a> {
     frame: &'a Frame,
     /// The window has focus (else the cursor is drawn hollow).
     focused: bool,
+    /// The cursor is left out (blinking, in its "off" half).
+    cursor_off: bool,
 }
 
 impl Grid<'_> {
@@ -1561,7 +1781,7 @@ impl Widget<Message, Theme, iced::Renderer> for Grid<'_> {
                 fill(renderer, cell_rect(origin, line, col, cells), color);
             }
         }
-        let Some(c) = &f.cursor else { return };
+        let Some(c) = f.cursor.as_ref().filter(|_| !self.cursor_off) else { return };
         let r = cell_rect(origin, c.line, c.col, c.cells);
         match c.shape {
             CursorShape::Block if self.focused => {
@@ -1850,7 +2070,9 @@ impl App {
         ("Alt+Shift+arrows (cm_FocusTerminalLeft/Right/Up/Down)", "Move the keyboard focus to the split pane in that direction (or click a pane)"),
         ("Ctrl+Alt+Shift+arrows (cm_MoveTerminalLeft/Right/Up/Down)", "Rearrange split panes: the focused pane swaps places with the one in that direction, or, with none there, moves to that edge (side by side becomes stacked and back)"),
         ("Ctrl+Shift+Z (cm_ZoomTerminalPane)", "Show the focused split pane alone, or all panes again"),
+        ("F10 (cm_Configuration)", "Settings; closing them comes back to the terminal (F10 doesn't reach programs in the terminal; bind cm_Configuration to another key in [keys] if one needs it)"),
         ("cm_TerminalFolderToPanel (no key by default)", "Active panel goes to the terminal's current folder and Files is shown"),
+        ("Ctrl+Shift+F", "Find text in the scrollback: typing finds the newest match, Enter / Up the next older one, Shift+Enter / Down the next newer one (wraps around); the match is selected (Ctrl+Shift+C copies it). Case-insensitive unless the text has capitals; Esc closes"),
         ("Ctrl+Shift+C or Ctrl+Insert", "Copy the selected text (select with the mouse: drag, double-click a word, triple-click a line)"),
         ("Ctrl+Shift+J", "Copy the selected text as one line: line breaks and the indentation after them removed (paths, URLs, commands a program wrapped)"),
         ("Right-click", "Copies the selection and clears it; with no selection pastes the clipboard"),
@@ -1868,6 +2090,16 @@ impl App {
 
     fn term_mut(&mut self, id: u64) -> Option<&mut TermSession> {
         self.terms.iter_mut().find(|t| t.id == id)
+    }
+
+    /// Redraws the shown terminals with the current colours (hidden ones
+    /// rebuild when shown).
+    pub(super) fn refresh_terms(&mut self) {
+        for t in &mut self.terms {
+            if t.visible.load(Ordering::Acquire) {
+                t.refresh();
+            }
+        }
     }
 
     /// Width taken by the terminal sidebar: only over the panels and the
@@ -1950,7 +2182,7 @@ impl App {
         let id = self.next_term_id;
         self.next_term_id += 1;
         // The grid widget reports the size it really gets on the next frame.
-        let (cols, lines) = grid_size(Size::new(self.window_width - SIDE_W, self.window_height - FOOTER_H));
+        let (cols, lines) = grid_size(Size::new(self.window_width - SIDE_W, self.window_height));
         match TermSession::spawn(id, shell, dir, cols, lines) {
             Ok(session) => {
                 self.terms.push(session);
@@ -2073,7 +2305,7 @@ impl App {
 
     /// Shows the sidebar entry holding terminal `id` with `id` focused
     /// (hiding the entry shown before).
-    fn show_term(&mut self, id: u64) {
+    pub(super) fn show_term(&mut self, id: u64) {
         let Some(tab) = self.tab_of(id) else { return };
         let old = self.shown_tab();
         if old != Some(tab) {
@@ -2155,7 +2387,7 @@ impl App {
     }
 
     /// Back to the panels; the terminal keeps running.
-    fn hide_term(&mut self) {
+    pub(super) fn hide_term(&mut self) {
         if let Some(tab) = self.shown_tab() {
             self.set_tab_visible(tab, false);
         }
@@ -2385,6 +2617,18 @@ impl App {
                     t.program = info.program;
                 }
             }
+            TermMsg::FindInput(id, text) => {
+                if let Some(t) = self.term_mut(id) {
+                    if let Some(find) = &mut t.find {
+                        find.text = text;
+                    }
+                    t.find(None);
+                }
+            }
+            TermMsg::Blink => {
+                let typing = self.term_blink.input.elapsed() < BLINK;
+                self.term_blink.off = !self.term_blink.off && !typing;
+            }
             TermMsg::IdleCheck(id) => {
                 let cue = cue(id);
                 let Some(t) = self.term_mut(id) else { return Task::none() };
@@ -2497,6 +2741,8 @@ impl App {
         text: Option<&str>,
     ) -> Task<Message> {
         let Some(&id) = self.screen.term() else { return Task::none() };
+        // The cursor shows while typing.
+        self.term_blink = Blink::default();
         let reserved = [
             Command::ToggleTerminal,
             Command::NewTerminal,
@@ -2517,6 +2763,8 @@ impl App {
             Command::ZoomTerminalPane,
             Command::NextTab,
             Command::PrevTab,
+            // Settings (F10); closing them comes back here.
+            Command::Configuration,
         ];
         if let Some(cmd) = self.keymap.command(key, mods).filter(|c| reserved.contains(c)) {
             match cmd {
@@ -2534,6 +2782,40 @@ impl App {
         };
         let letter = |l: &str| matches!(key, keyboard::Key::Character(c) if c.eq_ignore_ascii_case(l));
         let (ctrl, alt, shift) = (mods.control(), mods.alt(), mods.shift());
+        if ctrl && shift && !alt && letter("f") {
+            if let Some(t) = self.term_mut(id) {
+                t.find.get_or_insert_with(Find::default);
+            }
+            return Task::batch([text_input::focus(find_input_id()), text_input::select_all(find_input_id())]);
+        }
+        if t.find.is_some() {
+            let step = match named {
+                Some(Named::Escape) => {
+                    if let Some(t) = self.term_mut(id) {
+                        t.find = None;
+                    }
+                    return Task::none();
+                }
+                Some(Named::Enter) => Some(!shift),
+                Some(Named::F3) => Some(!shift),
+                Some(Named::ArrowUp) => Some(true),
+                Some(Named::ArrowDown) => Some(false),
+                _ => None,
+            };
+            if let Some(older) = step {
+                if let Some(t) = self.term_mut(id) {
+                    t.find(Some(older));
+                }
+                return Task::none();
+            }
+            let Some(t) = self.term(id) else { return Task::none() };
+            let copy = (ctrl && shift && !alt && letter("c")) || (ctrl && !shift && !alt && named == Some(Named::Insert));
+            if copy {
+                return t.selected_text(false).map_or_else(Task::none, iced::clipboard::write);
+            }
+            // The rest is the find box's (typing) or nobody's.
+            return Task::none();
+        }
         // Keys the terminal keeps for itself (TERM_KEYS): copy, paste, scrolling.
         let copy = (ctrl && shift && !alt && letter("c")) || (ctrl && !shift && !alt && named == Some(Named::Insert));
         let copy_one_line = ctrl && shift && !alt && letter("j");
@@ -2576,39 +2858,21 @@ impl App {
         };
         let bindings = self.keymap.bindings();
         let back = keymap::Keymap::keys_for(&bindings, Command::ToggleTerminal).first().map(|k| k.to_string());
-        let key = |cmd| keymap::Keymap::keys_for(&bindings, cmd).first().map(|k| k.to_string());
-        let mut hints = switch_hints(key(Command::PrevTerminal), key(Command::NextTerminal), key(Command::NewTerminal));
-        if let Some(tab) = key(Command::NextTab) {
-            hints.insert(0, HintOwned::new([tab], "next"));
-        }
-        let split: Vec<String> =
-            [Command::SplitTerminalRight, Command::SplitTerminalDown].into_iter().filter_map(key).collect();
-        if !split.is_empty() {
-            hints.push(HintOwned::new(split, "split"));
-        }
         // The terminal area's width (the sidebar takes the rest), less the footer's padding and spacing.
         let total = self.area_width() - 20.0 - 12.0;
-        // The way back keeps its place on the right; the switching hints drop pairs from the end to make room.
-        let (back_line, back_w): (Element<'_, Message>, f32) = match back {
-            Some(key) => {
-                let (line, w) = theme::key_hints_fit::<Message>(&[HintOwned::new([key], "back")], total - 120.0);
-                (line.into(), w)
-            }
-            None => (
+        // The keys are in the sidebar's "(?)"; a footer only points out a missing way back.
+        let footer = back.is_none().then(|| {
+            row![
+                Space::with_width(Length::Fill),
                 text("Bind cm_ToggleTerminal to a key to get back to the panels")
                     .size(12)
                     .color(colors.muted)
-                    .wrapping(Wrapping::None)
-                    .into(),
-                330.0,
-            ),
-        };
-        let left = theme::key_hints_row::<Message>(&hints, total - back_w);
-        let footer = row![left, back_line]
-            .spacing(12)
+                    .wrapping(Wrapping::None),
+            ]
             .padding([2, 10])
             .align_y(iced::Alignment::Center)
-            .height(Length::Fixed(FOOTER_H));
+            .height(Length::Fixed(FOOTER_H))
+        });
         let split = tab.panes.len() > 1;
         let focus = tab.focus;
         let panes = pane_grid(&tab.panes, move |pane, &tid, zoomed| {
@@ -2618,7 +2882,42 @@ impl App {
         })
         .spacing(PANE_GAP)
         .on_resize(PANE_GRAB, |e| Message::Term(TermMsg::PaneResize(e)));
-        container(column![panes, footer])
+        let mut body = column![panes];
+        if let Some(find) = &t.find {
+            let status: Element<'_, Message> = if find.missing {
+                text("not found").size(12).color(colors.error).into()
+            } else {
+                theme::key_hints_row::<Message>(
+                    &[
+                        HintOwned::new(["Enter"], "older"),
+                        HintOwned::new(["Shift+Enter"], "newer"),
+                        HintOwned::new(["Esc"], "close"),
+                    ],
+                    total - 320.0,
+                )
+            };
+            body = body.push(
+                container(
+                    row![
+                        text("Find:").size(13),
+                        text_input("text in the scrollback", &find.text)
+                            .id(find_input_id())
+                            .on_input(move |s| Message::Term(TermMsg::FindInput(id, s)))
+                            .padding(4)
+                            .size(13)
+                            .width(Length::Fixed(260.0))
+                            .style(theme::input),
+                        status,
+                    ]
+                    .spacing(8)
+                    .align_y(iced::Alignment::Center),
+                )
+                .padding([3, 10])
+                .width(Length::Fill)
+                .style(filled(colors.header)),
+            );
+        }
+        container(body.push_maybe(footer))
             .width(Length::Fill)
             .height(Length::Fill)
             .style(filled(t.frame.bg))
@@ -2630,7 +2929,9 @@ impl App {
     fn term_pane(&self, id: u64, focus: bool, frame: Option<bool>) -> Element<'_, Message> {
         let Some(t) = self.term(id) else { return Space::new(Length::Fill, Length::Fill).into() };
         // An unfocused pane draws its cursor hollow, like an unfocused window.
-        let grid = Element::new(Grid { id, frame: &t.frame, focused: self.focused && focus });
+        let focused = self.focused && focus;
+        let cursor_off = self.term_blink.off && focused && t.frame.cursor_blinks && self.config.terminal_cursor_blink;
+        let grid = Element::new(Grid { id, frame: &t.frame, focused, cursor_off });
         // The bar's position is the history line at the top of the view.
         let (history, offset, lines) = (t.frame.history, t.frame.offset, t.frame.lines);
         let grid = crate::scrollbar::attach(
@@ -2853,7 +3154,15 @@ impl App {
                 .push(new_button),
         );
         let line = container(Space::new(Length::Fixed(1.0), Length::Fill)).style(filled(c.border));
-        row![line, container(list).padding(4).width(Length::Fill).height(Length::Fill).style(filled(c.bg))]
+        // Over a terminal: the "(?)" with every terminal key at the bottom.
+        let mut side = Column::new().push(container(list).height(Length::Fill));
+        if !collapsed {
+            let bindings = self.keymap.bindings();
+            let key = |cmd| keymap::Keymap::keys_for(&bindings, cmd).first().map(|k| k.to_string());
+            let tip = theme::key_hints_tip_owned::<Message>("keys", &term_key_tip(&key));
+            side = side.push(container(tip).width(Length::Fill).align_x(alignment::Horizontal::Center).padding([2, 4]));
+        }
+        row![line, container(side).padding(4).width(Length::Fill).height(Length::Fill).style(filled(c.bg))]
             .width(Length::Fixed(self.term_side_w()))
             .height(Length::Fill)
             .into()
@@ -3013,6 +3322,55 @@ mod tests {
 
     fn ch(c: &str, m: M, text: Option<&str>) -> Option<Vec<u8>> {
         key_bytes(&Key::Character(c.into()), m, text, false)
+    }
+
+    #[test]
+    fn key_tip_lists_bound_keys() {
+        let k = |s: &str| Some(s.to_owned());
+        let same = [k("Alt+Shift+Left"), k("Alt+Shift+Right"), k("Alt+Shift+Up"), k("Alt+Shift+Down")];
+        assert_eq!(arrow_keys(same), ["Alt+Shift+arrows"]);
+        assert_eq!(arrow_keys([k("Ctrl+Left"), None, k("Alt+Up"), None]), ["Ctrl+Left", "Alt+Up"]);
+        let keymap = keymap::Keymap::new(&Default::default()).unwrap();
+        let bindings = keymap.bindings();
+        let key = |cmd| keymap::Keymap::keys_for(&bindings, cmd).first().map(|k| k.to_string());
+        let tip = term_key_tip(&key);
+        let find = |action: &str| tip.iter().find(|h| h.action == action).map(|h| h.keys.clone());
+        assert_eq!(find("move the pane (swap, or to that edge)").unwrap(), ["Ctrl+Alt+Shift+arrows"]);
+        assert_eq!(find("find text in the scrollback").unwrap(), ["Ctrl+Shift+F"]);
+        assert!(find("back to the panels").is_some());
+    }
+
+    #[test]
+    fn scrollback_search() {
+        assert_eq!(regex_escape("a.b*(c)"), "a\\.b\\*\\(c\\)");
+        // 30 lines on a 5-line grid: most are in the history.
+        let text: String = (0..30).map(|i| format!("line {i} x.y\r\n")).collect();
+        let mut term = small_term(20, 5, &text);
+        let found = |term: &Term<Proxy>| {
+            let r = term.selection.as_ref().and_then(|s| s.to_range(term)).unwrap();
+            (r.start.line.0, r.start.column.0, r.end.column.0)
+        };
+        // The newest match first; the last line written is the empty prompt line.
+        assert!(search(&mut term, "x.y", None));
+        let newest = found(&term);
+        assert_eq!((newest.1, newest.2), (8, 10));
+        // Older goes up a line, into the history, and scrolls there.
+        assert!(search(&mut term, "x.y", Some(true)));
+        assert_eq!(found(&term).0, newest.0 - 1);
+        // Case-insensitive for lower-case text; refining keeps the match.
+        term.selection = None;
+        assert!(search(&mut term, "line 1", None));
+        let (line, col, _) = found(&term);
+        assert_eq!(col, 0);
+        assert!(search(&mut term, "line 1", Some(true)));
+        assert!(found(&term).0 < line);
+        assert!(search(&mut term, "line 1", Some(false)));
+        assert_eq!(found(&term).0, line);
+        assert!(term.grid().display_offset() > 0);
+        // A literal dot: "x.y" matches, "xzy" doesn't; capitals make it case-sensitive.
+        assert!(!search(&mut term, "xzy", None));
+        assert!(!search(&mut term, "X.Y", None));
+        assert!(search(&mut term, "x.y", None));
     }
 
     fn small_term(cols: usize, lines: usize, input: &str) -> Term<Proxy> {
@@ -3321,6 +3679,35 @@ mod tests {
         assert_eq!(ch("x", M::CTRL | M::ALT, None).unwrap(), b"\x1b\x18");
         // AltGr (Ctrl+Alt) types `@` on many layouts.
         assert_eq!(ch("v", M::CTRL | M::ALT, Some("@")).unwrap(), b"@");
+    }
+
+    #[test]
+    fn terminal_colors_config() {
+        let map = |pairs: &[(&str, &str)]| -> std::collections::BTreeMap<String, String> {
+            pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        };
+        let rgb8 = |c: Color| c.into_rgba8();
+        let o = theme::term_colors(&map(&[("Red", "#102030"), ("background", "#ffffff"), ("cursor", "00ff00")])).unwrap();
+        let pal = Palette::new(Color::BLACK, Color::WHITE).with(&o);
+        assert_eq!(rgb8(pal.color(1)), [0x10, 0x20, 0x30, 0xff]);
+        // A light background picks the light set for the others.
+        assert_eq!(rgb8(pal.color(2)), [0x50, 0xa1, 0x4f, 0xff]);
+        assert_eq!(rgb8(pal.bg), [0xff, 0xff, 0xff, 0xff]);
+        assert_eq!(rgb8(pal.cursor), [0, 0xff, 0, 0xff]);
+        assert_eq!(pal.fg, Color::WHITE);
+        // A theme's own set is kept under overrides that don't flip dark / light.
+        let gruvbox = theme::preset("gruvbox").unwrap();
+        let themed = Palette { ansi: gruvbox.ansi.map(hex), ..Palette::new(gruvbox.colors.panel, gruvbox.colors.text) };
+        let o = theme::term_colors(&map(&[("background", "#101010"), ("blue", "#0000ff")])).unwrap();
+        let pal = themed.with(&o);
+        assert_eq!(rgb8(pal.color(1)), [0xcc, 0x24, 0x1d, 0xff]);
+        assert_eq!(rgb8(pal.color(4)), [0, 0, 0xff, 0xff]);
+        assert!(theme::PRESETS.iter().all(|p| p.ansi[0] != p.ansi[15]));
+        // Nothing set: the defaults.
+        let plain = Palette::new(Color::BLACK, Color::WHITE).with(&[None; 19]);
+        assert_eq!(rgb8(plain.color(1)), [0xc5, 0x0f, 0x1f, 0xff]);
+        assert!(theme::term_colors(&map(&[("pink", "#000000")])).unwrap_err().contains("pink"));
+        assert!(theme::term_colors(&map(&[("red", "red")])).unwrap_err().contains("red"));
     }
 
     #[test]

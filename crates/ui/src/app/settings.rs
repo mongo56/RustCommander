@@ -87,7 +87,30 @@ fn general_matches(query: &str, row: usize) -> bool {
     matches(query, &[label, about, TEXT_SUMMARY.get(row).copied().unwrap_or("")])
 }
 
-/// Whether Colours row `row` (0 the theme, then `theme::NAMES` + 1) matches the filter:
+/// Colours on the Colours page: the app's (`theme::NAMES`), then the built-in
+/// terminal's (`theme::TERM_NAMES`, from index `APP_COLORS`).
+const APP_COLORS: usize = theme::NAMES.len();
+const COLOR_ROWS: usize = APP_COLORS + theme::TERM_NAMES.len();
+
+fn color_name(i: usize) -> &'static str {
+    if i < APP_COLORS { theme::NAMES[i] } else { theme::TERM_NAMES[i - APP_COLORS] }
+}
+
+fn color_purpose(i: usize) -> &'static str {
+    if i < APP_COLORS { theme::PURPOSES.get(i).copied().unwrap_or("") } else { theme::TERM_PURPOSES[i - APP_COLORS] }
+}
+
+/// Colour `i` in use now.
+fn color_value(i: usize) -> iced::Color {
+    if i < APP_COLORS {
+        let c = theme::c();
+        c.get(theme::NAMES[i]).unwrap_or(c.text)
+    } else {
+        super::term::term_color(i - APP_COLORS, false)
+    }
+}
+
+/// Whether Colours row `row` (0 the theme, then colour + 1) matches the filter:
 /// the colour's name and purpose, or for the theme row "Theme" and the theme names.
 fn colors_matches(query: &str, row: usize) -> bool {
     if row == 0 {
@@ -95,7 +118,7 @@ fn colors_matches(query: &str, row: usize) -> bool {
         hay.extend(theme::PRESETS.iter().map(|p| p.name));
         return matches(query, &hay);
     }
-    matches(query, &[theme::NAMES[row - 1], theme::PURPOSES.get(row - 1).copied().unwrap_or("")])
+    matches(query, &[color_name(row - 1), color_purpose(row - 1)])
 }
 
 /// The rows of `page` the filter `query` lets through, in order: `ROW_*` on General, 0 (theme)
@@ -104,7 +127,7 @@ fn visible_rows(page: Page, query: &str, keys_shown: usize) -> Vec<usize> {
     match page {
         Page::General => (0..GENERAL_ROWS).filter(|&r| general_matches(query, r)).collect(),
         Page::Keys => (0..keys_shown).collect(),
-        Page::Colors => (0..1 + theme::NAMES.len()).filter(|&r| colors_matches(query, r)).collect(),
+        Page::Colors => (0..1 + COLOR_ROWS).filter(|&r| colors_matches(query, r)).collect(),
     }
 }
 
@@ -299,10 +322,11 @@ pub enum SettingsMsg {
 /// (the colour is only applied, not saved, until OK).
 #[derive(Debug)]
 struct Picker {
-    /// Colour index in `theme::NAMES`.
+    /// Colour index (`color_name`).
     i: usize,
     /// The colours in use when it opened, put back on cancel.
     saved: theme::Colors,
+    saved_term: theme::TermColors,
     /// Hue 0..360, saturation and value 0..100.
     h: f32,
     s: f32,
@@ -341,7 +365,7 @@ pub(super) struct Settings {
     terminals: Vec<rc_platform::FoundTerminal>,
     /// The built-in terminal's shell command being typed.
     shell: String,
-    /// The colours being typed, by `theme::NAMES` index.
+    /// The colours being typed, by `color_name` index.
     hex: Vec<String>,
     /// The filter of each page (not saved).
     filter: [String; 3],
@@ -351,6 +375,8 @@ pub(super) struct Settings {
     picker: Option<Picker>,
     /// Ctrl+R pressed once on the keys page (twice resets every key).
     reset_all: bool,
+    /// Opened from this terminal: closing shows it again.
+    back_to_term: Option<u64>,
     note: Option<(String, Tone)>,
 }
 
@@ -364,14 +390,17 @@ impl Settings {
 }
 
 fn current_hex() -> Vec<String> {
-    let colors = theme::c();
-    theme::NAMES.iter().map(|n| colors.get(n).map(theme::to_hex).unwrap_or_default()).collect()
+    (0..COLOR_ROWS).map(|i| theme::to_hex(color_value(i))).collect()
 }
 
 impl App {
     pub(super) fn open_settings(&mut self) -> Task<Message> {
         self.leave_edits();
         self.refresh_config();
+        let back_to_term = self.screen.term().copied();
+        if back_to_term.is_some() {
+            self.hide_term();
+        }
         self.screen = Some(Screen::Settings(Box::new(Settings {
             page: Page::General,
             row: [0; 3],
@@ -386,6 +415,7 @@ impl App {
             capture: None,
             picker: None,
             reset_all: false,
+            back_to_term,
             note: None,
         })));
         Task::batch([
@@ -403,7 +433,7 @@ impl App {
             Page::General => GENERAL_ROWS,
             Page::Keys => shown,
             // The theme row, then the colours.
-            Page::Colors => 1 + theme::NAMES.len(),
+            Page::Colors => 1 + COLOR_ROWS,
         }
     }
 
@@ -465,6 +495,7 @@ impl App {
         if let Some(p) = self.screen.settings_mut().and_then(|s| s.picker.take()) {
             if !keep {
                 theme::set(p.saved);
+                theme::set_term(p.saved_term);
             }
         }
     }
@@ -474,14 +505,24 @@ impl App {
         let Some(p) = self.screen.settings_mut().and_then(|s| s.picker.as_mut()) else { return };
         let color = p.color();
         p.hex = theme::to_hex(color);
-        theme::set(p.saved.with_color(theme::NAMES[p.i], color));
+        if p.i < APP_COLORS {
+            theme::set(p.saved.with_color(theme::NAMES[p.i], color));
+        } else {
+            let mut term = p.saved_term;
+            term[p.i - APP_COLORS] = Some(color);
+            theme::set_term(term);
+        }
     }
 
     fn settings_close(&mut self) {
         self.picker_close(false);
         self.settings_save_editor();
-        if matches!(self.screen, Some(Screen::Settings(_))) {
+        if let Some(Screen::Settings(s)) = &self.screen {
+            let back = s.back_to_term;
             self.screen = None;
+            if let Some(id) = back {
+                self.show_term(id);
+            }
         }
     }
 
@@ -853,16 +894,28 @@ impl App {
                     return Task::none();
                 };
                 s.hex[i] = value;
-                let name = theme::NAMES[i];
-                let preset = theme::preset(&self.config.theme).map(|p| p.colors);
+                let name = color_name(i);
                 let hex = theme::to_hex(color);
-                let edit = if preset.and_then(|p| p.get(name)) == Some(color) { None } else { Some(hex.clone()) };
-                self.settings_write(&[Edit::Color(name.to_owned(), edit)], format!("{name} = {hex}"));
+                // The default colour is written as no entry.
+                let change = if i < APP_COLORS {
+                    let preset = theme::preset(&self.config.theme).map(|p| p.colors);
+                    let edit = if preset.and_then(|p| p.get(name)) == Some(color) { None } else { Some(hex.clone()) };
+                    Edit::Color(name.to_owned(), edit)
+                } else {
+                    let default = theme::to_hex(super::term::term_color(i - APP_COLORS, true));
+                    Edit::TermColor(name.to_owned(), (default != hex).then(|| hex.clone()))
+                };
+                self.settings_write(&[change], format!("{name} = {hex}"));
             }
             SettingsMsg::ResetColor(i) => {
                 s.row[2] = i + 1;
-                let name = theme::NAMES[i];
-                self.settings_write(&[Edit::Color(name.to_owned(), None)], format!("{name}: the theme's colour"));
+                let name = color_name(i);
+                let (change, done) = if i < APP_COLORS {
+                    (Edit::Color(name.to_owned(), None), format!("{name}: the theme's colour"))
+                } else {
+                    (Edit::TermColor(name.to_owned(), None), format!("{name}: the default colour"))
+                };
+                self.settings_write(&[change], done);
                 if let Some(s) = self.screen.settings_mut() {
                     s.hex = current_hex();
                 }
@@ -873,11 +926,12 @@ impl App {
                 // Another picker still open: its preview is dropped first.
                 if let Some(old) = s.picker.take() {
                     theme::set(old.saved);
+                    theme::set_term(old.saved_term);
                 }
-                let saved = theme::c();
-                let (h, sat, v) = theme::to_hsv(saved.get(theme::NAMES[i]).unwrap_or(saved.text));
+                let (h, sat, v) = theme::to_hsv(color_value(i));
                 let hex = s.hex[i].clone();
-                s.picker = Some(Picker { i, saved, h, s: sat * 100.0, v: v * 100.0, hex });
+                let (saved, saved_term) = (theme::c(), theme::term());
+                s.picker = Some(Picker { i, saved, saved_term, h, s: sat * 100.0, v: v * 100.0, hex });
                 return blur();
             }
             SettingsMsg::PickHue(x) | SettingsMsg::PickSat(x) | SettingsMsg::PickVal(x) => {
@@ -1083,7 +1137,7 @@ impl App {
         let total = match s.page {
             Page::General => GENERAL_ROWS,
             Page::Keys => Command::ALL.len(),
-            Page::Colors => 1 + theme::NAMES.len(),
+            Page::Colors => 1 + COLOR_ROWS,
         };
         // The filter box, as in Help (F1): the typed text with a "|" while typing goes to it.
         let typed: Element<'a, Message> = if s.filtering {
@@ -1453,11 +1507,21 @@ impl App {
                     );
                 }
                 let preset = current.map_or(theme::DARK, |p| p.colors);
-                for (i, name) in theme::NAMES.iter().enumerate() {
+                let first_term = vis.iter().copied().find(|&r| r > APP_COLORS);
+                for i in 0..COLOR_ROWS {
                     if !vis.contains(&(i + 1)) {
                         continue;
                     }
-                    let value = theme::c().get(name).unwrap_or(colors.text);
+                    if first_term == Some(i + 1) {
+                        list = list.push(heading("Built-in terminal (F9)"));
+                    }
+                    let name = color_name(i);
+                    let value = color_value(i);
+                    let default = if i < APP_COLORS {
+                        preset.get(name).unwrap_or(value)
+                    } else {
+                        super::term::term_color(i - APP_COLORS, true)
+                    };
                     let swatch = button(Space::new(36, 16))
                         .on_press(msg(SettingsMsg::PickOpen(i)))
                         .padding(0)
@@ -1477,7 +1541,7 @@ impl App {
                         .size(theme::SIZE_BODY)
                         .width(Length::Fixed(90.0))
                         .style(theme::input);
-                    let changed: Element<'a, Message> = if preset.get(name) == Some(value) {
+                    let changed: Element<'a, Message> = if theme::to_hex(default) == theme::to_hex(value) {
                         Space::with_width(Length::Fixed(70.0)).into()
                     } else {
                         button(text("Reset").size(11))
@@ -1489,20 +1553,20 @@ impl App {
                     };
                     let content: Element<'a, Message> = if narrow {
                         column![
-                            row![text(*name).size(theme::SIZE_BODY).width(Length::Fixed(140.0)), swatch, input, changed]
+                            row![text(name).size(theme::SIZE_BODY).width(Length::Fixed(140.0)), swatch, input, changed]
                                 .spacing(10)
                                 .align_y(Alignment::Center),
-                            hint(theme::PURPOSES[i].into()),
+                            hint(color_purpose(i).into()),
                         ]
                         .spacing(theme::SPACING_TIGHT)
                         .into()
                     } else {
                         row![
-                            text(*name).size(theme::SIZE_BODY).width(Length::Fixed(140.0)),
+                            text(name).size(theme::SIZE_BODY).width(Length::Fixed(140.0)),
                             swatch,
                             input,
                             changed,
-                            hint(theme::PURPOSES[i].into()),
+                            hint(color_purpose(i).into()),
                         ]
                         .spacing(10)
                         .align_y(Alignment::Center)
@@ -1634,7 +1698,7 @@ impl App {
                 .style(theme::input);
             let panel = row![
                 column![
-                    text(format!("Colour: {}", theme::NAMES[p.i])).size(theme::SIZE_BODY),
+                    text(format!("Colour: {}", color_name(p.i))).size(theme::SIZE_BODY),
                     slider_row("Hue", 360.0, p.h, SettingsMsg::PickHue),
                     slider_row("Saturation", 100.0, p.s, SettingsMsg::PickSat),
                     slider_row("Value", 100.0, p.v, SettingsMsg::PickVal),
@@ -1708,7 +1772,9 @@ mod tests {
     #[test]
     fn colors_filter_matches_name_purpose_and_theme_names() {
         let all = visible_rows(Page::Colors, "", 0);
-        assert_eq!(all.len(), 1 + theme::NAMES.len());
+        assert_eq!(all.len(), 1 + COLOR_ROWS);
+        assert!(visible_rows(Page::Colors, "bright_red", 0).contains(&(APP_COLORS + 10)));
+        assert_eq!(visible_rows(Page::Colors, "terminal", 0).len(), theme::TERM_NAMES.len());
         let accent = theme::NAMES.iter().position(|&n| n == "accent").unwrap() + 1;
         assert!(visible_rows(Page::Colors, "ACCENT", 0).contains(&accent));
         assert!(!visible_rows(Page::Colors, "accent", 0).contains(&0));
