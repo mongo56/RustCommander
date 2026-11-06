@@ -322,6 +322,9 @@ mod tests {
         junction::create(&a, a.join("up")).unwrap();
         junction::create(&a, b.join("up")).unwrap();
         junction::create(a.join("twin"), a.join("other")).unwrap();
+        if crate::junction_untrusted(&a.join("up")) {
+            return;
+        }
         let never = AtomicBool::new(false);
         let list = |p: &Path| crate::fs::list_dir(p, true).unwrap();
         let opts = CompareOptions { by_content: true, subfolders: true, show_hidden: true, ignore_date: false };

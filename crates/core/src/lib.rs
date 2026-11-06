@@ -35,3 +35,18 @@ pub mod viewer;
 pub use command::Command;
 pub use entry::{Entry, EntryKind};
 pub use panel::{Activated, Nav, Panel, Sort, SortKey};
+
+/// Test helper: true (and says so) when Windows won't follow the junction
+/// `link` made by this user: ERROR_UNTRUSTED_MOUNT_POINT (448) under
+/// redirection trust, seen on Windows 11 build 26300 (2026-11-06). Junction
+/// tests skip then, since nothing can read through such a link.
+#[cfg(all(test, windows))]
+pub(crate) fn junction_untrusted(link: &std::path::Path) -> bool {
+    match std::fs::metadata(link) {
+        Err(e) if e.raw_os_error() == Some(448) => {
+            eprintln!("skipped: Windows doesn't follow junctions made by this user here ({e})");
+            true
+        }
+        _ => false,
+    }
+}

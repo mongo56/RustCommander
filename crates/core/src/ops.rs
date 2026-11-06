@@ -3805,6 +3805,9 @@ mod tests {
     fn copies_junction_as_junction() {
         let tmp = TempDir::new("junction-copy");
         let (src, target) = junction_tree(&tmp.0);
+        if crate::junction_untrusted(&src.join("j")) {
+            return;
+        }
         let dest = tmp.0.join("dest");
         fs::create_dir(&dest).unwrap();
 
@@ -3862,6 +3865,9 @@ mod tests {
     fn moves_junction_without_touching_target() {
         let tmp = TempDir::new("junction-move");
         let (src, target) = junction_tree(&tmp.0);
+        if crate::junction_untrusted(&src.join("j")) {
+            return;
+        }
         let dest = tmp.0.join("dest");
 
         // Rename path.
