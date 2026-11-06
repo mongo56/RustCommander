@@ -237,6 +237,8 @@ pub struct App {
     /// Built-in terminals (F9), running whether shown or not; `Screen::Term`
     /// names the one shown.
     terms: Vec<term::TermSession>,
+    /// The sidebar's entries: each holds one or more of `terms` in split panes.
+    term_tabs: Vec<term::TermTab>,
     next_term_id: u64,
     /// The terminal shown last (F9 shows it again).
     term_last: Option<u64>,
@@ -343,8 +345,8 @@ enum Dialog {
     ShareLogin(Box<share_login::ShareLogin>),
     /// Split `src` (`size` bytes) into parts in `target` (`split.rs`); `input`: the part size.
     Split { src: PathBuf, size: u64, target: PathBuf, input: String },
-    /// Closing terminal `id` while `program` runs in it.
-    CloseTerm { id: u64, program: String },
+    /// Closing terminals `ids` (one, or a sidebar entry's split panes) while `program` runs in them.
+    CloseTerm { ids: Vec<u64>, program: String },
     /// Quitting while terminals run.
     QuitTerms,
     /// Ctrl+Z: "Undo: `what`?" (the newest undo step).
@@ -717,6 +719,7 @@ impl App {
             focus_new: None,
             disk_usage_last: None,
             terms: Vec::new(),
+            term_tabs: Vec::new(),
             next_term_id: 1,
             term_last: None,
             focus_after_listing: Vec::new(),
@@ -1948,6 +1951,23 @@ impl App {
                 return Task::none();
             }
             TerminalFolderToPanel => return self.term_folder_to_panel(),
+            SplitTerminalRight => return self.split_term(iced::widget::pane_grid::Axis::Vertical),
+            SplitTerminalDown => return self.split_term(iced::widget::pane_grid::Axis::Horizontal),
+            FocusTerminalLeft | FocusTerminalRight | FocusTerminalUp | FocusTerminalDown => {
+                use iced::widget::pane_grid::Direction;
+                let dir = match cmd {
+                    FocusTerminalLeft => Direction::Left,
+                    FocusTerminalRight => Direction::Right,
+                    FocusTerminalUp => Direction::Up,
+                    _ => Direction::Down,
+                };
+                self.focus_term_pane(dir);
+                return Task::none();
+            }
+            ZoomTerminalPane => {
+                self.zoom_term_pane();
+                return Task::none();
+            }
             Terminal => {
                 self.open_terminal();
                 return Task::none();
@@ -2635,7 +2655,7 @@ impl App {
                 return self.palette_pick(selected);
             }
             Dialog::RemoveGroup { path, .. } => self.tree_remove_now(&path),
-            Dialog::CloseTerm { id, .. } => self.close_term_now(id),
+            Dialog::CloseTerm { ids, .. } => self.close_term_now(&ids),
             Dialog::QuitTerms => return self.quit(),
             Dialog::Undo { .. } => return self.run_undo(),
             Dialog::HotEdit { path, name, comment, back, .. } => {

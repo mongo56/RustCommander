@@ -193,6 +193,24 @@ commands! {
         CloseTerminal => "cm_CloseTerminal", "End the shown built-in terminal and close it", "CloseTerm";
         /// Show the folder the shown (or last used) built-in terminal is in in the active panel and return to the panels.
         TerminalFolderToPanel => "cm_TerminalFolderToPanel", "Go to the built-in terminal's current folder in the active panel", "TermDir";
+        /// Split the focused built-in terminal: another shell to its right, in
+        /// its current folder, in the same sidebar entry (Ctrl+Shift+E).
+        SplitTerminalRight => "cm_SplitTerminalRight",
+            "Split the built-in terminal: another shell to the right, in the same folder", "SplitRight";
+        /// Split the focused built-in terminal: another shell below it (Ctrl+Shift+O).
+        SplitTerminalDown => "cm_SplitTerminalDown",
+            "Split the built-in terminal: another shell below, in the same folder", "SplitDown";
+        /// Move the keyboard focus to the split terminal pane on the left (Alt+Shift+Left).
+        FocusTerminalLeft => "cm_FocusTerminalLeft", "Focus the split terminal pane on the left", "PaneLeft";
+        /// Move the keyboard focus to the split terminal pane on the right (Alt+Shift+Right).
+        FocusTerminalRight => "cm_FocusTerminalRight", "Focus the split terminal pane on the right", "PaneRight";
+        /// Move the keyboard focus to the split terminal pane above (Alt+Shift+Up).
+        FocusTerminalUp => "cm_FocusTerminalUp", "Focus the split terminal pane above", "PaneUp";
+        /// Move the keyboard focus to the split terminal pane below (Alt+Shift+Down).
+        FocusTerminalDown => "cm_FocusTerminalDown", "Focus the split terminal pane below", "PaneDown";
+        /// Show the focused split terminal pane alone, or all of them again (Ctrl+Shift+Z).
+        ZoomTerminalPane => "cm_ZoomTerminalPane",
+            "Zoom the focused split terminal pane (show it alone), or show all panes again", "Zoom";
         /// Open an external terminal in the active panel's folder (Ctrl+F9).
         Terminal => "cm_ExecuteTerm", "Open an external terminal in this folder (the \"terminal\" setting)", "Term";
         /// Delete to the recycle bin.

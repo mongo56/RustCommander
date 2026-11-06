@@ -4,8 +4,10 @@
 //! (`Grid` widget) and turn key presses into the bytes a terminal sends.
 //!
 //! Terminals live in `App::terms`, apart from the screen: `Screen::Term(id)`
-//! only says which one is shown, so a hidden terminal keeps running (and
-//! several can exist; the sidebar to switch between them comes later). Each
+//! only says which one has the keyboard, so a hidden terminal keeps running.
+//! The sidebar's entries are `App::term_tabs`: each shows one or more
+//! terminals in split panes (`pane_grid`); `Screen::Term(id)` shows the
+//! entry holding `id` with `id` focused. Each
 //! has its own event subscription keyed by its id (`TermSession::events`),
 //! running whether or not it is shown. The one key the terminal keeps for
 //! itself is the `ToggleTerminal` command (Ctrl+Shift+F9): back to the
@@ -33,7 +35,7 @@ use iced::advanced::{renderer, Clipboard, Renderer as _, Shell as IcedShell};
 use iced::alignment;
 use iced::font::{Style as FontStyle, Weight};
 use iced::widget::text::{LineHeight, Shaping, Wrapping};
-use iced::widget::{button, column, container, mouse_area, row, text, tooltip, Column, Row, Space};
+use iced::widget::{button, column, container, mouse_area, pane_grid, row, text, tooltip, Column, Row, Space};
 use iced::{Background, Color, Element, Font, Length, Pixels, Rectangle};
 use std::sync::mpsc as std_mpsc;
 use std::sync::Mutex;
@@ -51,6 +53,10 @@ const SIDE_W: f32 = 160.0;
 /// Width of the sidebar while the panels are shown: collapsed to short
 /// entries (Files, ">_1", ">_2", ..., +) with the details in tooltips.
 const SIDE_W_COLLAPSED: f32 = 44.0;
+/// Gap between split panes, and the extra width around it that grabs the
+/// line to resize them.
+const PANE_GAP: f32 = 3.0;
+const PANE_GRAB: f32 = 5.0;
 /// Characters a sidebar entry's label is cut to (it is clipped too).
 const LABEL_CHARS: usize = 18;
 /// How often `poll_info` looks at the shells.
@@ -155,8 +161,10 @@ pub enum TermMsg {
     Show(Option<u64>),
     /// Sidebar: "+".
     New,
-    /// Sidebar: close terminal `id`.
+    /// Sidebar: close the entry that holds terminal `id` (all its split panes).
     Close(u64),
+    /// A split between terminal panes was dragged.
+    PaneResize(pane_grid::ResizeEvent),
     /// What `poll_info` found out about terminal `id`'s shell (sent on change).
     Info(u64, ShellInfo),
     /// The mouse in terminal `id`'s grid.
@@ -1455,6 +1463,11 @@ impl Widget<Message, Theme, iced::Renderer> for Grid<'_> {
             Event::Mouse(mouse::Event::ButtonPressed(b)) => {
                 let Some(b) = button(b) else { return event::Status::Ignored };
                 let Some(at) = cursor.position_in(bounds) else { return event::Status::Ignored };
+                // The rim belongs to the line between split panes (dragging it resizes them).
+                let rim = PANE_GRAB / 2.0;
+                if at.x < rim || at.y < rim || at.x > bounds.width - rim || at.y > bounds.height - rim {
+                    return event::Status::Ignored;
+                }
                 if state.held.is_some() {
                     // A second button while one is down: ignored.
                     return event::Status::Captured;
@@ -1658,6 +1671,44 @@ fn quit_question(count: usize) -> Option<String> {
     }
 }
 
+/// An entry of the sidebar: one terminal, or several in split panes.
+pub(super) struct TermTab {
+    panes: pane_grid::State<u64>,
+    /// The pane that gets the keys (the one `Screen::Term` names while shown).
+    focus: pane_grid::Pane,
+}
+
+impl TermTab {
+    fn new(id: u64) -> TermTab {
+        let (panes, focus) = pane_grid::State::new(id);
+        TermTab { panes, focus }
+    }
+
+    /// Its terminals, oldest first.
+    fn ids(&self) -> Vec<u64> {
+        let mut ids: Vec<u64> = self.panes.iter().map(|(_, &id)| id).collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// The terminals drawn: all, or the zoomed one.
+    fn drawn(&self) -> Vec<u64> {
+        match self.panes.maximized().and_then(|p| self.panes.get(p)) {
+            Some(&id) => vec![id],
+            None => self.ids(),
+        }
+    }
+
+    fn pane(&self, id: u64) -> Option<pane_grid::Pane> {
+        self.panes.iter().find(|(_, &t)| t == id).map(|(&p, _)| p)
+    }
+
+    /// The focused terminal.
+    fn focused(&self) -> u64 {
+        self.panes.get(self.focus).copied().unwrap_or_default()
+    }
+}
+
 /// The bytes a terminal sends for a key press, or `None` for keys it
 /// doesn't send anything for. `text` is what the key typed (with the
 /// keyboard layout and AltGr applied); `app_cursor`: the program asked for
@@ -1759,7 +1810,10 @@ impl App {
         ("Ctrl+Shift+Down/Up (cm_NextTerminal, cm_PrevTerminal)", "Next/previous entry of the sidebar: Files, terminal 1, 2, ..."),
         ("Ctrl+Tab, Ctrl+Shift+Tab (cm_NextTab, cm_PrevTab)", "Next/previous terminal (Files is skipped; in the panels they switch panel tabs)"),
         ("Ctrl+Shift+T (cm_NewTerminal)", "Another terminal in the active panel's folder (the + of the sidebar)"),
-        ("Ctrl+Shift+W (cm_CloseTerminal)", "End the shown terminal and close it (middle-click or x on its sidebar entry too)"),
+        ("Ctrl+Shift+W (cm_CloseTerminal)", "End the focused terminal and close it (middle-click or x on its sidebar entry closes the entry with all its split panes)"),
+        ("Ctrl+Shift+E, Ctrl+Shift+O (cm_SplitTerminalRight, cm_SplitTerminalDown)", "Split: another shell to the right of / below the focused one, in its folder; drag the line between panes to resize"),
+        ("Alt+Shift+arrows (cm_FocusTerminalLeft/Right/Up/Down)", "Move the keyboard focus to the split pane in that direction (or click a pane)"),
+        ("Ctrl+Shift+Z (cm_ZoomTerminalPane)", "Show the focused split pane alone, or all panes again"),
         ("cm_TerminalFolderToPanel (no key by default)", "Active panel goes to the terminal's current folder and Files is shown"),
         ("Ctrl+Shift+C or Ctrl+Insert", "Copy the selected text (select with the mouse: drag, double-click a word, triple-click a line)"),
         ("Ctrl+Shift+J", "Copy the selected text as one line: line breaks and the indentation after them removed (paths, URLs, commands a program wrapped)"),
@@ -1831,15 +1885,56 @@ impl App {
         Task::none()
     }
 
-    /// Starts `shell` in `dir` as a new terminal and shows it; its id, or
-    /// `None` (with an error) if it didn't start.
+    /// `SplitTerminalRight/Down`: another shell beside or below the focused
+    /// terminal, in its folder, in the same sidebar entry.
+    pub(super) fn split_term(&mut self, axis: pane_grid::Axis) -> Task<Message> {
+        let Some(&id) = self.screen.term() else {
+            self.info("Splitting works in the built-in terminal (F9)");
+            return Task::none();
+        };
+        self.refresh_config();
+        let Some(dir) = self.term(id).map(|t| t.dir.clone()) else { return Task::none() };
+        if !dir.is_dir() {
+            self.error(format!("Can't open a terminal in {}: not a folder", dir.display()));
+            return Task::none();
+        }
+        let shell = self.config.builtin_shell();
+        self.spawn_term(&dir, &shell, Some(axis));
+        Task::none()
+    }
+
+    /// Starts `shell` in `dir` as a new terminal (a new sidebar entry) and
+    /// shows it; its id, or `None` (with an error) if it didn't start.
     fn start_term(&mut self, dir: &Path, shell: &str) -> Option<u64> {
+        self.spawn_term(dir, shell, None)
+    }
+
+    /// `start_term`; with `split`, in a new pane split off the focused one.
+    fn spawn_term(&mut self, dir: &Path, shell: &str, split: Option<pane_grid::Axis>) -> Option<u64> {
         let id = self.next_term_id;
         self.next_term_id += 1;
+        // The grid widget reports the size it really gets on the next frame.
         let (cols, lines) = grid_size(Size::new(self.window_width - SIDE_W, self.window_height - FOOTER_H));
         match TermSession::spawn(id, shell, dir, cols, lines) {
             Ok(session) => {
                 self.terms.push(session);
+                let tab = self.shown_tab();
+                let added = split.zip(tab).and_then(|(axis, tab)| {
+                    let t = &mut self.term_tabs[tab];
+                    t.panes.restore();
+                    let (pane, _) = t.panes.split(axis, t.focus, id)?;
+                    t.focus = pane;
+                    Some(())
+                });
+                match added {
+                    // Same entry: `show_term` only makes the entry's terminals visible when it changes.
+                    Some(()) => {
+                        if let Some(t) = self.term_mut(id) {
+                            t.set_visible(true);
+                        }
+                    }
+                    None => self.term_tabs.push(TermTab::new(id)),
+                }
                 self.show_term(id);
                 Some(id)
             }
@@ -1906,26 +2001,92 @@ impl App {
         }
     }
 
-    /// Shows terminal `id` (hiding the one shown).
-    fn show_term(&mut self, id: u64) {
-        if let Some(&shown) = self.screen.term() {
-            if shown != id {
-                if let Some(t) = self.term_mut(shown) {
-                    t.set_visible(false);
+    /// The sidebar entry holding terminal `id`.
+    fn tab_of(&self, id: u64) -> Option<usize> {
+        self.term_tabs.iter().position(|t| t.pane(id).is_some())
+    }
+
+    /// The sidebar entry shown.
+    fn shown_tab(&self) -> Option<usize> {
+        self.screen.term().and_then(|&id| self.tab_of(id))
+    }
+
+    /// The focused terminal of each sidebar entry, in sidebar order.
+    fn tab_order(&self) -> Vec<u64> {
+        self.term_tabs.iter().map(TermTab::focused).collect()
+    }
+
+    /// The terminals on screen (the cues are for the others).
+    fn drawn_terms(&self) -> Vec<u64> {
+        self.shown_tab().map(|t| self.term_tabs[t].drawn()).unwrap_or_default()
+    }
+
+    /// Shows or hides the terminals of entry `tab`; shown ones are looked at.
+    fn set_tab_visible(&mut self, tab: usize, on: bool) {
+        let Some(t) = self.term_tabs.get(tab) else { return };
+        let (ids, drawn) = (t.ids(), t.drawn());
+        for id in ids {
+            if let Some(t) = self.term_mut(id) {
+                t.set_visible(on);
+                if on && drawn.contains(&id) {
+                    t.attention = None;
                 }
             }
         }
+    }
+
+    /// Shows the sidebar entry holding terminal `id` with `id` focused
+    /// (hiding the entry shown before).
+    fn show_term(&mut self, id: u64) {
+        let Some(tab) = self.tab_of(id) else { return };
+        let old = self.shown_tab();
+        if old != Some(tab) {
+            if let Some(old) = old {
+                self.set_tab_visible(old, false);
+            }
+            self.set_tab_visible(tab, true);
+        }
+        let t = &mut self.term_tabs[tab];
+        if let Some(pane) = t.pane(id) {
+            t.focus = pane;
+        }
         if let Some(t) = self.term_mut(id) {
-            t.set_visible(true);
             t.attention = None;
-            self.term_last = Some(id);
-            self.screen = Some(Screen::Term(id));
+        }
+        self.term_last = Some(id);
+        self.screen = Some(Screen::Term(id));
+    }
+
+    /// `FocusTerminalLeft/Right/Up/Down`: the split pane next to the focused
+    /// one gets the keys (a zoomed pane is shown with the others again).
+    pub(super) fn focus_term_pane(&mut self, direction: pane_grid::Direction) {
+        let Some(tab) = self.shown_tab() else { return };
+        let t = &mut self.term_tabs[tab];
+        let Some(next) = t.panes.adjacent(t.focus, direction) else { return };
+        let Some(&id) = t.panes.get(next) else { return };
+        if t.panes.maximized().is_some() {
+            t.panes.restore();
+            self.set_tab_visible(tab, true);
+        }
+        self.show_term(id);
+    }
+
+    /// `ZoomTerminalPane`: the focused pane alone, or all panes again.
+    pub(super) fn zoom_term_pane(&mut self) {
+        let Some(tab) = self.shown_tab() else { return };
+        let t = &mut self.term_tabs[tab];
+        if t.panes.maximized().is_some() {
+            t.panes.restore();
+            // The other panes' frames weren't kept up to date meanwhile.
+            self.set_tab_visible(tab, true);
+        } else if t.panes.len() > 1 {
+            t.panes.maximize(t.focus);
         }
     }
 
-    /// The window got the focus: the shown terminal is looked at again.
+    /// The window got the focus: the terminals on screen are looked at again.
     pub(super) fn term_looked_at(&mut self) {
-        if let Some(&id) = self.screen.term() {
+        for id in self.drawn_terms() {
             if let Some(t) = self.term_mut(id) {
                 t.attention = None;
             }
@@ -1943,67 +2104,77 @@ impl App {
 
     /// Back to the panels; the terminal keeps running.
     fn hide_term(&mut self) {
-        if let Some(&id) = self.screen.term() {
-            if let Some(t) = self.term_mut(id) {
-                t.set_visible(false);
-            }
+        if let Some(tab) = self.shown_tab() {
+            self.set_tab_visible(tab, false);
+        }
+        if self.screen.term().is_some() {
             self.screen = None;
         }
     }
 
-    /// Sidebar entries are Files (0) and the terminals (1..); this is the
-    /// shown one.
+    /// Sidebar entries are Files (0) and the terminal entries (1..); this is
+    /// the shown one.
     fn side_index(&self) -> usize {
-        match self.screen.term() {
-            Some(&id) => self.terms.iter().position(|t| t.id == id).map_or(0, |i| i + 1),
-            None => 0,
-        }
+        self.shown_tab().map_or(0, |i| i + 1)
     }
 
     /// Shows entry `index` of the sidebar.
     fn show_entry(&mut self, index: usize) {
-        match index.checked_sub(1).and_then(|i| self.terms.get(i)).map(|t| t.id) {
+        match index.checked_sub(1).and_then(|i| self.term_tabs.get(i)).map(TermTab::focused) {
             Some(id) => self.show_term(id),
             None => self.hide_term(),
         }
     }
 
-    /// `NextTerminal` / `PrevTerminal`: around Files and the terminals.
-    /// Ctrl+Tab / Ctrl+Shift+Tab in a terminal: the next/previous terminal,
-    /// around, skipping Files (nothing with fewer than two terminals).
+    /// `NextTerminal` / `PrevTerminal`: around Files and the terminal entries.
+    /// Ctrl+Tab / Ctrl+Shift+Tab in a terminal: the next/previous entry,
+    /// around, skipping Files (nothing with fewer than two entries).
     fn cycle_among_terms(&mut self, delta: isize) {
-        let order: Vec<u64> = self.terms.iter().map(|t| t.id).collect();
         let Some(&current) = self.screen.term() else { return };
-        if let Some(id) = next_terminal(&order, current, delta) {
+        if let Some(id) = next_terminal(&self.tab_order(), current, delta) {
             self.show_term(id);
         }
     }
 
     pub(super) fn cycle_term(&mut self, delta: isize) {
-        if self.terms.is_empty() || !matches!(self.screen, None | Some(Screen::Term(_))) {
+        if self.term_tabs.is_empty() || !matches!(self.screen, None | Some(Screen::Term(_))) {
             return;
         }
         self.leave_edits();
-        let next = cycle(self.side_index(), self.terms.len() + 1, delta);
+        let next = cycle(self.side_index(), self.term_tabs.len() + 1, delta);
         self.show_entry(next);
     }
 
-    /// `CloseTerminal`: ends the shown terminal.
+    /// `CloseTerminal`: ends the focused terminal (its split pane closes).
     pub(super) fn close_shown_term(&mut self) {
         if let Some(&id) = self.screen.term() {
-            self.request_close_term(id);
+            self.request_close_terms(vec![id]);
         }
     }
 
-    /// Closes terminal `id`, asking first when a program runs in it (not
+    /// The sidebar's x or middle-click: ends every terminal of the entry
+    /// holding `id`.
+    fn request_close_tab(&mut self, id: u64) {
+        if let Some(tab) = self.tab_of(id) {
+            let ids = self.term_tabs[tab].ids();
+            self.request_close_terms(ids);
+        }
+    }
+
+    /// Closes terminals `ids`, asking first when a program runs in one (not
     /// for the idle shell).
-    fn request_close_term(&mut self, id: u64) {
-        let Some(program) = self.term(id).map(|t| t.program.clone()) else { return };
-        if close_needs_confirm(program.as_deref()) {
-            self.dialog_focus = None;
-            self.dialog = Some(Dialog::CloseTerm { id, program: program.unwrap_or_default() });
+    fn request_close_terms(&mut self, ids: Vec<u64>) {
+        let running: Vec<String> = ids
+            .iter()
+            .filter_map(|&id| self.term(id))
+            .filter(|t| close_needs_confirm(t.program.as_deref()))
+            .filter_map(|t| t.program.clone())
+            .collect();
+        if running.is_empty() {
+            self.close_term_now(&ids);
         } else {
-            self.close_term(id);
+            self.dialog_focus = None;
+            self.dialog = Some(Dialog::CloseTerm { ids, program: running.join(", ") });
         }
     }
 
@@ -2036,24 +2207,48 @@ impl App {
         quit_question(self.terms.len()).unwrap_or_else(|| "Quit?".to_owned())
     }
 
-    /// The dialog's OK: ends terminal `id` (if it still exists).
-    pub(super) fn close_term_now(&mut self, id: u64) {
-        if self.term(id).is_some() {
-            self.close_term(id);
+    /// The dialog's OK: ends terminals `ids` (those that still exist).
+    pub(super) fn close_term_now(&mut self, ids: &[u64]) {
+        for &id in ids {
+            if self.term(id).is_some() {
+                self.close_term(id);
+            }
         }
     }
 
-    /// Ends terminal `id` (dropping it stops its shell). If it was shown, the
-    /// terminal before it is shown, or Files when it was the first.
+    /// Ends terminal `id` (dropping it stops its shell). Its pane closes and
+    /// a neighbouring pane gets the focus; when it was the entry's last
+    /// terminal the entry goes, and if it was shown the entry before it is
+    /// shown, or Files when it was the first.
     fn close_term(&mut self, id: u64) {
-        let order: Vec<u64> = self.terms.iter().map(|t| t.id).collect();
+        let tab = self.tab_of(id);
         let was_shown = self.screen.term() == Some(&id);
-        let fallback = fallback_after_close(&order, id);
+        let tab_shown = tab.is_some() && self.shown_tab() == tab;
         self.terms.retain(|t| t.id != id);
+        let Some(tab) = tab else { return };
+        let t = &mut self.term_tabs[tab];
+        if t.panes.len() > 1 {
+            if let Some((_, sibling)) = t.pane(id).and_then(|pane| t.panes.close(pane)) {
+                if t.panes.get(t.focus).is_none() {
+                    t.focus = sibling;
+                }
+            }
+            let next = t.focused();
+            if self.term_last == Some(id) {
+                self.term_last = Some(next);
+            }
+            if was_shown {
+                self.show_term(next);
+            }
+            return;
+        }
+        // Its only terminal: the entry goes.
+        let fallback = fallback_after_close(&self.tab_order(), id);
+        self.term_tabs.remove(tab);
         if self.term_last == Some(id) {
             self.term_last = fallback;
         }
-        if was_shown {
+        if tab_shown {
             self.screen = None;
             if let Some(next) = fallback {
                 self.show_term(next);
@@ -2071,13 +2266,14 @@ impl App {
             let _ = t.chan.send(Msg::Shutdown);
         }
         self.terms.clear();
+        self.term_tabs.clear();
     }
 
     pub(super) fn term_update(&mut self, msg: TermMsg) -> Task<Message> {
-        let shown = self.screen.term().copied();
+        let drawn = self.drawn_terms();
         // Whether a cue for terminal `id` is wanted (the user doesn't look at it).
         let focused = self.focused;
-        let cue = |id: u64| wants_cue(shown == Some(id), focused);
+        let cue = |id: u64| wants_cue(drawn.contains(&id), focused);
         match msg {
             TermMsg::Show(Some(id)) => {
                 self.leave_edits();
@@ -2085,8 +2281,17 @@ impl App {
             }
             TermMsg::Show(None) => self.hide_term(),
             TermMsg::New => return self.new_term(),
-            TermMsg::Close(id) => self.request_close_term(id),
+            TermMsg::Close(id) => self.request_close_tab(id),
+            TermMsg::PaneResize(pane_grid::ResizeEvent { split, ratio }) => {
+                if let Some(tab) = self.shown_tab() {
+                    self.term_tabs[tab].panes.resize(split, ratio);
+                }
+            }
             TermMsg::Mouse(id, mouse) => {
+                // A press in another split pane gives it the keys.
+                if matches!(mouse, Mouse::Down { .. }) && self.screen.term() != Some(&id) {
+                    self.show_term(id);
+                }
                 let Some(t) = self.term_mut(id) else { return Task::none() };
                 match t.mouse(mouse) {
                     MouseOutcome::None => {}
@@ -2161,7 +2366,7 @@ impl App {
                         if t.pending.is_some() && prompt_dir(&t.term.lock()).is_some() {
                             t.send_pending();
                         }
-                        if shown == Some(id) {
+                        if drawn.contains(&id) {
                             t.refresh();
                         }
                     }
@@ -2247,6 +2452,13 @@ impl App {
             Command::PrevTerminal,
             Command::CloseTerminal,
             Command::TerminalFolderToPanel,
+            Command::SplitTerminalRight,
+            Command::SplitTerminalDown,
+            Command::FocusTerminalLeft,
+            Command::FocusTerminalRight,
+            Command::FocusTerminalUp,
+            Command::FocusTerminalDown,
+            Command::ZoomTerminalPane,
             Command::NextTab,
             Command::PrevTab,
         ];
@@ -2303,12 +2515,20 @@ impl App {
     pub(super) fn term_view(&self, id: u64) -> Element<'_, Message> {
         let colors = theme::c();
         let Some(t) = self.term(id) else { return Space::new(Length::Fill, Length::Fill).into() };
+        let Some(tab) = self.tab_of(id).map(|i| &self.term_tabs[i]) else {
+            return Space::new(Length::Fill, Length::Fill).into();
+        };
         let bindings = self.keymap.bindings();
         let back = keymap::Keymap::keys_for(&bindings, Command::ToggleTerminal).first().map(|k| k.to_string());
         let key = |cmd| keymap::Keymap::keys_for(&bindings, cmd).first().map(|k| k.to_string());
         let mut hints = switch_hints(key(Command::PrevTerminal), key(Command::NextTerminal), key(Command::NewTerminal));
         if let Some(tab) = key(Command::NextTab) {
             hints.insert(0, HintOwned::new([tab], "next terminal"));
+        }
+        let split: Vec<String> =
+            [Command::SplitTerminalRight, Command::SplitTerminalDown].into_iter().filter_map(key).collect();
+        if !split.is_empty() {
+            hints.push(HintOwned::new(split, "split"));
         }
         // The terminal area's width (the sidebar takes the rest), less the footer's padding and spacing.
         let total = self.area_width() - 20.0 - 12.0;
@@ -2340,7 +2560,28 @@ impl App {
             .padding([2, 10])
             .align_y(iced::Alignment::Center)
             .height(Length::Fixed(FOOTER_H));
-        let grid = Element::new(Grid { id, frame: &t.frame, focused: self.focused });
+        let split = tab.panes.len() > 1;
+        let focus = tab.focus;
+        let panes = pane_grid(&tab.panes, move |pane, &tid, zoomed| {
+            // Split: a frame around each pane, in the accent colour for the focused one.
+            let frame = (split && !zoomed).then_some(pane == focus);
+            pane_grid::Content::new(self.term_pane(tid, pane == focus, frame))
+        })
+        .spacing(PANE_GAP)
+        .on_resize(PANE_GRAB, |e| Message::Term(TermMsg::PaneResize(e)));
+        container(column![panes, footer])
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(filled(t.frame.bg))
+            .into()
+    }
+
+    /// Terminal `id`'s grid and scrollbar in its pane; `focus`: it gets the
+    /// keys; `frame`: drawn framed (split panes), in the accent colour if `true`.
+    fn term_pane(&self, id: u64, focus: bool, frame: Option<bool>) -> Element<'_, Message> {
+        let Some(t) = self.term(id) else { return Space::new(Length::Fill, Length::Fill).into() };
+        // An unfocused pane draws its cursor hollow, like an unfocused window.
+        let grid = Element::new(Grid { id, frame: &t.frame, focused: self.focused && focus });
         // The bar's position is the history line at the top of the view.
         let (history, offset, lines) = (t.frame.history, t.frame.offset, t.frame.lines);
         let grid = crate::scrollbar::attach(
@@ -2350,10 +2591,22 @@ impl App {
             (history + lines) as f32,
             move |top| Message::Term(TermMsg::ScrollTo(id, top)),
         );
-        container(column![grid, footer])
+        let c = theme::c();
+        let bg = t.frame.bg;
+        let border = match frame {
+            Some(true) => c.accent,
+            Some(false) => c.border,
+            None => Color::TRANSPARENT,
+        };
+        container(grid)
             .width(Length::Fill)
             .height(Length::Fill)
-            .style(filled(t.frame.bg))
+            .padding(if frame.is_some() { 1 } else { 0 })
+            .style(move |_| container::Style {
+                background: Some(Background::Color(bg)),
+                border: iced::Border { color: border, width: 1.0, radius: 0.0.into() },
+                ..container::Style::default()
+            })
             .into()
     }
 
@@ -2452,10 +2705,16 @@ impl App {
             let heading = text("TERMINALS").size(10).color(c.muted).font(Font { weight: Weight::Bold, ..Font::DEFAULT });
             list = list.push(container(heading).padding([4, 11]));
         }
-        for (i, t) in self.terms.iter().enumerate() {
-            let full =term_label(&t.dir, t.program.as_deref(), LABEL_CHARS);
+        for (i, tab) in self.term_tabs.iter().enumerate() {
+            let Some(t) = self.term(tab.focused()) else { continue };
+            let others: Vec<&TermSession> =
+                tab.ids().into_iter().filter(|&id| id != t.id).filter_map(|id| self.term(id)).collect();
+            let full = term_label(&t.dir, t.program.as_deref(), LABEL_CHARS);
+            // Any pane's cue; waiting wins over finished.
+            let cues: Vec<Attention> = std::iter::once(t).chain(others.iter().copied()).filter_map(|t| t.attention).collect();
+            let attention = cues.iter().copied().find(|a| matches!(a, Attention::Waiting)).or(cues.first().copied());
             // A cue: a dot, in green (finished) or amber (waiting); the label keeps its colour.
-            let cue = t.attention.map(|a| match a {
+            let cue = attention.map(|a| match a {
                 Attention::Finished => c.success,
                 Attention::Waiting => c.selected,
             });
@@ -2481,12 +2740,15 @@ impl App {
                 if let Some(color) = cue {
                     content = content.push(dot(color));
                 }
+                // Split: how many panes the entry holds.
+                if !others.is_empty() {
+                    content = content.push(text(format!("({})", others.len() + 1)).size(11).color(c.muted));
+                }
                 content.into()
             };
             let mut tip = t.dir.display().to_string();
             if collapsed {
-                tip = format!("{}: {full}
-{tip}", i + 1);
+                tip = format!("{}: {full}\n{tip}", i + 1);
             }
             if let Some(program) = &t.program {
                 tip.push_str(&format!("\nRunning: {program}"));
@@ -2496,6 +2758,15 @@ impl App {
             }
             if let Some(a) = t.attention {
                 tip.push_str(&format!("\n{}", a.tip()));
+            }
+            if !others.is_empty() {
+                tip.push_str(&format!("\n\nSplit with {}:", others.len()));
+                for o in &others {
+                    tip.push_str(&format!("\n{}", term_label(&o.dir, o.program.as_deref(), 60)));
+                    if let Some(a) = o.attention {
+                        tip.push_str(&format!(" ({})", a.tip()));
+                    }
+                }
             }
             let (current, press) = (shown == Some(t.id), TermMsg::Show(Some(t.id)));
             list = list.push(entry(content, Some(tip), current, press, Some(t.id), term_h));
@@ -2702,6 +2973,21 @@ mod tests {
         let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
         parser.advance(&mut term, input.as_bytes());
         term
+    }
+
+    #[test]
+    fn split_tabs_track_focus_and_zoom() {
+        let mut tab = TermTab::new(3);
+        assert_eq!((tab.ids(), tab.focused()), (vec![3], 3));
+        let (pane, _) = tab.panes.split(pane_grid::Axis::Vertical, tab.focus, 8).unwrap();
+        tab.focus = pane;
+        assert_eq!((tab.ids(), tab.focused(), tab.drawn()), (vec![3, 8], 8, vec![3, 8]));
+        assert_eq!(tab.panes.adjacent(tab.focus, pane_grid::Direction::Left).and_then(|p| tab.panes.get(p)), Some(&3));
+        tab.panes.maximize(tab.focus);
+        assert_eq!(tab.drawn(), vec![8]);
+        let (_, sibling) = tab.panes.close(pane).unwrap();
+        assert_eq!((tab.panes.get(sibling), tab.drawn()), (Some(&3), vec![3]));
+        assert_eq!(tab.pane(8), None);
     }
 
     #[test]

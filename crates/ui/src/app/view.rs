@@ -913,9 +913,13 @@ impl App {
                 None,
                 "Delete",
             ),
-            Dialog::CloseTerm { program, .. } => (
+            Dialog::CloseTerm { ids, program } => (
                 "Close terminal".into(),
-                format!("{program} is still running in this terminal. Close the terminal anyway?"),
+                if ids.len() > 1 {
+                    format!("Still running in these {} split terminals: {program}. Close them all anyway?", ids.len())
+                } else {
+                    format!("{program} is still running in this terminal. Close the terminal anyway?")
+                },
                 None,
                 "Close",
             ),
