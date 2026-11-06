@@ -595,16 +595,22 @@ pub fn window_placement(window: isize) -> Option<crate::Placement> {
 pub fn restore_placement(window: isize, p: &crate::Placement) {
     use windows::Win32::Foundation::RECT;
     use windows::Win32::UI::WindowsAndMessaging::{
-        SetWindowPlacement, ShowWindow, SW_SHOW, SW_SHOWMAXIMIZED, WINDOWPLACEMENT,
+        SetWindowPlacement, ShowWindow, SW_HIDE, SW_SHOW, SW_SHOWMAXIMIZED, WINDOWPLACEMENT,
     };
     let hwnd = HWND(window as *mut c_void);
-    let wp = WINDOWPLACEMENT {
+    let mut wp = WINDOWPLACEMENT {
         length: size_of::<WINDOWPLACEMENT>() as u32,
-        showCmd: if p.maximized { SW_SHOWMAXIMIZED.0 as u32 } else { SW_SHOWNORMAL.0 as u32 },
+        showCmd: SW_HIDE.0 as u32,
         rcNormalPosition: RECT { left: p.left, top: p.top, right: p.right, bottom: p.bottom },
         ..Default::default()
     };
     unsafe {
+        // Twice: a rectangle on a monitor with other scaling than the one the
+        // window was made on moves it there, and the scaling change
+        // (WM_DPICHANGED) resizes it by the ratio; the second call, now on
+        // that monitor, puts the saved size back and shows the window.
+        let _ = SetWindowPlacement(hwnd, &wp);
+        wp.showCmd = if p.maximized { SW_SHOWMAXIMIZED.0 as u32 } else { SW_SHOWNORMAL.0 as u32 };
         if SetWindowPlacement(hwnd, &wp).is_err() {
             let _ = ShowWindow(hwnd, SW_SHOW);
         }
