@@ -101,9 +101,7 @@ impl HotItem {
     pub fn label(&self) -> String {
         match self {
             HotItem::Folder { name, .. } if !name.is_empty() => name.clone(),
-            HotItem::Folder { path, .. } => {
-                path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string())
-            }
+            HotItem::Folder { path, .. } => rc_core::vfs::folder_label(path),
             HotItem::Menu { name, .. } => name.clone(),
         }
     }

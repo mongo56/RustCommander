@@ -421,6 +421,19 @@ pub fn is_network(path: &Path) -> bool {
     path.to_str().is_some_and(|s| s.strip_suffix(['\\', '/']).unwrap_or(s).eq_ignore_ascii_case(NETWORK))
 }
 
+/// A short name for the folder `path` (tabs, history, hotlist): its last
+/// part, "Network" for the Network list, `\\server` for a server's share
+/// list (just "server" would look like a folder), the whole path for roots.
+pub fn folder_label(path: &Path) -> String {
+    if is_network(path) {
+        return "Network".into();
+    }
+    if let Some(server) = unc_server_only(path) {
+        return format!(r"\\{server}");
+    }
+    path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string())
+}
+
 /// True for a listing that is no folder: the Network list or a server's
 /// list of shares (`\\server`). Nothing can be created, copied into or
 /// watched there.
@@ -1402,6 +1415,21 @@ pub(crate) mod tests {
         assert!(is_net_listing(&network_path()) && is_net_listing(Path::new(r"\\nas")));
         assert!(!is_net_listing(Path::new(r"\\nas\data")) && !is_net_listing(Path::new(r"C:\")));
         assert!(!is_virtual(&network_path()) && !in_archive(&network_path()));
+    }
+
+    #[test]
+    fn folder_labels() {
+        let label = |s: &str| folder_label(Path::new(s));
+        assert_eq!(label("net:"), "Network");
+        assert_eq!(label(r"NET:\"), "Network");
+        assert_eq!(label(r"\\nas"), r"\\nas");
+        assert_eq!(label(r"\\nas\"), r"\\nas");
+        assert_eq!(label(r"C:\Users\me"), "me");
+        assert_eq!(label(r"C:\"), r"C:\");
+        if cfg!(windows) {
+            assert_eq!(label(r"\\nas\data"), r"\\nas\data");
+            assert_eq!(label(r"\\nas\data\photos"), "photos");
+        }
     }
 
     #[test]

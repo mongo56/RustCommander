@@ -620,10 +620,7 @@ impl Panel {
                 remote.rsplit('/').next().unwrap_or_default().to_owned()
             };
         }
-        self.path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| self.path.display().to_string())
+        vfs::folder_label(&self.path)
     }
 
     // ---- selection --------------------------------------------------------

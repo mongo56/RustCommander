@@ -341,6 +341,7 @@ impl App {
                 w if w >= 300.0 => format!("{} free", format::size(free)),
                 _ => String::new(),
             })
+            .or_else(|| (width >= 300.0).then(|| net_listing_count(panel)).flatten())
             .unwrap_or_default();
 
         container(
@@ -1093,10 +1094,7 @@ impl App {
         let (list, current) = self.panel(self.active).history();
         let mut items = Column::new();
         for (i, path) in list.iter().enumerate() {
-            let name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| path.display().to_string());
+            let name = rc_core::vfs::folder_label(path);
             let (name, color) = if i == current {
                 (format!("{name}  (current)"), theme::c().selected)
             } else {
@@ -1454,9 +1452,34 @@ fn summary_text(sel: usize, total: usize, sel_bytes: u64, total_bytes: u64, room
     format!("{sel}/{total}")
 }
 
+/// For the Network list and a server's share list (which are on no volume),
+/// the text in place of the free space: "3 computers", "1 share".
+fn net_listing_count(panel: &Panel) -> Option<String> {
+    let what = if rc_core::vfs::is_network(&panel.path) {
+        "computer"
+    } else if rc_core::vfs::unc_server_only(&panel.path).is_some() {
+        "share"
+    } else {
+        return None;
+    };
+    Some(count_text(panel.entries.iter().filter(|e| !e.is_parent()).count(), what))
+}
+
+/// "1 share", "2 shares".
+fn count_text(n: usize, what: &str) -> String {
+    format!("{n} {what}{}", if n == 1 { "" } else { "s" })
+}
+
 #[cfg(test)]
 mod drag_edge_tests {
     use super::*;
+
+    #[test]
+    fn net_listing_counts() {
+        assert_eq!(count_text(0, "computer"), "0 computers");
+        assert_eq!(count_text(1, "share"), "1 share");
+        assert_eq!(count_text(5, "share"), "5 shares");
+    }
 
     #[test]
     fn elide_middle_keeps_the_extension() {

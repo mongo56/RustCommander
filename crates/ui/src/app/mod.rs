@@ -3709,13 +3709,38 @@ impl App {
 
     /// System icon for a path, cached.
     fn icon(&self, path: &Path, is_dir: bool) -> Option<image::Handle> {
+        if let Some(icon) = self.net_icon(path) {
+            return icon;
+        }
         self.icon_by_key(rc_platform::icon_key(path, is_dir), path, is_dir)
     }
 
     /// System icon for a listed entry, cached; a program's own icon is
     /// read again once the file changes (see [`entry_icon_key`]).
     pub(super) fn entry_icon(&self, entry: &Entry) -> Option<image::Handle> {
+        if let Some(icon) = Some(entry).filter(|e| !e.is_parent()).and_then(|e| self.net_icon(&e.path)) {
+            return icon;
+        }
         self.icon_by_key(entry_icon_key(entry), &entry.path, entry.is_dir())
+    }
+
+    /// The icon of the Network list (the globe), a computer (`\\server`) or a
+    /// share root (`\\server\share`), cached; `None` for other paths. Shell
+    /// stock icons: asking the shell about the share itself would reach out
+    /// to the server on the UI thread.
+    fn net_icon(&self, path: &Path) -> Option<Option<image::Handle>> {
+        if vfs::is_network(path) {
+            return Some(Some(network::globe_icon()));
+        }
+        let kind = net_icon_kind(path)?;
+        let key = format!("stock:{kind:?}");
+        if let Some(handle) = self.icons.borrow().get(&key) {
+            return Some(handle.clone());
+        }
+        let handle =
+            rc_platform::stock_icon(kind).map(|icon| image::Handle::from_rgba(icon.width, icon.height, icon.rgba));
+        self.icons.borrow_mut().insert(key, handle.clone());
+        Some(handle)
     }
 
     fn icon_by_key(&self, key: String, path: &Path, is_dir: bool) -> Option<image::Handle> {
@@ -4112,6 +4137,16 @@ fn read_restored(path: &Path) -> Result<(PathBuf, Vec<Entry>), String> {
         .ok_or_else(|| "no folder could be read".into())
 }
 
+/// The stock icon for a computer (`\\server`) or a share root
+/// (`\\server\share`); `None` for anything else, folders inside shares too.
+fn net_icon_kind(path: &Path) -> Option<rc_platform::StockIcon> {
+    if vfs::unc_server_only(path).is_some() {
+        Some(rc_platform::StockIcon::Server)
+    } else {
+        vfs::unc_share_parent(path).map(|_| rc_platform::StockIcon::Share)
+    }
+}
+
 /// Icon cache key for a listed entry. Files with their own icon (programs,
 /// shortcuts) are keyed by size and date as well: a file looked at while it
 /// was still being written (a download in progress) shows the generic icon,
@@ -4203,6 +4238,21 @@ mod tests {
         let gone = std::env::temp_dir().join("rc-no-such-folder").join("deeper");
         let (found, _) = read_restored(&gone).unwrap();
         assert_eq!(found, std::env::temp_dir());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn computers_and_shares_get_stock_icons() {
+        use rc_platform::StockIcon::{Server, Share};
+        let kind = |s: &str| net_icon_kind(Path::new(s));
+        assert_eq!(kind(r"\\nas"), Some(Server));
+        assert_eq!(kind(r"\\nas\"), Some(Server));
+        assert_eq!(kind(r"\\nas\data"), Some(Share));
+        assert_eq!(kind(r"\\nas\C$\"), Some(Share));
+        assert_eq!(kind(r"\\nas\data\photos"), None);
+        assert_eq!(kind(r"C:\"), None);
+        assert_eq!(kind("net:"), None);
+        assert!(rc_platform::stock_icon(Server).is_some() && rc_platform::stock_icon(Share).is_some());
     }
 
     #[cfg(windows)]

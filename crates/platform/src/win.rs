@@ -95,6 +95,27 @@ pub fn file_icon(path: &Path, is_dir: bool, by_type_only: bool) -> Option<Icon> 
     icon
 }
 
+/// The shell's small stock icon `kind` (no file or network access).
+pub fn stock_icon(kind: crate::StockIcon) -> Option<Icon> {
+    use windows::Win32::UI::Shell::{
+        SHGetStockIconInfo, SHGSI_ICON, SHGSI_SMALLICON, SHSTOCKICONINFO, SIID_SERVER, SIID_SERVERSHARE,
+    };
+    let id = match kind {
+        crate::StockIcon::Server => SIID_SERVER,
+        crate::StockIcon::Share => SIID_SERVERSHARE,
+    };
+    let mut info = SHSTOCKICONINFO { cbSize: size_of::<SHSTOCKICONINFO>() as u32, ..Default::default() };
+    unsafe { SHGetStockIconInfo(id, SHGSI_ICON | SHGSI_SMALLICON, &mut info) }.ok()?;
+    if info.hIcon.is_invalid() {
+        return None;
+    }
+    let icon = unsafe { hicon_to_rgba(info.hIcon) };
+    unsafe {
+        let _ = DestroyIcon(info.hIcon);
+    }
+    icon
+}
+
 unsafe fn hicon_to_rgba(hicon: HICON) -> Option<Icon> {
     let mut ii = ICONINFO::default();
     unsafe { GetIconInfo(hicon, &mut ii) }.ok()?;

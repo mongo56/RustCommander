@@ -277,6 +277,29 @@ pub fn file_icon(path: &Path, is_dir: bool) -> Option<Icon> {
     }
 }
 
+/// Shell icons for network things that are no files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StockIcon {
+    /// A computer (`\\server`).
+    Server,
+    /// A share (`\\server\share`).
+    Share,
+}
+
+/// The system's small stock icon `kind`. Never touches the disk or the
+/// network, so it is safe on the UI thread for servers and shares.
+pub fn stock_icon(kind: StockIcon) -> Option<Icon> {
+    #[cfg(windows)]
+    {
+        win::stock_icon(kind)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = kind;
+        None
+    }
+}
+
 /// The shell's thumbnail of a file (pictures, videos, PDFs, ... whatever
 /// Explorer previews), fitting `size`×`size`. `None` when there is none:
 /// it never falls back to an icon. Slow (decodes the file unless the
