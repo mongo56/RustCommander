@@ -1964,6 +1964,17 @@ impl App {
                 self.focus_term_pane(dir);
                 return Task::none();
             }
+            MoveTerminalLeft | MoveTerminalRight | MoveTerminalUp | MoveTerminalDown => {
+                use iced::widget::pane_grid::Direction;
+                let dir = match cmd {
+                    MoveTerminalLeft => Direction::Left,
+                    MoveTerminalRight => Direction::Right,
+                    MoveTerminalUp => Direction::Up,
+                    _ => Direction::Down,
+                };
+                self.move_term_pane(dir);
+                return Task::none();
+            }
             ZoomTerminalPane => {
                 self.zoom_term_pane();
                 return Task::none();

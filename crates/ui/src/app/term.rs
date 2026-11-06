@@ -1703,6 +1703,41 @@ impl TermTab {
         self.panes.iter().find(|(_, &t)| t == id).map(|(&p, _)| p)
     }
 
+    /// `MoveTerminalLeft/Right/Up/Down`: the focused pane swaps places with
+    /// the pane next to it in `direction`; with none there, it moves to that
+    /// edge of the entry, across all the others (how a side-by-side pair
+    /// becomes a stacked one). `false` if nothing changed.
+    fn move_focused(&mut self, direction: pane_grid::Direction) -> bool {
+        use pane_grid::{Axis, Direction, Edge, Node};
+        if self.panes.len() < 2 {
+            return false;
+        }
+        if let Some(next) = self.panes.adjacent(self.focus, direction) {
+            self.panes.swap(self.focus, next);
+            return true;
+        }
+        let (edge, axis, first) = match direction {
+            Direction::Left => (Edge::Left, Axis::Vertical, true),
+            Direction::Right => (Edge::Right, Axis::Vertical, false),
+            Direction::Up => (Edge::Top, Axis::Horizontal, true),
+            Direction::Down => (Edge::Bottom, Axis::Horizontal, false),
+        };
+        // Already alone along that edge: moving would only reset the split ratio.
+        if let Node::Split { axis: a, a: left, b: right, .. } = self.panes.layout() {
+            let side = if first { left } else { right };
+            if *a == axis && matches!(**side, Node::Pane(p) if p == self.focus) {
+                return false;
+            }
+        }
+        let id = self.focused();
+        self.panes.move_to_edge(self.focus, edge);
+        // The moved terminal gets a new pane.
+        if let Some(pane) = self.pane(id) {
+            self.focus = pane;
+        }
+        true
+    }
+
     /// The focused terminal.
     fn focused(&self) -> u64 {
         self.panes.get(self.focus).copied().unwrap_or_default()
@@ -1813,6 +1848,7 @@ impl App {
         ("Ctrl+Shift+W (cm_CloseTerminal)", "End the focused terminal and close it (middle-click or x on its sidebar entry closes the entry with all its split panes)"),
         ("Ctrl+Shift+E, Ctrl+Shift+O (cm_SplitTerminalRight, cm_SplitTerminalDown)", "Split: another shell to the right of / below the focused one, in its folder; drag the line between panes to resize"),
         ("Alt+Shift+arrows (cm_FocusTerminalLeft/Right/Up/Down)", "Move the keyboard focus to the split pane in that direction (or click a pane)"),
+        ("Ctrl+Alt+Shift+arrows (cm_MoveTerminalLeft/Right/Up/Down)", "Rearrange split panes: the focused pane swaps places with the one in that direction, or, with none there, moves to that edge (side by side becomes stacked and back)"),
         ("Ctrl+Shift+Z (cm_ZoomTerminalPane)", "Show the focused split pane alone, or all panes again"),
         ("cm_TerminalFolderToPanel (no key by default)", "Active panel goes to the terminal's current folder and Files is shown"),
         ("Ctrl+Shift+C or Ctrl+Insert", "Copy the selected text (select with the mouse: drag, double-click a word, triple-click a line)"),
@@ -2069,6 +2105,22 @@ impl App {
             self.set_tab_visible(tab, true);
         }
         self.show_term(id);
+    }
+
+    /// `MoveTerminalLeft/Right/Up/Down`: see `TermTab::move_focused` (a
+    /// zoomed pane is shown with the others again).
+    pub(super) fn move_term_pane(&mut self, direction: pane_grid::Direction) {
+        let Some(tab) = self.shown_tab() else { return };
+        let t = &mut self.term_tabs[tab];
+        if t.panes.len() < 2 {
+            return;
+        }
+        if t.panes.maximized().is_some() {
+            t.panes.restore();
+            self.set_tab_visible(tab, true);
+        }
+        // The focused terminal keeps the keys; pane sizes follow when drawn.
+        self.term_tabs[tab].move_focused(direction);
     }
 
     /// `ZoomTerminalPane`: the focused pane alone, or all panes again.
@@ -2458,6 +2510,10 @@ impl App {
             Command::FocusTerminalRight,
             Command::FocusTerminalUp,
             Command::FocusTerminalDown,
+            Command::MoveTerminalLeft,
+            Command::MoveTerminalRight,
+            Command::MoveTerminalUp,
+            Command::MoveTerminalDown,
             Command::ZoomTerminalPane,
             Command::NextTab,
             Command::PrevTab,
@@ -2981,6 +3037,33 @@ mod tests {
         let (_, sibling) = tab.panes.close(pane).unwrap();
         assert_eq!((tab.panes.get(sibling), tab.drawn()), (Some(&3), vec![3]));
         assert_eq!(tab.pane(8), None);
+    }
+
+    #[test]
+    fn split_panes_move() {
+        use pane_grid::{Axis, Direction, Node};
+        let at = |tab: &TermTab, d| tab.panes.adjacent(tab.focus, d).and_then(|p| tab.panes.get(p)).copied();
+        let mut tab = TermTab::new(3);
+        assert!(!tab.move_focused(Direction::Left));
+        // 3 | 8, focus on 8.
+        let (pane, _) = tab.panes.split(Axis::Vertical, tab.focus, 8).unwrap();
+        tab.focus = pane;
+        // Swap with the left neighbour: 8 | 3, focus stays on 8.
+        assert!(tab.move_focused(Direction::Left));
+        assert_eq!((tab.focused(), at(&tab, Direction::Right)), (8, Some(3)));
+        // Already alone on the left edge: nothing to do.
+        assert!(!tab.move_focused(Direction::Left));
+        // Nothing below: to the bottom edge, 3 over 8.
+        assert!(tab.move_focused(Direction::Down));
+        assert_eq!((tab.focused(), at(&tab, Direction::Up)), (8, Some(3)));
+        assert!(matches!(tab.panes.layout(), Node::Split { axis: Axis::Horizontal, .. }));
+        assert!(!tab.move_focused(Direction::Down));
+        // Back up: 8 over 3, then to the right edge: 3 | 8.
+        assert!(tab.move_focused(Direction::Up));
+        assert_eq!(at(&tab, Direction::Down), Some(3));
+        assert!(tab.move_focused(Direction::Right));
+        assert_eq!((tab.focused(), at(&tab, Direction::Left)), (8, Some(3)));
+        assert_eq!(tab.ids(), vec![3, 8]);
     }
 
     #[test]

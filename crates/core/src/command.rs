@@ -208,6 +208,18 @@ commands! {
         FocusTerminalUp => "cm_FocusTerminalUp", "Focus the split terminal pane above", "PaneUp";
         /// Move the keyboard focus to the split terminal pane below (Alt+Shift+Down).
         FocusTerminalDown => "cm_FocusTerminalDown", "Focus the split terminal pane below", "PaneDown";
+        /// Move the focused split terminal pane left: swap with its neighbour, or to the left edge (Ctrl+Alt+Shift+Left).
+        MoveTerminalLeft => "cm_MoveTerminalLeft",
+            "Move the focused split terminal pane left (swap with the pane there, or to the left edge)", "MoveLeft";
+        /// Move the focused split terminal pane right (Ctrl+Alt+Shift+Right).
+        MoveTerminalRight => "cm_MoveTerminalRight",
+            "Move the focused split terminal pane right (swap with the pane there, or to the right edge)", "MoveRight";
+        /// Move the focused split terminal pane up (Ctrl+Alt+Shift+Up).
+        MoveTerminalUp => "cm_MoveTerminalUp",
+            "Move the focused split terminal pane up (swap with the pane there, or to the top edge)", "MoveUp";
+        /// Move the focused split terminal pane down (Ctrl+Alt+Shift+Down).
+        MoveTerminalDown => "cm_MoveTerminalDown",
+            "Move the focused split terminal pane down (swap with the pane there, or to the bottom edge)", "MoveDown";
         /// Show the focused split terminal pane alone, or all of them again (Ctrl+Shift+Z).
         ZoomTerminalPane => "cm_ZoomTerminalPane",
             "Zoom the focused split terminal pane (show it alone), or show all panes again", "Zoom";
