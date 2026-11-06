@@ -836,30 +836,30 @@ fn meaningful_title(title: &str) -> bool {
 }
 
 /// The footer's hints for switching terminals, from the keys of the previous/next/new terminal commands
-/// (`Ctrl+Shift+Up/Down` switch terminals, `Ctrl+Shift+T` new terminal).
+/// (`Ctrl+Shift+Up/Down` switch, `Ctrl+Shift+T` new).
 fn switch_hints(prev: Option<String>, next: Option<String>, new: Option<String>) -> Vec<HintOwned> {
     let switch = match (prev, next) {
         (Some(prev), Some(next)) => {
             // Shared modifiers once: Ctrl+Shift+Up/Down.
             Some(match (prev.rsplit_once('+'), next.rsplit_once('+')) {
-                (Some((a, up)), Some((b, down))) if a == b => HintOwned::new([format!("{a}+{up}/{down}")], "switch terminals"),
-                _ => HintOwned::new([prev, next], "switch terminals"),
+                (Some((a, up)), Some((b, down))) if a == b => HintOwned::new([format!("{a}+{up}/{down}")], "switch"),
+                _ => HintOwned::new([prev, next], "switch"),
             })
         }
-        (Some(key), None) => Some(HintOwned::new([key], "previous terminal")),
-        (None, Some(key)) => Some(HintOwned::new([key], "next terminal")),
+        (Some(key), None) => Some(HintOwned::new([key], "previous")),
+        (None, Some(key)) => Some(HintOwned::new([key], "next")),
         (None, None) => None,
     };
-    let new = new.map(|key| HintOwned::new([key], "new terminal"));
+    let new = new.map(|key| HintOwned::new([key], "new"));
     match (switch, new) {
         (Some(s), Some(n)) => vec![s, n],
         (Some(s), None) => vec![s],
-        (None, Some(n)) => vec![HintOwned::new(Vec::<String>::new(), "Sidebar: switch terminals"), n],
+        (None, Some(n)) => vec![HintOwned::new(Vec::<String>::new(), "Sidebar: switch"), n],
         (None, None) => vec![HintOwned::new(Vec::<String>::new(), "The sidebar on the right switches terminals")],
     }
 }
 
-/// `switch_hints` as one line of text (`Ctrl+Shift+Up/Down: switch terminals \u{b7} Ctrl+Shift+T: new terminal`).
+/// `switch_hints` as one line of text (`Ctrl+Shift+Up/Down: switch \u{b7} Ctrl+Shift+T: new`).
 #[cfg(test)]
 fn switch_tip(prev: Option<String>, next: Option<String>, new: Option<String>) -> String {
     let part = |h: HintOwned| if h.keys.is_empty() { h.action } else { format!("{}: {}", h.keys.join(" / "), h.action) };
@@ -2523,7 +2523,7 @@ impl App {
         let key = |cmd| keymap::Keymap::keys_for(&bindings, cmd).first().map(|k| k.to_string());
         let mut hints = switch_hints(key(Command::PrevTerminal), key(Command::NextTerminal), key(Command::NewTerminal));
         if let Some(tab) = key(Command::NextTab) {
-            hints.insert(0, HintOwned::new([tab], "next terminal"));
+            hints.insert(0, HintOwned::new([tab], "next"));
         }
         let split: Vec<String> =
             [Command::SplitTerminalRight, Command::SplitTerminalDown].into_iter().filter_map(key).collect();
@@ -2535,15 +2535,8 @@ impl App {
         // The way back keeps its place on the right; the switching hints drop pairs from the end to make room.
         let (back_line, back_w): (Element<'_, Message>, f32) = match back {
             Some(key) => {
-                let long = [HintOwned::new([key.clone()], "back to the panels (the terminal keeps running)")];
-                let short = [HintOwned::new([key], "back to the panels")];
-                let (line, w) = theme::key_hints_fit::<Message>(&long, total - 120.0);
-                if w > 0.0 {
-                    (line.into(), w)
-                } else {
-                    let (line, w) = theme::key_hints_fit::<Message>(&short, total - 120.0);
-                    (line.into(), w)
-                }
+                let (line, w) = theme::key_hints_fit::<Message>(&[HintOwned::new([key], "back")], total - 120.0);
+                (line.into(), w)
             }
             None => (
                 text("Bind cm_ToggleTerminal to a key to get back to the panels")
@@ -3304,11 +3297,11 @@ mod tests {
         let s = |k: &str| Some(k.to_owned());
         assert_eq!(
             switch_tip(s("Ctrl+Shift+Up"), s("Ctrl+Shift+Down"), s("Ctrl+Shift+T")),
-            "Ctrl+Shift+Up/Down: switch terminals \u{b7} Ctrl+Shift+T: new terminal"
+            "Ctrl+Shift+Up/Down: switch \u{b7} Ctrl+Shift+T: new"
         );
-        assert_eq!(switch_tip(s("Alt+Up"), s("Ctrl+Down"), None), "Alt+Up / Ctrl+Down: switch terminals");
-        assert_eq!(switch_tip(None, s("F2"), None), "F2: next terminal");
-        assert_eq!(switch_tip(None, None, s("Ctrl+T")), "Sidebar: switch terminals \u{b7} Ctrl+T: new terminal");
+        assert_eq!(switch_tip(s("Alt+Up"), s("Ctrl+Down"), None), "Alt+Up / Ctrl+Down: switch");
+        assert_eq!(switch_tip(None, s("F2"), None), "F2: next");
+        assert_eq!(switch_tip(None, None, s("Ctrl+T")), "Sidebar: switch \u{b7} Ctrl+T: new");
         assert_eq!(switch_tip(None, None, None), "The sidebar on the right switches terminals");
     }
 
