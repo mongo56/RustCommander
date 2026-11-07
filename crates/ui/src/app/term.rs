@@ -207,6 +207,14 @@ fn grid_size(size: Size) -> (usize, usize) {
     (cols.min(u16::MAX as usize), lines.min(u16::MAX as usize))
 }
 
+/// Whether an area of `size` pixels holds at least the smallest grid (two
+/// columns, one line). Smaller ones (a minimized window lays everything out
+/// at 0x0) aren't sent to the shell: shrinking the ConPTY to 2x1 and back
+/// can lose or hard-wrap its output.
+fn fits_grid(size: Size) -> bool {
+    size.width - 2.0 * PAD - crate::scrollbar::WIDTH >= 2.0 * cell_w() && size.height - 2.0 * PAD >= CELL_H
+}
+
 fn window_size(cols: usize, lines: usize) -> WindowSize {
     WindowSize {
         num_lines: lines as u16,
@@ -1658,6 +1666,9 @@ impl Widget<Message, Theme, iced::Renderer> for Grid<'_> {
     ) -> event::Status {
         // Checked before every frame, so a window resize resizes the grid.
         if let Event::Window(window::Event::RedrawRequested(_)) = event {
+            if !fits_grid(layout.bounds().size()) {
+                return event::Status::Ignored;
+            }
             let (cols, lines) = grid_size(layout.bounds().size());
             if (cols, lines) != (self.frame.cols, self.frame.lines) {
                 shell.publish(Message::Term(TermMsg::Resize(self.id, cols, lines)));
@@ -3445,6 +3456,20 @@ mod tests {
         assert_eq!(paste_bytes("ls\r\npwd", true), b"\x1b[200~ls\rpwd\x1b[201~");
         // An ESC can't end the bracket early.
         assert_eq!(paste_bytes("a\x1b[201~b", true), b"\x1b[200~a[201~b\x1b[201~");
+    }
+
+    #[test]
+    fn minimized_window_doesnt_resize_the_grid() {
+        // A minimized window lays the grid out at 0x0: no resize is sent.
+        assert!(!fits_grid(Size::ZERO));
+        assert!(!fits_grid(Size::new(800.0, 0.0)));
+        assert!(!fits_grid(Size::new(0.0, 600.0)));
+        assert!(fits_grid(Size::new(800.0, 600.0)));
+        // The smallest area that fits gives the smallest grid, 2x1.
+        let side = 2.0 * PAD + crate::scrollbar::WIDTH;
+        let min = Size::new(side + 2.0 * cell_w() + 0.5, 2.0 * PAD + CELL_H + 0.5);
+        assert!(fits_grid(min));
+        assert_eq!(grid_size(min), (2, 1));
     }
 
     #[test]
