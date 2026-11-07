@@ -1,7 +1,7 @@
 ; Inno Setup script for RustCommander (https://jrsoftware.org/isinfo.php).
 ; Built by scripts\package.ps1, which passes:
 ;   /DAppVersion=<version from Cargo.toml>
-;   /DSourceDir=<folder with rustcommander.exe, README.md, LICENSE, THIRD-PARTY-NOTICES.txt>
+;   /DSourceDir=<folder with rustcommander.exe, conpty.dll, x64\OpenConsole.exe, README.md, LICENSE, THIRD-PARTY-NOTICES.txt>
 ;   /DOutputDir=<dist folder>
 ;   /DIconFile=<icon.ico written by crates\ui\build.rs> (optional)
 ;
@@ -69,6 +69,9 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 Source: "{#SourceDir}\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
+; Microsoft's ConPTY for the built-in terminal (scripts\fetch-conpty.ps1).
+Source: "{#SourceDir}\conpty.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourceDir}\x64\OpenConsole.exe"; DestDir: "{app}\x64"; Flags: ignoreversion
 Source: "{#SourceDir}\README.md"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#SourceDir}\LICENSE*"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#SourceDir}\THIRD-PARTY-NOTICES.txt"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist

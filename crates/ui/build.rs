@@ -32,6 +32,38 @@ fn main() {
     println!("cargo:rustc-link-arg-bins={}", out.display());
     // The same icon as a .ico file, for the installer (scripts/package.ps1).
     std::fs::write(out.with_file_name("icon.ico"), icon_ico()).expect("write icon.ico");
+    copy_conpty(&out);
+}
+
+/// Copies Microsoft's ConPTY from `vendor/conpty` (scripts/fetch-conpty.ps1)
+/// next to the exe: alacritty_terminal then loads that `conpty.dll` instead
+/// of the ConPTY built into Windows, which drops mouse-mode requests a
+/// program writes before it switches to raw input. Without it the built-in
+/// terminal still works, with the inbox ConPTY.
+fn copy_conpty(out: &std::path::Path) {
+    let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    let vendor = manifest.join("../../vendor/conpty");
+    let files = ["conpty.dll", "x64/OpenConsole.exe"];
+    for f in files {
+        println!("cargo:rerun-if-changed={}", vendor.join(f).display());
+    }
+    if !files.iter().all(|f| vendor.join(f).is_file()) {
+        println!("cargo:warning=vendor/conpty is missing: run scripts\\fetch-conpty.ps1 (the built-in terminal falls back to Windows' own ConPTY)");
+        return;
+    }
+    // `out` is <target>/<profile>/build/<crate>-<hash>/out/icon.res.
+    let Some(profile_dir) = out.ancestors().nth(4) else { return };
+    for f in files {
+        let (from, to) = (vendor.join(f), profile_dir.join(f));
+        if std::fs::read(&from).ok() == std::fs::read(&to).ok() {
+            continue;
+        }
+        let copied = to.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::copy(&from, &to));
+        if let Err(e) = copied {
+            // In use: a running build of the app has it loaded.
+            println!("cargo:warning=couldn't copy {f} next to the exe: {e}");
+        }
+    }
 }
 
 /// An .ico file with the PNG images: header, directory, then the images.

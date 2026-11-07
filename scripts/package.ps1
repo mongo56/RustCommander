@@ -5,6 +5,9 @@ $env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
+# Microsoft's ConPTY for the built-in terminal (vendor\conpty), shipped next to the exe.
+& (Join-Path $PSScriptRoot 'fetch-conpty.ps1')
+
 cargo build --release -p rustcommander
 if ($LASTEXITCODE -ne 0) { throw 'cargo build failed' }
 
@@ -16,6 +19,9 @@ if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
 New-Item -ItemType Directory -Force (Join-Path $root 'dist') | Out-Null
 New-Item -ItemType Directory -Force $stage | Out-Null
 Copy-Item 'target\release\rustcommander.exe' $stage
+Copy-Item 'vendor\conpty\conpty.dll' $stage
+New-Item -ItemType Directory -Force (Join-Path $stage 'x64') | Out-Null
+Copy-Item 'vendor\conpty\x64\OpenConsole.exe' (Join-Path $stage 'x64')
 foreach ($f in 'LICENSE', 'LICENSE-MIT', 'LICENSE-APACHE', 'THIRD-PARTY-NOTICES.txt') {
     if (Test-Path $f) { Copy-Item $f $stage }
 }

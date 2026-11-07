@@ -129,6 +129,7 @@ are kept unless you choose to remove them.
 **From source** (needs a Rust toolchain with the MSVC target):
 
 ```sh
+powershell -File scripts\fetch-conpty.ps1  # once: Microsoft's ConPTY for the built-in terminal (optional)
 cargo run -p rustcommander --release    # run
 cargo build --release                   # build only
 cargo test                              # tests
