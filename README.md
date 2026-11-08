@@ -11,10 +11,16 @@ with a modern, minimalist look. Written in Rust with [iced](https://iced.rs).
 - Dual panels with tabs per side, virtualised lists, sorting, hidden-file toggle
 - Thumbnail view per tab (Ctrl+Shift+F5): pictures, videos and documents as a grid of previews (Windows shell thumbnails), size set with `thumbnail_size`
 - Quick search (just type), quick filter (Ctrl+S)
+- Quick view: the other panel previews the file under the cursor (text, hex, image, Markdown, folder, archive)
+- Branch view (Ctrl+B): every file below the folder in one list
+- Zoom the panels with Ctrl+mouse wheel or Ctrl+Plus/Minus/0 (text, rows and columns; kept in the session)
+- Git status: a letter per changed file and the branch in the path bar (`git_status`)
 - Folder history (Alt+Left/Right, Alt+Down list) and a hotlist of favourite folders (Ctrl+D) with names and comments, optionally shown as a folder tree beside the panels (Ctrl+Shift+D)
 - Folder sizes (Space on a folder), compare folders (Shift+F2)
+- Disk usage (Alt+Shift+F7): folder tree sorted by size, a treemap and a list by extension; delete from there
 - Folders are watched and refresh by themselves; tabs and folders are restored on start
 - Drive bar with free space and the drive's name as a tooltip (middle-click opens a new tab, right-click the shell menu, updates when drives come and go), Enter on a disk image (.iso, .img, .vhd, .vhdx) mounts it and opens the new drive, path bar with autocomplete (expands %VAR% and ~)
+- Network: a Network button lists the computers on the network (WS-Discovery, NetBIOS, mDNS) and their shares (`\server`); asks for user and password when a share refuses access
 
 **File operations**
 - Copy, move, delete, recycle bin and new folder run as background jobs, several at once, with progress, speed, pause and cancel
@@ -23,6 +29,11 @@ with a modern, minimalist look. Written in Rust with [iced](https://iced.rs).
 - Inline rename (F2) and multi-rename with masks and live preview (Ctrl+M)
 - Find files (Ctrl+F) by name, mask or regex and by content, also inside archives and on servers
 - Compare files side by side (Alt+F2)
+- Synchronize folders (Alt+Shift+F2): recursive compare, two-way, mirror or update, confirmed before it copies or recycles
+- Undo (Ctrl+Z) for rename, multi-rename, moves on the same drive, new folders and files, copies and recycling
+- Find duplicate files (in Find files): by size, then hash; mark them and send them to a panel
+- Change attributes and dates (Ctrl+Shift+A), also in subfolders
+- SHA-256 checksums (save or copy as .sha256, verify a .sha256 file), split and combine files (name.001, ...)
 
 **Viewer (F3)**
 - Text, hex and image modes, find, word wrap, zoom and pan
@@ -31,7 +42,7 @@ with a modern, minimalist look. Written in Rust with [iced](https://iced.rs).
 - Enter on a .md file opens it in the viewer ("Markdown in the viewer" setting)
 
 **Archives**
-- Browse zip, 7z, rar (rar4/rar5, multi-volume, encrypted; read-only), tar, tar.gz, tar.bz2 and gz like folders; pack (Alt+F5) and unpack (Alt+F9)
+- Browse zip, 7z, rar (rar4/rar5, multi-volume, encrypted; read-only), tar, tar.gz, tar.bz2 and gz like folders; pack (Alt+F5, optionally with a password: AES-256 zip, 7z with encrypted names) and unpack (Alt+F9)
 - Add, change and delete files inside zip, 7z, tar and gz archives
 
 **Remote (SFTP, FTP, FTPS)**
@@ -49,14 +60,21 @@ with a modern, minimalist look. Written in Rust with [iced](https://iced.rs).
 **Built-in terminal (F9)**
 - PowerShell 7 if installed, else Windows PowerShell (or any shell you set), in a ConPTY, started in the current folder
 - Several terminals: a sidebar on the right switches between Files and the terminals; while the files are shown it collapses to a thin strip over the panels
+- Split panes in each entry (Ctrl+Shift+E right, Ctrl+Shift+O down): focus with Alt+Shift+arrows, rearrange with Ctrl+Alt+Shift+arrows, zoom one pane with Ctrl+Shift+Z, drag the dividers
+- Themed colours (`[terminal_colors]` overrides), blinking cursor, Cascadia Mono built in with real bold and italic, underline styles; block, box and Powerline characters drawn as shapes so they join without seams
+- Zoom per terminal (Ctrl+mouse wheel, Ctrl+Plus/Minus/0); font and size settings (`terminal_font`, `terminal_font_size`)
+- Find in the scrollback (Ctrl+Shift+F); Ctrl+click opens links: web addresses in the browser, folders in the panel, `file:line` paths in your editor at that line
+- Ctrl+Shift+Enter sends the panel's folder to the terminal (cd); files dropped on a terminal are pasted as their paths (handy for Claude Code)
+- Programs that track the mouse get clicks and the wheel (Microsoft's newer ConPTY ships next to the exe)
 - Mouse selection, copy/paste (bracketed paste), scrollback with a scrollbar; asks before quitting while terminals run
 - Enter on a .ps1, .cmd or .bat file runs it in a new terminal in its folder ("Run scripts in terminal" setting); the context menu of a script also has Run in terminal and Run in external terminal
-- A terminal you're not looking at gets a dot in the sidebar when a command finishes or its program waits for input (bell, OSC 777/9/99 notifications, OSC 9;4 progress cleared). opencode works as is; for Pi, either use its `notify.ts` extension or set `"terminal": { "showTerminalProgress": true }` in `~/.pi/agent/settings.json` (off by default)
+- A terminal you're not looking at gets a dot in the sidebar when a command finishes or its program waits for input (bell, OSC 777/9/99 notifications, OSC 9;4 progress cleared). opencode works as is; for Pi, either use its `notify.ts` extension or set `"terminal": { "showTerminalProgress": true }` in `~/.pi/agent/settings.json` (off by default). The taskbar button flashes when the window is in the background
 
 **Configuration and keymap**
 - `config.toml` with editor, terminal, built-in terminal shell, theme, key bindings and colours; changes apply on save
 - F10 settings view (general, key bindings with a filter box, colours) that keeps your comments in the file
-- F1 help, Ctrl+Space command palette, built-in themes (Gruvbox, the default, Dark, Light, Nord)
+- F1 help, Ctrl+Space command palette, built-in themes (Gruvbox, the default, Dark, Light, Nord, Sunset, Seventies, 808)
+- Your own commands (`[[user_commands]]`) with placeholders for folders and files, optional keys, in the palette and F1; they can run in a built-in terminal
 - Every action is a `cm_*` command, so any key can be bound to any command
 - Check for updates (command palette): finds a newer release on GitHub, downloads the installer and updates in place; optionally at startup (`check_updates_at_startup`)
 - Software rendering (`software_rendering`, F10, off by default so the GPU draws): draws with the CPU instead, so the window opens in about 0.1 s instead of 0.6 s, but scrolling and big folders are slower; the panels fill in as their folders are read
@@ -77,6 +95,9 @@ with a modern, minimalist look. Written in Rust with [iced](https://iced.rs).
 | Ctrl+H | Show / hide hidden files |
 | Ctrl+Shift+F5 | Thumbnail view on / off |
 | Ctrl+S | Quick filter |
+| Ctrl+B | Branch view |
+| Ctrl+Z | Undo |
+| Ctrl+Shift+A | Change attributes and dates |
 | Ctrl+C / Ctrl+X / Ctrl+V | Copy / cut / paste files (clipboard) |
 | Ctrl+D / Ctrl+Shift+D | Hotlist / hotlist tree |
 | Alt+Left / Alt+Right / Alt+Down | History back / forward / list |
@@ -94,8 +115,13 @@ with a modern, minimalist look. Written in Rust with [iced](https://iced.rs).
 | Ctrl+Tab, Ctrl+Shift+Tab (in a terminal) | Next / previous terminal (Files is skipped); in the panels they switch panel tabs |
 | Ctrl+Shift+T / Ctrl+Shift+Down, Up / Ctrl+Shift+W | New terminal / next, previous entry of the terminal sidebar / close the shown terminal |
 | Ctrl+Shift+C, Ctrl+Shift+V / right-click (in the terminal) | Copy the mouse selection / paste (right-click copies the selection, else pastes); mouse wheel and Shift+PgUp/PgDn scroll the history |
+| Ctrl+Shift+E / Ctrl+Shift+O (in a terminal) | Split right / down; Alt+Shift+arrows focus, Ctrl+Alt+Shift+arrows move, Ctrl+Shift+Z zoom a pane |
+| Ctrl+Shift+F (in a terminal) | Find in the scrollback |
+| Ctrl+Shift+Enter | Send the panel's folder to the built-in terminal |
+| Ctrl+wheel, Ctrl+Plus / Minus / 0 | Zoom the panels or the terminal |
 | F10 | Settings |
-| Shift+F2 | Compare folders |
+| Shift+F2 / Alt+Shift+F2 | Compare / synchronize folders |
+| Alt+Shift+F7 | Disk usage |
 | Alt+F2 | Compare files |
 | Alt+F5 / Alt+F9 | Pack / unpack |
 | Ctrl+F | Find files |
@@ -111,10 +137,12 @@ with a modern, minimalist look. Written in Rust with [iced](https://iced.rs).
 |---|---|
 | ![Viewer](docs/screenshots/viewer-text.png) | ![Rendered Markdown](docs/screenshots/viewer-markdown.png) |
 | ![Image viewer](docs/screenshots/viewer-image.png) | ![Thumbnail view](docs/screenshots/thumbnails.png) |
-| ![Built-in terminal](docs/screenshots/terminal.png) | ![Find files](docs/screenshots/find-files.png) |
+| ![Built-in terminal with split panes](docs/screenshots/terminal.png) | ![Find files](docs/screenshots/find-files.png) |
 | ![Command palette](docs/screenshots/command-palette.png) | ![Archive browsing](docs/screenshots/archive-browsing.png) |
-| ![File operation progress](docs/screenshots/file-operation-progress.png) | ![Settings: general](docs/screenshots/settings-general.png) |
-| ![Settings: key bindings](docs/screenshots/settings-keys.png) | ![Settings: colours](docs/screenshots/settings-colours.png) |
+| ![Quick view](docs/screenshots/quick-view.png) | ![Disk usage](docs/screenshots/disk-usage.png) |
+| ![Synchronize folders](docs/screenshots/sync-folders.png) | ![File operation progress](docs/screenshots/file-operation-progress.png) |
+| ![Settings: general](docs/screenshots/settings-general.png) | ![Settings: key bindings](docs/screenshots/settings-keys.png) |
+| ![Settings: colours](docs/screenshots/settings-colours.png) | |
 
 ## Install and run
 
@@ -145,7 +173,7 @@ The open tabs are kept in `session.toml` and saved connections in
 `connections.toml` in the same folder.
 
 ```toml
-theme = "nord"            # gruvbox (default), dark, light or nord
+theme = "nord"            # gruvbox (default), dark, light, nord, sunset, seventies or 808
 
 [compare]                 # compare folders (Shift+F2), also Ctrl+Shift+F2 / F10
 by_content = true
@@ -157,6 +185,11 @@ by_content = true
 [colors]                  # "#rrggbb", on top of the theme
 accent = "#ff8800"
 dir = "#8cb8ff"
+
+[[user_commands]]         # palette, F1 and an optional key
+name = "Open in VS Code"
+run = "code %P"           # %P folder, %T other folder, %N name, %F full path, %S selection
+key = "Ctrl+Alt+1"
 ```
 
 Colour names: `bg`, `panel`, `zebra`, `header`, `border`, `text`, `muted`,
