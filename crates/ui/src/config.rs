@@ -56,6 +56,13 @@ pub struct Config {
     /// The built-in terminal's cursor blinks (unless a program asks for a
     /// steady one).
     pub terminal_cursor_blink: bool,
+    /// The built-in terminal's font: a family name (a monospace one); empty =
+    /// the system's monospace font (Cascadia Code / Consolas on Windows).
+    pub terminal_font: String,
+    /// The built-in terminal's font size (Ctrl+0 there goes back to it;
+    /// Ctrl++ / Ctrl+- zoom from it, kept in the session); see
+    /// [`Config::terminal_font_size`].
+    pub terminal_font_size: u32,
     /// Edge of the thumbnail view's pictures in pixels (Ctrl+Shift+F5);
     /// 0 = the default, see [`Config::thumbnail_size`].
     pub thumbnail_size: u32,
@@ -149,6 +156,8 @@ impl Default for Config {
             check_updates_at_startup: false,
             software_rendering: false,
             terminal_cursor_blink: true,
+            terminal_font: String::new(),
+            terminal_font_size: DEFAULT_TERMINAL_FONT_SIZE,
             thumbnail_size: 0,
             keys: BTreeMap::new(),
             colors: BTreeMap::new(),
@@ -221,7 +230,19 @@ fn bind_user_key(
     }
 }
 
+/// The built-in terminal's font size when unset, and the sizes it can have.
+pub const DEFAULT_TERMINAL_FONT_SIZE: u32 = 14;
+pub const TERMINAL_FONT_SIZES: std::ops::RangeInclusive<u32> = 8..=32;
+
 impl Config {
+    /// `terminal_font_size`, 14 when 0, kept within `TERMINAL_FONT_SIZES`.
+    pub fn terminal_font_size(&self) -> u32 {
+        match self.terminal_font_size {
+            0 => DEFAULT_TERMINAL_FONT_SIZE,
+            size => size.clamp(*TERMINAL_FONT_SIZES.start(), *TERMINAL_FONT_SIZES.end()),
+        }
+    }
+
     /// The thumbnail edge in pixels: `thumbnail_size`, 128 when unset,
     /// kept within 32..=512.
     pub fn thumbnail_size(&self) -> u32 {
@@ -541,6 +562,14 @@ fn template(editor: &str, compare: CompareState) -> String {
          # for a steady cursor get one either way.\n\
          terminal_cursor_blink = true\n\
          \n\
+         # The built-in terminal's font: a monospace family name, e.g. 'Cascadia Mono'\n\
+         # or 'Consolas'. Empty = the system's monospace font.\n\
+         terminal_font = \"\"\n\
+         \n\
+         # Its font size, 8-32. Ctrl++ / Ctrl+- in a terminal zoom all terminals (the\n\
+         # zoom is kept for the next start); Ctrl+0 goes back to this size.\n\
+         terminal_font_size = 14\n\
+         \n\
          # Show hidden and system files at the first start (Ctrl+H toggles them per tab).\n\
          show_hidden = false\n\
          \n\
@@ -798,6 +827,18 @@ key = \"F7\"
         assert_eq!(parse("").unwrap().editor, "");
         assert_eq!(parse("").unwrap().builtin_shell, "");
         assert!(parse("editor = ").is_err());
+    }
+
+    #[test]
+    fn terminal_font_settings() {
+        let config = parse("").unwrap();
+        assert_eq!((config.terminal_font.as_str(), config.terminal_font_size()), ("", 14));
+        assert_eq!(parse("terminal_font_size = 0").unwrap().terminal_font_size(), 14);
+        assert_eq!(parse("terminal_font_size = 3").unwrap().terminal_font_size(), 8);
+        assert_eq!(parse("terminal_font_size = 99").unwrap().terminal_font_size(), 32);
+        assert_eq!(parse("terminal_font_size = 16").unwrap().terminal_font_size(), 16);
+        assert_eq!(parse("terminal_font = 'Consolas'").unwrap().terminal_font, "Consolas");
+        assert!(parse("terminal_font_size = -1").is_err());
     }
 
     #[test]

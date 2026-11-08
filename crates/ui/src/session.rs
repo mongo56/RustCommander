@@ -51,9 +51,17 @@ pub struct Session {
     /// doesn't offer it again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skipped_update: Option<String>,
+    /// Font size steps the built-in terminals are zoomed by (Ctrl++ / Ctrl+-)
+    /// from `config.toml`'s `terminal_font_size`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub terminal_zoom: i32,
     /// Editor setting from older versions; read once to seed `config.toml`.
     #[serde(default, skip_serializing)]
     pub editor: String,
+}
+
+fn is_zero(n: &i32) -> bool {
+    *n == 0
 }
 
 fn default_split() -> f32 {
@@ -203,6 +211,7 @@ mod tests {
             compare: Some(CompareState { by_content: true, ignore_date: false, subfolders: true }),
             recent_commands: vec!["cm_MkDir".into(), "cm_Copy".into()],
             skipped_update: Some("0.9.1".into()),
+            terminal_zoom: -2,
             split: 0.3,
             columns: [45.0, 95.0, 150.0],
             editor: r#""my editor.exe" -n %1"#.into(),
@@ -218,6 +227,9 @@ mod tests {
         assert_eq!(back.tree_width, 310.0);
         assert_eq!(back.recent_commands, session.recent_commands);
         assert_eq!(back.skipped_update.as_deref(), Some("0.9.1"));
+        assert_eq!(back.terminal_zoom, -2);
+        let unzoomed = toml::to_string_pretty(&Session { terminal_zoom: 0, ..back.clone() }).unwrap();
+        assert!(!unzoomed.contains("terminal_zoom"), "{unzoomed}");
         // Compare options not yet moved to config.toml are kept...
         assert_eq!(back.compare, session.compare);
         // ...and dropped once they were.

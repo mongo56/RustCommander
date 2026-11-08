@@ -240,6 +240,11 @@ pub struct App {
     terms: Vec<term::TermSession>,
     /// The terminals' blink cycle.
     term_blink: term::Blink,
+    /// Font size steps from `terminal_font_size` (`TerminalZoomIn/Out`; session).
+    term_zoom: i32,
+    /// The grids' cell size and faces (`term_metrics`), measured on first use;
+    /// emptied when the font or its size changes.
+    term_metrics: std::cell::OnceCell<term::Metrics>,
     /// The sidebar's entries: each holds one or more of `terms` in split panes.
     term_tabs: Vec<term::TermTab>,
     next_term_id: u64,
@@ -723,6 +728,8 @@ impl App {
             disk_usage_last: None,
             terms: Vec::new(),
             term_blink: term::Blink::default(),
+            term_zoom: session.as_ref().map_or(0, |s| s.terminal_zoom),
+            term_metrics: std::cell::OnceCell::new(),
             term_tabs: Vec::new(),
             next_term_id: 1,
             term_last: None,
@@ -1963,6 +1970,9 @@ impl App {
             SendFolderToTerminal => return self.send_folder_to_terminal(),
             SplitTerminalRight => return self.split_term(iced::widget::pane_grid::Axis::Vertical),
             SplitTerminalDown => return self.split_term(iced::widget::pane_grid::Axis::Horizontal),
+            TerminalZoomIn => return self.zoom_term(Some(1)),
+            TerminalZoomOut => return self.zoom_term(Some(-1)),
+            TerminalZoomReset => return self.zoom_term(None),
             FocusTerminalLeft | FocusTerminalRight | FocusTerminalUp | FocusTerminalDown => {
                 use iced::widget::pane_grid::Direction;
                 let dir = match cmd {
@@ -3598,6 +3608,7 @@ impl App {
             compare: self.compare_unsaved,
             recent_commands: self.recent_commands.iter().map(|c| c.id().to_owned()).collect(),
             skipped_update: self.skipped_update.clone(),
+            terminal_zoom: self.term_zoom,
             split: self.split,
             columns: self.columns,
             window: self.placement.map(Into::into),
@@ -3647,6 +3658,10 @@ impl App {
         self.user_cmds = cmds;
         self.user_keys = keys;
         self.config_notes = notes;
+        let font = |c: &crate::config::Config| (c.terminal_font.clone(), c.terminal_font_size);
+        if font(&config) != font(&self.config) {
+            self.term_metrics = std::cell::OnceCell::new();
+        }
         self.config = config;
         self.git_missing = false; // look for git again
         self.keymap = keymap;

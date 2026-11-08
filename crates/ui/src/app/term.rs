@@ -43,9 +43,6 @@ use std::sync::mpsc as std_mpsc;
 use std::sync::Mutex;
 use std::thread::JoinHandle;
 
-/// Font size and line height of the grid.
-const FONT_SIZE: f32 = 14.0;
-const CELL_H: f32 = 18.0;
 /// Space around the grid.
 const PAD: f32 = 6.0;
 /// Height of the line under the grid (how to switch, how to get back).
@@ -132,17 +129,22 @@ impl Default for Blink {
     }
 }
 
+/// Line height of the grid at font size `size`: 18 at 14, in proportion.
+fn line_height(size: f32) -> f32 {
+    (size * 18.0 / 14.0).round()
+}
+
 /// The advance of "0" and the baseline (from the top of the line) of `font` at
-/// the grid's size and line height.
-fn measure(font: Font) -> (f32, f32) {
+/// font size `size` and line height `cell_h`.
+fn measure(font: Font, size: f32, cell_h: f32) -> (f32, f32) {
     use iced::advanced::text::Paragraph as _;
     const N: usize = 100;
     let sample = "0".repeat(N);
     let paragraph = iced::advanced::graphics::text::Paragraph::with_text(iced::advanced::Text {
         content: sample.as_str(),
         bounds: Size::INFINITY,
-        size: Pixels(FONT_SIZE),
-        line_height: LineHeight::Absolute(Pixels(CELL_H)),
+        size: Pixels(size),
+        line_height: LineHeight::Absolute(Pixels(cell_h)),
         font,
         horizontal_alignment: alignment::Horizontal::Left,
         vertical_alignment: alignment::Vertical::Top,
@@ -153,37 +155,62 @@ fn measure(font: Font) -> (f32, f32) {
     (paragraph.min_width() / N as f32, baseline)
 }
 
-/// Width of a cell: a monospace character at `FONT_SIZE`, measured once with
-/// the font the system resolves `Font::MONOSPACE` to.
-fn cell_w() -> f32 {
-    static W: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-    *W.get_or_init(|| {
-        let w = measure(Font::MONOSPACE).0;
-        if w.is_finite() && w > 1.0 { w } else { 8.4 }
-    })
+/// `terminal_font` as a font: empty = `Font::MONOSPACE`. iced wants a
+/// `'static` family name, so each name is leaked once.
+pub(super) fn font_named(name: &str) -> Font {
+    static NAMES: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+    let name = name.trim();
+    if name.is_empty() {
+        return Font::MONOSPACE;
+    }
+    let mut names = NAMES.lock().unwrap_or_else(|e| e.into_inner());
+    let name = match names.iter().find(|n| **n == name) {
+        Some(n) => *n,
+        None => {
+            let n: &'static str = Box::leak(name.to_owned().into_boxed_str());
+            names.push(n);
+            n
+        }
+    };
+    Font::with_name(name)
 }
 
 /// How far the second copy of synthetic bold text is drawn to the right.
 const BOLD_OFFSET: f32 = 0.6;
 
-/// The font a style is drawn with, and whether to embolden it by drawing it
-/// twice (`BOLD_OFFSET` apart). A bold or italic face is only used when it
-/// has the regular face's advance and baseline: `Font::MONOSPACE` can resolve
-/// the styles to other families (on Windows regular is Cascadia Code, a
-/// variable font cosmic-text sees only at weight 400, so bold and italic come
-/// from Consolas, narrower and with another baseline), which would put the
-/// text off the cell grid. Then bold is synthetic and italic is drawn upright.
-fn style_font(bold: bool, italic: bool) -> (Font, bool) {
-    static STYLES: std::sync::OnceLock<[(Font, bool); 4]> = std::sync::OnceLock::new();
-    let styles = STYLES.get_or_init(|| {
-        let regular = measure(Font::MONOSPACE);
+/// What the grid is drawn with: the font size, the cell measured from the
+/// font at that size, and the face of each style (`style_font`). Measured
+/// when the font or size changes (`App::term_metrics`).
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Metrics {
+    size: f32,
+    /// Width of a cell: the advance of a monospace character.
+    cell_w: f32,
+    /// Line height.
+    cell_h: f32,
+    /// By `bold | italic << 1`.
+    styles: [(Font, bool); 4],
+}
+
+impl Metrics {
+    /// Measures `font` at font size `size`.
+    pub(super) fn new(font: Font, size: f32) -> Metrics {
+        let cell_h = line_height(size);
+        let regular = measure(font, size, cell_h);
+        let cell_w = if regular.0.is_finite() && regular.0 > 1.0 { regular.0 } else { (size * 0.6).max(2.0) };
+        // A bold or italic face is only used when it has the regular face's
+        // advance and baseline: `Font::MONOSPACE` can resolve the styles to
+        // other families (on Windows regular is Cascadia Code, a variable font
+        // cosmic-text sees only at weight 400, so bold and italic come from
+        // Consolas, narrower and with another baseline), which would put the
+        // text off the cell grid. Then bold is synthetic and italic is drawn upright.
         let face = |bold: bool, italic: bool| Font {
             weight: if bold { Weight::Bold } else { Weight::Normal },
             style: if italic { FontStyle::Italic } else { FontStyle::Normal },
-            ..Font::MONOSPACE
+            ..font
         };
         let fits = |font: Font| {
-            let (w, baseline) = measure(font);
+            let (w, baseline) = measure(font, size, cell_h);
             (w - regular.0).abs() < 0.05 && (baseline - regular.1).abs() < 0.5
         };
         let italic_fits = fits(face(false, true));
@@ -193,36 +220,79 @@ fn style_font(bold: bool, italic: bool) -> (Font, bool) {
             } else if italic && italic_fits {
                 (face(false, true), bold)
             } else {
-                (Font::MONOSPACE, bold)
+                (font, bold)
             }
         };
-        [pick(false, false), pick(true, false), pick(false, true), pick(true, true)]
-    });
-    styles[bold as usize | (italic as usize) << 1]
-}
-
-/// Columns and lines that fit in an area of `size` pixels (the grid widget).
-fn grid_size(size: Size) -> (usize, usize) {
-    let cols = ((size.width - 2.0 * PAD - crate::scrollbar::WIDTH) / cell_w()).floor().max(2.0) as usize;
-    let lines = ((size.height - 2.0 * PAD) / CELL_H).floor().max(1.0) as usize;
-    (cols.min(u16::MAX as usize), lines.min(u16::MAX as usize))
-}
-
-/// Whether an area of `size` pixels holds at least the smallest grid (two
-/// columns, one line). Smaller ones (a minimized window lays everything out
-/// at 0x0) aren't sent to the shell: shrinking the ConPTY to 2x1 and back
-/// can lose or hard-wrap its output.
-fn fits_grid(size: Size) -> bool {
-    size.width - 2.0 * PAD - crate::scrollbar::WIDTH >= 2.0 * cell_w() && size.height - 2.0 * PAD >= CELL_H
-}
-
-fn window_size(cols: usize, lines: usize) -> WindowSize {
-    WindowSize {
-        num_lines: lines as u16,
-        num_cols: cols as u16,
-        cell_width: cell_w().round() as u16,
-        cell_height: CELL_H as u16,
+        let styles = [pick(false, false), pick(true, false), pick(false, true), pick(true, true)];
+        Metrics { size, cell_w, cell_h, styles }
     }
+
+    /// The font a style is drawn with, and whether to embolden it by drawing
+    /// it twice (`BOLD_OFFSET` apart).
+    fn style_font(&self, bold: bool, italic: bool) -> (Font, bool) {
+        self.styles[bold as usize | (italic as usize) << 1]
+    }
+
+    /// Columns and lines that fit in an area of `size` pixels (the grid widget).
+    fn grid_size(&self, size: Size) -> (usize, usize) {
+        let cols = ((size.width - 2.0 * PAD - crate::scrollbar::WIDTH) / self.cell_w).floor().max(2.0) as usize;
+        let lines = ((size.height - 2.0 * PAD) / self.cell_h).floor().max(1.0) as usize;
+        (cols.min(u16::MAX as usize), lines.min(u16::MAX as usize))
+    }
+
+    /// Whether an area of `size` pixels holds at least the smallest grid (two
+    /// columns, one line). Smaller ones (a minimized window lays everything out
+    /// at 0x0) aren't sent to the shell: shrinking the ConPTY to 2x1 and back
+    /// can lose or hard-wrap its output.
+    fn fits_grid(&self, size: Size) -> bool {
+        size.width - 2.0 * PAD - crate::scrollbar::WIDTH >= 2.0 * self.cell_w && size.height - 2.0 * PAD >= self.cell_h
+    }
+
+    fn window_size(&self, cols: usize, lines: usize) -> WindowSize {
+        WindowSize {
+            num_lines: lines as u16,
+            num_cols: cols as u16,
+            cell_width: self.cell_w.round() as u16,
+            cell_height: self.cell_h as u16,
+        }
+    }
+
+    /// The pixel rectangle of `cells` cells at (line, col); edges rounded so
+    /// neighbouring fills meet without seams.
+    fn cell_rect(&self, origin: Point, line: u16, col: u16, cells: u16) -> Rectangle {
+        let cw = self.cell_w;
+        let x0 = (origin.x + col as f32 * cw).round();
+        let x1 = (origin.x + (col + cells) as f32 * cw).round();
+        let y = (origin.y + line as f32 * self.cell_h).round();
+        Rectangle { x: x0, y, width: x1 - x0, height: self.cell_h }
+    }
+
+    /// The cell under `at` (relative to the widget): line, column, right half.
+    /// Outside the grid it is the nearest cell.
+    fn cell_at(&self, at: Point, cols: usize, lines: usize) -> (u16, u16, bool) {
+        let (x, y) = (at.x - PAD, at.y - PAD);
+        let col = (x / self.cell_w).floor();
+        let right = col >= cols as f32 || (x / self.cell_w).fract() >= 0.5;
+        let col = col.clamp(0.0, cols.saturating_sub(1) as f32) as u16;
+        let line = (y / self.cell_h).floor().clamp(0.0, lines.saturating_sub(1) as f32) as u16;
+        (line, col, right && x >= 0.0)
+    }
+}
+
+/// The zoom (font size steps from the configured size `base`) after `step`
+/// (+1 / -1; `None` = back to `base`), the size kept within
+/// `config::TERMINAL_FONT_SIZES`.
+fn zoom_after(base: u32, zoom: i32, step: Option<i32>) -> i32 {
+    match step {
+        None => 0,
+        Some(step) => zoomed_size(base, zoomed_size(base, zoom) as i32 - base as i32 + step) as i32 - base as i32,
+    }
+}
+
+/// The font size at `zoom` steps from `base`.
+fn zoomed_size(base: u32, zoom: i32) -> u32 {
+    let range = crate::config::TERMINAL_FONT_SIZES;
+    (base as i32).saturating_add(zoom).clamp(*range.start() as i32, *range.end() as i32) as u32
 }
 
 #[derive(Debug, Clone)]
@@ -384,8 +454,15 @@ pub(super) struct TermSession {
 
 impl TermSession {
     /// Starts `command` (program and arguments) in `dir` with a grid of
-    /// `cols` x `lines`.
-    pub(super) fn spawn(id: u64, command: &str, dir: &Path, cols: usize, lines: usize) -> io::Result<TermSession> {
+    /// `cols` x `lines` cells of `m`.
+    pub(super) fn spawn(
+        id: u64,
+        command: &str,
+        dir: &Path,
+        m: &Metrics,
+        cols: usize,
+        lines: usize,
+    ) -> io::Result<TermSession> {
         let (program, args) = shell_command(command)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "the builtin_shell setting is empty"))?;
         safe_dll_search();
@@ -406,7 +483,7 @@ impl TermSession {
             #[cfg(windows)]
             escape_args: true,
         };
-        let pty = tty::new(&options, window_size(cols, lines), id)?;
+        let pty = tty::new(&options, m.window_size(cols, lines), id)?;
         #[cfg(windows)]
         let pid = pty.child_watcher().pid().map(|p| p.get());
         #[cfg(not(windows))]
@@ -641,14 +718,14 @@ impl TermSession {
     }
 
     /// Resizes the grid and the ConPTY when the size changed.
-    fn resize(&mut self, cols: usize, lines: usize) {
+    fn resize(&mut self, m: &Metrics, cols: usize, lines: usize) {
         let mut term = self.term.lock();
         if (term.columns(), term.screen_lines()) == (cols, lines) {
             return;
         }
         term.resize(TermSize::new(cols, lines));
         drop(term);
-        let _ = self.chan.send(Msg::Resize(window_size(cols, lines)));
+        let _ = self.chan.send(Msg::Resize(m.window_size(cols, lines)));
     }
 
     /// Rebuilds what the widget draws from the grid.
@@ -1023,6 +1100,8 @@ fn term_key_tip(key: &dyn Fn(Command) -> Option<String>) -> Vec<HintOwned> {
     add(&mut tip, key(Command::TerminalFolderToPanel).into_iter().collect(), "its folder in the active panel");
     add(&mut tip, key(Command::SendFolderToTerminal).into_iter().collect(), "the active panel's folder here (cd)");
     add(&mut tip, key(Command::Configuration).into_iter().collect(), "settings (Esc comes back here)");
+    let zoom = [Command::TerminalZoomIn, Command::TerminalZoomOut, Command::TerminalZoomReset];
+    add(&mut tip, zoom.into_iter().filter_map(key).collect(), "bigger / smaller / normal text");
     tip.push(HintOwned::new(Vec::<String>::new(), "Split panes"));
     add(&mut tip, key(Command::SplitTerminalRight).into_iter().collect(), "split: new shell to the right");
     add(&mut tip, key(Command::SplitTerminalDown).into_iter().collect(), "split: new shell below");
@@ -1592,19 +1671,21 @@ struct Grid<'a> {
     focused: bool,
     /// The cursor is left out (blinking, in its "off" half).
     cursor_off: bool,
+    metrics: Metrics,
 }
 
 impl Grid<'_> {
     fn draw_run(&self, renderer: &mut iced::Renderer, run: &Run, origin: Point, clip: Rectangle) {
-        let cw = cell_w();
+        let m = &self.metrics;
+        let (cw, ch) = (m.cell_w, m.cell_h);
         let x = origin.x + run.col as f32 * cw;
-        let y = origin.y + run.line as f32 * CELL_H;
-        let (font, synthetic_bold) = style_font(run.bold, run.italic);
+        let y = origin.y + run.line as f32 * ch;
+        let (font, synthetic_bold) = m.style_font(run.bold, run.italic);
         let text = || iced::advanced::Text {
             content: run.text.clone(),
-            bounds: Size::new((run.cells + 1) as f32 * cw, CELL_H),
-            size: Pixels(FONT_SIZE),
-            line_height: LineHeight::Absolute(Pixels(CELL_H)),
+            bounds: Size::new((run.cells + 1) as f32 * cw, ch),
+            size: Pixels(m.size),
+            line_height: LineHeight::Absolute(Pixels(ch)),
             font,
             horizontal_alignment: alignment::Horizontal::Left,
             vertical_alignment: alignment::Vertical::Top,
@@ -1617,10 +1698,10 @@ impl Grid<'_> {
         }
         let width = run.cells as f32 * cw;
         if run.underline {
-            fill(renderer, Rectangle { x, y: y + CELL_H - 2.0, width, height: 1.0 }, run.color);
+            fill(renderer, Rectangle { x, y: y + ch - 2.0, width, height: 1.0 }, run.color);
         }
         if run.strike {
-            fill(renderer, Rectangle { x, y: y + (CELL_H / 2.0).round(), width, height: 1.0 }, run.color);
+            fill(renderer, Rectangle { x, y: y + (ch / 2.0).round(), width, height: 1.0 }, run.color);
         }
     }
 }
@@ -1631,9 +1712,9 @@ fn fill(renderer: &mut iced::Renderer, bounds: Rectangle, color: Color) {
 
 /// Draws a block element or box drawing line (`term_glyphs::drawn`) in
 /// `cell`, a `cell_rect`.
-fn draw_shape(renderer: &mut iced::Renderer, cell: Rectangle, c: char, color: Color) {
+fn draw_shape(m: &Metrics, renderer: &mut iced::Renderer, cell: Rectangle, c: char, color: Color) {
     // Light lines: about the font's stroke.
-    let t = (cell_w() / 8.0).round().max(1.0);
+    let t = (m.cell_w / 8.0).round().max(1.0);
     term_glyphs::pieces(c, cell, t, &mut |piece| match piece {
         Piece::Rect(r, alpha) => fill(renderer, r, Color { a: color.a * alpha, ..color }),
         Piece::Arc { rect, radius, width, clip } => renderer.with_layer(clip, |r| {
@@ -1647,16 +1728,6 @@ fn draw_shape(renderer: &mut iced::Renderer, cell: Rectangle, c: char, color: Co
             )
         }),
     });
-}
-
-/// The pixel rectangle of `cells` cells at (line, col); edges rounded so
-/// neighbouring fills meet without seams.
-fn cell_rect(origin: Point, line: u16, col: u16, cells: u16) -> Rectangle {
-    let cw = cell_w();
-    let x0 = (origin.x + col as f32 * cw).round();
-    let x1 = (origin.x + (col + cells) as f32 * cw).round();
-    let y = (origin.y + line as f32 * CELL_H).round();
-    Rectangle { x: x0, y, width: x1 - x0, height: CELL_H }
 }
 
 /// Mouse state of the grid widget.
@@ -1677,17 +1748,6 @@ struct GridState {
 
 /// Longest time between presses of a double or triple click.
 const MULTI_CLICK: Duration = Duration::from_millis(500);
-
-/// The cell under `at` (relative to the widget): line, column, right half.
-/// Outside the grid it is the nearest cell.
-fn cell_at(at: Point, cols: usize, lines: usize) -> (u16, u16, bool) {
-    let (x, y) = (at.x - PAD, at.y - PAD);
-    let col = (x / cell_w()).floor();
-    let right = col >= cols as f32 || (x / cell_w()).fract() >= 0.5;
-    let col = col.clamp(0.0, cols.saturating_sub(1) as f32) as u16;
-    let line = (y / CELL_H).floor().clamp(0.0, lines.saturating_sub(1) as f32) as u16;
-    (line, col, right && x >= 0.0)
-}
 
 impl Widget<Message, Theme, iced::Renderer> for Grid<'_> {
     fn tag(&self) -> iced::advanced::widget::tree::Tag {
@@ -1730,10 +1790,10 @@ impl Widget<Message, Theme, iced::Renderer> for Grid<'_> {
     ) -> event::Status {
         // Checked before every frame, so a window resize resizes the grid.
         if let Event::Window(window::Event::RedrawRequested(_)) = event {
-            if !fits_grid(layout.bounds().size()) {
+            if !self.metrics.fits_grid(layout.bounds().size()) {
                 return event::Status::Ignored;
             }
-            let (cols, lines) = grid_size(layout.bounds().size());
+            let (cols, lines) = self.metrics.grid_size(layout.bounds().size());
             if (cols, lines) != (self.frame.cols, self.frame.lines) {
                 shell.publish(Message::Term(TermMsg::Resize(self.id, cols, lines)));
             }
@@ -1747,6 +1807,8 @@ impl Widget<Message, Theme, iced::Renderer> for Grid<'_> {
         let bounds = layout.bounds();
         let (cols, lines) = (self.frame.cols, self.frame.lines);
         let mods = state.mods;
+        let m = self.metrics;
+        let cell_at = |at: Point, cols: usize, lines: usize| m.cell_at(at, cols, lines);
         let mut send = |m: Mouse| shell.publish(Message::Term(TermMsg::Mouse(self.id, m)));
         let button = |b: mouse::Button| match b {
             mouse::Button::Left => Some(Btn::Left),
@@ -1813,7 +1875,7 @@ impl Widget<Message, Theme, iced::Renderer> for Grid<'_> {
                 let amount = match delta {
                     mouse::ScrollDelta::Lines { y, .. } => (y * 3.0).round() as i32,
                     mouse::ScrollDelta::Pixels { y, .. } => {
-                        state.wheel += y / CELL_H;
+                        state.wheel += y / m.cell_h;
                         let whole = state.wheel.trunc();
                         state.wheel -= whole;
                         whole as i32
@@ -1844,30 +1906,32 @@ impl Widget<Message, Theme, iced::Renderer> for Grid<'_> {
         let f = self.frame;
         fill(renderer, bounds, f.bg);
         let origin = Point::new(bounds.x + PAD, bounds.y + PAD);
+        let m = &self.metrics;
+        let cell_rect = |line, col, cells| m.cell_rect(origin, line, col, cells);
         for &(line, col, cells, color) in &f.fills {
-            fill(renderer, cell_rect(origin, line, col, cells), color);
+            fill(renderer, cell_rect(line, col, cells), color);
         }
         for run in &f.runs {
             self.draw_run(renderer, run, origin, bounds);
         }
         for &(line, col, c, color) in &f.shapes {
-            draw_shape(renderer, cell_rect(origin, line, col, 1), c, color);
+            draw_shape(m, renderer, cell_rect(line, col, 1), c, color);
         }
         if !f.selection.is_empty() {
             let color = Color { a: 0.4, ..theme::c().accent };
             for &(line, col, cells) in &f.selection {
-                fill(renderer, cell_rect(origin, line, col, cells), color);
+                fill(renderer, cell_rect(line, col, cells), color);
             }
         }
         let Some(c) = f.cursor.as_ref().filter(|_| !self.cursor_off) else { return };
-        let r = cell_rect(origin, c.line, c.col, c.cells);
+        let r = cell_rect(c.line, c.col, c.cells);
         match c.shape {
             CursorShape::Block if self.focused => {
                 fill(renderer, r, c.color);
                 if let Some(run) = &c.text {
                     let mut chars = run.text.chars();
                     match (chars.next(), chars.next()) {
-                        (Some(ch), None) if !run.complex && term_glyphs::drawn(ch) => draw_shape(renderer, r, ch, run.color),
+                        (Some(ch), None) if !run.complex && term_glyphs::drawn(ch) => draw_shape(m, renderer, r, ch, run.color),
                         _ => self.draw_run(renderer, run, origin, bounds),
                     }
                 }
@@ -2167,6 +2231,7 @@ impl App {
         ("Alt+Shift+arrows (cm_FocusTerminalLeft/Right/Up/Down)", "Move the keyboard focus to the split pane in that direction (or click a pane)"),
         ("Ctrl+Alt+Shift+arrows (cm_MoveTerminalLeft/Right/Up/Down)", "Rearrange split panes: the focused pane swaps places with the one in that direction, or, with none there, moves to that edge (side by side becomes stacked and back)"),
         ("Ctrl+Shift+Z (cm_ZoomTerminalPane)", "Show the focused split pane alone, or all panes again"),
+        ("Ctrl++ / Ctrl+-, Ctrl+0 (cm_TerminalZoomIn, cm_TerminalZoomOut, cm_TerminalZoomReset)", "Bigger / smaller text in all terminals, or back to the terminal_font_size setting (kept for the next start; the font is the terminal_font setting)"),
         ("F10 (cm_Configuration)", "Settings; closing them comes back to the terminal (F10 doesn't reach programs in the terminal; bind cm_Configuration to another key in [keys] if one needs it)"),
         ("cm_TerminalFolderToPanel (no key by default)", "Active panel goes to the terminal's current folder and Files is shown"),
         ("Ctrl+Shift+Enter (cm_SendFolderToTerminal)", "This terminal goes to the folder selected in the active panel (cd); from the panels it goes to the last used terminal"),
@@ -2198,6 +2263,37 @@ impl App {
                 t.refresh();
             }
         }
+    }
+
+    /// The terminals' font size: `terminal_font_size` zoomed by
+    /// `TerminalZoomIn/Out`.
+    fn term_font_size(&self) -> u32 {
+        zoomed_size(self.config.terminal_font_size(), self.term_zoom)
+    }
+
+    /// The grid's metrics at the current font and size, measured on first use
+    /// after a change.
+    pub(super) fn term_metrics(&self) -> Metrics {
+        *self.term_metrics.get_or_init(|| {
+            Metrics::new(font_named(&self.config.terminal_font), self.term_font_size() as f32)
+        })
+    }
+
+    /// `TerminalZoomIn/Out/Reset`: one font size step bigger or smaller
+    /// (`step`), or back to `terminal_font_size` (`None`), in every terminal.
+    /// The shown grids get their new size on the next frame (like after a
+    /// window resize) and resize their shells; hidden ones when shown.
+    pub(super) fn zoom_term(&mut self, step: Option<i32>) -> Task<Message> {
+        if self.screen.term().is_none() {
+            self.info("Zooming works in the built-in terminal (F9)");
+            return Task::none();
+        }
+        let zoom = zoom_after(self.config.terminal_font_size(), self.term_zoom, step);
+        if zoom != self.term_zoom {
+            self.term_zoom = zoom;
+            self.term_metrics = std::cell::OnceCell::new();
+        }
+        Task::none()
     }
 
     /// Width taken by the terminal sidebar: only over the panels and the
@@ -2280,8 +2376,9 @@ impl App {
         let id = self.next_term_id;
         self.next_term_id += 1;
         // The grid widget reports the size it really gets on the next frame.
-        let (cols, lines) = grid_size(Size::new(self.window_width - SIDE_W, self.window_height));
-        match TermSession::spawn(id, shell, dir, cols, lines) {
+        let m = self.term_metrics();
+        let (cols, lines) = m.grid_size(Size::new(self.window_width - SIDE_W, self.window_height));
+        match TermSession::spawn(id, shell, dir, &m, cols, lines) {
             Ok(session) => {
                 self.terms.push(session);
                 let tab = self.shown_tab();
@@ -2813,13 +2910,15 @@ impl App {
                 }
             }
             TermMsg::Resize(id, cols, lines) => {
+                let m = self.term_metrics();
                 if let Some(t) = self.term_mut(id) {
-                    t.resize(cols, lines);
+                    t.resize(&m, cols, lines);
                     t.refresh();
                 }
             }
             TermMsg::Event(id, event) => {
                 let cue = cue(id);
+                let m = self.term_metrics();
                 let Some(t) = self.term_mut(id) else { return Task::none() };
                 match event {
                     // (A late one for a terminal just hidden is dropped: showing
@@ -2873,7 +2972,7 @@ impl App {
                     TermEvent::TextAreaSizeRequest(format) => {
                         let size = {
                             let term = t.term.lock();
-                            window_size(term.columns(), term.screen_lines())
+                            m.window_size(term.columns(), term.screen_lines())
                         };
                         let _ = t.chan.send(Msg::Input(format(size).into_bytes().into()));
                     }
@@ -2929,6 +3028,9 @@ impl App {
             Command::MoveTerminalUp,
             Command::MoveTerminalDown,
             Command::ZoomTerminalPane,
+            Command::TerminalZoomIn,
+            Command::TerminalZoomOut,
+            Command::TerminalZoomReset,
             Command::NextTab,
             Command::PrevTab,
             // Settings (F10); closing them comes back here.
@@ -3099,7 +3201,7 @@ impl App {
         // An unfocused pane draws its cursor hollow, like an unfocused window.
         let focused = self.focused && focus;
         let cursor_off = self.term_blink.off && focused && t.frame.cursor_blinks && self.config.terminal_cursor_blink;
-        let grid = Element::new(Grid { id, frame: &t.frame, focused, cursor_off });
+        let grid = Element::new(Grid { id, frame: &t.frame, focused, cursor_off, metrics: self.term_metrics() });
         // The bar's position is the history line at the top of the view.
         let (history, offset, lines) = (t.frame.history, t.frame.offset, t.frame.lines);
         let grid = crate::scrollbar::attach(
@@ -3385,8 +3487,8 @@ mod tests {
                 let p = Paragraph::with_text(iced::advanced::Text {
                     content: sample.as_str(),
                     bounds: Size::INFINITY,
-                    size: Pixels(FONT_SIZE),
-                    line_height: LineHeight::Absolute(Pixels(CELL_H)),
+                    size: Pixels(14.0),
+                    line_height: LineHeight::Absolute(Pixels(18.0)),
                     font,
                     horizontal_alignment: alignment::Horizontal::Left,
                     vertical_alignment: alignment::Vertical::Top,
@@ -3407,8 +3509,9 @@ mod tests {
                 println!("{name:14} {style:12} w={:.4} baseline={y:.2} face={face}", p.min_width() / 100.0);
             }
         }
+        let m = Metrics::new(Font::MONOSPACE, 14.0);
         for (bold, italic) in [(true, false), (false, true), (true, true)] {
-            let (font, synthetic) = style_font(bold, italic);
+            let (font, synthetic) = m.style_font(bold, italic);
             println!("bold={bold} italic={italic}: drawn with {font:?}, synthetic bold {synthetic}");
         }
     }
@@ -3640,15 +3743,16 @@ mod tests {
     #[test]
     fn minimized_window_doesnt_resize_the_grid() {
         // A minimized window lays the grid out at 0x0: no resize is sent.
-        assert!(!fits_grid(Size::ZERO));
-        assert!(!fits_grid(Size::new(800.0, 0.0)));
-        assert!(!fits_grid(Size::new(0.0, 600.0)));
-        assert!(fits_grid(Size::new(800.0, 600.0)));
+        let m = Metrics::new(Font::MONOSPACE, 14.0);
+        assert!(!m.fits_grid(Size::ZERO));
+        assert!(!m.fits_grid(Size::new(800.0, 0.0)));
+        assert!(!m.fits_grid(Size::new(0.0, 600.0)));
+        assert!(m.fits_grid(Size::new(800.0, 600.0)));
         // The smallest area that fits gives the smallest grid, 2x1.
         let side = 2.0 * PAD + crate::scrollbar::WIDTH;
-        let min = Size::new(side + 2.0 * cell_w() + 0.5, 2.0 * PAD + CELL_H + 0.5);
-        assert!(fits_grid(min));
-        assert_eq!(grid_size(min), (2, 1));
+        let min = Size::new(side + 2.0 * m.cell_w + 0.5, 2.0 * PAD + m.cell_h + 0.5);
+        assert!(m.fits_grid(min));
+        assert_eq!(m.grid_size(min), (2, 1));
     }
 
     #[test]
@@ -3771,15 +3875,68 @@ mod tests {
     fn styles_keep_the_cell_grid() {
         // Whatever face each style ends up with, it has the regular advance
         // and baseline (else bold/italic text drifts off the cells).
-        let regular = measure(Font::MONOSPACE);
+        let m = Metrics::new(Font::MONOSPACE, 14.0);
+        let regular = measure(Font::MONOSPACE, 14.0, 18.0);
         for (bold, italic) in [(false, false), (true, false), (false, true), (true, true)] {
-            let (font, synthetic) = style_font(bold, italic);
-            let (w, baseline) = measure(font);
+            let (font, synthetic) = m.style_font(bold, italic);
+            let (w, baseline) = measure(font, 14.0, 18.0);
             assert!((w - regular.0).abs() < 0.05, "{bold} {italic}: {w} vs {}", regular.0);
             assert!((baseline - regular.1).abs() < 0.5, "{bold} {italic}: {baseline} vs {}", regular.1);
             assert!(!synthetic || bold);
         }
-        assert!((cell_w() - regular.0).abs() < 0.001);
+        assert!((m.cell_w - regular.0).abs() < 0.001);
+        assert_eq!(m.cell_h, 18.0);
+    }
+
+    #[test]
+    fn metrics_follow_the_font_size() {
+        assert_eq!(line_height(14.0), 18.0);
+        assert_eq!(line_height(8.0), 10.0);
+        assert_eq!(line_height(20.0), 26.0);
+        assert_eq!(line_height(32.0), 41.0);
+        let area = Size::new(1000.0, 600.0);
+        let mut last = (usize::MAX, usize::MAX);
+        for size in [8.0, 12.0, 14.0, 20.0, 32.0] {
+            let m = Metrics::new(Font::MONOSPACE, size);
+            assert_eq!(m.cell_h, line_height(size));
+            // About 0.55 em wide, whatever the monospace font is.
+            assert!(m.cell_w > size * 0.4 && m.cell_w < size * 0.7, "{size}: {}", m.cell_w);
+            let (cols, lines) = m.grid_size(area);
+            assert_eq!(lines, ((600.0 - 2.0 * PAD) / m.cell_h).floor() as usize, "{size}");
+            assert!(cols < last.0 && lines < last.1, "{size}: {cols}x{lines} after {last:?}");
+            last = (cols, lines);
+            let ws = m.window_size(cols, lines);
+            assert_eq!((ws.num_cols as usize, ws.num_lines as usize, ws.cell_height), (cols, lines, m.cell_h as u16));
+        }
+    }
+
+    #[test]
+    fn zoom_steps_stay_in_range() {
+        assert_eq!(zoom_after(14, 0, Some(1)), 1);
+        assert_eq!(zoom_after(14, 3, Some(-1)), 2);
+        assert_eq!(zoom_after(14, 5, None), 0);
+        assert_eq!(zoomed_size(14, 4), 18);
+        // At the ends of 8..=32 a step does nothing.
+        assert_eq!(zoom_after(14, 18, Some(1)), 18);
+        assert_eq!(zoom_after(14, -6, Some(-1)), -6);
+        // A zoom beyond the range (the setting changed since) comes back in one step.
+        assert_eq!(zoomed_size(30, 10), 32);
+        assert_eq!(zoom_after(30, 10, Some(-1)), 1);
+        assert_eq!(zoomed_size(14, i32::MAX), 32);
+        assert_eq!(zoomed_size(14, i32::MIN), 8);
+    }
+
+    #[test]
+    fn font_names_are_kept_once() {
+        assert_eq!(font_named(""), Font::MONOSPACE);
+        assert_eq!(font_named("  "), Font::MONOSPACE);
+        let a = font_named(" Cascadia Mono ");
+        assert_eq!(a, Font::with_name("Cascadia Mono"));
+        let (iced::font::Family::Name(x), iced::font::Family::Name(y)) = (a.family, font_named("Cascadia Mono").family)
+        else {
+            panic!("not named")
+        };
+        assert!(std::ptr::eq(x, y));
     }
 
     #[test]
@@ -3821,8 +3978,8 @@ mod tests {
 
     #[test]
     fn cells_under_the_mouse() {
-        let cw = cell_w();
-        let at = |x: f32, y: f32| cell_at(Point::new(PAD + x * cw, PAD + y * CELL_H), 10, 5);
+        let m = Metrics::new(Font::MONOSPACE, 14.0);
+        let at = |x: f32, y: f32| m.cell_at(Point::new(PAD + x * m.cell_w, PAD + y * m.cell_h), 10, 5);
         assert_eq!(at(0.2, 0.5), (0, 0, false));
         assert_eq!(at(3.7, 2.5), (2, 3, true));
         // Outside: the nearest cell.
@@ -4024,7 +4181,7 @@ mod tests {
     fn shell_folder_and_program_are_found() {
         let dir = std::env::temp_dir().join(format!("rc-term-cwd-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("sub")).unwrap();
-        let s = TermSession::spawn(2, "cmd.exe /q /k", &dir, 120, 24).unwrap();
+        let s = TermSession::spawn(2, "cmd.exe /q /k", &dir, &Metrics::new(Font::MONOSPACE, 14.0), 120, 24).unwrap();
         let rx = s.events.lock().unwrap().take().unwrap();
         let same = |a: &Option<PathBuf>, b: &Path| a.as_ref().is_some_and(|a| a.as_os_str().eq_ignore_ascii_case(b));
         let wait = |what: &dyn Fn() -> bool| {
@@ -4065,7 +4222,8 @@ mod tests {
     fn shell_runs_and_ends_with_the_session() {
         let dir = std::env::temp_dir().join(format!("rc-term-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let mut s = TermSession::spawn(1, "cmd.exe /q /k prompt $G", &dir, 80, 24).unwrap();
+        let m = Metrics::new(Font::MONOSPACE, 14.0);
+        let mut s = TermSession::spawn(1, "cmd.exe /q /k prompt $G", &dir, &m, 80, 24).unwrap();
         let rx = s.events.lock().unwrap().take().unwrap();
         let screen = |s: &TermSession| -> String {
             let term = s.term.lock();
@@ -4097,7 +4255,7 @@ mod tests {
         s.refresh();
         assert!(s.frame.runs.iter().any(|r| r.text == "hello-from-term"), "{:?}", s.frame.runs);
         assert!(s.frame.cursor.is_some());
-        s.resize(100, 30);
+        s.resize(&m, 100, 30);
         let size = {
             let term = s.term.lock();
             (term.columns(), term.screen_lines())
@@ -4140,7 +4298,8 @@ mod ctrl_c_tests {
     fn ctrl_c_stops_a_command_even_if_we_ignore_it() {
         // SAFETY: sets this test process's ignore flag (what some launchers hand down).
         unsafe { windows_sys::Win32::System::Console::SetConsoleCtrlHandler(None, 1) };
-        let s = TermSession::spawn(1, "cmd.exe /d /c ping -t 127.0.0.1", &std::env::temp_dir(), 80, 24).unwrap();
+        let m = Metrics::new(Font::MONOSPACE, 14.0);
+        let s = TermSession::spawn(1, "cmd.exe /d /c ping -t 127.0.0.1", &std::env::temp_dir(), &m, 80, 24).unwrap();
         let pid = s.pid.unwrap();
         std::thread::sleep(Duration::from_millis(1500));
         assert!(alive(pid), "ping should be running");
