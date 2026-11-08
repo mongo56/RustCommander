@@ -67,6 +67,9 @@ pub struct Config {
     /// Bold text in the built-in terminal in one of the 8 normal ANSI colours
     /// is drawn in the bright variant (as older terminals did).
     pub terminal_bold_is_bright: bool,
+    /// Flash the taskbar button when a terminal wants attention (bell, a
+    /// command finished, a program waits) while the window isn't focused.
+    pub terminal_bell_flash: bool,
     /// Edge of the thumbnail view's pictures in pixels (Ctrl+Shift+F5);
     /// 0 = the default, see [`Config::thumbnail_size`].
     pub thumbnail_size: u32,
@@ -163,6 +166,7 @@ impl Default for Config {
             terminal_font: String::new(),
             terminal_font_size: DEFAULT_TERMINAL_FONT_SIZE,
             terminal_bold_is_bright: false,
+            terminal_bell_flash: true,
             thumbnail_size: 0,
             keys: BTreeMap::new(),
             colors: BTreeMap::new(),
@@ -581,6 +585,11 @@ fn template(editor: &str, compare: CompareState) -> String {
          # (as older terminals did). Off = bold only changes the weight.\n\
          terminal_bold_is_bright = false\n\
          \n\
+         # Flash the taskbar button when a terminal wants attention (a bell, a\n\
+         # command finished, a program waits for input) while the window isn't\n\
+         # in front. It stops when you switch back. No sound.\n\
+         terminal_bell_flash = true\n\
+         \n\
          # Show hidden and system files at the first start (Ctrl+H toggles them per tab).\n\
          show_hidden = false\n\
          \n\
@@ -853,6 +862,9 @@ key = \"F7\"
         assert!(!config.terminal_bold_is_bright);
         assert!(parse("terminal_bold_is_bright = true").unwrap().terminal_bold_is_bright);
         assert!(!parse(&template("", CompareState::default())).unwrap().terminal_bold_is_bright);
+        assert!(config.terminal_bell_flash);
+        assert!(!parse("terminal_bell_flash = false").unwrap().terminal_bell_flash);
+        assert!(parse(&template("", CompareState::default())).unwrap().terminal_bell_flash);
     }
 
     #[test]

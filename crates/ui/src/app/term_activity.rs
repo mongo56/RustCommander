@@ -138,9 +138,38 @@ pub(super) fn wants_cue(shown: bool, window_focused: bool) -> bool {
     !(shown && window_focused)
 }
 
+/// Sets a terminal's `Attention` to `a`. Returns whether the taskbar button
+/// should flash: `enabled`, the window isn't focused, and the terminal had no
+/// attention yet (so once per terminal until it is looked at).
+pub(super) fn raise(slot: &mut Option<Attention>, a: Attention, window_focused: bool, enabled: bool) -> bool {
+    let first = slot.replace(a).is_none();
+    first && enabled && !window_focused
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flash_once_until_looked_at() {
+        let mut slot = None;
+        assert!(raise(&mut slot, Attention::Waiting, false, true));
+        assert!(!raise(&mut slot, Attention::Waiting, false, true));
+        assert!(!raise(&mut slot, Attention::Finished, false, true));
+        assert_eq!(slot, Some(Attention::Finished));
+        slot = None;
+        assert!(raise(&mut slot, Attention::Finished, false, true));
+    }
+
+    #[test]
+    fn no_flash_when_focused_or_off() {
+        let mut slot = None;
+        assert!(!raise(&mut slot, Attention::Waiting, true, true));
+        assert_eq!(slot, Some(Attention::Waiting));
+        let mut slot = None;
+        assert!(!raise(&mut slot, Attention::Waiting, false, false));
+        assert_eq!(slot, Some(Attention::Waiting));
+    }
 
     fn ms(n: u64) -> Duration {
         Duration::from_millis(n)

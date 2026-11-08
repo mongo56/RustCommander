@@ -14,7 +14,7 @@
 //! panels. When the shell exits, its terminal is removed.
 
 use super::*;
-use super::term_activity::{wants_cue, Activity, Attention, Check};
+use super::term_activity::{raise, wants_cue, Activity, Attention, Check};
 use super::term_glyphs::{self, Piece};
 use super::term_links::{Link, LinkTarget, Scan};
 use crate::theme::{filled, HintOwned};
@@ -2998,6 +2998,9 @@ impl App {
         // Whether a cue for terminal `id` is wanted (the user doesn't look at it).
         let focused = self.focused;
         let cue = |id: u64| wants_cue(drawn.contains(&id), focused);
+        // Flash the taskbar button (a new cue while the window isn't focused).
+        let flash_on = self.config.terminal_bell_flash;
+        let mut flash = false;
         match msg {
             TermMsg::Show(Some(id)) => {
                 self.leave_edits();
@@ -3052,7 +3055,7 @@ impl App {
                         t.dir = dir;
                     }
                     if let Some(a) = t.activity.program(info.program.is_some(), Instant::now()).filter(|_| cue) {
-                        t.attention = Some(a);
+                        flash = raise(&mut t.attention, a, focused, flash_on);
                     }
                     t.program = info.program;
                 }
@@ -3081,7 +3084,7 @@ impl App {
                             eprintln!("[term {id}] title steady: waiting");
                         }
                         if cue {
-                            t.attention = Some(Attention::Waiting);
+                            flash = raise(&mut t.attention, Attention::Waiting, focused, flash_on);
                         }
                     }
                 }
@@ -3133,7 +3136,7 @@ impl App {
                             eprintln!("[term {id}] bell");
                         }
                         if cue {
-                            t.attention = Some(Attention::Waiting);
+                            flash = raise(&mut t.attention, Attention::Waiting, focused, flash_on);
                         }
                     }
                     // Answers to queries (cursor position, device attributes...):
@@ -3170,6 +3173,11 @@ impl App {
                     | TermEvent::CursorBlinkingChange => {}
                 }
             }
+        }
+        if flash {
+            return iced::window::get_oldest()
+                .and_then(|id| iced::window::run_with_handle(id, |h| rc_platform::flash_taskbar(super::native_handle(&h))))
+                .discard();
         }
         Task::none()
     }
