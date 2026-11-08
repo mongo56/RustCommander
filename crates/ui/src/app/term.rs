@@ -1146,7 +1146,7 @@ fn term_key_tip(key: &dyn Fn(Command) -> Option<String>) -> Vec<HintOwned> {
     add(&mut tip, key(Command::NewTerminal).into_iter().collect(), "new terminal");
     add(&mut tip, key(Command::CloseTerminal).into_iter().collect(), "close the terminal");
     add(&mut tip, key(Command::TerminalFolderToPanel).into_iter().collect(), "its folder in the active panel");
-    add(&mut tip, key(Command::SendFolderToTerminal).into_iter().collect(), "the active panel's folder here (cd)");
+    add(&mut tip, key(Command::SendFolderToTerminal).into_iter().collect(), "the active panel's folder here");
     add(&mut tip, key(Command::Configuration).into_iter().collect(), "settings (Esc comes back here)");
     let zoom = [Command::TerminalZoomIn, Command::TerminalZoomOut, Command::TerminalZoomReset];
     add(&mut tip, zoom.into_iter().filter_map(key).collect(), "bigger / smaller / normal text");
@@ -2456,7 +2456,7 @@ impl App {
         ("Ctrl++ / Ctrl+-, Ctrl+0 (cm_TerminalZoomIn, cm_TerminalZoomOut, cm_TerminalZoomReset)", "Bigger / smaller text in all terminals, or back to the terminal_font_size setting (kept for the next start; the font is the terminal_font setting)"),
         ("F10 (cm_Configuration)", "Settings; closing them comes back to the terminal (F10 doesn't reach programs in the terminal; bind cm_Configuration to another key in [keys] if one needs it)"),
         ("cm_TerminalFolderToPanel (no key by default)", "Active panel goes to the terminal's current folder and Files is shown"),
-        ("Ctrl+Shift+Enter (cm_SendFolderToTerminal)", "This terminal goes to the folder selected in the active panel (cd); from the panels it goes to the last used terminal"),
+        ("Ctrl+Shift+Enter (cm_SendFolderToTerminal)", "This terminal goes to the folder selected in the active panel; from the panels it goes to the last used terminal"),
         ("Ctrl+Shift+F", "Find text in the scrollback: typing finds the newest match, Enter / Up the next older one, Shift+Enter / Down the next newer one (wraps around); the match is selected (Ctrl+Shift+C copies it). Case-insensitive unless the text has capitals; Esc closes"),
         ("Ctrl+Shift+C or Ctrl+Insert", "Copy the selected text (select with the mouse: drag, double-click a word, triple-click a line)"),
         ("Ctrl+Shift+J", "Copy the selected text as one line: line breaks and the indentation after them removed (paths, URLs, commands a program wrapped)"),

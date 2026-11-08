@@ -3,6 +3,8 @@
 //! font glyphs. Glyphs don't fill the cell height and sit on fractional cell
 //! edges, which left thin seams between neighbouring cells (progress bars,
 //! scroll bars, borders). Dashed lines and diagonals stay with the font.
+//! Also the sextants (U+1FB00..1FB3B) and the Powerline separators
+//! (U+E0B0..E0B7: triangles and half circles), as rows of 1 px rects.
 
 use iced::Rectangle;
 
@@ -18,7 +20,32 @@ pub(super) enum Piece {
 
 /// Whether `c` is drawn here (else it's text).
 pub(super) fn drawn(c: char) -> bool {
-    matches!(c as u32, 0x2580..=0x259f | 0x256d..=0x2570) || arms(c).is_some()
+    matches!(c as u32, 0x2580..=0x259f | 0x256d..=0x2570 | 0x1fb00..=0x1fb3b | 0xe0b0..=0xe0b7) || arms(c).is_some()
+}
+
+/// The sextants: 2x3 blocks, 60 of the 64 patterns (not empty, full, ▌, ▐).
+pub(super) const SEXTANTS: std::ops::RangeInclusive<u32> = 0x1fb00..=0x1fb3b;
+/// The Powerline separators: filled and outlined triangles, then half circles.
+pub(super) const POWERLINE: std::ops::RangeInclusive<u32> = 0xe0b0..=0xe0b7;
+
+/// The cells of a sextant, bit 0 = upper left, then right, then down by rows
+/// (bit 5 = lower right). The code counts the patterns from 1, skipping the
+/// left column (cells 1, 3, 5) and the right one (2, 4, 6).
+fn sextant(code: u32) -> u8 {
+    let mut p = code - 0x1fb00 + 1;
+    for skipped in [0b010101, 0b101010] {
+        if p >= skipped {
+            p += 1;
+        }
+    }
+    p as u8
+}
+
+/// How far a separator reaches across the cell (0..=1) at `u`, -1 (top) to
+/// 1 (bottom): a triangle or a half circle.
+fn reach(round: bool, u: f32) -> f32 {
+    let u = u.clamp(-1.0, 1.0);
+    if round { (1.0 - u * u).sqrt() } else { 1.0 - u.abs() }
 }
 
 /// The arms of a box drawing line from the cell centre: [left, right, up,
@@ -162,6 +189,39 @@ pub(super) fn pieces(c: char, cell: Rectangle, t: f32, out: &mut impl FnMut(Piec
             for (bit, (l, t, r, b)) in parts.into_iter().enumerate() {
                 if q & (1 << bit) != 0 {
                     rect(l, t, r, b, 1.0);
+                }
+            }
+        }
+        c if SEXTANTS.contains(&c) => {
+            let bits = sextant(c);
+            let ys = [y0, y0 + (h / 3.0).round(), y0 + (h * 2.0 / 3.0).round(), y1];
+            for bit in 0..6 {
+                if bits & (1 << bit) != 0 {
+                    let (l, r) = if bit % 2 == 0 { (x0, xm) } else { (xm, x1) };
+                    rect(l, ys[bit / 2], r, ys[bit / 2 + 1], 1.0);
+                }
+            }
+        }
+        c if POWERLINE.contains(&c) => {
+            // A staircase of 1 px rows (no layer, so the selection stays on top).
+            let (outline, left, round) = (c % 2 == 1, matches!(c, 0xe0b2 | 0xe0b3 | 0xe0b6 | 0xe0b7), c >= 0xe0b4);
+            for row in 0..h as i32 {
+                let (top, bottom) = (y0 + row as f32, y0 + row as f32 + 1.0);
+                let at = |y: f32| (reach(round, (y - y0) / h * 2.0 - 1.0) * w).round();
+                let mid = at((top + bottom) / 2.0);
+                // The edge reaches `hi`; an outline is `t` thick and spans the row's slope.
+                let (lo, hi) = if outline {
+                    let hi = at(top).max(at(bottom)).max(mid);
+                    (at(top).min(at(bottom)).min(hi - t).max(0.0), hi)
+                } else {
+                    (0.0, mid)
+                };
+                if hi > lo {
+                    if left {
+                        rect(x1 - hi, top, x1 - lo, bottom, 1.0);
+                    } else {
+                        rect(x0 + lo, top, x0 + hi, bottom, 1.0);
+                    }
                 }
             }
         }
@@ -310,6 +370,69 @@ mod tests {
         // the upper one at a corner (╕).
         assert_eq!(&pixels('╤')[7..11], ["#########", ".........", "#########", "....#...."]);
         assert_eq!(&pixels('╕')[6..11], [".........", "#####....", "....#....", "#####....", "....#...."]);
+    }
+
+    #[test]
+    fn sextants_cover_exactly_their_cells() {
+        // SEXTANT-1, -2, -12 and -23456 are the first three and the last.
+        assert_eq!(sextant(0x1fb00), 0b000001);
+        assert_eq!(sextant(0x1fb01), 0b000010);
+        assert_eq!(sextant(0x1fb02), 0b000011);
+        assert_eq!(sextant(0x1fb3b), 0b111110);
+        // ▌ and ▐ (SEXTANT-135, -246) are left out: 1FB13 is SEXTANT-35, 1FB14 SEXTANT-235.
+        assert_eq!(sextant(0x1fb13), 0b010100);
+        assert_eq!(sextant(0x1fb14), 0b010110);
+        let mut seen = std::collections::HashSet::new();
+        for code in SEXTANTS {
+            let bits = sextant(code);
+            assert!(!matches!(bits, 0 | 63 | 0b010101 | 0b101010), "{code:x}");
+            assert!(seen.insert(bits), "{code:x} twice");
+            // Each of the six cells is filled or empty as its bit says.
+            let px = pixels(char::from_u32(code).unwrap());
+            for bit in 0..6 {
+                let (x, y) = (if bit % 2 == 0 { 1 } else { 7 }, [1, 7, 13][bit / 2]);
+                assert_eq!(px[y].as_bytes()[x] == b'#', bits & (1 << bit) != 0, "{code:x} cell {bit}");
+            }
+            // With the complement (or ▌ ▐) it fills the cell exactly.
+            let rest = !bits & 63;
+            let other = match rest {
+                0b010101 => pixels('▌'),
+                0b101010 => pixels('▐'),
+                _ => pixels(char::from_u32(SEXTANTS.clone().find(|&c| sextant(c) == rest).unwrap()).unwrap()),
+            };
+            for (a, b) in px.iter().zip(&other) {
+                for (p, q) in a.bytes().zip(b.bytes()) {
+                    assert!((p == b'#') != (q == b'#'), "{code:x}");
+                }
+            }
+        }
+        assert_eq!(seen.len(), 60);
+        assert!(drawn('\u{1fb00}') && drawn('\u{1fb3b}') && !drawn('\u{1fb3c}'));
+    }
+
+    #[test]
+    fn powerline_triangles_and_half_circles() {
+        let (tri, circle) = (pixels('\u{e0b0}'), pixels('\u{e0b4}'));
+        // Full width at the middle, narrow at the top and bottom, hugging the left edge.
+        for p in [&tri, &circle] {
+            assert!(p[0].starts_with('#') && p[17].starts_with('#'));
+            assert_eq!(p[8].matches('#').count(), 9);
+            assert!(p[0].matches('#').count() < 4);
+            assert!(p.iter().all(|r| r.starts_with('#')));
+        }
+        assert!(circle[2].matches('#').count() > tri[2].matches('#').count());
+        // The left ones are the mirror image.
+        let mirror = |v: &Vec<String>| v.iter().map(|r| r.chars().rev().collect::<String>()).collect::<Vec<_>>();
+        assert_eq!(pixels('\u{e0b2}'), mirror(&tri));
+        assert_eq!(pixels('\u{e0b6}'), mirror(&circle));
+        // Outlines are thin and reach the point at the middle.
+        for c in ['\u{e0b1}', '\u{e0b3}', '\u{e0b5}', '\u{e0b7}'] {
+            let p = pixels(c);
+            assert!(p.iter().all(|r| r.contains('#')), "{c}");
+            // Half circles are flat at the ends, so only the triangles are thin there.
+            assert!(c > '\u{e0b4}' || (p[0].matches('#').count() <= 3 && p[4].matches('#').count() <= 3), "{c}");
+        }
+        assert!(pixels('\u{e0b1}')[8].ends_with('#') && pixels('\u{e0b3}')[8].starts_with('#'));
     }
 
     #[test]
