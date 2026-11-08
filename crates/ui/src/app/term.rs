@@ -374,6 +374,8 @@ pub enum TermMsg {
     Blink,
     /// Ctrl+click on a link in a grid (`term_links`).
     OpenLink(LinkTarget),
+    /// Ctrl+wheel in a grid: font size steps (`zoom_term`).
+    Zoom(i32),
 }
 
 /// What the mouse did in the grid; cells are viewport positions.
@@ -2086,6 +2088,18 @@ impl Widget<Message, Theme, iced::Renderer> for Grid<'_> {
                         whole as i32
                     }
                 };
+                // Ctrl+wheel zooms (like Windows Terminal), even when the
+                // program tracks the mouse.
+                if mods.control() && !mods.shift() && !mods.alt() {
+                    if amount != 0 {
+                        let step = match delta {
+                            mouse::ScrollDelta::Lines { y, .. } => y.round() as i32,
+                            mouse::ScrollDelta::Pixels { .. } => amount,
+                        };
+                        shell.publish(Message::Term(TermMsg::Zoom(step)));
+                    }
+                    return event::Status::Captured;
+                }
                 if amount != 0 {
                     let at = cursor.position_in(bounds).unwrap_or(Point::ORIGIN);
                     let (line, col, _) = cell_at(at, cols, lines);
@@ -2443,7 +2457,7 @@ impl App {
         ("Alt+Shift+arrows (cm_FocusTerminalLeft/Right/Up/Down)", "Move the keyboard focus to the split pane in that direction (or click a pane)"),
         ("Ctrl+Alt+Shift+arrows (cm_MoveTerminalLeft/Right/Up/Down)", "Rearrange split panes: the focused pane swaps places with the one in that direction, or, with none there, moves to that edge (side by side becomes stacked and back)"),
         ("Ctrl+Shift+Z (cm_ZoomTerminalPane)", "Show the focused split pane alone, or all panes again"),
-        ("Ctrl++ / Ctrl+-, Ctrl+0 (cm_TerminalZoomIn, cm_TerminalZoomOut, cm_TerminalZoomReset)", "Bigger / smaller text in all terminals, or back to the terminal_font_size setting (kept for the next start; the font is the terminal_font setting)"),
+        ("Ctrl++ / Ctrl+- or Ctrl+wheel, Ctrl+0 (cm_TerminalZoomIn, cm_TerminalZoomOut, cm_TerminalZoomReset)", "Bigger / smaller text in all terminals, or back to the terminal_font_size setting (kept for the next start; the font is the terminal_font setting)"),
         ("F10 (cm_Configuration)", "Settings; closing them comes back to the terminal (F10 doesn't reach programs in the terminal; bind cm_Configuration to another key in [keys] if one needs it)"),
         ("cm_TerminalFolderToPanel (no key by default)", "Active panel goes to the terminal's current folder and Files is shown"),
         ("Ctrl+Shift+Enter (cm_SendFolderToTerminal)", "This terminal goes to the folder selected in the active panel; from the panels it goes to the last used terminal"),
@@ -3140,6 +3154,7 @@ impl App {
                 }
             }
             TermMsg::OpenLink(target) => return self.open_term_link(target),
+            TermMsg::Zoom(step) => return self.zoom_term(Some(step)),
             TermMsg::Blink => {
                 let typing = self.term_blink.input.elapsed() < BLINK;
                 self.term_blink.off = !self.term_blink.off && !typing;
