@@ -27,6 +27,7 @@ mod multi_rename;
 mod settings;
 mod term;
 mod term_activity;
+mod term_glyphs;
 mod thumbs;
 mod undo;
 mod update;
@@ -1207,6 +1208,10 @@ impl App {
                     return focus.chain(self.tree_drop_external(sources));
                 }
                 if position.is_some_and(|(x, _)| self.term_side_w() > 0.0 && x >= self.area_width()) {
+                    return focus;
+                }
+                if matches!(self.screen, Some(Screen::Term(_))) {
+                    self.term_drop(&sources);
                     return focus;
                 }
                 let side = position.map(|(x, _)| usize::from(x >= self.split_x())).unwrap_or(self.active);

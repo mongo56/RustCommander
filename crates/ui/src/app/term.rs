@@ -15,6 +15,7 @@
 
 use super::*;
 use super::term_activity::{wants_cue, Activity, Attention, Check};
+use super::term_glyphs::{self, Piece};
 use crate::theme::{filled, HintOwned};
 use alacritty_terminal::event::{Event as TermEvent, EventListener, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg, State};
@@ -1326,6 +1327,9 @@ struct Frame {
     /// Cell backgrounds that differ from `bg`: (line, column, cells, colour).
     fills: Vec<(u16, u16, u16, Color)>,
     runs: Vec<Run>,
+    /// Block elements and box drawing lines, drawn as shapes rather than
+    /// text (`term_glyphs`): (line, column, character, colour).
+    shapes: Vec<(u16, u16, char, Color)>,
     cursor: Option<Cursor>,
     /// Selected cells: (line, column, cells), drawn over the text.
     selection: Vec<(u16, u16, u16)>,
@@ -1527,6 +1531,10 @@ impl Frame {
             if item.point == cursor_point {
                 cursor_cell = Some(new_run(glyph(), !simple));
             }
+            if !blank && simple && term_glyphs::drawn(item.c) {
+                frame.shapes.push((line, col, item.c, fg));
+                continue;
+            }
             if blank {
                 // A space: part of the open run if text of its style follows.
                 if open.as_ref().is_some_and(|o| o.line == line) {
@@ -1621,13 +1629,34 @@ fn fill(renderer: &mut iced::Renderer, bounds: Rectangle, color: Color) {
     renderer.fill_quad(renderer::Quad { bounds, ..renderer::Quad::default() }, Background::Color(color));
 }
 
+/// Draws a block element or box drawing line (`term_glyphs::drawn`) in
+/// `cell`, a `cell_rect`.
+fn draw_shape(renderer: &mut iced::Renderer, cell: Rectangle, c: char, color: Color) {
+    // Light lines: about the font's stroke.
+    let t = (cell_w() / 8.0).round().max(1.0);
+    term_glyphs::pieces(c, cell, t, &mut |piece| match piece {
+        Piece::Rect(r, alpha) => fill(renderer, r, Color { a: color.a * alpha, ..color }),
+        Piece::Arc { rect, radius, width, clip } => renderer.with_layer(clip, |r| {
+            r.fill_quad(
+                renderer::Quad {
+                    bounds: rect,
+                    border: iced::Border { color, width, radius: radius.into() },
+                    ..renderer::Quad::default()
+                },
+                Background::Color(Color::TRANSPARENT),
+            )
+        }),
+    });
+}
+
 /// The pixel rectangle of `cells` cells at (line, col); edges rounded so
 /// neighbouring fills meet without seams.
 fn cell_rect(origin: Point, line: u16, col: u16, cells: u16) -> Rectangle {
     let cw = cell_w();
     let x0 = (origin.x + col as f32 * cw).round();
     let x1 = (origin.x + (col + cells) as f32 * cw).round();
-    Rectangle { x: x0, y: origin.y + line as f32 * CELL_H, width: x1 - x0, height: CELL_H }
+    let y = (origin.y + line as f32 * CELL_H).round();
+    Rectangle { x: x0, y, width: x1 - x0, height: CELL_H }
 }
 
 /// Mouse state of the grid widget.
@@ -1821,6 +1850,9 @@ impl Widget<Message, Theme, iced::Renderer> for Grid<'_> {
         for run in &f.runs {
             self.draw_run(renderer, run, origin, bounds);
         }
+        for &(line, col, c, color) in &f.shapes {
+            draw_shape(renderer, cell_rect(origin, line, col, 1), c, color);
+        }
         if !f.selection.is_empty() {
             let color = Color { a: 0.4, ..theme::c().accent };
             for &(line, col, cells) in &f.selection {
@@ -1833,7 +1865,11 @@ impl Widget<Message, Theme, iced::Renderer> for Grid<'_> {
             CursorShape::Block if self.focused => {
                 fill(renderer, r, c.color);
                 if let Some(run) = &c.text {
-                    self.draw_run(renderer, run, origin, bounds);
+                    let mut chars = run.text.chars();
+                    match (chars.next(), chars.next()) {
+                        (Some(ch), None) if !run.complex && term_glyphs::drawn(ch) => draw_shape(renderer, r, ch, run.color),
+                        _ => self.draw_run(renderer, run, origin, bounds),
+                    }
                 }
             }
             CursorShape::Underline => fill(renderer, Rectangle { y: r.y + r.height - 2.0, height: 2.0, ..r }, c.color),
@@ -1864,6 +1900,21 @@ fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
     bytes.extend(text.replace('\x1b', "").into_bytes());
     bytes.extend(b"\x1b[201~");
     bytes
+}
+
+/// Dropped paths as typed text: separated by spaces, each in double quotes
+/// when it has a space or a character shells treat specially (Windows
+/// Terminal does the same).
+fn drop_text(paths: &[PathBuf]) -> String {
+    let quote = |p: &PathBuf| {
+        let s = p.to_string_lossy();
+        if s.chars().any(|c| c.is_whitespace() || "&()[]{}^=;!'+,`~$#@%".contains(c)) {
+            format!("\"{s}\"")
+        } else {
+            s.into_owned()
+        }
+    };
+    paths.iter().map(quote).collect::<Vec<_>>().join(" ")
 }
 
 /// The arrow keys the wheel sends on the alternate screen (programs like
@@ -2590,6 +2641,16 @@ impl App {
         }
         self.info(format!("cd {}", dir.display()));
         Task::none()
+    }
+
+    /// Files dropped on a shown terminal: their paths go to the focused pane
+    /// as a paste, like other terminals do (programs like Claude Code take
+    /// dropped images and files this way).
+    pub(super) fn term_drop(&mut self, sources: &[PathBuf]) {
+        let Some(&id) = self.screen.term() else { return };
+        if let Some(t) = self.term(id) {
+            t.paste(&drop_text(sources));
+        }
     }
 
     /// The text of the quit question (for the dialog).
@@ -3563,6 +3624,13 @@ mod tests {
     }
 
     #[test]
+    fn dropped_paths_are_quoted_when_needed() {
+        let paths = [PathBuf::from(r"C:\img\shot.png"), PathBuf::from(r"C:\My Files\a b.txt"), PathBuf::from(r"D:\x&y")];
+        assert_eq!(drop_text(&paths), r#"C:\img\shot.png "C:\My Files\a b.txt" "D:\x&y""#);
+        assert_eq!(drop_text(&[]), "");
+    }
+
+    #[test]
     fn paste_in_bracketed_mode() {
         assert_eq!(paste_bytes("ls\r\npwd", true), b"\x1b[200~ls\rpwd\x1b[201~");
         // An ESC can't end the bracket early.
@@ -3712,6 +3780,17 @@ mod tests {
             assert!(!synthetic || bold);
         }
         assert!((cell_w() - regular.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn blocks_and_lines_are_shapes_not_text() {
+        let term = small_term(10, 2, "ab\u{2588}\u{2588}c\u{2502}\u{2504}");
+        let frame = Frame::build(&term, &Palette::new(Color::BLACK, Color::WHITE));
+        let shapes: Vec<_> = frame.shapes.iter().map(|&(l, c, ch, _)| (l, c, ch)).collect();
+        assert_eq!(shapes, vec![(0, 2, '\u{2588}'), (0, 3, '\u{2588}'), (0, 5, '\u{2502}')]);
+        // Dashed lines stay text.
+        let runs: Vec<_> = frame.runs.iter().map(|r| (r.col, r.text.as_str())).collect();
+        assert_eq!(runs, vec![(0, "ab"), (4, "c"), (6, "\u{2504}")]);
     }
 
     #[test]
