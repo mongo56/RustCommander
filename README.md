@@ -51,6 +51,7 @@ with a modern, minimalist look. Written in Rust with [iced](https://iced.rs).
 - Several terminals: a sidebar on the right switches between Files and the terminals; while the files are shown it collapses to a thin strip over the panels
 - Mouse selection, copy/paste (bracketed paste), scrollback with a scrollbar; asks before quitting while terminals run
 - Enter on a .ps1, .cmd or .bat file runs it in a new terminal in its folder ("Run scripts in terminal" setting); the context menu of a script also has Run in terminal and Run in external terminal
+- A terminal you're not looking at gets a dot in the sidebar when a command finishes or its program waits for input (bell, OSC 777/9/99 notifications, OSC 9;4 progress cleared). opencode works as is; for Pi, either use its `notify.ts` extension or set `"terminal": { "showTerminalProgress": true }` in `~/.pi/agent/settings.json` (off by default)
 
 **Configuration and keymap**
 - `config.toml` with editor, terminal, built-in terminal shell, theme, key bindings and colours; changes apply on save
