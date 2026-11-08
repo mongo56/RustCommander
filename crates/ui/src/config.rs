@@ -12,7 +12,8 @@ use std::path::PathBuf;
 #[serde(default)]
 pub struct Config {
     /// Editor for F4: a program, optionally with arguments; `%1` stands for
-    /// the file (appended when missing). Empty = the platform default.
+    /// the file (appended when missing), `%L` for a line (`editor::launch_at_line`).
+    /// Empty = the platform default.
     pub editor: String,
     /// External terminal for Ctrl+F9: a program, optionally with arguments;
     /// `%1` stands for the folder (optional: it is the working directory anyway).
@@ -545,6 +546,8 @@ fn template(editor: &str, compare: CompareState) -> String {
          \n\
          # Editor for F4 / Shift+F4: a program, optionally with arguments.\n\
          # %1 stands for the file (appended when missing); quote paths with spaces.\n\
+         # %L stands for a line (Ctrl+click on file:line in the built-in terminal;\n\
+         # Notepad++, VS Code and Sublime Text get the line without it).\n\
          # Empty = Notepad on Windows, else $VISUAL / $EDITOR.\n\
          # Example: editor = '\"C:\\Program Files\\Notepad++\\notepad++.exe\" -multiInst %1'\n\
          editor = {editor}\n\

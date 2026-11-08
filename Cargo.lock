@@ -4660,6 +4660,7 @@ dependencies = [
  "raw-window-handle",
  "rc-core",
  "rc-platform",
+ "regex",
  "serde",
  "serde_json",
  "sha2",

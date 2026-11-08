@@ -203,6 +203,47 @@ pub fn run_program(path: &Path, args: &str) -> io::Result<()> {
     }
 }
 
+/// Opens a web address (http or https only) in the default browser, without
+/// blocking. Anything else is refused, so text from a terminal can't make
+/// the shell run a program or open another URL scheme.
+pub fn open_url(url: &str) -> io::Result<()> {
+    if !is_web_url(url) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "only http and https addresses are opened"));
+    }
+    #[cfg(windows)]
+    {
+        use windows::core::{HSTRING, PCWSTR};
+        use windows::Win32::UI::Shell::ShellExecuteW;
+        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+        win::allow_foreground();
+        // SAFETY: the strings live until the call returns.
+        let result = unsafe {
+            ShellExecuteW(None, &HSTRING::from("open"), &HSTRING::from(url), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL)
+        };
+        match result.0 as isize {
+            n if n > 32 => Ok(()),
+            n => Err(io::Error::other(format!("ShellExecute failed ({n})"))),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        open::that_detached(url)
+    }
+}
+
+/// `url` is an http(s) address with a host and no spaces or control characters.
+pub fn is_web_url(url: &str) -> bool {
+    let lower = url.get(..8).unwrap_or(url).to_ascii_lowercase();
+    let rest = if lower.starts_with("https://") {
+        &url[8..]
+    } else if lower.starts_with("http://") {
+        &url[7..]
+    } else {
+        return false;
+    };
+    !rest.is_empty() && !rest.starts_with('/') && !url.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
 /// True for files that start a program rather than open a document.
 pub fn is_executable(path: &Path) -> bool {
     let ext = path

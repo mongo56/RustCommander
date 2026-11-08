@@ -16,6 +16,7 @@
 use super::*;
 use super::term_activity::{wants_cue, Activity, Attention, Check};
 use super::term_glyphs::{self, Piece};
+use super::term_links::{Link, LinkTarget, Scan};
 use crate::theme::{filled, HintOwned};
 use alacritty_terminal::event::{Event as TermEvent, EventListener, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg, State};
@@ -366,6 +367,8 @@ pub enum TermMsg {
     FindInput(u64, String),
     /// The blink cycle's next half (`blink_ticks`).
     Blink,
+    /// Ctrl+click on a link in a grid (`term_links`).
+    OpenLink(LinkTarget),
 }
 
 /// What the mouse did in the grid; cells are viewport positions.
@@ -1173,6 +1176,8 @@ fn term_key_tip(key: &dyn Fn(Command) -> Option<String>) -> Vec<HintOwned> {
         fixed(&["Ctrl+Shift+J"], "copy as one line"),
         fixed(&["Ctrl+Shift+V", "Shift+Ins"], "paste"),
         fixed(&["Shift+Right-click"], "copy as one line, or paste"),
+        HintOwned::new(Vec::<String>::new(), "Links"),
+        fixed(&["Ctrl+click"], "open a web address; show a file or folder in the panel"),
     ]);
     tip
 }
@@ -1484,6 +1489,8 @@ struct Frame {
     /// The cursor blinks: the default, unless the program asked for a
     /// steady one (DECSCUSR, DECRST 12).
     cursor_blinks: bool,
+    /// OSC 8 links and the addresses and paths in the text (`term_links`).
+    links: Vec<Link>,
 }
 
 /// Text of one style on one line, starting at a cell.
@@ -1521,6 +1528,14 @@ struct Cursor {
 /// fallback font's different width can't shift the rest of the line.
 fn simple_char(c: char) -> bool {
     matches!(c as u32, 0x20..=0x7e | 0xa0..=0x24f | 0x370..=0x4ff | 0x2010..=0x2027 | 0x2500..=0x259f)
+}
+
+/// A line whose last cell is this goes on in the next one: alacritty marked
+/// it wrapped, or it ends in a character (ConPTY often re-sends a soft-wrapped
+/// line as a hard break, see `selection_text`), not box drawing.
+fn wraps_on(flags: Flags, c: char) -> bool {
+    flags.intersects(Flags::WRAPLINE | Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+        || (!flags.contains(Flags::HIDDEN) && !c.is_whitespace() && !matches!(c as u32, 0x2500..=0x259f))
 }
 
 /// The cells of the viewport inside `range`, a run per line.
@@ -1618,13 +1633,18 @@ impl Frame {
         // of its style follows).
         let mut open: Option<Run> = None;
         let mut spaces = 0u16;
+        let mut scan = Scan::new(frame.lines);
+        let last_col = frame.cols.saturating_sub(1);
         for item in content.display_iter {
             let flags = item.flags;
+            let line = (item.point.line.0 + offset) as u16;
+            let col = item.point.column.0 as u16;
+            if item.point.column.0 == last_col && wraps_on(flags, item.c) {
+                scan.joins(line);
+            }
             if flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
                 continue;
             }
-            let line = (item.point.line.0 + offset) as u16;
-            let col = item.point.column.0 as u16;
             let cells = if flags.contains(Flags::WIDE_CHAR) { 2 } else { 1 };
             let bright = pal.bold_bright && flags.contains(Flags::BOLD) && !flags.contains(Flags::DIM);
             let mut fg = pal.resolve(if bright { bold_color(item.fg) } else { item.fg }, overrides);
@@ -1643,6 +1663,10 @@ impl Frame {
             }
             let blank = flags.contains(Flags::HIDDEN) || item.c == ' ' || item.c == '\t';
             let zerowidth = item.zerowidth().filter(|z| !z.is_empty());
+            let hyperlink = item.hyperlink();
+            let link = hyperlink.as_ref().map(|h| (h.id(), h.uri()));
+            let extra = zerowidth.filter(|_| !blank).unwrap_or(&[]);
+            scan.cell(line, col, cells, if blank { ' ' } else { item.c }, extra, link);
             let style = (
                 fg,
                 flags.contains(Flags::BOLD),
@@ -1705,6 +1729,7 @@ impl Frame {
             open = Some(new_run(glyph(), !simple));
         }
         frame.runs.extend(open);
+        frame.links = scan.finish();
 
         let in_view = cursor_point.line.0 + offset;
         if cursor_shape != CursorShape::Hidden && (0..frame.lines as i32).contains(&in_view) {
@@ -1724,6 +1749,11 @@ impl Frame {
             });
         }
         frame
+    }
+
+    /// The link that covers cell (line, col) of the viewport.
+    fn link_at(&self, line: u16, col: u16) -> Option<&Link> {
+        self.links.iter().find(|l| l.covers(line, col))
     }
 }
 
@@ -1767,6 +1797,23 @@ impl Grid<'_> {
         if run.strike {
             fill(renderer, Rectangle { x, y: y + (ch / 2.0).round(), width, height: 1.0 }, run.color);
         }
+    }
+
+    /// The link under the mouse while Ctrl is held (and no button is).
+    fn hovered_link(&self, state: &GridState, cursor: mouse::Cursor, bounds: Rectangle) -> Option<&Link> {
+        if !state.mods.control() || state.held.is_some() {
+            return None;
+        }
+        let at = cursor.position_in(bounds)?;
+        let (x, y) = (at.x - PAD, at.y - PAD);
+        if x < 0.0 || y < 0.0 {
+            return None;
+        }
+        let (col, line) = ((x / self.metrics.cell_w) as usize, (y / self.metrics.cell_h) as usize);
+        if col >= self.frame.cols || line >= self.frame.lines {
+            return None;
+        }
+        self.frame.link_at(line as u16, col as u16)
     }
 }
 
@@ -1832,13 +1879,20 @@ impl Widget<Message, Theme, iced::Renderer> for Grid<'_> {
 
     fn mouse_interaction(
         &self,
-        _tree: &Tree,
+        tree: &Tree,
         layout: Layout<'_>,
         cursor: mouse::Cursor,
         _viewport: &Rectangle,
         _renderer: &iced::Renderer,
     ) -> mouse::Interaction {
-        if cursor.is_over(layout.bounds()) { mouse::Interaction::Text } else { mouse::Interaction::None }
+        let bounds = layout.bounds();
+        if self.hovered_link(tree.state.downcast_ref::<GridState>(), cursor, bounds).is_some() {
+            mouse::Interaction::Pointer
+        } else if cursor.is_over(bounds) {
+            mouse::Interaction::Text
+        } else {
+            mouse::Interaction::None
+        }
     }
 
     fn on_event(
@@ -1865,10 +1919,26 @@ impl Widget<Message, Theme, iced::Renderer> for Grid<'_> {
         }
         let state = tree.state.downcast_mut::<GridState>();
         if let Event::Keyboard(keyboard::Event::ModifiersChanged(mods)) = event {
+            if mods.control() != state.mods.control() {
+                // Ctrl shows or hides the link under the mouse.
+                shell.request_redraw(window::RedrawRequest::NextFrame);
+            }
             state.mods = mods;
             return event::Status::Ignored;
         }
         let bounds = layout.bounds();
+        if let Event::Mouse(mouse::Event::CursorMoved { .. }) = event {
+            if state.mods.control() {
+                shell.request_redraw(window::RedrawRequest::NextFrame);
+            }
+        }
+        // Ctrl+click on a link opens it; the program doesn't get the click.
+        if let Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) = event {
+            if let Some(link) = self.hovered_link(state, cursor, bounds) {
+                shell.publish(Message::Term(TermMsg::OpenLink(link.target.clone())));
+                return event::Status::Captured;
+            }
+        }
         let (cols, lines) = (self.frame.cols, self.frame.lines);
         let mods = state.mods;
         let m = self.metrics;
@@ -1958,12 +2028,12 @@ impl Widget<Message, Theme, iced::Renderer> for Grid<'_> {
 
     fn draw(
         &self,
-        _tree: &Tree,
+        tree: &Tree,
         renderer: &mut iced::Renderer,
         _theme: &Theme,
         _style: &renderer::Style,
         layout: Layout<'_>,
-        _cursor: mouse::Cursor,
+        cursor: mouse::Cursor,
         _viewport: &Rectangle,
     ) {
         let bounds = layout.bounds();
@@ -1980,6 +2050,13 @@ impl Widget<Message, Theme, iced::Renderer> for Grid<'_> {
         }
         for &(line, col, c, color) in &f.shapes {
             draw_shape(m, renderer, cell_rect(line, col, 1), c, color);
+        }
+        if let Some(link) = self.hovered_link(tree.state.downcast_ref::<GridState>(), cursor, bounds) {
+            let color = theme::c().accent;
+            for &(line, col, cells) in &link.spans {
+                let r = cell_rect(line, col, cells);
+                fill(renderer, Rectangle { y: r.y + r.height - 2.0, height: 1.0, ..r }, color);
+            }
         }
         if !f.selection.is_empty() {
             let color = Color { a: 0.4, ..theme::c().accent };
@@ -2745,6 +2822,41 @@ impl App {
         self.start_nav_to(side, Nav::to(dir), true)
     }
 
+    /// Ctrl+click on a link in a terminal: a web address opens in the
+    /// browser, a folder in the active panel, a file is selected in its
+    /// folder's panel; a file with a line opens in the editor at that line
+    /// when the editor takes one (`editor::launch_at_line`). Nothing is run.
+    fn open_term_link(&mut self, target: LinkTarget) -> Task<Message> {
+        let path = match target {
+            LinkTarget::Url(url) => {
+                match rc_platform::open_url(&url) {
+                    Ok(()) => self.info(format!("Opened {url}")),
+                    Err(e) => self.error(format!("Can't open {url}: {e}")),
+                }
+                return Task::none();
+            }
+            LinkTarget::Path { path, line: Some(line) } if path.is_file() => {
+                self.refresh_config();
+                let name = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+                match crate::editor::launch_at_line(&self.config.editor, &path, line) {
+                    Some(Ok(_)) => {
+                        self.info(format!("Editing {name} at line {line}"));
+                        return Task::none();
+                    }
+                    Some(Err(e)) => {
+                        self.error(format!("Can't start the editor: {e}"));
+                        return Task::none();
+                    }
+                    // The editor takes no line: select the file instead.
+                    None => path,
+                }
+            }
+            LinkTarget::Path { path, .. } => path,
+        };
+        self.hide_term();
+        self.start_nav_to(self.active, Nav::to(path), true)
+    }
+
     /// `SendFolderToTerminal`: types `cd <folder>` into the focused terminal
     /// (from the panels: the one used last), or starts one there when none
     /// runs. The folder is the one under the cursor, else the panel's.
@@ -2953,6 +3065,7 @@ impl App {
                     t.find(None);
                 }
             }
+            TermMsg::OpenLink(target) => return self.open_term_link(target),
             TermMsg::Blink => {
                 let typing = self.term_blink.input.elapsed() < BLINK;
                 self.term_blink.off = !self.term_blink.off && !typing;
@@ -4000,6 +4113,22 @@ mod tests {
             assert_eq!(face.post_script_name, name);
             assert!(matches!(face.source, Source::Binary(_)), "{name}");
         }
+    }
+
+    #[test]
+    fn links_from_osc8_and_text() {
+        let pal = Palette::new(Color::BLACK, Color::WHITE);
+        let term = small_term(20, 3, "\x1b]8;;https://x.y\x1b\\text\x1b]8;;\x1b\\ C:\\a.rs:3\r\nftp://no \x1b]8;;javascript:x\x1b\\js\x1b]8;;\x1b\\");
+        let frame = Frame::build(&term, &pal);
+        let url = LinkTarget::Url("https://x.y".to_owned());
+        let path = LinkTarget::Path { path: PathBuf::from(r"C:\a.rs"), line: Some(3) };
+        assert_eq!(frame.links, [Link { target: url, spans: vec![(0, 0, 4)] }, Link { target: path, spans: vec![(0, 5, 9)] }]);
+        assert!(frame.link_at(0, 3).is_some() && frame.link_at(0, 4).is_none() && frame.link_at(1, 9).is_none());
+        // A path that runs to the edge goes on in the next line.
+        let term = small_term(10, 3, "> C:\\Users\\me\\x.txt is it");
+        let frame = Frame::build(&term, &pal);
+        let path = LinkTarget::Path { path: PathBuf::from(r"C:\Users\me\x.txt"), line: None };
+        assert_eq!(frame.links, [Link { target: path, spans: vec![(0, 2, 8), (1, 0, 9)] }]);
     }
 
     #[test]

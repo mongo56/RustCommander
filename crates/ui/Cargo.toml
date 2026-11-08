@@ -25,6 +25,8 @@ sha2 = "0.11"
 alacritty_terminal = "=0.26.0"
 # Markdown view of the viewer (F3 on .md): parser only, we draw the blocks.
 pulldown-cmark = { version = "0.13", default-features = false }
+# Links in the built-in terminal (web addresses, paths).
+regex = "1"
 
 [target.'cfg(windows)'.dependencies]
 # SetDllDirectoryW for the built-in terminal (same version as alacritty_terminal's).

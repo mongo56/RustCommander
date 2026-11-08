@@ -29,6 +29,7 @@ mod term;
 pub use term::load_fonts;
 mod term_activity;
 mod term_glyphs;
+mod term_links;
 mod thumbs;
 mod undo;
 mod update;
