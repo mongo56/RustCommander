@@ -184,4 +184,6 @@ compiled into the program (via the `unrar_sys` crate). UnRAR is freeware, not
 open source: it may be used free of charge to handle RAR archives, but not to
 build a RAR-compatible archiver or re-create the RAR compression algorithm.
 Its full license is in [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt),
-which ships with the zip and the installer.
+which ships with the zip and the installer. The built-in terminal's font,
+Microsoft's Cascadia Mono, is built in under the SIL Open Font License 1.1
+(also in that file).

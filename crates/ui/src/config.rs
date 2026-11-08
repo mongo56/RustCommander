@@ -57,12 +57,15 @@ pub struct Config {
     /// steady one).
     pub terminal_cursor_blink: bool,
     /// The built-in terminal's font: a family name (a monospace one); empty =
-    /// the system's monospace font (Cascadia Code / Consolas on Windows).
+    /// Cascadia Mono, shipped with the program.
     pub terminal_font: String,
     /// The built-in terminal's font size (Ctrl+0 there goes back to it;
     /// Ctrl++ / Ctrl+- zoom from it, kept in the session); see
     /// [`Config::terminal_font_size`].
     pub terminal_font_size: u32,
+    /// Bold text in the built-in terminal in one of the 8 normal ANSI colours
+    /// is drawn in the bright variant (as older terminals did).
+    pub terminal_bold_is_bright: bool,
     /// Edge of the thumbnail view's pictures in pixels (Ctrl+Shift+F5);
     /// 0 = the default, see [`Config::thumbnail_size`].
     pub thumbnail_size: u32,
@@ -158,6 +161,7 @@ impl Default for Config {
             terminal_cursor_blink: true,
             terminal_font: String::new(),
             terminal_font_size: DEFAULT_TERMINAL_FONT_SIZE,
+            terminal_bold_is_bright: false,
             thumbnail_size: 0,
             keys: BTreeMap::new(),
             colors: BTreeMap::new(),
@@ -562,13 +566,17 @@ fn template(editor: &str, compare: CompareState) -> String {
          # for a steady cursor get one either way.\n\
          terminal_cursor_blink = true\n\
          \n\
-         # The built-in terminal's font: a monospace family name, e.g. 'Cascadia Mono'\n\
-         # or 'Consolas'. Empty = the system's monospace font.\n\
+         # The built-in terminal's font: a monospace family name, e.g. 'Consolas'.\n\
+         # Empty = Cascadia Mono (shipped with RustCommander, with real bold and italic).\n\
          terminal_font = \"\"\n\
          \n\
          # Its font size, 8-32. Ctrl++ / Ctrl+- in a terminal zoom all terminals (the\n\
          # zoom is kept for the next start); Ctrl+0 goes back to this size.\n\
          terminal_font_size = 14\n\
+         \n\
+         # Bold text in one of the 8 normal colours is drawn in the bright colour\n\
+         # (as older terminals did). Off = bold only changes the weight.\n\
+         terminal_bold_is_bright = false\n\
          \n\
          # Show hidden and system files at the first start (Ctrl+H toggles them per tab).\n\
          show_hidden = false\n\
@@ -839,6 +847,9 @@ key = \"F7\"
         assert_eq!(parse("terminal_font_size = 16").unwrap().terminal_font_size(), 16);
         assert_eq!(parse("terminal_font = 'Consolas'").unwrap().terminal_font, "Consolas");
         assert!(parse("terminal_font_size = -1").is_err());
+        assert!(!config.terminal_bold_is_bright);
+        assert!(parse("terminal_bold_is_bright = true").unwrap().terminal_bold_is_bright);
+        assert!(!parse(&template("", CompareState::default())).unwrap().terminal_bold_is_bright);
     }
 
     #[test]

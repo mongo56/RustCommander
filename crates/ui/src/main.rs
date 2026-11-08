@@ -111,6 +111,7 @@ fn main() -> iced::Result {
         .default_font(iced::Font::with_name("Segoe UI"))
         .run_with(move || {
             startup::mark("iced started (window + renderer)");
+            app::load_fonts();
             app::App::new(session)
         })
 }

@@ -155,13 +155,52 @@ fn measure(font: Font, size: f32, cell_h: f32) -> (f32, f32) {
     (paragraph.min_width() / N as f32, baseline)
 }
 
-/// `terminal_font` as a font: empty = `Font::MONOSPACE`. iced wants a
+/// The terminal's default font, shipped with the program (static faces, SIL
+/// OFL, see `assets/fonts/OFL.txt`): the system's Cascadia Code / Mono are
+/// variable fonts cosmic-text only sees at weight 400, so they have no bold.
+pub(super) const BUNDLED_FONT: Font = Font::with_name("Cascadia Mono");
+
+const BUNDLED_FACES: [&[u8]; 4] = [
+    include_bytes!("../../assets/fonts/CascadiaMono-Regular.ttf"),
+    include_bytes!("../../assets/fonts/CascadiaMono-Bold.ttf"),
+    include_bytes!("../../assets/fonts/CascadiaMono-Italic.ttf"),
+    include_bytes!("../../assets/fonts/CascadiaMono-BoldItalic.ttf"),
+];
+
+/// Adds the bundled faces to iced's font system (once; before anything is
+/// shaped). An installed Cascadia Mono (the variable one Windows ships) is
+/// dropped from it first: it has the same family name and weight 400, and
+/// cosmic-text would pick it for regular text and ours for bold, two
+/// versions that needn't share their metrics.
+pub fn load_fonts() {
+    use iced::advanced::graphics::text::cosmic_text::fontdb::Source;
+    use iced::advanced::graphics::text::font_system;
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let mut fonts = font_system().write().unwrap_or_else(|e| e.into_inner());
+        let Font { family: iced::font::Family::Name(family), .. } = BUNDLED_FONT else { unreachable!() };
+        let db = fonts.raw().db_mut();
+        let installed: Vec<_> = db
+            .faces()
+            .filter(|f| !matches!(f.source, Source::Binary(_)) && f.families.iter().any(|(n, _)| n == family))
+            .map(|f| f.id)
+            .collect();
+        for id in installed {
+            db.remove_face(id);
+        }
+        for face in BUNDLED_FACES {
+            fonts.load_font(std::borrow::Cow::Borrowed(face));
+        }
+    });
+}
+
+/// `terminal_font` as a font: empty = `BUNDLED_FONT`. iced wants a
 /// `'static` family name, so each name is leaked once.
 pub(super) fn font_named(name: &str) -> Font {
     static NAMES: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
     let name = name.trim();
     if name.is_empty() {
-        return Font::MONOSPACE;
+        return BUNDLED_FONT;
     }
     let mut names = NAMES.lock().unwrap_or_else(|e| e.into_inner());
     let name = match names.iter().find(|n| **n == name) {
@@ -199,11 +238,12 @@ impl Metrics {
         let regular = measure(font, size, cell_h);
         let cell_w = if regular.0.is_finite() && regular.0 > 1.0 { regular.0 } else { (size * 0.6).max(2.0) };
         // A bold or italic face is only used when it has the regular face's
-        // advance and baseline: `Font::MONOSPACE` can resolve the styles to
-        // other families (on Windows regular is Cascadia Code, a variable font
-        // cosmic-text sees only at weight 400, so bold and italic come from
-        // Consolas, narrower and with another baseline), which would put the
-        // text off the cell grid. Then bold is synthetic and italic is drawn upright.
+        // advance and baseline: a font can resolve the styles to other
+        // families (`Font::MONOSPACE` on Windows is Cascadia Code, a variable
+        // font cosmic-text sees only at weight 400, so bold and italic come
+        // from Consolas, narrower and with another baseline), which would put
+        // the text off the cell grid. Then bold is synthetic and italic is
+        // drawn upright. `BUNDLED_FONT` has all four faces.
         let face = |bold: bool, italic: bool| Font {
             weight: if bold { Weight::Bold } else { Weight::Normal },
             style: if italic { FontStyle::Italic } else { FontStyle::Normal },
@@ -1281,6 +1321,29 @@ struct Palette {
     fg: Color,
     bg: Color,
     cursor: Color,
+    /// Bold text in one of the 8 normal colours uses the bright one
+    /// (`terminal_bold_is_bright`).
+    bold_bright: bool,
+}
+
+/// `terminal_bold_is_bright` from `config.toml` (`set_bold_bright`).
+static BOLD_BRIGHT: AtomicBool = AtomicBool::new(false);
+
+/// Sets `terminal_bold_is_bright`; shown terminals redraw with `App::refresh_terms`.
+pub(super) fn set_bold_bright(on: bool) {
+    BOLD_BRIGHT.store(on, Ordering::Relaxed);
+}
+
+/// What bold text in `color` is drawn with when bold is bright: the 8 normal
+/// ANSI colours (named or indexed 0-7) become their bright variants.
+fn bold_color(color: AnsiColor) -> AnsiColor {
+    match color {
+        AnsiColor::Named(n) if (NamedColor::Black as usize..=NamedColor::White as usize).contains(&(n as usize)) => {
+            AnsiColor::Named(n.to_bright())
+        }
+        AnsiColor::Indexed(i) if i < 8 => AnsiColor::Indexed(i + 8),
+        c => c,
+    }
 }
 
 use theme::{TERM_DARK_ANSI as DARK_ANSI, TERM_LIGHT_ANSI as LIGHT_ANSI};
@@ -1310,11 +1373,11 @@ fn to_rgb(c: Color) -> Rgb {
 impl Palette {
     fn new(bg: Color, fg: Color) -> Palette {
         let set = if luminance(bg) > 0.5 { LIGHT_ANSI } else { DARK_ANSI };
-        Palette { ansi: set.map(hex), fg, bg, cursor: fg }
+        Palette { ansi: set.map(hex), fg, bg, cursor: fg, bold_bright: false }
     }
 
     fn from_theme() -> Palette {
-        Palette::theme_base().with(&theme::term())
+        Palette { bold_bright: BOLD_BRIGHT.load(Ordering::Relaxed), ..Palette::theme_base().with(&theme::term()) }
     }
 
     /// The theme's colours without `[terminal_colors]`: its text, file list
@@ -1563,7 +1626,8 @@ impl Frame {
             let line = (item.point.line.0 + offset) as u16;
             let col = item.point.column.0 as u16;
             let cells = if flags.contains(Flags::WIDE_CHAR) { 2 } else { 1 };
-            let mut fg = pal.resolve(item.fg, overrides);
+            let bright = pal.bold_bright && flags.contains(Flags::BOLD) && !flags.contains(Flags::DIM);
+            let mut fg = pal.resolve(if bright { bold_color(item.fg) } else { item.fg }, overrides);
             let mut bg = pal.resolve(item.bg, overrides);
             if flags.contains(Flags::INVERSE) {
                 std::mem::swap(&mut fg, &mut bg);
@@ -3474,9 +3538,10 @@ mod tests {
     fn measure_fonts() {
         use iced::advanced::graphics::text::{font_system, Paragraph};
         use iced::advanced::text::Paragraph as _;
+        load_fonts();
         let fonts = [
             ("MONOSPACE", Font::MONOSPACE),
-            ("Cascadia Mono", Font::with_name("Cascadia Mono")),
+            ("bundled", BUNDLED_FONT),
             ("Consolas", Font::with_name("Consolas")),
         ];
         for (name, base) in fonts {
@@ -3509,10 +3574,12 @@ mod tests {
                 println!("{name:14} {style:12} w={:.4} baseline={y:.2} face={face}", p.min_width() / 100.0);
             }
         }
-        let m = Metrics::new(Font::MONOSPACE, 14.0);
-        for (bold, italic) in [(true, false), (false, true), (true, true)] {
-            let (font, synthetic) = m.style_font(bold, italic);
-            println!("bold={bold} italic={italic}: drawn with {font:?}, synthetic bold {synthetic}");
+        for base in [Font::MONOSPACE, BUNDLED_FONT] {
+            let m = Metrics::new(base, 14.0);
+            for (bold, italic) in [(true, false), (false, true), (true, true)] {
+                let (font, synthetic) = m.style_font(bold, italic);
+                println!("bold={bold} italic={italic}: drawn with {font:?}, synthetic bold {synthetic}");
+            }
         }
     }
 
@@ -3874,18 +3941,84 @@ mod tests {
     #[test]
     fn styles_keep_the_cell_grid() {
         // Whatever face each style ends up with, it has the regular advance
-        // and baseline (else bold/italic text drifts off the cells).
-        let m = Metrics::new(Font::MONOSPACE, 14.0);
-        let regular = measure(Font::MONOSPACE, 14.0, 18.0);
-        for (bold, italic) in [(false, false), (true, false), (false, true), (true, true)] {
-            let (font, synthetic) = m.style_font(bold, italic);
-            let (w, baseline) = measure(font, 14.0, 18.0);
-            assert!((w - regular.0).abs() < 0.05, "{bold} {italic}: {w} vs {}", regular.0);
-            assert!((baseline - regular.1).abs() < 0.5, "{bold} {italic}: {baseline} vs {}", regular.1);
-            assert!(!synthetic || bold);
+        // and baseline (else bold/italic text drifts off the cells). The
+        // bundled font has real bold and italic faces.
+        load_fonts();
+        for base in [Font::MONOSPACE, BUNDLED_FONT] {
+            let m = Metrics::new(base, 14.0);
+            let regular = measure(base, 14.0, 18.0);
+            for (bold, italic) in [(false, false), (true, false), (false, true), (true, true)] {
+                let (font, synthetic) = m.style_font(bold, italic);
+                let (w, baseline) = measure(font, 14.0, 18.0);
+                assert!((w - regular.0).abs() < 0.05, "{bold} {italic}: {w} vs {}", regular.0);
+                assert!((baseline - regular.1).abs() < 0.5, "{bold} {italic}: {baseline} vs {}", regular.1);
+                assert!(!synthetic || bold);
+                if base == BUNDLED_FONT {
+                    assert!(!synthetic, "{bold} {italic}: synthetic bold");
+                    assert_eq!((font.weight == Weight::Bold, font.style == FontStyle::Italic), (bold, italic));
+                }
+            }
+            assert!((m.cell_w - regular.0).abs() < 0.001);
+            assert_eq!(m.cell_h, 18.0);
         }
-        assert!((m.cell_w - regular.0).abs() < 0.001);
-        assert_eq!(m.cell_h, 18.0);
+    }
+
+    #[test]
+    fn bundled_faces_are_the_ones_drawn() {
+        // Each style of the bundled font shapes with its own face, not with
+        // an installed Cascadia Mono or a fallback.
+        use iced::advanced::graphics::text::cosmic_text::fontdb::Source;
+        use iced::advanced::graphics::text::{font_system, Paragraph};
+        use iced::advanced::text::Paragraph as _;
+        load_fonts();
+        let faces = [
+            ("CascadiaMono-Regular", false, false),
+            ("CascadiaMono-Bold", true, false),
+            ("CascadiaMono-Italic", false, true),
+            ("CascadiaMono-BoldItalic", true, true),
+        ];
+        for (name, bold, italic) in faces {
+            let font = Font {
+                weight: if bold { Weight::Bold } else { Weight::Normal },
+                style: if italic { FontStyle::Italic } else { FontStyle::Normal },
+                ..BUNDLED_FONT
+            };
+            let p = Paragraph::with_text(iced::advanced::Text {
+                content: "0",
+                bounds: Size::INFINITY,
+                size: Pixels(14.0),
+                line_height: LineHeight::Absolute(Pixels(18.0)),
+                font,
+                horizontal_alignment: alignment::Horizontal::Left,
+                vertical_alignment: alignment::Vertical::Top,
+                shaping: Shaping::Basic,
+                wrapping: Wrapping::None,
+            });
+            let id = p.buffer().layout_runs().next().and_then(|run| run.glyphs.first()).map(|g| g.font_id).unwrap();
+            let mut fs = font_system().write().unwrap();
+            let face = fs.raw().db().face(id).unwrap();
+            assert_eq!(face.post_script_name, name);
+            assert!(matches!(face.source, Source::Binary(_)), "{name}");
+        }
+    }
+
+    #[test]
+    fn bold_is_bright_only_when_asked() {
+        // Bold red, bold indexed green, bold bright red, bold RGB, plain red.
+        let term = small_term(8, 1, "\x1b[1;31ma\x1b[38;5;2mb\x1b[38;5;9mc\x1b[38;2;1;2;3md\x1b[0;31me");
+        let colors = |pal: &Palette| -> Vec<Color> {
+            let frame = Frame::build(&term, pal);
+            frame.runs.iter().flat_map(|r| r.text.chars().map(move |_| r.color)).collect()
+        };
+        let pal = Palette::new(Color::BLACK, Color::WHITE);
+        let rgb = Color::from_rgb8(1, 2, 3);
+        assert_eq!(colors(&pal), [pal.ansi[1], pal.ansi[2], pal.ansi[9], rgb, pal.ansi[1]]);
+        let bright = Palette { bold_bright: true, ..pal };
+        assert_eq!(colors(&bright), [pal.ansi[9], pal.ansi[10], pal.ansi[9], rgb, pal.ansi[1]]);
+        assert_eq!(bold_color(AnsiColor::Named(NamedColor::Foreground)), AnsiColor::Named(NamedColor::Foreground));
+        assert_eq!(bold_color(AnsiColor::Named(NamedColor::White)), AnsiColor::Named(NamedColor::BrightWhite));
+        assert_eq!(bold_color(AnsiColor::Indexed(7)), AnsiColor::Indexed(15));
+        assert_eq!(bold_color(AnsiColor::Indexed(8)), AnsiColor::Indexed(8));
     }
 
     #[test]
@@ -3928,8 +4061,8 @@ mod tests {
 
     #[test]
     fn font_names_are_kept_once() {
-        assert_eq!(font_named(""), Font::MONOSPACE);
-        assert_eq!(font_named("  "), Font::MONOSPACE);
+        assert_eq!(font_named(""), BUNDLED_FONT);
+        assert_eq!(font_named("  "), BUNDLED_FONT);
         let a = font_named(" Cascadia Mono ");
         assert_eq!(a, Font::with_name("Cascadia Mono"));
         let (iced::font::Family::Name(x), iced::font::Family::Name(y)) = (a.family, font_named("Cascadia Mono").family)

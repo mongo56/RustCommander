@@ -26,6 +26,7 @@ mod git;
 mod multi_rename;
 mod settings;
 mod term;
+pub use term::load_fonts;
 mod term_activity;
 mod term_glyphs;
 mod thumbs;
@@ -3668,6 +3669,7 @@ impl App {
         theme::set(colors);
         theme::set_term(term_colors);
         theme::set_term_ansi(theme::preset(&self.config.theme).map_or(theme::TERM_DARK_ANSI, |p| p.ansi));
+        term::set_bold_bright(self.config.terminal_bold_is_bright);
         self.refresh_terms();
         Ok(())
     }
