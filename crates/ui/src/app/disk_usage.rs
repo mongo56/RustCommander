@@ -1079,7 +1079,8 @@ impl App {
         let cell = |t: String| text(t).size(13).color(color).wrapping(Wrapping::None);
 
         let arrow: Element<'a, Message> = if is_dir && !n.children.is_empty() {
-            let glyph = if s.outline.is_expanded(node) { "\u{25be}" } else { "\u{25b8}" };
+            // Arrows the UI font can draw (the small triangles came out as boxes).
+            let glyph = if s.outline.is_expanded(node) { "\u{2193}" } else { "\u{2192}" };
             mouse_area(container(text(glyph).size(12).color(colors.muted)).width(Length::Fixed(ARROW_W)))
                 .on_press(Message::DiskUsage(DuMsg::Toggle(i)))
                 .into()
