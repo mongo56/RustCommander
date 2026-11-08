@@ -353,6 +353,8 @@ pub(super) struct TermSession {
     pub(super) dir: PathBuf,
     /// Exe name (no `.exe`) of the program the shell runs, if any (polled).
     program: Option<String>,
+    /// What the shell is (PowerShell, cmd, ...): how `cd_line` quotes a folder.
+    family: ShellFamily,
     /// Process id of the shell (Windows).
     pub(super) pid: Option<u32>,
     /// Exit code once the shell has exited.
@@ -426,6 +428,7 @@ impl TermSession {
             osc_title: None,
             dir: dir.to_owned(),
             program: None,
+            family: shell_family(command),
             pid,
             exit_code: None,
             frame: Frame::default(),
@@ -802,6 +805,37 @@ fn cmd_target(dir: &Path, name: &str) -> String {
     if dir.as_os_str().to_string_lossy().starts_with(r"\\") { dir.join(name).display().to_string() } else { name.to_owned() }
 }
 
+/// `s` as a POSIX shell single-quoted string: each `'` becomes `'\''`.
+fn sh_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// The line that changes a shell of `family` to `dir`, typed at its prompt.
+fn cd_line(family: ShellFamily, dir: &Path) -> String {
+    let dir = dir.to_string_lossy();
+    match family {
+        ShellFamily::WindowsPowerShell | ShellFamily::Pwsh => {
+            format!("Set-Location -LiteralPath {}", ps_quote(&dir))
+        }
+        // Without `/d` cmd stays on the current drive; it can't be in a UNC
+        // folder at all, and `pushd` maps one to a free drive.
+        ShellFamily::Cmd if dir.starts_with(r"\\") => format!("pushd \"{dir}\""),
+        ShellFamily::Cmd => format!("cd /d \"{dir}\""),
+        // bash, zsh, ... (fish and nu quote differently; best effort).
+        ShellFamily::Other => format!("cd -- {}", sh_quote(&dir)),
+    }
+}
+
 /// The shell command line to start in `dir` for running the script `name`
 /// (in `dir`) of `kind`, and the line to type into it at its prompt. The
 /// configured `shell` when it is PowerShell or cmd; otherwise one of those
@@ -986,6 +1020,7 @@ fn term_key_tip(key: &dyn Fn(Command) -> Option<String>) -> Vec<HintOwned> {
     add(&mut tip, key(Command::NewTerminal).into_iter().collect(), "new terminal");
     add(&mut tip, key(Command::CloseTerminal).into_iter().collect(), "close the terminal");
     add(&mut tip, key(Command::TerminalFolderToPanel).into_iter().collect(), "its folder in the active panel");
+    add(&mut tip, key(Command::SendFolderToTerminal).into_iter().collect(), "the active panel's folder here (cd)");
     add(&mut tip, key(Command::Configuration).into_iter().collect(), "settings (Esc comes back here)");
     tip.push(HintOwned::new(Vec::<String>::new(), "Split panes"));
     add(&mut tip, key(Command::SplitTerminalRight).into_iter().collect(), "split: new shell to the right");
@@ -2083,6 +2118,7 @@ impl App {
         ("Ctrl+Shift+Z (cm_ZoomTerminalPane)", "Show the focused split pane alone, or all panes again"),
         ("F10 (cm_Configuration)", "Settings; closing them comes back to the terminal (F10 doesn't reach programs in the terminal; bind cm_Configuration to another key in [keys] if one needs it)"),
         ("cm_TerminalFolderToPanel (no key by default)", "Active panel goes to the terminal's current folder and Files is shown"),
+        ("Ctrl+Shift+Enter (cm_SendFolderToTerminal)", "This terminal goes to the folder selected in the active panel (cd); from the panels it goes to the last used terminal"),
         ("Ctrl+Shift+F", "Find text in the scrollback: typing finds the newest match, Enter / Up the next older one, Shift+Enter / Down the next newer one (wraps around); the match is selected (Ctrl+Shift+C copies it). Case-insensitive unless the text has capitals; Esc closes"),
         ("Ctrl+Shift+C or Ctrl+Insert", "Copy the selected text (select with the mouse: drag, double-click a word, triple-click a line)"),
         ("Ctrl+Shift+J", "Copy the selected text as one line: line breaks and the indentation after them removed (paths, URLs, commands a program wrapped)"),
@@ -2497,6 +2533,65 @@ impl App {
         self.start_nav_to(side, Nav::to(dir), true)
     }
 
+    /// `SendFolderToTerminal`: types `cd <folder>` into the focused terminal
+    /// (from the panels: the one used last), or starts one there when none
+    /// runs. The folder is the one under the cursor, else the panel's.
+    pub(super) fn send_folder_to_terminal(&mut self) -> Task<Message> {
+        let dir = {
+            let panel = self.panel(self.active);
+            match panel.current().filter(|entry| entry.is_dir()) {
+                Some(entry) => entry.path.clone(),
+                None => panel.path.clone(),
+            }
+        };
+        if vfs::in_archive(&dir) {
+            let place = if remote::is_remote(&dir) { "on a server" } else { "inside an archive" };
+            self.error(format!("The built-in terminal only opens in local folders, not {place}"));
+            return Task::none();
+        }
+        if !dir.is_dir() {
+            self.error(format!("Can't change to {}: not a folder", dir.display()));
+            return Task::none();
+        }
+        let target = self
+            .screen
+            .term()
+            .copied()
+            .or_else(|| self.term_last.filter(|&id| self.term(id).is_some()));
+        let Some(id) = target else {
+            self.refresh_config();
+            let shell = self.config.builtin_shell();
+            self.start_term(&dir, &shell);
+            return Task::none();
+        };
+        let (family, refusal) = {
+            let Some(t) = self.term(id) else { return Task::none() };
+            let refusal = if let Some(program) = &t.program {
+                Some(format!(
+                    "Can't change the terminal's folder while {program} runs; end it, or open a new terminal here (Ctrl+Shift+T)"
+                ))
+            } else if t.alt_screen() {
+                Some("Can't change the terminal's folder while a full-screen program runs; end it first".to_owned())
+            } else if t.pending.is_some() {
+                Some("Can't change the terminal's folder while a line for it is still waiting to be typed".to_owned())
+            } else {
+                None
+            };
+            (t.family, refusal)
+        };
+        if let Some(text) = refusal {
+            self.error(text);
+            return Task::none();
+        }
+        let line = cd_line(family, &dir);
+        if let Some(t) = self.term_mut(id) {
+            t.write(format!("{line}\r").into_bytes());
+            t.dir = dir.clone();
+        }
+        self.info(format!("cd {}", dir.display()));
+        Task::none()
+    }
+
     /// The text of the quit question (for the dialog).
     pub(super) fn quit_text(&self) -> String {
         quit_question(self.terms.len()).unwrap_or_else(|| "Quit?".to_owned())
@@ -2761,6 +2856,7 @@ impl App {
             Command::PrevTerminal,
             Command::CloseTerminal,
             Command::TerminalFolderToPanel,
+            Command::SendFolderToTerminal,
             Command::SplitTerminalRight,
             Command::SplitTerminalDown,
             Command::FocusTerminalLeft,
@@ -3325,6 +3421,21 @@ mod tests {
         assert_eq!(ps_quote("it's"), "'it''s'");
         assert_eq!(ps_quote("\u{2018}x\u{201b}"), "'\u{2018}\u{2018}x\u{201b}\u{201b}'");
         assert_eq!(ps_quote("$a `b\""), "'$a `b\"'");
+    }
+
+    #[test]
+    fn cd_lines() {
+        let dir = Path::new(r"C:\My Files");
+        let ps = r"Set-Location -LiteralPath 'C:\My Files'";
+        assert_eq!(cd_line(ShellFamily::WindowsPowerShell, dir), ps);
+        assert_eq!(cd_line(ShellFamily::Pwsh, dir), ps);
+        assert_eq!(cd_line(ShellFamily::WindowsPowerShell, Path::new(r"C:\it's")), r"Set-Location -LiteralPath 'C:\it''s'");
+        assert_eq!(cd_line(ShellFamily::Cmd, dir), r#"cd /d "C:\My Files""#);
+        assert_eq!(cd_line(ShellFamily::Cmd, Path::new(r"C:\a&b\100%")), r#"cd /d "C:\a&b\100%""#);
+        assert_eq!(cd_line(ShellFamily::Cmd, Path::new(r"\\srv\share\x")), r#"pushd "\\srv\share\x""#);
+        assert_eq!(cd_line(ShellFamily::Other, Path::new("/home/a b")), "cd -- '/home/a b'");
+        assert_eq!(cd_line(ShellFamily::Other, Path::new("/home/it's")), r"cd -- '/home/it'\''s'");
+        assert_eq!(cd_line(ShellFamily::Other, Path::new("/srv/ünïcode")), "cd -- '/srv/ünïcode'");
     }
 
     fn named(n: Named, m: M) -> Option<Vec<u8>> {

@@ -1955,6 +1955,7 @@ impl App {
                 return Task::none();
             }
             TerminalFolderToPanel => return self.term_folder_to_panel(),
+            SendFolderToTerminal => return self.send_folder_to_terminal(),
             SplitTerminalRight => return self.split_term(iced::widget::pane_grid::Axis::Vertical),
             SplitTerminalDown => return self.split_term(iced::widget::pane_grid::Axis::Horizontal),
             FocusTerminalLeft | FocusTerminalRight | FocusTerminalUp | FocusTerminalDown => {

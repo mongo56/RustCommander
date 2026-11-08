@@ -193,6 +193,11 @@ commands! {
         CloseTerminal => "cm_CloseTerminal", "End the shown built-in terminal and close it", "CloseTerm";
         /// Show the folder the shown (or last used) built-in terminal is in in the active panel and return to the panels.
         TerminalFolderToPanel => "cm_TerminalFolderToPanel", "Go to the built-in terminal's current folder in the active panel", "TermDir";
+        /// Change the focused built-in terminal's folder to the folder under
+        /// the cursor (else the active panel's folder) by typing `cd` at its
+        /// prompt (Ctrl+Shift+Enter).
+        SendFolderToTerminal => "cm_SendFolderToTerminal",
+            "Change the built-in terminal's folder to the folder selected in the panel (cd)", "ToTerm";
         /// Split the focused built-in terminal: another shell to its right, in
         /// its current folder, in the same sidebar entry (Ctrl+Shift+E).
         SplitTerminalRight => "cm_SplitTerminalRight",

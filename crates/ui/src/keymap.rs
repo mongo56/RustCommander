@@ -435,6 +435,7 @@ const DEFAULTS: &[(&str, Command)] = {
         ("ctrl+alt+shift+up", MoveTerminalUp),
         ("ctrl+alt+shift+down", MoveTerminalDown),
         ("ctrl+shift+z", ZoomTerminalPane),
+        ("ctrl+shift+enter", SendFolderToTerminal),
         ("ctrl+shift+f", Disconnect),
         ("ctrl+shift+d", HotlistTree),
         ("ctrl+shift+a", SetAttrib),
