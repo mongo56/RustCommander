@@ -1909,16 +1909,6 @@ fn draw_shape(m: &Metrics, renderer: &mut iced::Renderer, cell: Rectangle, c: ch
     let t = (m.cell_w / 8.0).round().max(1.0);
     term_glyphs::pieces(c, cell, t, &mut |piece| match piece {
         Piece::Rect(r, alpha) => fill(renderer, r, Color { a: color.a * alpha, ..color }),
-        Piece::Arc { rect, radius, width, clip } => renderer.with_layer(clip, |r| {
-            r.fill_quad(
-                renderer::Quad {
-                    bounds: rect,
-                    border: iced::Border { color, width, radius: radius.into() },
-                    ..renderer::Quad::default()
-                },
-                Background::Color(Color::TRANSPARENT),
-            )
-        }),
     });
 }
 

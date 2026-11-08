@@ -4,7 +4,8 @@
 //! edges, which left thin seams between neighbouring cells (progress bars,
 //! scroll bars, borders). Dashed lines and diagonals stay with the font.
 //! Also the sextants (U+1FB00..1FB3B) and the Powerline separators
-//! (U+E0B0..E0B7: triangles and half circles), as rows of 1 px rects.
+//! (U+E0B0..E0B7: triangles and half circles) and the rounded corners
+//! (╭╮╯╰), as rows of 1 px rects.
 
 use iced::Rectangle;
 
@@ -13,9 +14,6 @@ use iced::Rectangle;
 pub(super) enum Piece {
     /// A filled rectangle at this opacity (the shades are see-through).
     Rect(Rectangle, f32),
-    /// A rounded corner (╭╮╯╰): the border of `rect` (`width` thick, corners
-    /// of `radius`), shown only inside `clip` (the cell).
-    Arc { rect: Rectangle, radius: f32, width: f32, clip: Rectangle },
 }
 
 /// Whether `c` is drawn here (else it's text).
@@ -48,6 +46,36 @@ fn reach(round: bool, u: f32) -> f32 {
     if round { (1.0 - u * u).sqrt() } else { 1.0 - u.abs() }
 }
 
+/// The quarter ring of a rounded corner as pixels, `grid[row][col]`: the
+/// corner is at the top left, the ring (`t` thick, outer radius `r`) is
+/// centred at the bottom right and runs from the top right to the bottom
+/// left, where straight lines of the same thickness continue it.
+fn arc(r: usize, t: usize) -> Vec<Vec<bool>> {
+    let (rf, tf) = (r as f32, t as f32);
+    let dist = |j: usize, i: usize| ((rf - i as f32 - 0.5).powi(2) + (rf - j as f32 - 0.5).powi(2)).sqrt();
+    let mut grid = vec![vec![false; r]; r];
+    for (j, row) in grid.iter_mut().enumerate() {
+        for (i, on) in row.iter_mut().enumerate() {
+            let d = dist(j, i);
+            *on = d <= rf && d > rf - tf;
+        }
+    }
+    // Pixels that only touch at a corner get the one nearer the ring's middle.
+    for j in 0..r.saturating_sub(1) {
+        for i in 1..r {
+            if grid[j][i] && grid[j + 1][i - 1] && !grid[j][i - 1] && !grid[j + 1][i] {
+                let off = |j, i| (dist(j, i) - (rf - tf / 2.0)).abs();
+                if off(j, i - 1) <= off(j + 1, i) {
+                    grid[j][i - 1] = true;
+                } else {
+                    grid[j + 1][i] = true;
+                }
+            }
+        }
+    }
+    grid
+}
+
 /// The arms of a box drawing line from the cell centre: [left, right, up,
 /// down], each 0 (none), 1 (light), 2 (heavy) or 3 (double).
 const ARMS: [&str; 128] = [
@@ -65,7 +93,7 @@ const ARMS: [&str; 128] = [
     "0310", "0130", "0330", "3010", "1030", "3030", "0311", "0133", // ╘╙╚╛╜╝╞╟
     "0333", "3011", "1033", "3033", "3301", "1103", "3303", "3310", // ╠╡╢╣╤╥╦╧
     "1130", "3330", "3311", "1133", "3333", // ╨╩╪╫╬
-    "", "", "", "", "", "", "", // rounded corners (`Piece::Arc`), diagonals
+    "", "", "", "", "", "", "", // rounded corners (see `arc`), diagonals
     "1000", "0010", "0100", "0001", "2000", "0020", "0200", "0002", // ╴╵╶╷╸╹╺╻
     "1200", "0012", "2100", "0021", // ╼╽╾╿
 ];
@@ -227,12 +255,45 @@ pub(super) fn pieces(c: char, cell: Rectangle, t: f32, out: &mut impl FnMut(Piec
         }
         0x256d..=0x2570 => {
             // The corner of a rounded rectangle whose straight edges run on
-            // the light lines and out of the cell (clipped).
+            // the light lines to the cell edges. The arc is a staircase of
+            // 1 px rows (no layer, so the selection stays on top).
             let (Some(xs), Some(ys)) = (Band::new(x0, w, 1, t), Band::new(y0, h, 1, t)) else { return };
-            let (l, r) = if matches!(code, 0x256d | 0x2570) { (xs.first.0, x1 + w) } else { (x0 - w, xs.first.1) };
-            let (top, b) = if code <= 0x256e { (ys.first.0, y1 + h) } else { (y0 - h, ys.first.1) };
-            let rect = Rectangle { x: l, y: top, width: r - l, height: b - top };
-            out(Piece::Arc { rect, radius: (w.min(h) / 2.0).round(), width: t, clip: cell });
+            let r = (w.min(h) / 2.0).round();
+            let right = matches!(code, 0x256d | 0x2570);
+            let down = code <= 0x256e;
+            // The outer corner of the ring's box.
+            let (ex, ey) = (if right { xs.first.0 } else { xs.first.1 }, if down { ys.first.0 } else { ys.first.1 });
+            let (sx, sy) = (if right { 1.0 } else { -1.0 }, if down { 1.0 } else { -1.0 });
+            // The edges of pixel `c` across and `j` down in the arc grid.
+            let px = |c: f32| if right { ex + c } else { ex - c - 1.0 };
+            let py = |j: f32| if down { ey + j } else { ey - j - 1.0 };
+            let grid = arc(r as usize, t as usize);
+            for (j, row) in grid.iter().enumerate() {
+                let mut i = 0;
+                while i < row.len() {
+                    if row[i] {
+                        let start = i;
+                        while i < row.len() && row[i] {
+                            i += 1;
+                        }
+                        let (a, b) = (px(start as f32), px(i as f32 - 1.0));
+                        rect(a.min(b), py(j as f32), a.max(b) + 1.0, py(j as f32) + 1.0, 1.0);
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            // The straight lines from the arc to the cell edges.
+            let (hx, vy) = (ex + sx * r, ey + sy * r);
+            let (hy, vx) = (if down { ey } else { ey - t }, if right { ex } else { ex - t });
+            let (hl, hr) = if right { (hx, x1) } else { (x0, hx) };
+            let (vt, vb) = if down { (vy, y1) } else { (y0, vy) };
+            if hr > hl {
+                rect(hl, hy, hr, hy + t, 1.0);
+            }
+            if vb > vt {
+                rect(vx, vt, vx + t, vb, 1.0);
+            }
         }
         _ => {
             let Some([left, right, up, down]) = arms(c) else { return };
@@ -261,23 +322,30 @@ mod tests {
 
     const CELL: Rectangle = Rectangle { x: 10.0, y: 20.0, width: 9.0, height: 18.0 };
 
-    fn rects(c: char) -> Vec<(f32, f32, f32, f32)> {
+    fn rects_in(c: char, cell: Rectangle, t: f32) -> Vec<(f32, f32, f32, f32)> {
         let mut v = Vec::new();
-        pieces(c, CELL, 1.0, &mut |p| match p {
+        pieces(c, cell, t, &mut |p| match p {
             Piece::Rect(r, _) => v.push((r.x, r.y, r.x + r.width, r.y + r.height)),
-            Piece::Arc { .. } => panic!("arc"),
         });
         v
     }
 
+    fn rects(c: char) -> Vec<(f32, f32, f32, f32)> {
+        rects_in(c, CELL, 1.0)
+    }
+
     /// The pixels covered, as rows of '#' and '.' over the cell.
     fn pixels(c: char) -> Vec<String> {
-        let rs = rects(c);
-        (0..CELL.height as i32)
+        pixels_in(c, CELL, 1.0)
+    }
+
+    fn pixels_in(c: char, cell: Rectangle, t: f32) -> Vec<String> {
+        let rs = rects_in(c, cell, t);
+        (0..cell.height as i32)
             .map(|y| {
-                (0..CELL.width as i32)
+                (0..cell.width as i32)
                     .map(|x| {
-                        let (px, py) = (CELL.x + x as f32 + 0.5, CELL.y + y as f32 + 0.5);
+                        let (px, py) = (cell.x + x as f32 + 0.5, cell.y + y as f32 + 0.5);
                         let hit = rs.iter().any(|&(l, t, r, b)| px > l && px < r && py > t && py < b);
                         if hit { '#' } else { '.' }
                     })
@@ -435,19 +503,121 @@ mod tests {
         assert!(pixels('\u{e0b1}')[8].ends_with('#') && pixels('\u{e0b3}')[8].starts_with('#'));
     }
 
+    /// Whether the '#' pixels form one piece, joined side to side.
+    fn connected(px: &[String]) -> bool {
+        let g: Vec<&[u8]> = px.iter().map(|r| r.as_bytes()).collect();
+        let total = g.iter().flat_map(|r| r.iter()).filter(|&&b| b == b'#').count();
+        let Some((y, x)) = (0..g.len()).find_map(|y| g[y].iter().position(|&b| b == b'#').map(|x| (y, x))) else {
+            return false;
+        };
+        let mut seen = vec![vec![false; g[0].len()]; g.len()];
+        let mut todo = vec![(y, x)];
+        seen[y][x] = true;
+        let mut n = 0;
+        while let Some((y, x)) = todo.pop() {
+            n += 1;
+            for (dy, dx) in [(0, 1), (1, 0), (0, -1), (-1, 0)] {
+                let (ny, nx) = (y as i32 + dy, x as i32 + dx);
+                if ny < 0 || nx < 0 || ny as usize >= g.len() || nx as usize >= g[0].len() {
+                    continue;
+                }
+                let (ny, nx) = (ny as usize, nx as usize);
+                if g[ny][nx] == b'#' && !seen[ny][nx] {
+                    seen[ny][nx] = true;
+                    todo.push((ny, nx));
+                }
+            }
+        }
+        n == total
+    }
+
     #[test]
-    fn rounded_corners_are_clipped_borders() {
-        let mut v = Vec::new();
-        pieces('╭', CELL, 1.0, &mut |p| v.push(p));
-        let [Piece::Arc { rect, width, clip, radius }] = v[..] else { panic!("{v:?}") };
-        assert_eq!((width, clip, radius), (1.0, CELL, 5.0));
-        // Its top and left edges are the light lines; it goes on past the cell.
-        assert_eq!((rect.x, rect.y), (14.0, 28.0));
-        assert!(rect.x + rect.width > CELL.x + CELL.width && rect.y + rect.height > CELL.y + CELL.height);
-        let mut v = Vec::new();
-        pieces('╯', CELL, 1.0, &mut |p| v.push(p));
-        let [Piece::Arc { rect, .. }] = v[..] else { panic!("{v:?}") };
-        assert_eq!((rect.x + rect.width, rect.y + rect.height), (15.0, 29.0));
-        assert!(rect.x < CELL.x && rect.y < CELL.y);
+    fn rounded_corners_join_the_lines() {
+        let sizes = [(9.0, 18.0, 1.0), (10.0, 20.0, 1.0), (7.0, 14.0, 1.0), (16.0, 32.0, 2.0), (24.0, 48.0, 3.0), (13.0, 26.0, 2.0)];
+        for (w, h, t) in sizes {
+            let cell = Rectangle { x: 10.0, y: 20.0, width: w, height: h };
+            let (wi, hi) = (w as usize, h as usize);
+            let (h_line, v_line) = (pixels_in('─', cell, t), pixels_in('│', cell, t));
+            for c in ['╭', '╮', '╯', '╰'] {
+                let px = pixels_in(c, cell, t);
+                assert!(connected(&px), "{c} {w}x{h}\n{}", px.join("\n"));
+                // Nothing outside the cell.
+                for &(l, tp, r, b) in &rects_in(c, cell, t) {
+                    assert!(l >= cell.x && tp >= cell.y && r <= cell.x + w && b <= cell.y + h, "{c} outside");
+                }
+                // The ends are the pixels of the straight lines at the cell edges.
+                let hx = if c == '╭' || c == '╰' { wi - 1 } else { 0 };
+                let vy = if c == '╭' || c == '╮' { hi - 1 } else { 0 };
+                let col = |p: &Vec<String>, x: usize| p.iter().map(|r| r.as_bytes()[x]).collect::<Vec<_>>();
+                assert_eq!(col(&px, hx), col(&h_line, hx), "{c} {w}x{h} horizontal end\n{}", px.join("\n"));
+                assert_eq!(px[vy], v_line[vy], "{c} {w}x{h} vertical end\n{}", px.join("\n"));
+            }
+        }
+    }
+
+    #[test]
+    fn rounded_corner_shapes() {
+        // The default cell, and a zoomed one (2 px lines).
+        let cell = Rectangle { x: 10.0, y: 20.0, width: 16.0, height: 32.0 };
+        assert_eq!(
+            pixels('╭'),
+            [
+                ".........",
+                ".........",
+                ".........",
+                ".........",
+                ".........",
+                ".........",
+                ".........",
+                ".........",
+                "......###",
+                ".....##..",
+                "....##...",
+                "....#....",
+                "....#....",
+                "....#....",
+                "....#....",
+                "....#....",
+                "....#....",
+                "....#....",
+            ]
+        );
+        assert_eq!(
+            pixels_in('╭', cell, 2.0),
+            [
+                "................",
+                "................",
+                "................",
+                "................",
+                "................",
+                "................",
+                "................",
+                "................",
+                "................",
+                "................",
+                "................",
+                "................",
+                "................",
+                "................",
+                "................",
+                "............####",
+                "..........######",
+                ".........####...",
+                "........###.....",
+                "........##......",
+                ".......###......",
+                ".......##.......",
+                ".......##.......",
+                ".......##.......",
+                ".......##.......",
+                ".......##.......",
+                ".......##.......",
+                ".......##.......",
+                ".......##.......",
+                ".......##.......",
+                ".......##.......",
+                ".......##.......",
+            ]
+        );
     }
 }
