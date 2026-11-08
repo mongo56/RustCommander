@@ -4656,6 +4656,7 @@ dependencies = [
  "image",
  "notify",
  "png",
+ "polling",
  "pulldown-cmark",
  "raw-window-handle",
  "rc-core",

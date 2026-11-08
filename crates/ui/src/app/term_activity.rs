@@ -11,6 +11,8 @@
 //! - Waiting, bell: any BEL from the terminal (`TermEvent::Bell`). Claude
 //!   Code rings it when it needs input only if its notification channel is
 //!   the terminal bell (`/config` -> notifications, `terminal_bell`).
+//!   Notification OSCs (777, 9, 99) and a cleared OSC 9;4 progress count as
+//!   bells too (`term_osc`, scanned on the I/O thread).
 //! - Waiting, title: Claude Code animates a spinner in its OSC title while it
 //!   works and leaves the title steady when idle. `BUSY_CHANGES` title
 //!   changes within `BUSY_WINDOW` make the terminal busy; a busy terminal

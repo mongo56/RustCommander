@@ -577,8 +577,9 @@ fn template(editor: &str, compare: CompareState) -> String {
          # Empty = Cascadia Mono (shipped with RustCommander, with real bold and italic).\n\
          terminal_font = \"\"\n\
          \n\
-         # Its font size, 8-32. Ctrl++ / Ctrl+- in a terminal zoom all terminals (the\n\
-         # zoom is kept for the next start); Ctrl+0 goes back to this size.\n\
+         # Its font size, 8-32. Ctrl++ / Ctrl+- (or Ctrl+wheel) zoom one terminal; new\n\
+         # terminals start at the last zoom (kept for the next start); Ctrl+0 goes\n\
+         # back to this size.\n\
          terminal_font_size = 14\n\
          \n\
          # Bold text in one of the 8 normal colours is drawn in the bright colour\n\

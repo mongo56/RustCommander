@@ -228,14 +228,15 @@ commands! {
         /// Show the focused split terminal pane alone, or all of them again (Ctrl+Shift+Z).
         ZoomTerminalPane => "cm_ZoomTerminalPane",
             "Zoom the focused split terminal pane (show it alone), or show all panes again", "Zoom";
-        /// Bigger text in all built-in terminals: one font size step (Ctrl++,
-        /// Ctrl+=; only in a shown terminal).
-        TerminalZoomIn => "cm_TerminalZoomIn", "Bigger text in the built-in terminals (font size +1)", "Zoom+";
-        /// Smaller text in all built-in terminals (Ctrl+-).
-        TerminalZoomOut => "cm_TerminalZoomOut", "Smaller text in the built-in terminals (font size -1)", "Zoom-";
-        /// The built-in terminals' font size back to `terminal_font_size` (Ctrl+0).
+        /// Bigger text: one font size step in the built-in terminal with the
+        /// keys, or in the panels' file lists (Ctrl++, Ctrl+=). The id keeps
+        /// its old name so `[keys]` bindings stay valid.
+        TerminalZoomIn => "cm_TerminalZoomIn", "Bigger text in this terminal, or in the file panels (font size +1)", "Zoom+";
+        /// Smaller text in the terminal or the file panels (Ctrl+-).
+        TerminalZoomOut => "cm_TerminalZoomOut", "Smaller text in this terminal, or in the file panels (font size -1)", "Zoom-";
+        /// Text size back to normal (`terminal_font_size` in a terminal) (Ctrl+0).
         TerminalZoomReset => "cm_TerminalZoomReset",
-            "Built-in terminals back to the terminal_font_size setting", "Zoom0";
+            "Normal text size in this terminal (the terminal_font_size setting), or in the file panels", "Zoom0";
         /// Open an external terminal in the active panel's folder (Ctrl+F9).
         Terminal => "cm_ExecuteTerm", "Open an external terminal in this folder (the \"terminal\" setting)", "Term";
         /// Delete to the recycle bin.

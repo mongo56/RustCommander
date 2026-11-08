@@ -17,8 +17,9 @@ use super::*;
 use super::term_activity::{raise, wants_cue, Activity, Attention, Check};
 use super::term_glyphs::{self, Piece};
 use super::term_links::{Link, LinkTarget, Scan};
+use super::term_osc::{Cue, OscScan};
 use crate::theme::{filled, HintOwned};
-use alacritty_terminal::event::{Event as TermEvent, EventListener, WindowSize};
+use alacritty_terminal::event::{Event as TermEvent, EventListener, OnResize, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg, State};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Boundary, Column as GridColumn, Direction, Line, Point as GridPoint, Side};
@@ -29,7 +30,7 @@ use alacritty_terminal::term::color::Colors as TermColors;
 use alacritty_terminal::term::search::RegexSearch;
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{Config as TermConfig, Term, TermMode};
-use alacritty_terminal::tty::{self, Pty, Shell};
+use alacritty_terminal::tty::{self, ChildEvent, EventedPty, EventedReadWrite, Pty, Shell};
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, CursorStyle, NamedColor, Rgb};
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::text::Renderer as _;
@@ -40,6 +41,7 @@ use iced::font::{Style as FontStyle, Weight};
 use iced::widget::text::{LineHeight, Shaping, Wrapping};
 use iced::widget::{button, column, container, mouse_area, pane_grid, row, text, tooltip, Column, Row, Space};
 use iced::{Background, Color, Element, Font, Length, Pixels, Rectangle};
+use polling::{Event as PollEvent, PollMode, Poller};
 use std::sync::mpsc as std_mpsc;
 use std::sync::Mutex;
 use std::thread::JoinHandle;
@@ -374,8 +376,8 @@ pub enum TermMsg {
     Blink,
     /// Ctrl+click on a link in a grid (`term_links`).
     OpenLink(LinkTarget),
-    /// Ctrl+wheel in a grid: font size steps (`zoom_term`).
-    Zoom(i32),
+    /// Ctrl+wheel in terminal `id`'s grid: font size steps (`zoom_term`).
+    Zoom(u64, i32),
 }
 
 /// What the mouse did in the grid; cells are viewport positions.
@@ -454,12 +456,78 @@ impl EventListener for Proxy {
     }
 }
 
+/// The PTY, its output scanned for the notification sequences alacritty
+/// drops (`term_osc`); each one is reported as a bell (a query is answered
+/// through `PtyWrite`, like alacritty's own answers). Its own reader: the
+/// I/O thread reads through it before parsing.
+pub(super) struct TapPty {
+    pty: Pty,
+    osc: OscScan,
+    proxy: Proxy,
+    id: u64,
+}
+
+impl io::Read for TapPty {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.pty.reader().read(buf)?;
+        let (id, proxy) = (self.id, &self.proxy);
+        self.osc.feed(&buf[..n], |cue| {
+            if term_debug() {
+                eprintln!("[term {id}] {cue:?}");
+            }
+            proxy.send_event(match cue {
+                Cue::Reply(text) => TermEvent::PtyWrite(text),
+                Cue::Notify | Cue::ProgressDone => TermEvent::Bell,
+            });
+        });
+        Ok(n)
+    }
+}
+
+impl EventedReadWrite for TapPty {
+    type Reader = TapPty;
+    type Writer = <Pty as EventedReadWrite>::Writer;
+
+    unsafe fn register(&mut self, poll: &Arc<Poller>, event: PollEvent, mode: PollMode) -> io::Result<()> {
+        // SAFETY: the caller's contract, passed on.
+        unsafe { self.pty.register(poll, event, mode) }
+    }
+
+    fn reregister(&mut self, poll: &Arc<Poller>, event: PollEvent, mode: PollMode) -> io::Result<()> {
+        self.pty.reregister(poll, event, mode)
+    }
+
+    fn deregister(&mut self, poll: &Arc<Poller>) -> io::Result<()> {
+        self.pty.deregister(poll)
+    }
+
+    fn reader(&mut self) -> &mut TapPty {
+        self
+    }
+
+    fn writer(&mut self) -> &mut Self::Writer {
+        self.pty.writer()
+    }
+}
+
+impl EventedPty for TapPty {
+    fn next_child_event(&mut self) -> Option<ChildEvent> {
+        self.pty.next_child_event()
+    }
+}
+
+impl OnResize for TapPty {
+    fn on_resize(&mut self, size: WindowSize) {
+        self.pty.on_resize(size);
+    }
+}
+
 /// One running shell.
 pub(super) struct TermSession {
     pub(super) id: u64,
     term: Arc<FairMutex<Term<Proxy>>>,
     chan: EventLoopSender,
-    thread: Option<JoinHandle<(EventLoop<Pty, Proxy>, State)>>,
+    thread: Option<JoinHandle<(EventLoop<TapPty, Proxy>, State)>>,
     /// The events, until the subscription takes them (it gives them back if
     /// it is dropped while the terminal lives).
     events: Arc<Mutex<Option<std_mpsc::Receiver<TermEvent>>>>,
@@ -500,6 +568,11 @@ pub(super) struct TermSession {
     attention: Option<Attention>,
     /// What `attention` is worked out from (`term_activity`).
     activity: Activity,
+    /// Focus reporting (mode 1004): the focus last reported to the program,
+    /// `None` while it hasn't asked for reports.
+    focus_report: Option<bool>,
+    /// Font size steps from `terminal_font_size` (Ctrl+wheel, Ctrl++/-).
+    zoom: i32,
 }
 
 impl TermSession {
@@ -542,6 +615,7 @@ impl TermSession {
         let default_cursor_style = CursorStyle { shape: CursorShape::Block, blinking: true };
         let config = TermConfig { scrolling_history: HISTORY, default_cursor_style, ..TermConfig::default() };
         let term = Arc::new(FairMutex::new(Term::new(config, &TermSize::new(cols, lines), proxy.clone())));
+        let pty = TapPty { pty, osc: OscScan::default(), proxy: proxy.clone(), id };
         let event_loop = EventLoop::new(term.clone(), proxy, pty, true, false)?;
         let chan = event_loop.channel();
         let thread = event_loop.spawn();
@@ -567,6 +641,8 @@ impl TermSession {
             selecting: false,
             attention: None,
             activity: Activity::default(),
+            focus_report: None,
+            zoom: 0,
         };
         session.refresh();
         Ok(session)
@@ -764,6 +840,22 @@ impl TermSession {
     fn write_raw(&self, bytes: Vec<u8>) {
         if !bytes.is_empty() {
             let _ = self.chan.send(Msg::Input(bytes.into()));
+        }
+    }
+
+    /// Focus reporting (mode 1004): tells the program it has the focus
+    /// (`ESC [ I`) or lost it (`ESC [ O`) when that changed, or when it just
+    /// asked for reports (then its first report tells the current state; xterm
+    /// waits for a change, but opencode and others treat focus as unknown
+    /// until one comes).
+    fn report_focus(&mut self, focused: bool) {
+        if !self.term.lock().mode().contains(TermMode::FOCUS_IN_OUT) {
+            self.focus_report = None;
+            return;
+        }
+        if self.focus_report != Some(focused) {
+            self.focus_report = Some(focused);
+            self.write_raw(if focused { b"\x1b[I".to_vec() } else { b"\x1b[O".to_vec() });
         }
     }
 
@@ -2097,7 +2189,7 @@ impl Widget<Message, Theme, iced::Renderer> for Grid<'_> {
                             mouse::ScrollDelta::Lines { y, .. } => y.round() as i32,
                             mouse::ScrollDelta::Pixels { .. } => amount,
                         };
-                        shell.publish(Message::Term(TermMsg::Zoom(step)));
+                        shell.publish(Message::Term(TermMsg::Zoom(self.id, step)));
                     }
                     return event::Status::Captured;
                 }
@@ -2458,7 +2550,7 @@ impl App {
         ("Alt+Shift+arrows (cm_FocusTerminalLeft/Right/Up/Down)", "Move the keyboard focus to the split pane in that direction (or click a pane)"),
         ("Ctrl+Alt+Shift+arrows (cm_MoveTerminalLeft/Right/Up/Down)", "Rearrange split panes: the focused pane swaps places with the one in that direction, or, with none there, moves to that edge (side by side becomes stacked and back)"),
         ("Ctrl+Shift+Z (cm_ZoomTerminalPane)", "Show the focused split pane alone, or all panes again"),
-        ("Ctrl++ / Ctrl+- or Ctrl+wheel, Ctrl+0 (cm_TerminalZoomIn, cm_TerminalZoomOut, cm_TerminalZoomReset)", "Bigger / smaller text in all terminals, or back to the terminal_font_size setting (kept for the next start; the font is the terminal_font setting)"),
+        ("Ctrl++ / Ctrl+- or Ctrl+wheel, Ctrl+0 (cm_TerminalZoomIn, cm_TerminalZoomOut, cm_TerminalZoomReset)", "Bigger / smaller text in this terminal, or back to the terminal_font_size setting (new terminals start at the last zoom, also after a restart; the font is the terminal_font setting)"),
         ("F10 (cm_Configuration)", "Settings; closing them comes back to the terminal (F10 doesn't reach programs in the terminal; bind cm_Configuration to another key in [keys] if one needs it)"),
         ("cm_TerminalFolderToPanel (no key by default)", "Active panel goes to the terminal's current folder and Files is shown"),
         ("Ctrl+Shift+Enter (cm_SendFolderToTerminal)", "This terminal goes to the folder selected in the active panel; from the panels it goes to the last used terminal"),
@@ -2492,33 +2584,38 @@ impl App {
         }
     }
 
-    /// The terminals' font size: `terminal_font_size` zoomed by
-    /// `TerminalZoomIn/Out`.
-    fn term_font_size(&self) -> u32 {
-        zoomed_size(self.config.terminal_font_size(), self.term_zoom)
+    /// The grid metrics of the terminal font at `zoom` steps from
+    /// `terminal_font_size`, measured on first use of that size.
+    fn term_metrics_at(&self, zoom: i32) -> Metrics {
+        let size = zoomed_size(self.config.terminal_font_size(), zoom);
+        let mut cache = self.term_metrics.borrow_mut();
+        if let Some(&(_, m)) = cache.iter().find(|(s, _)| *s == size) {
+            return m;
+        }
+        let m = Metrics::new(font_named(&self.config.terminal_font), size as f32);
+        cache.push((size, m));
+        m
     }
 
-    /// The grid's metrics at the current font and size, measured on first use
-    /// after a change.
-    pub(super) fn term_metrics(&self) -> Metrics {
-        *self.term_metrics.get_or_init(|| {
-            Metrics::new(font_named(&self.config.terminal_font), self.term_font_size() as f32)
-        })
+    /// Terminal `id`'s grid metrics (at its own zoom).
+    pub(super) fn term_metrics(&self, id: u64) -> Metrics {
+        self.term_metrics_at(self.term(id).map_or(self.term_zoom, |t| t.zoom))
     }
 
     /// `TerminalZoomIn/Out/Reset`: one font size step bigger or smaller
-    /// (`step`), or back to `terminal_font_size` (`None`), in every terminal.
-    /// The shown grids get their new size on the next frame (like after a
-    /// window resize) and resize their shells; hidden ones when shown.
-    pub(super) fn zoom_term(&mut self, step: Option<i32>) -> Task<Message> {
-        if self.screen.term().is_none() {
+    /// (`step`), or back to `terminal_font_size` (`None`), in terminal `id`
+    /// (the one with the keys when `None`). New terminals start at the zoom
+    /// set last. The grid gets its new size on the next frame (like after a
+    /// window resize) and resizes its shell.
+    pub(super) fn zoom_term(&mut self, id: Option<u64>, step: Option<i32>) -> Task<Message> {
+        let Some(id) = id.or_else(|| self.screen.term().copied()) else {
             self.info("Zooming works in the built-in terminal (F9)");
             return Task::none();
-        }
-        let zoom = zoom_after(self.config.terminal_font_size(), self.term_zoom, step);
-        if zoom != self.term_zoom {
-            self.term_zoom = zoom;
-            self.term_metrics = std::cell::OnceCell::new();
+        };
+        let base = self.config.terminal_font_size();
+        if let Some(t) = self.term_mut(id) {
+            t.zoom = zoom_after(base, t.zoom, step);
+            self.term_zoom = t.zoom;
         }
         Task::none()
     }
@@ -2603,10 +2700,11 @@ impl App {
         let id = self.next_term_id;
         self.next_term_id += 1;
         // The grid widget reports the size it really gets on the next frame.
-        let m = self.term_metrics();
+        let m = self.term_metrics_at(self.term_zoom);
         let (cols, lines) = m.grid_size(Size::new(self.window_width - SIDE_W, self.window_height));
         match TermSession::spawn(id, shell, dir, &m, cols, lines) {
-            Ok(session) => {
+            Ok(mut session) => {
+                session.zoom = self.term_zoom;
                 self.terms.push(session);
                 let tab = self.shown_tab();
                 let added = split.zip(tab).and_then(|(axis, tab)| {
@@ -2704,6 +2802,21 @@ impl App {
     /// The focused terminal of each sidebar entry, in sidebar order.
     fn tab_order(&self) -> Vec<u64> {
         self.term_tabs.iter().map(TermTab::focused).collect()
+    }
+
+    /// The terminal that has the focus (it gets the keys and the window has
+    /// the focus), if any.
+    pub(super) fn focused_term(&self) -> Option<u64> {
+        self.screen.term().copied().filter(|_| self.focused)
+    }
+
+    /// Reports the focus to every terminal whose program asked for reports
+    /// (`report_focus`); after `focused_term` changed.
+    pub(super) fn sync_term_focus(&mut self) {
+        let focused = self.focused_term();
+        for t in &mut self.terms {
+            t.report_focus(focused == Some(t.id));
+        }
     }
 
     /// The terminals on screen (the cues are for the others).
@@ -3081,6 +3194,7 @@ impl App {
 
     pub(super) fn term_update(&mut self, msg: TermMsg) -> Task<Message> {
         let drawn = self.drawn_terms();
+        let has_focus = self.focused_term();
         // Whether a cue for terminal `id` is wanted (the user doesn't look at it).
         let focused = self.focused;
         let cue = |id: u64| wants_cue(drawn.contains(&id), focused);
@@ -3155,7 +3269,7 @@ impl App {
                 }
             }
             TermMsg::OpenLink(target) => return self.open_term_link(target),
-            TermMsg::Zoom(step) => return self.zoom_term(Some(step)),
+            TermMsg::Zoom(id, step) => return self.zoom_term(Some(id), Some(step)),
             TermMsg::Blink => {
                 let typing = self.term_blink.input.elapsed() < BLINK;
                 self.term_blink.off = !self.term_blink.off && !typing;
@@ -3177,7 +3291,7 @@ impl App {
                 }
             }
             TermMsg::Resize(id, cols, lines) => {
-                let m = self.term_metrics();
+                let m = self.term_metrics(id);
                 if let Some(t) = self.term_mut(id) {
                     t.resize(&m, cols, lines);
                     t.refresh();
@@ -3185,7 +3299,7 @@ impl App {
             }
             TermMsg::Event(id, event) => {
                 let cue = cue(id);
-                let m = self.term_metrics();
+                let m = self.term_metrics(id);
                 let Some(t) = self.term_mut(id) else { return Task::none() };
                 match event {
                     // (A late one for a terminal just hidden is dropped: showing
@@ -3198,6 +3312,8 @@ impl App {
                         if drawn.contains(&id) {
                             t.refresh();
                         }
+                        // The program may just have asked for focus reports.
+                        t.report_focus(has_focus == Some(id));
                     }
                     TermEvent::Title(title) => {
                         if term_debug() {
@@ -3473,7 +3589,7 @@ impl App {
         // An unfocused pane draws its cursor hollow, like an unfocused window.
         let focused = self.focused && focus;
         let cursor_off = self.term_blink.off && focused && t.frame.cursor_blinks && self.config.terminal_cursor_blink;
-        let grid = Element::new(Grid { id, frame: &t.frame, focused, cursor_off, metrics: self.term_metrics() });
+        let grid = Element::new(Grid { id, frame: &t.frame, focused, cursor_off, metrics: self.term_metrics(id) });
         // The bar's position is the history line at the top of the view.
         let (history, offset, lines) = (t.frame.history, t.frame.offset, t.frame.lines);
         let grid = crate::scrollbar::attach(

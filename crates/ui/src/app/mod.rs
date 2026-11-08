@@ -30,6 +30,7 @@ pub use term::load_fonts;
 mod term_activity;
 mod term_glyphs;
 mod term_links;
+mod term_osc;
 mod thumbs;
 mod undo;
 mod update;
@@ -242,11 +243,15 @@ pub struct App {
     terms: Vec<term::TermSession>,
     /// The terminals' blink cycle.
     term_blink: term::Blink,
-    /// Font size steps from `terminal_font_size` (`TerminalZoomIn/Out`; session).
+    /// Font size steps from `terminal_font_size` that a new terminal starts
+    /// with: the last zoom set in any terminal (`TerminalZoomIn/Out`; session).
+    /// Each terminal then zooms on its own (`TermSession::zoom`).
     term_zoom: i32,
-    /// The grids' cell size and faces (`term_metrics`), measured on first use;
-    /// emptied when the font or its size changes.
-    term_metrics: std::cell::OnceCell<term::Metrics>,
+    /// Text size steps of the panels' file lists (`zoom_panels`; session).
+    panel_zoom: i32,
+    /// The grids' cell size and faces per font size (`term_metrics_at`),
+    /// measured on first use; emptied when the font or its size changes.
+    term_metrics: std::cell::RefCell<Vec<(u32, term::Metrics)>>,
     /// The sidebar's entries: each holds one or more of `terms` in split panes.
     term_tabs: Vec<term::TermTab>,
     next_term_id: u64,
@@ -731,7 +736,8 @@ impl App {
             terms: Vec::new(),
             term_blink: term::Blink::default(),
             term_zoom: session.as_ref().map_or(0, |s| s.terminal_zoom),
-            term_metrics: std::cell::OnceCell::new(),
+            panel_zoom: session.as_ref().map_or(0, |s| s.panel_zoom.clamp(*view::PANEL_ZOOMS.start(), *view::PANEL_ZOOMS.end())),
+            term_metrics: Default::default(),
             term_tabs: Vec::new(),
             next_term_id: 1,
             term_last: None,
@@ -883,7 +889,11 @@ impl App {
             _ => None,
         };
         let mark = self.note_mark();
+        let focused_term = self.focused_term();
         let task = self.handle(message);
+        if self.focused_term() != focused_term {
+            self.sync_term_focus();
+        }
         let task = self.note_after(mark, task);
         let thumbs = self.pump_thumbs();
         let git = self.git_check(changed.as_deref());
@@ -1243,6 +1253,13 @@ impl App {
                     }
                 }
                 return focus.chain(self.open_transfer(false, sources, &target));
+            }
+            // Ctrl+wheel zooms the file lists (one step a notch).
+            Message::Wheel(_, lines) if self.modifiers.control() => {
+                let step = lines.round() as i32;
+                if step != 0 {
+                    self.zoom_panels(Some(step));
+                }
             }
             Message::Wheel(side, lines) => {
                 let rows = self.page_rows();
@@ -1972,9 +1989,19 @@ impl App {
             SendFolderToTerminal => return self.send_folder_to_terminal(),
             SplitTerminalRight => return self.split_term(iced::widget::pane_grid::Axis::Vertical),
             SplitTerminalDown => return self.split_term(iced::widget::pane_grid::Axis::Horizontal),
-            TerminalZoomIn => return self.zoom_term(Some(1)),
-            TerminalZoomOut => return self.zoom_term(Some(-1)),
-            TerminalZoomReset => return self.zoom_term(None),
+            // In a terminal they zoom it; over the panels, the file lists.
+            TerminalZoomIn | TerminalZoomOut | TerminalZoomReset => {
+                let step = match cmd {
+                    TerminalZoomIn => Some(1),
+                    TerminalZoomOut => Some(-1),
+                    _ => None,
+                };
+                if self.screen.is_some() {
+                    return self.zoom_term(None, step);
+                }
+                self.zoom_panels(step);
+                return Task::none();
+            }
             FocusTerminalLeft | FocusTerminalRight | FocusTerminalUp | FocusTerminalDown => {
                 use iced::widget::pane_grid::Direction;
                 let dir = match cmd {
@@ -3611,6 +3638,7 @@ impl App {
             recent_commands: self.recent_commands.iter().map(|c| c.id().to_owned()).collect(),
             skipped_update: self.skipped_update.clone(),
             terminal_zoom: self.term_zoom,
+            panel_zoom: self.panel_zoom,
             split: self.split,
             columns: self.columns,
             window: self.placement.map(Into::into),
@@ -3662,7 +3690,7 @@ impl App {
         self.config_notes = notes;
         let font = |c: &crate::config::Config| (c.terminal_font.clone(), c.terminal_font_size);
         if font(&config) != font(&self.config) {
-            self.term_metrics = std::cell::OnceCell::new();
+            self.term_metrics.get_mut().clear();
         }
         self.config = config;
         self.git_missing = false; // look for git again
@@ -3747,7 +3775,7 @@ impl App {
     fn page_rows(&self) -> usize {
         let bar = if self.config.show_fkeys { 0.0 } else { FKEYS_H };
         let chrome = CHROME_H - bar + self.jobs.len() as f32 * JOB_ROW_H;
-        ((self.window_height - chrome) / ROW_H).floor().max(1.0) as usize
+        ((self.window_height - chrome) / self.row_h()).floor().max(1.0) as usize
     }
 
     /// System icon for a path, cached.

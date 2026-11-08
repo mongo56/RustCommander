@@ -13,6 +13,20 @@ use iced::{Alignment, Element, Length, Padding, Vector};
 use rc_core::format;
 
 const ICON: f32 = 16.0;
+/// The file list's text size, unzoomed.
+const LIST_TEXT: f32 = 13.0;
+/// The file list's zoom range: text size steps from `LIST_TEXT` (9 to 24 px).
+pub(super) const PANEL_ZOOMS: std::ops::RangeInclusive<i32> = -4..=11;
+
+/// The file list's text size at `zoom` steps.
+fn list_text(zoom: i32) -> f32 {
+    LIST_TEXT + zoom.clamp(*PANEL_ZOOMS.start(), *PANEL_ZOOMS.end()) as f32
+}
+
+/// How much bigger than unzoomed the file list is at `zoom`.
+fn list_scale(zoom: i32) -> f32 {
+    list_text(zoom) / LIST_TEXT
+}
 
 /// Which optional columns fit a panel of a given width (narrow panels drop
 /// the date first, then the extension (merged into the name), then the size).
@@ -170,12 +184,36 @@ impl App {
             .into()
     }
 
+    /// The file list's text size (zoomed: `zoom_panels`).
+    fn panel_text(&self) -> f32 {
+        list_text(self.panel_zoom)
+    }
+
+    /// Height of a file list row (zoomed).
+    pub(super) fn row_h(&self) -> f32 {
+        (ROW_H * list_scale(self.panel_zoom)).round()
+    }
+
+    /// The column widths as drawn: `columns` (kept unzoomed) zoomed.
+    fn col_widths(&self) -> [f32; 3] {
+        let s = list_scale(self.panel_zoom);
+        self.columns.map(|w| (w * s).round())
+    }
+
+    /// `TerminalZoomIn/Out/Reset` and Ctrl+wheel over the panels: the file
+    /// list's text (and rows, columns) one step bigger or smaller (`step`), or
+    /// back to normal (`None`). Both panels; kept for the next start.
+    pub(super) fn zoom_panels(&mut self, step: Option<i32>) {
+        let zoom = step.map_or(0, |s| self.panel_zoom + s);
+        self.panel_zoom = zoom.clamp(*PANEL_ZOOMS.start(), *PANEL_ZOOMS.end());
+    }
+
     /// Press on the edge in front of column `col`: start resizing it.
     pub(super) fn column_press(&mut self, side: usize, col: usize) {
-        let shown = Columns::for_width(self.panel_width(side), &self.columns).shown();
+        let shown = Columns::for_width(self.panel_width(side), &self.col_widths()).shown();
         let visible: Vec<usize> = (0..3).filter(|&i| shown[i]).collect();
         let Some(edge) = visible.iter().position(|&i| i == col) else { return };
-        self.column_drag = Some(ColumnDrag { side, visible, edge, x0: None, start: self.columns });
+        self.column_drag = Some(ColumnDrag { side, visible, edge, x0: None, start: self.col_widths() });
     }
 
     /// Mouse moved to window x while an edge is dragged: the edge follows
@@ -186,7 +224,9 @@ impl App {
         let width = self.panel_width(d.side);
         let shown = Columns::for_width(width, &d.start).shown();
         let spare = (Columns::name_room(width, &d.start, shown) - MIN_NAME).max(0.0);
-        self.columns = drag_edge(d.start, &d.visible, d.edge, x - x0, spare);
+        // `start` is as drawn (zoomed); `columns` is kept unzoomed.
+        let s = list_scale(self.panel_zoom);
+        self.columns = drag_edge(d.start, &d.visible, d.edge, x - x0, spare).map(|w| w / s);
         self.column_drag = Some(d);
     }
 
@@ -549,7 +589,7 @@ impl App {
             // Right-aligned by the container, not the text: iced_tiny_skia
             // 0.13 gets the redraw area of right-aligned text wrong, so the
             // label vanished when hovering recoloured it.
-            let label = text(format!("{label}{arrow}")).size(theme::SIZE_SMALL);
+            let label = text(format!("{label}{arrow}")).size((f32::from(theme::SIZE_SMALL) * list_scale(self.panel_zoom)).round());
             let label = container(label).width(Length::Fill);
             let label = if right { label.align_x(Alignment::End) } else { label };
             button(label)
@@ -558,7 +598,8 @@ impl App {
                 .width(width)
                 .style(theme::flat)
         };
-        let cols = Columns::for_width(self.panel_width(side), &self.columns);
+        let widths = self.col_widths();
+        let cols = Columns::for_width(self.panel_width(side), &widths);
         // The 10 px gaps between the columns are the drag handles of the
         // column on their right.
         let handle = |col: usize| {
@@ -573,15 +614,15 @@ impl App {
         ];
         if cols.ext {
             header = header.push(handle(0));
-            header = header.push(sort_button("Ext", SortKey::Ext, Length::Fixed(self.columns[0]), false));
+            header = header.push(sort_button("Ext", SortKey::Ext, Length::Fixed(widths[0]), false));
         }
         if cols.size {
             header = header.push(handle(1));
-            header = header.push(sort_button("Size", SortKey::Size, Length::Fixed(self.columns[1]), true));
+            header = header.push(sort_button("Size", SortKey::Size, Length::Fixed(widths[1]), true));
         }
         if cols.date {
             header = header.push(handle(2));
-            header = header.push(sort_button("Modified", SortKey::Modified, Length::Fixed(self.columns[2]), false));
+            header = header.push(sort_button("Modified", SortKey::Modified, Length::Fixed(widths[2]), false));
         }
         container(header.align_y(Alignment::Center).clip(true))
         .padding([4, 10])
@@ -592,11 +633,12 @@ impl App {
     /// The panel's entries: the list, or the thumbnail grid.
     fn file_list(&self, side: usize, active: bool) -> Element<'_, Message> {
         let list = if self.panel(side).thumbnails { self.thumb_grid(side, active) } else { self.list_rows(side, active) };
+        let row_h = self.row_h();
         let mut area = mouse_area(list)
             .on_scroll(move |delta| {
                 let lines = match delta {
                     mouse::ScrollDelta::Lines { y, .. } => y,
-                    mouse::ScrollDelta::Pixels { y, .. } => y / ROW_H,
+                    mouse::ScrollDelta::Pixels { y, .. } => y / row_h,
                 };
                 Message::Wheel(side, lines)
             })
@@ -611,8 +653,9 @@ impl App {
     /// Virtualised list: only the rows that fit on screen are built.
     fn list_rows(&self, side: usize, active: bool) -> Element<'_, Message> {
         let panel = self.panel(side);
+        let row_h = self.row_h();
         responsive(move |size| {
-            let rows = ((size.height / ROW_H).floor() as usize).max(1);
+            let rows = ((size.height / row_h).floor() as usize).max(1);
             let len = panel.entries.len();
             let start = panel.view_start(rows);
             let end = (start + rows).min(len);
@@ -621,7 +664,7 @@ impl App {
             // `ring`); a shorter list is just in order.
             let slots = end - start;
             let children = (0..slots).map(|k| self.entry_row(side, start + (k + slots - start % slots) % slots, active)).collect();
-            let rows_view = container(Ring::new(children, ROW_H, start))
+            let rows_view = container(Ring::new(children, row_h, start))
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .clip(true);
@@ -636,7 +679,9 @@ impl App {
     fn entry_row(&self, side: usize, index: usize, active: bool) -> Element<'_, Message> {
         let panel = self.panel(side);
         let entry = &panel.entries[index];
-        let cols = Columns::for_width(self.panel_width(side), &self.columns);
+        let widths = self.col_widths();
+        let cols = Columns::for_width(self.panel_width(side), &widths);
+        let (text_size, row_h) = (self.panel_text(), self.row_h());
 
         let color = if panel.is_selected(entry) {
             theme::c().selected
@@ -647,14 +692,14 @@ impl App {
         } else {
             theme::c().text
         };
-        let cell = |s: String, width: Length| text(s).size(13).color(color).wrapping(Wrapping::None).width(width);
+        let cell = |s: String, width: Length| text(s).size(text_size).color(color).wrapping(Wrapping::None).width(width);
 
         let (stem, ext) = entry.split_name();
         // Narrow panels ellipsize the name instead of just clipping it.
         let git_w = if self.git[side].marks_for(&panel.path).is_some_and(|v| v.branch.is_some()) { 9.0 + 10.0 } else { 0.0 };
-        let room = Columns::name_room(self.panel_width(side), &self.columns, cols.shown()) - git_w;
+        let room = Columns::name_room(self.panel_width(side), &widths, cols.shown()) - git_w;
         // One char of slack so a name never runs under the next column.
-        let name_chars = ((room / (13.0 * NAME_CHAR_WIDTH)) as usize).saturating_sub(1).max(4);
+        let name_chars = ((room / (text_size * NAME_CHAR_WIDTH)) as usize).saturating_sub(1).max(4);
         // With a separate extension column the stem is cut at its end; a whole name keeps its extension.
         let fit_stem = |s: &str| if s.chars().count() <= name_chars { s.to_string() } else { elide_end(s, name_chars) };
         let size = match entry.kind {
@@ -685,7 +730,7 @@ impl App {
                     .id(rename_input_id())
                     .on_input(Message::RenameInput)
                     .on_submit(Message::RenameSubmit)
-                    .size(13)
+                    .size(text_size)
                     .padding([1, 4])
                     .width(Length::Fill)
                     .style(theme::input),
@@ -695,30 +740,34 @@ impl App {
             )),
             None if cols.ext => content
                 .push(cell(fit_stem(stem), Length::Fill))
-                .push(cell(ext.to_string(), Length::Fixed(self.columns[0]))),
+                .push(cell(ext.to_string(), Length::Fixed(widths[0]))),
             None => content.push(cell(elide_middle(&entry.name, name_chars), Length::Fill)),
         };
         // Git status letter; every row of a work tree folder reserves the room.
         if let Some(view) = self.git[side].marks_for(&panel.path).filter(|v| v.branch.is_some()) {
             content = content.push(match view.marks.get(entry.name.as_str()) {
                 Some(&letter) => Element::from(
-                    text(letter.to_string()).size(12).color(git_color(letter)).wrapping(Wrapping::None).width(Length::Fixed(9.0)),
+                    text(letter.to_string())
+                        .size(text_size - 1.0)
+                        .color(git_color(letter))
+                        .wrapping(Wrapping::None)
+                        .width(Length::Fixed(9.0)),
                 ),
                 None => Space::new(9.0, 1.0).into(),
             });
         }
         if cols.size {
             // Aligned by a container (see `column_header`).
-            let size = container(cell(size, Length::Shrink)).width(Length::Fixed(self.columns[1])).align_x(Alignment::End);
+            let size = container(cell(size, Length::Shrink)).width(Length::Fixed(widths[1])).align_x(Alignment::End);
             content = content.push(size);
         }
         if cols.date {
-            content = content.push(cell(format::date(&entry.modified), Length::Fixed(self.columns[2])).color(theme::c().muted));
+            content = content.push(cell(format::date(&entry.modified), Length::Fixed(widths[2])).color(theme::c().muted));
         }
         let content = content
             .spacing(10)
             .padding([0, 10])
-            .height(ROW_H)
+            .height(row_h)
             .align_y(Alignment::Center);
 
         let drop_target = self.drag.as_ref().is_some_and(|d| {
@@ -737,7 +786,7 @@ impl App {
         let mut area = mouse_area(
             container(content)
                 .width(Length::Fill)
-                .height(ROW_H)
+                .height(row_h)
                 .clip(true)
                 .style(filled(background)),
         )
