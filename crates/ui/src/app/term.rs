@@ -298,6 +298,11 @@ impl Metrics {
         }
     }
 
+    /// Thickness of underlines: 1 px at the default size, in proportion.
+    fn line_thickness(&self) -> f32 {
+        (self.cell_h / 18.0).round().max(1.0)
+    }
+
     /// The pixel rectangle of `cells` cells at (line, col); edges rounded so
     /// neighbouring fills meet without seams.
     fn cell_rect(&self, origin: Point, line: u16, col: u16, cells: u16) -> Rectangle {
@@ -1493,6 +1498,70 @@ struct Frame {
     links: Vec<Link>,
 }
 
+/// How a run is underlined.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Underline {
+    Single,
+    Double,
+    Curly,
+    Dotted,
+    Dashed,
+}
+
+impl Underline {
+    fn of(flags: Flags) -> Option<Underline> {
+        if flags.contains(Flags::UNDERCURL) {
+            Some(Underline::Curly)
+        } else if flags.contains(Flags::DOTTED_UNDERLINE) {
+            Some(Underline::Dotted)
+        } else if flags.contains(Flags::DASHED_UNDERLINE) {
+            Some(Underline::Dashed)
+        } else if flags.contains(Flags::DOUBLE_UNDERLINE) {
+            Some(Underline::Double)
+        } else if flags.contains(Flags::UNDERLINE) {
+            Some(Underline::Single)
+        } else {
+            None
+        }
+    }
+}
+
+/// The rectangles of an underline across x0..x1 (whole pixels) of a cell row
+/// of height `ch` starting at `y`, `t` thick. Patterns are phased from `ox`
+/// (the left edge of column 0), so neighbouring runs continue them.
+fn underline_rects(kind: Underline, x0: f32, x1: f32, ox: f32, y: f32, ch: f32, t: f32) -> Vec<Rectangle> {
+    // A rectangle `t` high whose top edge is `up` above the cell's bottom.
+    let rect = |x: f32, w: f32, up: f32| Rectangle { x, y: y + ch - up, width: w, height: t };
+    let mut out = Vec::new();
+    match kind {
+        Underline::Single => out.push(rect(x0, x1 - x0, 2.0 * t)),
+        Underline::Double => {
+            out.push(rect(x0, x1 - x0, 4.0 * t));
+            out.push(rect(x0, x1 - x0, 2.0 * t));
+        }
+        Underline::Dotted | Underline::Dashed | Underline::Curly => {
+            // One piece per `t` of width; the pattern repeats every 2 (dots),
+            // 4 (dashes: 2 on, 2 off, and the wave) pieces.
+            let mut x = x0;
+            while x < x1 {
+                let i = ((x - ox) / t).floor() as i64;
+                let w = t.min(x1 - x);
+                match kind {
+                    Underline::Dotted if i.rem_euclid(2) == 0 => out.push(rect(x, w, 2.0 * t)),
+                    Underline::Dashed if i.rem_euclid(4) < 2 => out.push(rect(x, w, 2.0 * t)),
+                    Underline::Curly => {
+                        let lift = [0.0, 1.0, 2.0, 1.0][i.rem_euclid(4) as usize];
+                        out.push(rect(x, w, (2.0 + lift) * t));
+                    }
+                    _ => {}
+                }
+                x += t;
+            }
+        }
+    }
+    out
+}
+
 /// Text of one style on one line, starting at a cell.
 #[derive(Debug, Clone, PartialEq)]
 struct Run {
@@ -1504,7 +1573,8 @@ struct Run {
     color: Color,
     bold: bool,
     italic: bool,
-    underline: bool,
+    /// Style and colour of the underline (SGR 4, 21, 4:x and 58).
+    underline: Option<(Underline, Color)>,
     strike: bool,
     /// Needs full shaping (characters outside the simple ranges).
     complex: bool,
@@ -1671,7 +1741,10 @@ impl Frame {
                 fg,
                 flags.contains(Flags::BOLD),
                 flags.contains(Flags::ITALIC),
-                flags.intersects(Flags::ALL_UNDERLINES),
+                Underline::of(flags).map(|u| {
+                    let color = item.underline_color().map_or(fg, |c| pal.resolve(c, overrides));
+                    (u, color)
+                }),
                 flags.contains(Flags::STRIKEOUT),
             );
             let new_run = |text: String, complex: bool| Run {
@@ -1738,7 +1811,11 @@ impl Frame {
             let text = cell
                 .as_ref()
                 .filter(|r| !r.text.is_empty() && cursor_shape == CursorShape::Block)
-                .map(|r| Run { color: frame.bg, ..r.clone() });
+                .map(|r| Run {
+                    color: frame.bg,
+                    underline: r.underline.map(|(u, _)| (u, frame.bg)),
+                    ..r.clone()
+                });
             frame.cursor = Some(Cursor {
                 line: in_view as u16,
                 col: cursor_point.column.0 as u16,
@@ -1791,8 +1868,12 @@ impl Grid<'_> {
             renderer.fill_text(text(), Point::new(x + BOLD_OFFSET, y), run.color, clip);
         }
         let width = run.cells as f32 * cw;
-        if run.underline {
-            fill(renderer, Rectangle { x, y: y + ch - 2.0, width, height: 1.0 }, run.color);
+        if let Some((kind, color)) = run.underline {
+            let cell = m.cell_rect(origin, run.line, run.col, run.cells);
+            let t = m.line_thickness();
+            for r in underline_rects(kind, cell.x, cell.x + cell.width, origin.x.round(), cell.y, ch, t) {
+                fill(renderer, r, color);
+            }
         }
         if run.strike {
             fill(renderer, Rectangle { x, y: y + (ch / 2.0).round(), width, height: 1.0 }, run.color);
@@ -4207,6 +4288,48 @@ mod tests {
             panic!("not named")
         };
         assert!(std::ptr::eq(x, y));
+    }
+
+    #[test]
+    fn underline_style_and_colour_split_runs() {
+        let pal = Palette::new(Color::BLACK, Color::WHITE);
+        let term = small_term(10, 2, "\x1b[4:3mx\x1b[58:2::255:0:0my\x1b[24mz\x1b[4:2mw\x1b[4:4m\x1b[59mv");
+        let frame = Frame::build(&term, &pal);
+        let red = Color::from_rgb8(255, 0, 0);
+        let got: Vec<_> = frame.runs.iter().map(|r| (r.text.as_str(), r.underline)).collect();
+        assert_eq!(
+            got,
+            vec![
+                ("x", Some((Underline::Curly, Color::WHITE))),
+                ("y", Some((Underline::Curly, red))),
+                ("z", None),
+                // Colour stays until SGR 59.
+                ("w", Some((Underline::Double, red))),
+                ("v", Some((Underline::Dotted, Color::WHITE))),
+            ]
+        );
+    }
+
+    #[test]
+    fn underline_patterns_sit_on_whole_pixels() {
+        let rects = |k, x0, x1| underline_rects(k, x0, x1, 4.0, 10.0, 18.0, 1.0);
+        let single = rects(Underline::Single, 4.0, 13.0);
+        assert_eq!(single, vec![Rectangle { x: 4.0, y: 26.0, width: 9.0, height: 1.0 }]);
+        let double = rects(Underline::Double, 4.0, 13.0);
+        assert_eq!((double[0].y, double[1].y), (24.0, 26.0));
+        // Dots every 2 px, dashes 2 on and 2 off, from the grid's origin.
+        let dots: Vec<f32> = rects(Underline::Dotted, 4.0, 13.0).iter().map(|r| r.x).collect();
+        assert_eq!(dots, vec![4.0, 6.0, 8.0, 10.0, 12.0]);
+        let dashes: Vec<(f32, f32)> = rects(Underline::Dashed, 4.0, 13.0).iter().map(|r| (r.x, r.width)).collect();
+        assert_eq!(dashes, vec![(4.0, 1.0), (5.0, 1.0), (8.0, 1.0), (9.0, 1.0), (12.0, 1.0)]);
+        // A run starting later continues the pattern.
+        let later: Vec<f32> = rects(Underline::Dotted, 7.0, 13.0).iter().map(|r| r.x).collect();
+        assert_eq!(later, vec![8.0, 10.0, 12.0]);
+        // The wave stays inside the cell.
+        let wave = rects(Underline::Curly, 4.0, 13.0);
+        assert_eq!(wave.len(), 9);
+        assert!(wave.iter().all(|r| r.y >= 10.0 && r.y + r.height <= 28.0 && r.height == 1.0));
+        assert_eq!(wave.iter().map(|r| r.y).fold(f32::MAX, f32::min), 24.0);
     }
 
     #[test]
