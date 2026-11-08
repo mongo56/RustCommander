@@ -197,7 +197,7 @@ commands! {
         /// the cursor (else the active panel's folder) by typing `cd` at its
         /// prompt (Ctrl+Shift+Enter).
         SendFolderToTerminal => "cm_SendFolderToTerminal",
-            "Change the built-in terminal's folder to the folder selected in the panel (cd)", "ToTerm";
+            "Change the built-in terminal's folder to the folder selected in the panel", "ToTerm";
         /// Split the focused built-in terminal: another shell to its right, in
         /// its current folder, in the same sidebar entry (Ctrl+Shift+E).
         SplitTerminalRight => "cm_SplitTerminalRight",
