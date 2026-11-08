@@ -1152,6 +1152,7 @@ fn term_key_tip(key: &dyn Fn(Command) -> Option<String>) -> Vec<HintOwned> {
     add(&mut tip, key(Command::Configuration).into_iter().collect(), "settings (Esc comes back here)");
     let zoom = [Command::TerminalZoomIn, Command::TerminalZoomOut, Command::TerminalZoomReset];
     add(&mut tip, zoom.into_iter().filter_map(key).collect(), "bigger / smaller / normal text");
+    tip.push(HintOwned::new(["Ctrl+wheel".to_string()], "bigger / smaller text"));
     tip.push(HintOwned::new(Vec::<String>::new(), "Split panes"));
     add(&mut tip, key(Command::SplitTerminalRight).into_iter().collect(), "split: new shell to the right");
     add(&mut tip, key(Command::SplitTerminalDown).into_iter().collect(), "split: new shell below");
