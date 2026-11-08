@@ -4665,6 +4665,156 @@ mod tests {
             .unwrap();
         String::from_utf8_lossy(&out.stdout).contains(&format!("\"{pid}\""))
     }
+
+    /// A screen's worth of dense output for the timing tests: lines of
+    /// `cols` cells with a colour change every few characters, bold, italic,
+    /// underlined and backgrounds now and then, box drawing, blocks and wide
+    /// characters. Deterministic (`seed`).
+    fn dense_lines(cols: usize, lines: usize, seed: u32) -> Vec<String> {
+        let mut state = seed.wrapping_mul(2654435761).wrapping_add(1);
+        let mut next = move |n: u32| {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            (state >> 8) % n
+        };
+        (0..lines)
+            .map(|_| {
+                let mut line = String::new();
+                let mut used = 0;
+                while used < cols {
+                    let attr = match next(8) {
+                        0 => ";1",
+                        1 => ";3",
+                        2 => ";4",
+                        3 => ";48;5;236",
+                        _ => "",
+                    };
+                    line.push_str(&format!("\x1b[0;38;5;{}{attr}m", 16 + next(216)));
+                    let n = (3 + next(4) as usize).min(cols - used);
+                    for _ in 0..n {
+                        let c = match next(20) {
+                            0 => '─',
+                            1 => '│',
+                            2 => '█',
+                            3 => '▒',
+                            4 if used + 2 <= cols => '漢',
+                            5 => ' ',
+                            k => (b'a' + (k as u8 + next(20) as u8) % 26) as char,
+                        };
+                        line.push(c);
+                        used += if c == '漢' { 2 } else { 1 };
+                        if used >= cols {
+                            break;
+                        }
+                    }
+                }
+                line.push_str("\x1b[0m");
+                line
+            })
+            .collect()
+    }
+
+    /// Shapes a frame's text the way `draw_run` hands it to the renderer,
+    /// through the text cache iced's renderers keep (`fill_text` text is
+    /// looked up by content, font, size and bounds; entries not used in a
+    /// frame are dropped at its end, `trim`).
+    fn shape_frame(frame: &Frame, m: &Metrics, cache: &mut iced::advanced::graphics::text::Cache) {
+        use iced::advanced::graphics::text::{cache::Key, font_system};
+        let mut fonts = font_system().write().unwrap();
+        let fonts = fonts.raw();
+        for run in frame.runs.iter().chain(frame.cursor.as_ref().and_then(|c| c.text.as_ref())) {
+            let (font, _) = m.style_font(run.bold, run.italic);
+            let key = Key {
+                content: &run.text,
+                size: m.size,
+                line_height: m.cell_h,
+                font,
+                bounds: Size::new((run.cells + 1) as f32 * m.cell_w, m.cell_h),
+                shaping: if run.complex { Shaping::Advanced } else { Shaping::Basic },
+            };
+            std::hint::black_box(cache.allocate(fonts, key));
+        }
+        cache.trim();
+    }
+
+    /// Times building and shaping a full dense 240x70 screen, and a scrolling
+    /// one (a line of output per frame): run with
+    /// `cargo test --release -p rustcommander term_render_speed -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn term_render_speed() {
+        use iced::advanced::graphics::text::Cache;
+        use std::time::Instant;
+        load_fonts();
+        let (cols, lines) = (240, 70);
+        let pal = Palette::new(Color::BLACK, Color::WHITE);
+        let m = Metrics::new(BUNDLED_FONT, 14.0);
+        let screen = dense_lines(cols, lines, 1).join("\r\n");
+        let term = small_term(cols, lines, &screen);
+        let frame = Frame::build(&term, &pal);
+        let chars: usize = frame.runs.iter().map(|r| r.text.chars().count()).sum();
+        println!(
+            "dense {cols}x{lines}: {} runs ({chars} chars), {} fills, {} shapes",
+            frame.runs.len(),
+            frame.fills.len(),
+            frame.shapes.len()
+        );
+
+        const N: u32 = 200;
+        let start = Instant::now();
+        for _ in 0..N {
+            std::hint::black_box(Frame::build(&term, &pal));
+        }
+        println!("Frame::build, full screen: {:.0} us", start.elapsed().as_secs_f64() * 1e6 / N as f64);
+
+        // Every run shaped anew (a new font size, or a screen of new text).
+        let start = Instant::now();
+        for _ in 0..20 {
+            let mut cache = Cache::new();
+            shape_frame(&frame, &m, &mut cache);
+        }
+        println!("shaping, all runs new: {:.0} us", start.elapsed().as_secs_f64() * 1e6 / 20.0);
+        // The same screen drawn again (cursor blink, mouse moves).
+        let mut cache = Cache::new();
+        shape_frame(&frame, &m, &mut cache);
+        let start = Instant::now();
+        for _ in 0..N {
+            shape_frame(&frame, &m, &mut cache);
+        }
+        println!("shaping, unchanged screen (cache hits): {:.0} us", start.elapsed().as_secs_f64() * 1e6 / N as f64);
+
+        // Scrolling: a new dense line per frame, then build and shape.
+        let mut term = small_term(cols, lines, &screen);
+        let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
+        let feed: Vec<String> = dense_lines(cols, 500, 2).into_iter().map(|l| format!("\r\n{l}")).collect();
+        let mut cache = Cache::new();
+        shape_frame(&Frame::build(&term, &pal), &m, &mut cache);
+        // The cache key of a run, to count the ones the last frame didn't have.
+        let key = |r: &Run| (r.text.clone(), r.bold, r.italic, r.cells, r.complex);
+        let mut last: std::collections::HashSet<_> = Frame::build(&term, &pal).runs.iter().map(key).collect();
+        let (mut t_parse, mut t_build, mut t_shape, mut missed) = (0.0, 0.0, 0.0, 0);
+        for line in &feed {
+            let start = Instant::now();
+            parser.advance(&mut term, line.as_bytes());
+            let parsed = Instant::now();
+            let frame = Frame::build(&term, &pal);
+            let built = Instant::now();
+            shape_frame(&frame, &m, &mut cache);
+            t_parse += (parsed - start).as_secs_f64();
+            t_build += (built - parsed).as_secs_f64();
+            t_shape += built.elapsed().as_secs_f64();
+            let now: std::collections::HashSet<_> = frame.runs.iter().map(key).collect();
+            missed += now.difference(&last).count();
+            last = now;
+        }
+        let n = feed.len() as f64;
+        println!(
+            "scrolling, per line: parse {:.0} us, Frame::build {:.0} us, shaping {:.0} us ({:.1} runs new)",
+            t_parse * 1e6 / n,
+            t_build * 1e6 / n,
+            t_shape * 1e6 / n,
+            missed as f64 / n
+        );
+    }
 }
 
 #[cfg(all(test, windows))]
@@ -4692,5 +4842,4 @@ mod ctrl_c_tests {
             !alive(pid)
         });
         assert!(stopped, "ping still runs after Ctrl+C");
-    }
-}
+    }}
