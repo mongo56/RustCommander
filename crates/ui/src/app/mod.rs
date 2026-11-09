@@ -2791,6 +2791,8 @@ impl App {
             return Task::none();
         }
         let Some(drag) = self.drag.take() else { return Task::none() };
+        // Before `hover` is cleared: it names the folder row under the mouse.
+        let target = self.drop_target(&drag);
         self.hover = None;
         if !drag.active {
             if drag.collapse {
@@ -2808,7 +2810,7 @@ impl App {
         if self.tree_under_mouse() {
             return self.tree_drop_files(drag.side, &drag.sources);
         }
-        let Some(target) = self.drop_target(&drag) else { return Task::none() };
+        let Some(target) = target else { return Task::none() };
         self.focus_panel(drag.side);
         // The shell's drop menu can't take files inside archives.
         let in_archive = vfs::in_archive(&self.panel(drag.side).path)
