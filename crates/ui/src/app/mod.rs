@@ -1305,10 +1305,13 @@ impl App {
             }
             Message::DriveLabels(labels) => self.drive_labels = labels,
             Message::DriveIcons(icons) => {
+                // A failed read keeps the cached icon: the shell returns none on
+                // the worker while the UI thread reads its first icons (startup).
                 let mut cache = self.icons.borrow_mut();
                 for (drive, icon) in icons {
-                    let handle = icon.map(|i| image::Handle::from_rgba(i.width, i.height, i.rgba));
-                    cache.insert(rc_platform::icon_key(Path::new(&drive), true), handle);
+                    let Some(i) = icon else { continue };
+                    let handle = image::Handle::from_rgba(i.width, i.height, i.rgba);
+                    cache.insert(rc_platform::icon_key(Path::new(&drive), true), Some(handle));
                 }
             }
             Message::Sort(side, key) => {
