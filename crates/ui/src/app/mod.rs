@@ -108,6 +108,8 @@ pub struct App {
     /// Explorer's names of the drives ("Local Disk (C:)"), for the drive
     /// buttons' tooltips; read by `read_drive_labels`.
     drive_labels: HashMap<String, String>,
+    /// When each drive's icon was last read again (`refresh_drive_icon`).
+    drive_icon_at: HashMap<String, Instant>,
     status: Option<(String, Tone)>,
     window_width: f32,
     window_height: f32,
@@ -532,6 +534,9 @@ pub enum Message {
     DrivesChanged(Vec<String>),
     /// Names of the drives, read on a worker thread.
     DriveLabels(HashMap<String, String>),
+    /// Drive icons read again on a worker thread (a network drive's icon
+    /// shows whether it's connected).
+    DriveIcons(Vec<(String, Option<rc_platform::Icon>)>),
     Sort(usize, SortKey),
     Resized(Size),
     CloseRequested,
@@ -666,6 +671,7 @@ impl App {
             // Filled by `list_drives` on a worker thread.
             drives: Vec::new(),
             drive_labels: HashMap::new(),
+            drive_icon_at: HashMap::new(),
             status: None,
             window_width: width,
             window_height: height,
@@ -1295,9 +1301,16 @@ impl App {
             }
             Message::DrivesChanged(drives) => {
                 self.drives = drives;
-                return read_drive_labels(self.drives.clone());
+                return Task::batch([read_drive_labels(self.drives.clone()), self.read_drive_icons(self.drives.clone())]);
             }
             Message::DriveLabels(labels) => self.drive_labels = labels,
+            Message::DriveIcons(icons) => {
+                let mut cache = self.icons.borrow_mut();
+                for (drive, icon) in icons {
+                    let handle = icon.map(|i| image::Handle::from_rgba(i.width, i.height, i.rgba));
+                    cache.insert(rc_platform::icon_key(Path::new(&drive), true), handle);
+                }
+            }
             Message::Sort(side, key) => {
                 self.focus_panel(side);
                 self.panel_mut(side).sort_by(key);
@@ -2071,9 +2084,10 @@ impl App {
                 self.disk.borrow_mut().clear();
                 let path = self.panel(active).path.clone();
                 let labels = read_drive_labels(self.drives.clone());
+                let icons = self.read_drive_icons(self.drives.clone());
                 // The Network list: search the network again.
                 let net = if vfs::is_network(&path) { self.start_net_search() } else { Task::none() };
-                return Task::batch([self.list_in_background(path.clone()), remote_space(&path), labels, net]);
+                return Task::batch([self.list_in_background(path.clone()), remote_space(&path), labels, icons, net]);
             }
             Network => return self.open_network(active),
             QuickFilter => {
@@ -3485,7 +3499,7 @@ impl App {
                 if self.dialog.is_none() && vfs::needs_password(&path) {
                     return self.ask_password(path, None);
                 }
-                remote_space(&path)
+                Task::batch([remote_space(&path), self.refresh_drive_icon(&path)])
             }
             Err(e) if e.contains(vfs::PASSWORD_REQUIRED) && self.dialog.is_none() => {
                 match self.panel(side).nav_target(&nav) {
@@ -3759,6 +3773,39 @@ impl App {
                 None => Task::done(None),
             })
             .map(Message::Quit)
+    }
+
+    /// After a folder on drive `path` listed: reads that drive's icon again
+    /// (at most every 10 s), so a network drive that was offline when its
+    /// icon was first read stops showing the red cross once it's back.
+    fn refresh_drive_icon(&mut self, path: &Path) -> Task<Message> {
+        let Some(drive) = self.drives.iter().find(|d| path.starts_with(d.as_str())).cloned() else {
+            return Task::none();
+        };
+        if self.drive_icon_at.get(&drive).is_some_and(|at| at.elapsed() < Duration::from_secs(10)) {
+            return Task::none();
+        }
+        self.read_drive_icons(vec![drive])
+    }
+
+    /// Reads the icons of `drives` on a worker thread (`Message::DriveIcons`):
+    /// the shell may ask a network drive's server, which can be slow.
+    fn read_drive_icons(&mut self, drives: Vec<String>) -> Task<Message> {
+        let now = Instant::now();
+        for drive in &drives {
+            self.drive_icon_at.insert(drive.clone(), now);
+        }
+        Task::perform(
+            async {
+                let (tx, rx) = iced::futures::channel::oneshot::channel();
+                std::thread::spawn(move || {
+                    let icons = rc_platform::drive_icons(&drives);
+                    let _ = tx.send(drives.into_iter().zip(icons).collect());
+                });
+                rx.await.unwrap_or_default()
+            },
+            Message::DriveIcons,
+        )
     }
 
     fn after_change(&mut self) {

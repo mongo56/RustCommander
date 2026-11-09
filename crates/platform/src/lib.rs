@@ -320,6 +320,19 @@ pub fn file_icon(path: &Path, is_dir: bool) -> Option<Icon> {
     }
 }
 
+/// The icons of drive roots (`C:\`), for a worker thread: sets up COM
+/// there first, as the shell asks. A network drive's icon shows whether it
+/// is connected.
+pub fn drive_icons(drives: &[String]) -> Vec<Option<Icon>> {
+    // COM stays set up until the thread ends.
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+    }
+    drives.iter().map(|d| file_icon(Path::new(d), true)).collect()
+}
+
 /// Shell icons for network things that are no files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StockIcon {
