@@ -9,11 +9,11 @@ use std::time::Duration;
 use windows::core::{w, BOOL};
 use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND, POINT};
 use windows::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, RegisterClipboardFormatW,
-    SetClipboardData,
+    CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
+    RegisterClipboardFormatW, SetClipboardData,
 };
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE};
-use windows::Win32::System::Ole::{CF_HDROP, DROPEFFECT_COPY, DROPEFFECT_MOVE};
+use windows::Win32::System::Ole::{CF_BITMAP, CF_DIB, CF_DIBV5, CF_HDROP, DROPEFFECT_COPY, DROPEFFECT_MOVE};
 use windows::Win32::UI::Shell::{DragQueryFileW, DROPFILES, HDROP};
 
 /// Closes the clipboard when dropped.
@@ -139,3 +139,8 @@ pub fn get_files() -> Option<(Vec<PathBuf>, bool)> {
     }
 }
 
+/// Whether the clipboard holds a picture (a screenshot, an image copied
+/// from a browser). Doesn't open the clipboard.
+pub(crate) fn has_image() -> bool {
+    [CF_DIB, CF_DIBV5, CF_BITMAP].iter().any(|f| unsafe { IsClipboardFormatAvailable(f.0 as u32) }.is_ok())
+}

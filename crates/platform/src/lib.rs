@@ -455,6 +455,18 @@ pub fn clipboard_files() -> Option<(Vec<PathBuf>, bool)> {
     }
 }
 
+/// Whether the system clipboard holds a picture.
+pub fn clipboard_has_image() -> bool {
+    #[cfg(windows)]
+    {
+        clipboard_win::has_image()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 /// Right-button drop of `items` (all inside `folder`) onto the folder
 /// `target`: the OS shows its drop menu (copy/move/link here and handlers
 /// like archive extraction). Blocks until the menu closes.

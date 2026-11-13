@@ -730,7 +730,10 @@ impl TermSession {
         let side = |right: bool| if right { Side::Right } else { Side::Left };
         match mouse {
             Mouse::Down { button, line, col, right, clicks, mods } => {
-                if reports_mouse(mode, mods) {
+                // Right-click (copy / paste) stays the terminal's even in programs
+                // that track the mouse: Claude Code's own right-click paste starts
+                // PowerShell (about a second) and can't paste a picture.
+                if button != Btn::Right && reports_mouse(mode, mods) {
                     drop(term);
                     self.reported = Some(button);
                     self.selecting = false;
@@ -2270,6 +2273,10 @@ impl Widget<Message, Theme, iced::Renderer> for Grid<'_> {
     }
 }
 
+/// What a paste sends when the clipboard holds only a picture: Alt+V, the
+/// key Claude Code reads the clipboard image on (Windows).
+const IMAGE_PASTE: &[u8] = b"\x1bv";
+
 /// What pasting `text` sends: line breaks as Enter (`\r`); in bracketed
 /// paste mode (the program asked for it) wrapped in `ESC [ 200 ~` ..
 /// `ESC [ 201 ~`, with ESC characters dropped so the text can't end the
@@ -2557,11 +2564,11 @@ impl App {
         ("Ctrl+Shift+F", "Find text in the scrollback: typing finds the newest match, Enter / Up the next older one, Shift+Enter / Down the next newer one (wraps around); the match is selected (Ctrl+Shift+C copies it). Case-insensitive unless the text has capitals; Esc closes"),
         ("Ctrl+Shift+C or Ctrl+Insert", "Copy the selected text (select with the mouse: drag, double-click a word, triple-click a line)"),
         ("Ctrl+Shift+J", "Copy the selected text as one line: line breaks and the indentation after them removed (paths, URLs, commands a program wrapped)"),
-        ("Right-click", "Copies the selection and clears it; with no selection pastes the clipboard"),
+        ("Right-click", "Copies the selection and clears it; with no selection pastes the clipboard (also in programs that track the mouse)"),
         ("Shift+Right-click", "Copies the selection as one line (like Ctrl+Shift+J) and clears it; with no selection pastes"),
-        ("Ctrl+Shift+V or Shift+Insert", "Paste the clipboard (bracketed when the program asks for it)"),
+        ("Ctrl+Shift+V or Shift+Insert", "Paste the clipboard (bracketed when the program asks for it); a picture is sent as Alt+V, which attaches it in Claude Code; right-click too"),
         ("Mouse wheel, Shift+PgUp/PgDn, Shift+Home/End", "Scroll the history (programs that use the mouse get wheel events, other full-screen programs arrow keys); typing jumps back to the bottom"),
-        ("Mouse in programs that use it", "Programs that track the mouse (Claude Code, vim with mouse=a, htop, ...) get the clicks, drags and wheel instead; hold Shift to select, copy/paste with Shift+Right-click, or scroll the history with Shift+wheel as usual"),
+        ("Mouse in programs that use it", "Programs that track the mouse (Claude Code, vim with mouse=a, htop, ...) get the clicks (except right-click), drags and wheel instead; hold Shift to select, or scroll the history with Shift+wheel as usual"),
         ("Every other key", "Goes to the shell (Esc, Tab, Ctrl+C, arrows, F1-F12, ...)"),
         ("exit", "Ends the shell and closes the terminal"),
     ];
@@ -3239,8 +3246,13 @@ impl App {
                 }
             }
             TermMsg::Paste(id, text) => {
-                if let (Some(t), Some(text)) = (self.term(id), text.filter(|t| !t.is_empty())) {
-                    t.paste(&text);
+                let Some(t) = self.term(id) else { return Task::none() };
+                match text.filter(|t| !t.is_empty()) {
+                    Some(text) => t.paste(&text),
+                    // A picture and no text: send Alt+V, Claude Code's
+                    // (Windows) key for attaching the clipboard image.
+                    None if rc_platform::clipboard_has_image() => t.write(IMAGE_PASTE.to_vec()),
+                    None => {}
                 }
             }
             TermMsg::SendPending(id) => {
