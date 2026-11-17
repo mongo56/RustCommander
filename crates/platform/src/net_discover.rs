@@ -33,6 +33,8 @@ pub enum Via {
     NetBios,
     /// mDNS / DNS-SD `_smb._tcp`.
     Mdns,
+    /// This computer: Windows' discovery doesn't report it to itself.
+    Local,
 }
 
 /// The UNC host name for a name as a source reports it: `WORKGROUP\NAME`,
@@ -123,6 +125,13 @@ pub fn merge(hosts: impl IntoIterator<Item = Host>) -> Vec<Host> {
     out
 }
 
+/// This computer, as Explorer's Network view lists it (WS-Discovery and
+/// NetBIOS on this machine don't find it).
+fn local_host() -> Option<Host> {
+    let name = std::env::var("COMPUTERNAME").ok().filter(|n| !n.trim().is_empty())?;
+    Some(Host { name, address: None, via: Via::Local })
+}
+
 /// Searches the network for about 4 s, calling `found` (on this thread) with
 /// each host once, as soon as it is found. Returns early when `cancel` is
 /// set. Blocks: call it from a worker.
@@ -143,6 +152,9 @@ pub fn discover(cancel: &AtomicBool, mut found: impl FnMut(Host)) {
     }
     drop(tx);
     let mut merger = Merger::default();
+    if let Some(h) = local_host().and_then(|h| merger.add(h)) {
+        found(h);
+    }
     while !cancel.load(Ordering::Relaxed) {
         let now = Instant::now();
         if now >= deadline {
