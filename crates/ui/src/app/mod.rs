@@ -202,6 +202,11 @@ pub struct App {
     /// Icon cache keyed by `rc_platform::icon_key`. Filled lazily from
     /// `view`, hence the RefCell.
     icons: RefCell<HashMap<String, Option<image::Handle>>>,
+    /// Icon keys whose last read failed: when, and how many reads failed.
+    /// Read again after [`ICON_RETRY`], up to [`ICON_TRIES`] times.
+    icon_failed: RefCell<HashMap<String, (Instant, u8)>>,
+    /// A `Message::IconRetry` is on its way.
+    icon_retry: bool,
     /// Thumbnail view: decoded thumbnails, decodes running, grid sizes.
     thumbs: thumbs::Thumbs,
     /// Free/total space per volume root, refreshed every few seconds.
@@ -307,6 +312,10 @@ struct PendingNav {
 /// loading and finishing in the background. Local folders list well within
 /// this, so keys typed right after Enter still apply to the new folder.
 const SYNC_LISTING_WAIT: Duration = Duration::from_millis(150);
+/// How long a failed icon read waits before it is tried again.
+const ICON_RETRY: Duration = Duration::from_millis(500);
+/// Reads of one icon before it is shown as missing for good.
+const ICON_TRIES: u8 = 5;
 
 /// One side of the window: a set of tabs, one of them shown.
 struct Side {
@@ -537,6 +546,8 @@ pub enum Message {
     /// Drive icons read again on a worker thread (a network drive's icon
     /// shows whether it's connected).
     DriveIcons(Vec<(String, Option<rc_platform::Icon>)>),
+    /// Re-render so icons whose read failed are read again.
+    IconRetry,
     Sort(usize, SortKey),
     Resized(Size),
     CloseRequested,
@@ -723,6 +734,8 @@ impl App {
             focused: true,
             leaked_enter: false,
             icons: RefCell::new(HashMap::new()),
+            icon_failed: RefCell::new(HashMap::new()),
+            icon_retry: false,
             thumbs: thumbs::Thumbs::default(),
             disk: RefCell::new(HashMap::new()),
             listings: HashMap::new(),
@@ -904,10 +917,11 @@ impl App {
         let thumbs = self.pump_thumbs();
         let git = self.git_check(changed.as_deref());
         let quick = self.quick_view_check();
+        let icons = self.icon_retry_check();
         if self.deferred.is_empty() {
-            return Task::batch([task, thumbs, git, quick]);
+            return Task::batch([task, thumbs, git, quick, icons]);
         }
-        Task::batch([task, thumbs, git, quick].into_iter().chain(self.deferred.drain(..)))
+        Task::batch([task, thumbs, git, quick, icons].into_iter().chain(self.deferred.drain(..)))
     }
 
     fn handle(&mut self, message: Message) -> Task<Message> {
@@ -1304,6 +1318,7 @@ impl App {
                 return Task::batch([read_drive_labels(self.drives.clone()), self.read_drive_icons(self.drives.clone())]);
             }
             Message::DriveLabels(labels) => self.drive_labels = labels,
+            Message::IconRetry => self.icon_retry = false,
             Message::DriveIcons(icons) => {
                 // A failed read keeps the cached icon: the shell returns none on
                 // the worker while the UI thread reads its first icons (startup).
@@ -3870,10 +3885,33 @@ impl App {
         if let Some(handle) = self.icons.borrow().get(&key) {
             return handle.clone();
         }
+        // A failed read isn't final (the shell can fail while busy, e.g. at
+        // startup): retry it on a later render, but not on every one.
+        let tries = match self.icon_failed.borrow().get(&key) {
+            Some(&(at, tries)) if tries >= ICON_TRIES || at.elapsed() < ICON_RETRY => return None,
+            Some(&(_, tries)) => tries,
+            None => 0,
+        };
         let handle = rc_platform::file_icon(path, is_dir)
             .map(|icon| image::Handle::from_rgba(icon.width, icon.height, icon.rgba));
-        self.icons.borrow_mut().insert(key, handle.clone());
+        if handle.is_some() {
+            self.icon_failed.borrow_mut().remove(&key);
+            self.icons.borrow_mut().insert(key, handle.clone());
+        } else {
+            self.icon_failed.borrow_mut().insert(key, (Instant::now(), tries + 1));
+        }
         handle
+    }
+
+    /// Schedules a re-render while failed icon reads have tries left (and
+    /// were tried lately: an icon scrolled out of view isn't read again).
+    fn icon_retry_check(&mut self) -> Task<Message> {
+        let pending = |&(at, tries): &(Instant, u8)| tries < ICON_TRIES && at.elapsed() < ICON_RETRY * 4;
+        if self.icon_retry || !self.icon_failed.borrow().values().any(pending) {
+            return Task::none();
+        }
+        self.icon_retry = true;
+        delayed(ICON_RETRY, Message::IconRetry)
     }
 
     /// (free, total) for the volume holding `path`, cached for a few seconds.

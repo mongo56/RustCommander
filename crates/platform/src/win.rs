@@ -68,6 +68,24 @@ pub fn disk_space(path: &Path) -> Option<(u64, u64)> {
 // ---- icons ------------------------------------------------------------------
 
 pub fn file_icon(path: &Path, is_dir: bool, by_type_only: bool) -> Option<Icon> {
+    // The shell's first icon lookup sets up its image lists; another thread
+    // asking at the same moment gets no icon (startup: the drive-icon worker
+    // and the UI thread). Let one lookup finish before any other starts.
+    static WARM: std::sync::Once = std::sync::Once::new();
+    WARM.call_once(|| {
+        let w = wide(OsStr::new("x"));
+        let mut info = SHFILEINFOW::default();
+        let flags = SHGFI_ICON | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES;
+        let ok = unsafe {
+            let size = size_of::<SHFILEINFOW>() as u32;
+            SHGetFileInfoW(PCWSTR(w.as_ptr()), FILE_ATTRIBUTE_DIRECTORY, Some(&mut info), size, flags)
+        };
+        if ok != 0 && !info.hIcon.is_invalid() {
+            unsafe {
+                let _ = DestroyIcon(info.hIcon);
+            }
+        }
+    });
     let w = wide(path.as_os_str());
     let mut info = SHFILEINFOW::default();
     let mut flags = SHGFI_ICON | SHGFI_SMALLICON;
