@@ -694,6 +694,30 @@ impl Panel {
         self.selected.extend(names);
     }
 
+    /// The selected names.
+    pub fn selection(&self) -> &HashSet<String> {
+        &self.selected
+    }
+
+    /// Mouse sweep (left drag outside the name): moves the cursor to `index`
+    /// and makes the selection `base` with the rows between `start` and
+    /// `index` (`..` excluded) added, or taken out when `!select`. Moving
+    /// back over rows restores them from `base`.
+    pub fn sweep_to(&mut self, start: usize, index: usize, base: &HashSet<String>, select: bool) {
+        let Some(last) = self.entries.len().checked_sub(1) else { return };
+        let (start, index) = (start.min(last), index.min(last));
+        self.set_cursor(index);
+        self.selected = base.clone();
+        let (lo, hi) = (start.min(index), start.max(index));
+        for e in self.entries[lo..=hi].iter().filter(|e| !e.is_parent()) {
+            if select {
+                self.selected.insert(e.name.clone());
+            } else {
+                self.selected.remove(&e.name);
+            }
+        }
+    }
+
     fn mark_anchor_at(&mut self, index: usize) {
         self.anchor = self.entries.get(index).map(|e| e.name.clone());
     }
@@ -1049,6 +1073,44 @@ mod tests {
         assert_eq!(mv(7, 0, -100), 3); // page up keeps the column
         assert_eq!(grid_move(0, 0, 4, 1, 1), 0);
         assert_eq!(grid_move(3, 5, 1, 0, 1), 4); // one column = a list
+    }
+
+    #[test]
+    fn sweep_selection() {
+        let root = std::env::temp_dir().join(format!("rc-core-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        for i in 0..6 {
+            std::fs::write(root.join(format!("f{i}.txt")), b"").unwrap();
+        }
+        let mut p = Panel::open(&root).unwrap();
+        // Entries: "..", f0..f5 (rows 0..=6).
+        let sel = |p: &Panel| -> Vec<String> {
+            let mut v: Vec<String> = p.selection().iter().cloned().collect();
+            v.sort();
+            v
+        };
+        let empty = HashSet::new();
+        // Sweeping down from row 2 selects 2..=4; back up to 3 shrinks it.
+        p.sweep_to(2, 4, &empty, true);
+        assert_eq!(sel(&p), ["f1.txt", "f2.txt", "f3.txt"]);
+        assert_eq!(p.cursor, 4);
+        p.sweep_to(2, 3, &empty, true);
+        assert_eq!(sel(&p), ["f1.txt", "f2.txt"]);
+        // Upwards over "..": never selected.
+        p.sweep_to(2, 0, &empty, true);
+        assert_eq!(sel(&p), ["f0.txt", "f1.txt"]);
+        // Deselecting sweep from a base; rows left behind come back.
+        let base: HashSet<String> = ["f1.txt", "f2.txt", "f3.txt", "f5.txt"].map(String::from).into();
+        p.sweep_to(3, 5, &base, false);
+        assert_eq!(sel(&p), ["f1.txt", "f5.txt"]);
+        p.sweep_to(3, 3, &base, false);
+        assert_eq!(sel(&p), ["f1.txt", "f3.txt", "f5.txt"]);
+        // Past the end is clamped.
+        p.sweep_to(5, 99, &empty, true);
+        assert_eq!(sel(&p), ["f4.txt", "f5.txt"]);
+        assert_eq!(p.cursor, 6);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

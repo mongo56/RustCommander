@@ -160,6 +160,10 @@ pub struct App {
     /// Side whose quick filter (Ctrl+S) is being typed.
     filter_edit: Option<usize>,
     drag: Option<Drag>,
+    /// Selecting by dragging outside the name column.
+    sweep: Option<Sweep>,
+    /// Height of each side's list as last drawn (sweep auto-scroll).
+    list_h: [std::cell::Cell<f32>; 2],
     /// Files dropped in from other apps, waiting for the drop position.
     dropped: Vec<PathBuf>,
     /// Was an outside drag held with the right button? Read during hover: by
@@ -312,6 +316,8 @@ struct PendingNav {
 /// loading and finishing in the background. Local folders list well within
 /// this, so keys typed right after Enter still apply to the new folder.
 const SYNC_LISTING_WAIT: Duration = Duration::from_millis(150);
+/// Auto-scroll step interval while a selecting drag is past the list's edge.
+const SWEEP_TICK: Duration = Duration::from_millis(60);
 /// How long a failed icon read waits before it is tried again.
 const ICON_RETRY: Duration = Duration::from_millis(500);
 /// Reads of one icon before it is shown as missing for good.
@@ -476,6 +482,31 @@ struct Drag {
     index: usize,
 }
 
+/// Left drag that started outside the name column (Total Commander): the
+/// rows it passes over are selected, or deselected when it started on a
+/// selected row with Ctrl held.
+struct Sweep {
+    side: usize,
+    /// Row the press was on.
+    start: usize,
+    /// Selection before the sweep; the swept rows are applied on top of it.
+    base: HashSet<String>,
+    select: bool,
+    /// Applied yet: a plain press only moves the cursor until the mouse
+    /// reaches another row.
+    applied: bool,
+    /// Window y of the list's top, once the mouse moved over the list.
+    top: Option<f32>,
+    /// Mouse y within the list from the list's own move event, turned into
+    /// `top` by the window's move event for the same motion.
+    local_y: Option<f32>,
+    /// How far the mouse is above (< 0) or below (> 0) the list: the list
+    /// scrolls by itself while it isn't 0.
+    edge: f32,
+    /// A `Message::SweepTick` is on its way.
+    ticking: bool,
+}
+
 struct RunningJob {
     id: u64,
     title: String,
@@ -505,6 +536,12 @@ pub enum Message {
     Run(Command),
     Click(usize, usize),
     MiddleClick(usize, usize),
+    /// Left press on a row outside its name: starts a [`Sweep`].
+    SweepPress(usize, usize),
+    /// The mouse moved over a side's list during a sweep: its y in the list.
+    SweepMove(usize, f32),
+    /// Auto-scroll step of a sweep past the list's top or bottom.
+    SweepTick,
     RightPress(usize, usize),
     RightClickBackground(usize),
     ClickBackground(usize),
@@ -718,6 +755,8 @@ impl App {
             quick_search: None,
             filter_edit: None,
             drag: None,
+            sweep: None,
+            list_h: Default::default(),
             dropped: Vec::new(),
             drop_right: false,
             mouse: Point::ORIGIN,
@@ -849,6 +888,7 @@ impl App {
         // be starting or in progress, or the viewer shows a document (mouse
         // selection).
         if self.drag.is_some()
+            || self.sweep.is_some()
             || self.split_drag
             || self.column_drag.is_some()
             || self.viewer_tracks_mouse()
@@ -989,6 +1029,13 @@ impl App {
                 }
                 self.last_click = Some((side, index, now));
             }
+            Message::SweepPress(side, index) => return self.sweep_press(side, index),
+            Message::SweepMove(side, y) => {
+                if let Some(sweep) = self.sweep.as_mut().filter(|s| s.side == side) {
+                    sweep.local_y = Some(y);
+                }
+            }
+            Message::SweepTick => return self.sweep_tick(),
             Message::MiddleClick(side, index) => {
                 self.leave_edits();
                 let entry = self.panel(side).entries.get(index);
@@ -1097,7 +1144,10 @@ impl App {
                 }
                 Err(e) => self.error(e),
             },
-            Message::Hover(side, index) => self.hover = Some((side, index)),
+            Message::Hover(side, index) => {
+                self.hover = Some((side, index));
+                self.sweep_to(side, index);
+            }
             Message::HoverEnd(side) => {
                 if self.hover.is_some_and(|(s, _)| s == side) {
                     self.hover = None;
@@ -1118,7 +1168,8 @@ impl App {
                 self.column_dragged(position.x);
                 self.tree_mouse_moved();
                 let pan = self.viewer_mouse_moved();
-                return Task::batch([pan, self.update_drag()]);
+                let sweep = self.sweep_moved(position);
+                return Task::batch([pan, self.update_drag(), sweep]);
             }
             Message::SplitPress => {
                 let now = Instant::now();
@@ -1144,6 +1195,9 @@ impl App {
                 }
             }
             Message::MouseUp(right) => {
+                if !right {
+                    self.sweep = None;
+                }
                 if std::mem::take(&mut self.split_drag) && self.split_ghost.take().is_some() {
                     self.drag_split_to(self.mouse.x);
                     self.sync_grids();
@@ -1573,6 +1627,7 @@ impl App {
         ("Ctrl+click", "Select / unselect one item"),
         ("Shift+click", "Select the range from the last clicked item to this one"),
         ("Ctrl+Shift+click", "Add that range to the selection"),
+        ("Drag outside the name (size, date, ...)", "Select the rows passed over; with Ctrl add to the selection, or unselect when started on a selected row"),
         ("Shift+Up/Down/PgUp/PgDn/Home/End", "Move and select the range from the cursor's starting point"),
         ("Thumbnail view (Ctrl+Shift+F5)", "Arrows move in the grid (Shift+arrows select), PgUp/PgDn by a screen; Enter, Space/Ins, quick search, clicks and dragging work as in the list. Picture size: thumbnail_size in config.toml"),
         ("Middle-click a folder or drive", "Open it in a new tab"),
@@ -2816,6 +2871,118 @@ impl App {
             _ => self.drag = None, // e.g. dragging ".."
         }
         Task::none()
+    }
+
+    /// Left press outside a row's name. Shift picks a range as on the name;
+    /// otherwise the drag that follows selects the rows it passes over
+    /// (with Ctrl: on top of the selection, deselecting if the row was
+    /// selected). A plain click moves the cursor; a double click opens.
+    fn sweep_press(&mut self, side: usize, index: usize) -> Task<Message> {
+        let (ctrl, shift) = (self.modifiers.control(), self.modifiers.shift());
+        if shift {
+            return self.handle(Message::Click(side, index));
+        }
+        self.leave_edits();
+        self.focus_panel(side);
+        self.drag = None;
+        let panel = self.panel_mut(side);
+        let Some(entry) = panel.entries.get(index) else { return Task::none() };
+        let select = !(ctrl && !entry.is_parent() && panel.is_selected(entry));
+        let base = if ctrl { panel.selection().clone() } else { HashSet::new() };
+        if ctrl {
+            panel.sweep_to(index, index, &base, select);
+        } else {
+            panel.deselect_all();
+            panel.set_cursor(index);
+        }
+        panel.mark_anchor();
+        self.sweep =
+            Some(Sweep { side, start: index, base, select, applied: ctrl, top: None, local_y: None, edge: 0.0, ticking: false });
+        if ctrl {
+            self.last_click = None;
+            return Task::none();
+        }
+        let now = Instant::now();
+        if matches!(self.last_click, Some((s, i, t)) if s == side && i == index && now - t < DOUBLE_CLICK) {
+            self.last_click = None;
+            self.sweep = None;
+            return self.run(Command::Open);
+        }
+        self.last_click = Some((side, index, now));
+        Task::none()
+    }
+
+    /// The mouse entered row `index` of `side` during a sweep.
+    fn sweep_to(&mut self, side: usize, index: usize) {
+        let Some(mut sweep) = self.sweep.take() else { return };
+        if sweep.side == side && (sweep.applied || index != sweep.start) {
+            sweep.applied = true;
+            self.last_click = None;
+            self.panel_mut(side).sweep_to(sweep.start, index, &sweep.base, sweep.select);
+        }
+        self.sweep = Some(sweep);
+    }
+
+    /// Window mouse move during a sweep: inside the list it sweeps to the
+    /// row under the mouse (rows are recycled while scrolling, so their own
+    /// enter events miss some); above or below it, auto-scroll starts.
+    fn sweep_moved(&mut self, position: Point) -> Task<Message> {
+        let Some(sweep) = self.sweep.as_mut() else { return Task::none() };
+        if let Some(y) = sweep.local_y.take() {
+            sweep.top = Some(position.y - y);
+        }
+        let (side, Some(top)) = (sweep.side, sweep.top) else { return Task::none() };
+        let bottom = top + self.list_h[side].get();
+        sweep.edge = if position.y < top {
+            position.y - top
+        } else if position.y >= bottom {
+            position.y - bottom + 1.0
+        } else {
+            0.0
+        };
+        if sweep.edge != 0.0 {
+            return self.sweep_schedule();
+        }
+        let (rows, row_h) = (self.page_rows(), self.row_h());
+        let panel = self.panel(side);
+        if panel.thumbnails || panel.entries.is_empty() {
+            return Task::none();
+        }
+        let start = panel.view_start(rows);
+        let last = (start + rows).min(panel.entries.len()) - 1;
+        let index = (start + ((position.y - top) / row_h) as usize).min(last);
+        self.sweep_to(side, index);
+        Task::none()
+    }
+
+    /// Schedules the next auto-scroll step unless one is on its way.
+    fn sweep_schedule(&mut self) -> Task<Message> {
+        match self.sweep.as_mut() {
+            Some(sweep) if sweep.edge != 0.0 && !sweep.ticking => {
+                sweep.ticking = true;
+                delayed(SWEEP_TICK, Message::SweepTick)
+            }
+            _ => Task::none(),
+        }
+    }
+
+    /// Auto-scroll step: sweeps one row further (more the farther the mouse
+    /// is past the edge) and keeps the cursor in view.
+    fn sweep_tick(&mut self) -> Task<Message> {
+        let Some(sweep) = self.sweep.as_mut() else { return Task::none() };
+        sweep.ticking = false;
+        let (side, edge) = (sweep.side, sweep.edge);
+        if edge == 0.0 {
+            return Task::none();
+        }
+        let step = ((edge.abs() / self.row_h()) as usize + 1).min(10);
+        let panel = self.panel(side);
+        let Some(last) = panel.entries.len().checked_sub(1) else { return Task::none() };
+        let index = if edge < 0.0 { panel.cursor.saturating_sub(step) } else { (panel.cursor + step).min(last) };
+        self.sweep_to(side, index);
+        let rows = self.page_rows();
+        self.panel_mut(side).ensure_visible(rows);
+        self.sweep_schedule()
     }
 
     fn finish_drag(&mut self, right: bool) -> Task<Message> {

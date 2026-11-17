@@ -647,6 +647,9 @@ impl App {
         if self.dragging() {
             area = area.on_exit(Message::HoverEnd(side));
         }
+        if self.sweep.is_some() {
+            area = area.on_move(move |p| Message::SweepMove(side, p.y));
+        }
         area.into()
     }
 
@@ -655,6 +658,7 @@ impl App {
         let panel = self.panel(side);
         let row_h = self.row_h();
         responsive(move |size| {
+            self.list_h[side].set(size.height);
             let rows = ((size.height / row_h).floor() as usize).max(1);
             let len = panel.entries.len();
             let start = panel.view_start(rows);
@@ -723,9 +727,11 @@ impl App {
 
         // While renaming, the name and extension columns become one input.
         let renaming = self.rename.as_ref().filter(|r| r.side == side && r.src == entry.path);
-        let mut content = Row::new().push(icon);
-        content = match renaming {
-            Some(r) => content.push(SelectRange::new(
+        // Icon, name and extension: a press there clicks (and can drag the
+        // files); elsewhere on the row it starts a selecting sweep.
+        let name = Row::new().push(icon);
+        let name = match renaming {
+            Some(r) => name.push(SelectRange::new(
                 text_input("", &r.text)
                     .id(rename_input_id())
                     .on_input(Message::RenameInput)
@@ -738,11 +744,14 @@ impl App {
                 r.select,
                 r.selection(),
             )),
-            None if cols.ext => content
+            None if cols.ext => name
                 .push(cell(fit_stem(stem), Length::Fill))
                 .push(cell(ext.to_string(), Length::Fixed(widths[0]))),
-            None => content.push(cell(elide_middle(&entry.name, name_chars), Length::Fill)),
+            None => name.push(cell(elide_middle(&entry.name, name_chars), Length::Fill)),
         };
+        let name = mouse_area(name.spacing(10).width(Length::Fill).align_y(Alignment::Center))
+            .on_press(Message::Click(side, index));
+        let mut content = Row::new().push(name);
         // Git status letter; every row of a work tree folder reserves the room.
         if let Some(view) = self.git[side].marks_for(&panel.path).filter(|v| v.branch.is_some()) {
             content = content.push(match view.marks.get(entry.name.as_str()) {
@@ -790,12 +799,12 @@ impl App {
                 .clip(true)
                 .style(filled(background)),
         )
-        .on_press(Message::Click(side, index))
+        .on_press(Message::SweepPress(side, index))
         .on_middle_press(Message::MiddleClick(side, index))
         .on_right_press(Message::RightPress(side, index));
-        // Hover only matters for drop targets; skipping it otherwise avoids
-        // a re-render every time the mouse crosses a row.
-        if self.dragging() {
+        // Hover only matters for drop targets and sweeps; skipping it
+        // otherwise avoids a re-render every time the mouse crosses a row.
+        if self.dragging() || self.sweep.is_some() {
             area = area.on_enter(Message::Hover(side, index));
         }
         area.into()
