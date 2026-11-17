@@ -14,6 +14,8 @@ use rc_platform::net_discover::{self, Host};
 pub enum NetMsg {
     /// The button of `side` (after the drive buttons) was clicked.
     Open(usize),
+    /// The button of `side` was middle-clicked: the list in a new tab.
+    OpenTab(usize),
     /// Search `gen` found a computer.
     Found(u64, Host),
     /// Search `gen` ended (or was cancelled).
@@ -154,6 +156,12 @@ impl App {
     pub(super) fn net_update(&mut self, msg: NetMsg) -> Task<Message> {
         match msg {
             NetMsg::Open(side) => return self.open_network(side),
+            NetMsg::OpenTab(side) => {
+                self.leave_edits();
+                let tab = self.open_tab(side, vfs::network_path(), false);
+                let search = if self.net.searching() { Task::none() } else { self.start_net_search() };
+                return Task::batch([tab, search]);
+            }
             NetMsg::Found(gen, host) => {
                 if gen == self.net.gen && self.net.add(host) {
                     self.net_relist();

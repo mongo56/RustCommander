@@ -404,10 +404,13 @@ impl App {
     fn network_button(&self, side: usize) -> Element<'_, Message> {
         let current = rc_core::vfs::is_net_listing(&self.panel(side).path);
         let globe = image(super::network::globe_icon()).width(ICON).height(ICON);
-        let button = button(globe)
-            .on_press(Message::Net(super::network::NetMsg::Open(side)))
-            .padding([2, 6])
-            .style(theme::drive(current));
+        let button = mouse_area(
+            button(globe)
+                .on_press(Message::Net(super::network::NetMsg::Open(side)))
+                .padding([2, 6])
+                .style(theme::drive(current)),
+        )
+        .on_middle_press(Message::Net(super::network::NetMsg::OpenTab(side)));
         tooltip(
             button,
             container(text("Network").size(12)).padding([3, 8]).style(theme::drag_label),

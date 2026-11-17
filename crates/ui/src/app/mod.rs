@@ -1630,7 +1630,7 @@ impl App {
         ("Drag outside the name (size, date, ...)", "Select the rows passed over; with Ctrl add to the selection, or unselect when started on a selected row"),
         ("Shift+Up/Down/PgUp/PgDn/Home/End", "Move and select the range from the cursor's starting point"),
         ("Thumbnail view (Ctrl+Shift+F5)", "Arrows move in the grid (Shift+arrows select), PgUp/PgDn by a screen; Enter, Space/Ins, quick search, clicks and dragging work as in the list. Picture size: thumbnail_size in config.toml"),
-        ("Middle-click a folder or drive", "Open it in a new tab"),
+        ("Middle-click a folder, drive or the Network button", "Open it in a new tab"),
         ("Right-click a drive", "Windows menu for the drive"),
         ("Enter on a .iso, .img, .vhd, .vhdx", "Mount the disk image (Windows' Mount) and open the new drive"),
         ("Enter / Ctrl+PgDn on a .zip, .7z, .rar, .tar, .tar.gz, .gz, ...", "Browse the archive like a folder: view, copy out, Enter opens a temp copy; in a zip, 7z, tar or gz also copy/move in (also from other archives), F7, F2, F8 (rar is read-only)"),
