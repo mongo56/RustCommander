@@ -334,6 +334,8 @@ pub enum DuMsg {
     GoTo,
     Rescan,
     Close,
+    /// Treemap PNG written (the path) or failed (the message).
+    Exported(Result<PathBuf, String>),
 }
 
 pub(super) struct DiskUsage {
@@ -795,6 +797,41 @@ impl App {
         d.hover = None;
     }
 
+    /// Renders the map as shown (zoomed folder, measure, colours, extension highlight) into a PNG in the
+    /// other panel's folder, on a worker thread.
+    fn du_export(&mut self) -> Task<Message> {
+        let other = self.screen.disk_usage_mut().map_or(0, |d| 1 - d.side.min(1));
+        let other_path = self.panel(other).path.clone();
+        let Some(d) = self.screen.disk_usage_mut() else { return Task::none() };
+        let Some(s) = &d.scanned else { return Task::none() };
+        let (tree, zoom, ext_colors, ext_sel) = (s.tree.clone(), s.zoom, s.ext_colors.clone(), d.ext_sel);
+        let root = d.root.clone();
+        d.note = Some(("Saving the map\u{2026}".to_owned(), Tone::Info));
+        let dir = if other_path.is_dir() { other_path } else { root.clone() };
+        let bg = color_rgba(theme::c().panel);
+        Task::perform(
+            async move {
+                let (tx, rx) = iced::futures::channel::oneshot::channel();
+                std::thread::spawn(move || {
+                    let zoom = if (zoom as usize) < tree.nodes.len() { zoom } else { ROOT };
+                    let name = if zoom == ROOT {
+                        root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+                    } else {
+                        tree.node(zoom).name.to_string()
+                    };
+                    let mut tiles = Vec::new();
+                    let rect = Rect::new(0.0, 0.0, EXPORT_W as f32, EXPORT_H as f32);
+                    treemap::layout(&tree, zoom, rect, MAP_MIN_PX, &mut tiles);
+                    let paints = map_paints(&tree, &tiles, &ext_colors, ext_sel, bg);
+                    let pixels = rasterize(&paints, EXPORT_W, EXPORT_H, bg);
+                    let _ = tx.send(export_png(&dir, &name, &pixels));
+                });
+                rx.await.unwrap_or_else(|_| Err("the export stopped".to_owned()))
+            },
+            |r| Message::DiskUsage(DuMsg::Exported(r)),
+        )
+    }
+
     fn du_toggle_measure(&mut self) {
         self.next_listing += 1;
         let gen = self.next_listing;
@@ -910,6 +947,12 @@ impl App {
             DuMsg::GoTo => return self.du_go_to(),
             DuMsg::Measure => self.du_toggle_measure(),
             DuMsg::Rescan => return self.start_disk_usage(),
+            DuMsg::Exported(result) => {
+                d.note = Some(match result {
+                    Ok(path) => (format!("Saved {}", path.display()), Tone::Info),
+                    Err(e) => (format!("Couldn't save the map: {e}"), Tone::Error),
+                });
+            }
             DuMsg::Close => self.close_disk_usage(),
         }
         Task::none()
@@ -932,6 +975,7 @@ impl App {
         ("Shift+F10, Menu key, right click", "Shell context menu of the item (list row or map tile)"),
         ("Z", "Map: show only the folder under the cursor (a file: its folder)"),
         ("S", "Switch between size and size on disk (compressed, sparse and online-only files, cluster rounding)"),
+        ("E", "Save the map as a PNG (1920x1080) in the other panel's folder"),
         ("Backspace", "Map: one folder level out"),
         ("Shift+Z", "Map: the whole tree again"),
         ("Click on an extension", "Highlight its files on the map (click again: clear)"),
@@ -1005,6 +1049,7 @@ impl App {
                     "+" => self.du_outline(|o, t, c| o.right(t, c, false)),
                     "-" => self.du_outline(|o, _, c| o.left(c, false)),
                     "s" | "S" => self.du_toggle_measure(),
+                    "e" | "E" => return self.du_export(),
                     "z" | "Z" if mods.shift() => self.du_zoom(|_, _, _| ROOT),
                     "z" | "Z" => self.du_zoom(|t, n, _| zoom_in_target(t, n)),
                     _ => {}
@@ -1212,6 +1257,7 @@ impl App {
             (&["Shift+F10"], "menu"),
             (&["Z"], "zoom map"),
             (&["S"], "size on disk"),
+            (&["E"], "map to PNG"),
             (&["Tab"], "extensions"),
             (&["Ctrl+\u{2191}\u{2193}"], "resize"),
             (&["F5"], "scan again"),
@@ -1418,6 +1464,112 @@ fn ext_colors(exts: &[(Box<str>, u64, u32)], bytes: &[u64]) -> Vec<u8> {
         colors[i] = k as u8;
     }
     colors
+}
+
+const EXPORT_W: u32 = 1920;
+const EXPORT_H: u32 = 1080;
+
+/// One rectangle to paint, in pixels, with opaque colours.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Paint {
+    rect: Rect,
+    fill: [u8; 4],
+    /// `None`: no border (tiles under 3 px).
+    border: Option<[u8; 4]>,
+}
+
+fn color_rgba(c: Color) -> [u8; 4] {
+    let b = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    [b(c.r), b(c.g), b(c.b), 255]
+}
+
+/// `fg` over opaque `bg` with `alpha` (0..=1).
+fn blend(fg: [u8; 4], bg: [u8; 4], alpha: f32) -> [u8; 4] {
+    let m = |f: u8, b: u8| (f as f32 * alpha + b as f32 * (1.0 - alpha)).round() as u8;
+    [m(fg[0], bg[0]), m(fg[1], bg[1]), m(fg[2], bg[2]), 255]
+}
+
+/// The map's tiles with the colours the on-screen widget gives them (dimmed when another extension is
+/// highlighted).
+fn map_paints(tree: &Tree, tiles: &[Tile], ext_colors: &[u8], ext_sel: Option<u16>, bg: [u8; 4]) -> Vec<Paint> {
+    let fills = MAP_FILLS.map(|hex| {
+        let c = color_rgba(hex_color(hex));
+        (c, [(c[0] as f32 * 0.6) as u8, (c[1] as f32 * 0.6) as u8, (c[2] as f32 * 0.6) as u8, 255])
+    });
+    tiles
+        .iter()
+        .map(|t| {
+            let ext = tree.node(t.node).ext_id;
+            let (mut fill, mut border) = fills[color_slot(ext_colors, ext)];
+            if ext_sel.is_some_and(|e| e != ext) {
+                fill = blend(fill, bg, 0.15);
+                border = blend(border, bg, 0.15);
+            }
+            let bordered = t.rect.w >= 3.0 && t.rect.h >= 3.0;
+            Paint { rect: t.rect, fill, border: bordered.then_some(border) }
+        })
+        .collect()
+}
+
+/// RGBA pixels (`w` x `h`): `bg`, then each rectangle (edges rounded to whole pixels, so neighbours don't
+/// overlap) filled, with a 1 px border inside its edge.
+fn rasterize(paints: &[Paint], w: u32, h: u32, bg: [u8; 4]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(w as usize * h as usize * 4);
+    for _ in 0..w as usize * h as usize {
+        buf.extend_from_slice(&bg);
+    }
+    let edge = |v: f32, max: u32| (v.round().max(0.0) as u32).min(max);
+    for p in paints {
+        let (x0, x1) = (edge(p.rect.x, w), edge(p.rect.x + p.rect.w, w));
+        let (y0, y1) = (edge(p.rect.y, h), edge(p.rect.y + p.rect.h, h));
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let on_edge = x == x0 || x == x1 - 1 || y == y0 || y == y1 - 1;
+                let c = match p.border {
+                    Some(b) if on_edge => b,
+                    _ => p.fill,
+                };
+                let i = (y as usize * w as usize + x as usize) * 4;
+                buf[i..i + 4].copy_from_slice(&c);
+            }
+        }
+    }
+    buf
+}
+
+fn encode_png(pixels: &[u8], w: u32, h: u32) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    let mut encoder = png::Encoder::new(&mut out, w, h);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().map_err(|e| e.to_string())?;
+    writer.write_image_data(pixels).map_err(|e| e.to_string())?;
+    writer.finish().map_err(|e| e.to_string())?;
+    Ok(out)
+}
+
+/// Writes `treemap-<name>-<yyyymmdd-hhmmss>.png` into `dir` (never over an existing file).
+fn export_png(dir: &Path, name: &str, pixels: &[u8]) -> Result<PathBuf, String> {
+    use std::io::Write;
+    let data = encode_png(pixels, EXPORT_W, EXPORT_H)?;
+    let name: String = name.chars().map(|c| if "<>:\"/\\|?*".contains(c) || c.is_control() { '_' } else { c }).collect();
+    let name = if name.trim().is_empty() { "map" } else { name.trim() };
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    for n in 0..100 {
+        let suffix = if n == 0 { String::new() } else { format!("-{n}") };
+        let path = dir.join(format!("treemap-{name}-{stamp}{suffix}.png"));
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut f) => {
+                return f.write_all(&data).and_then(|_| f.flush()).map(|_| path.clone()).map_err(|e| {
+                    let _ = std::fs::remove_file(&path);
+                    e.to_string()
+                });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Err("no free file name".to_owned())
 }
 
 /// When the tiles must be laid out again: another size or another tree.
@@ -1664,6 +1816,50 @@ impl<Renderer: renderer::Renderer> Widget<Message, Theme, Renderer> for Treemap<
 mod tests {
     use super::*;
     use rc_core::disk_usage::{Node, EXT_DIR, EXT_NONE};
+
+    #[test]
+    fn rasterize_fills_borders_and_size() {
+        let (bg, fill, border) = ([1, 2, 3, 255], [200, 100, 50, 255], [120, 60, 30, 255]);
+        let paints = [
+            Paint { rect: Rect::new(0.0, 0.0, 10.0, 8.0), fill, border: Some(border) },
+            Paint { rect: Rect::new(10.0, 0.0, 2.0, 2.0), fill, border: None },
+        ];
+        let buf = rasterize(&paints, 16, 10, bg);
+        assert_eq!(buf.len(), 16 * 10 * 4);
+        let px = |x: usize, y: usize| buf[(y * 16 + x) * 4..(y * 16 + x) * 4 + 4].to_vec();
+        assert_eq!(px(5, 4), fill);
+        assert_eq!(px(0, 4), border);
+        assert_eq!(px(9, 7), border);
+        assert_eq!(px(5, 0), border);
+        assert_eq!(px(1, 1), fill);
+        assert_eq!(px(10, 0), fill, "no border on a tiny tile");
+        assert_eq!(px(12, 0), bg);
+        assert_eq!(px(5, 9), bg);
+    }
+
+    #[test]
+    fn png_round_trips_size() {
+        let pixels = rasterize(&[], 7, 5, [9, 8, 7, 255]);
+        let data = encode_png(&pixels, 7, 5).unwrap();
+        let decoder = png::Decoder::new(std::io::Cursor::new(data));
+        let mut reader = decoder.read_info().unwrap();
+        let mut out = vec![0; reader.output_buffer_size()];
+        let info = reader.next_frame(&mut out).unwrap();
+        assert_eq!((info.width, info.height), (7, 5));
+        assert_eq!(&out[..info.buffer_size()], &pixels[..]);
+    }
+
+    #[test]
+    fn export_never_overwrites() {
+        let dir = std::env::temp_dir().join(format!("rc-treemap-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let px = vec![0u8; (EXPORT_W * EXPORT_H * 4) as usize];
+        let a = export_png(&dir, "a:b", &px).unwrap();
+        let b = export_png(&dir, "a:b", &px).unwrap();
+        assert_ne!(a, b);
+        assert!(a.file_name().unwrap().to_string_lossy().starts_with("treemap-a_b-"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn split_is_clamped_and_portioned() {

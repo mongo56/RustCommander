@@ -10,6 +10,8 @@ rc-core.workspace = true
 rc-platform.workspace = true
 iced.workspace = true
 image = "0.24"
+png = "0.17"
+chrono.workspace = true
 raw-window-handle = "0.6"
 notify = "8"
 serde = { version = "1", features = ["derive"] }

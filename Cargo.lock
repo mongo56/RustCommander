@@ -4652,6 +4652,7 @@ name = "rustcommander"
 version = "0.9.13"
 dependencies = [
  "alacritty_terminal",
+ "chrono",
  "iced",
  "image",
  "notify",
