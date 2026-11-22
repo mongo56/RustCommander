@@ -45,6 +45,14 @@ pub trait Vfs: Send + Sync {
     /// `path` itself and, for a folder, everything under it; a folder comes
     /// before its contents.
     fn walk(&self, path: &Path) -> io::Result<Vec<Entry>>;
+    /// The folder `dir`'s entries without `..`, for going through a tree one
+    /// folder at a time: a link to a folder (FTP) comes as a file of size 0,
+    /// not to be entered (as [`Vfs::walk`] doesn't).
+    fn list_unfollowed(&self, dir: &Path) -> io::Result<Vec<Entry>> {
+        let mut entries = self.list(dir)?;
+        entries.retain(|e| !e.is_parent());
+        Ok(entries)
+    }
     /// Reads the files `files`, calling `each(i, reader)` with the index in
     /// `files` of each one, in whatever order suits the format. `each`
     /// returns `Ok(false)` to stop early.

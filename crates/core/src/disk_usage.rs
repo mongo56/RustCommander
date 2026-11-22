@@ -5,6 +5,8 @@
 //! The tree is a flat [`Vec`] of [`Node`]s linked by `u32` indices (index 0 is
 //! the scanned folder), which keeps memory low enough for millions of files.
 
+use crate::entry::EntryKind;
+use crate::vfs::{self, Vfs};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -373,8 +375,10 @@ impl Tree {
     /// Applies a [`rescan`] of folder `index`: a folder gone from disk is
     /// removed ([`Tree::remove`]) and its parent returned; a scanned one
     /// replaces the old subtree ([`Tree::replace_subtree`]) and its new index
-    /// is returned. `None`: nothing changed (see those two); scan everything
-    /// again then.
+    /// is returned; a file still there ([`Rescan::File`], only for archives
+    /// and servers) stays as it was and its index is returned. `None`:
+    /// nothing changed (see those two, or a folder that became a file); scan
+    /// everything again then.
     pub fn splice(&mut self, index: u32, rescan: Rescan) -> Option<u32> {
         match rescan {
             Rescan::Gone => {
@@ -382,6 +386,9 @@ impl Tree {
                 self.remove(index).then_some(parent)
             }
             Rescan::Tree(sub) => self.replace_subtree(index, sub),
+            Rescan::File => {
+                (self.node(index).kind == NodeKind::File && self.surviving(index) == index).then_some(index)
+            }
         }
     }
 
@@ -514,6 +521,64 @@ struct Scanner {
 }
 
 impl Scanner {
+    /// A scanner holding only the root folder `root`, to be read first.
+    fn new(root: &Path, cluster: u64) -> Self {
+        let tree = Tree {
+            nodes: vec![Node {
+                name: root.to_string_lossy().into(),
+                size: 0,
+                alloc: 0,
+                files: 0,
+                dirs: 0,
+                kind: NodeKind::Dir,
+                ext_id: EXT_DIR,
+                parent: ROOT,
+                children: Vec::new(),
+            }],
+            exts: vec![("".into(), 0, 0), ("*".into(), 0, 0)],
+            ext_alloc: vec![0, 0],
+            ..Tree::default()
+        };
+        Scanner {
+            tree,
+            ext_ids: HashMap::new(),
+            cluster,
+            files: 0,
+            bytes: 0,
+            stack: vec![(ROOT, root.to_path_buf())],
+            ids: Vec::new(),
+            wide: Vec::new(),
+        }
+    }
+
+    /// The finished tree: hard links counted once, folder sizes and counts
+    /// summed up and children sorted.
+    fn finish(mut self) -> Tree {
+        self.count_hard_links_once();
+        let mut tree = self.tree;
+        // Children always come after their parent, so one pass from the end sums
+        // every folder before its own parent sees it.
+        for i in (1..tree.nodes.len()).rev() {
+            let node = &tree.nodes[i];
+            let (size, alloc, parent) = (node.size, node.alloc, node.parent as usize);
+            let (files, dirs) = match node.kind {
+                NodeKind::File => (1, 0),
+                NodeKind::Dir => (node.files, node.dirs + 1),
+            };
+            let p = &mut tree.nodes[parent];
+            p.size += size;
+            p.alloc += alloc;
+            p.files = p.files.saturating_add(files);
+            p.dirs = p.dirs.saturating_add(dirs);
+        }
+        for i in 0..tree.nodes.len() {
+            if tree.nodes[i].children.len() >= 2 {
+                tree.sort_children(i as u32);
+            }
+        }
+        tree
+    }
+
     /// The next node's index, or `None` once the tree is full.
     fn next_index(&self) -> Option<u32> {
         u32::try_from(self.tree.nodes.len()).ok()
@@ -713,11 +778,26 @@ pub enum Rescan {
     /// The folder isn't there (or isn't a folder) any more.
     Gone,
     Tree(Tree),
+    /// A file is there (only from archives and servers: locally a file is
+    /// [`Rescan::Gone`] as a folder).
+    File,
 }
 
 /// Scans folder `path` again (a folder already in a tree, for
 /// [`Tree::splice`]), or tells it is gone. `None` once `cancel` is set.
+/// A path inside an archive or on a server is read through its [`Vfs`]
+/// ([`scan_vfs`]); there `None` also means it couldn't be checked (scan
+/// everything again then).
 pub fn rescan(path: &Path, cancel: &AtomicBool, progress: impl FnMut(Progress)) -> Option<Rescan> {
+    if vfs::in_archive(path) {
+        let vfs = vfs::open(path).ok()?;
+        return match vfs.stat(path) {
+            Ok(None) => Some(Rescan::Gone),
+            Ok(Some(e)) if !e.is_dir() => Some(Rescan::File),
+            Ok(Some(_)) => scan_vfs(path, vfs.as_ref(), cancel, progress).ok()?.map(Rescan::Tree),
+            Err(_) => None,
+        };
+    }
     match fs::symlink_metadata(path) {
         Ok(m) if !m.is_dir() => Some(Rescan::Gone),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(Rescan::Gone),
@@ -740,32 +820,7 @@ pub fn rescan(path: &Path, cancel: &AtomicBool, progress: impl FnMut(Progress)) 
 /// network shares) `std::fs::read_dir` is used and hard links aren't
 /// detected. On Unix only files with a link count above 1 are tracked.
 pub fn scan(root: &Path, cancel: &AtomicBool, mut progress: impl FnMut(Progress)) -> Option<Tree> {
-    let tree = Tree {
-        nodes: vec![Node {
-            name: root.to_string_lossy().into(),
-            size: 0,
-            alloc: 0,
-            files: 0,
-            dirs: 0,
-            kind: NodeKind::Dir,
-            ext_id: EXT_DIR,
-            parent: ROOT,
-            children: Vec::new(),
-        }],
-        exts: vec![("".into(), 0, 0), ("*".into(), 0, 0)],
-        ext_alloc: vec![0, 0],
-        ..Tree::default()
-    };
-    let mut s = Scanner {
-        tree,
-        ext_ids: HashMap::new(),
-        cluster: rc_platform::cluster_size(root),
-        files: 0,
-        bytes: 0,
-        stack: vec![(ROOT, root.to_path_buf())],
-        ids: Vec::new(),
-        wide: Vec::new(),
-    };
+    let mut s = Scanner::new(root, rc_platform::cluster_size(root));
     let mut fast = cfg!(windows);
     let mut volume = None;
     let mut last_report = Instant::now();
@@ -801,34 +856,78 @@ pub fn scan(root: &Path, cancel: &AtomicBool, mut progress: impl FnMut(Progress)
         children.shrink_to_fit();
         s.tree.nodes[dir_index as usize].children = children;
     }
-    s.count_hard_links_once();
-    let mut tree = s.tree;
-    // Children always come after their parent, so one pass from the end sums
-    // every folder before its own parent sees it.
-    for i in (1..tree.nodes.len()).rev() {
-        let node = &tree.nodes[i];
-        let (size, alloc, parent) = (node.size, node.alloc, node.parent as usize);
-        let (files, dirs) = match node.kind {
-            NodeKind::File => (1, 0),
-            NodeKind::Dir => (node.files, node.dirs + 1),
-        };
-        let p = &mut tree.nodes[parent];
-        p.size += size;
-        p.alloc += alloc;
-        p.files = p.files.saturating_add(files);
-        p.dirs = p.dirs.saturating_add(dirs);
-    }
-    for i in 0..tree.nodes.len() {
-        if tree.nodes[i].children.len() >= 2 {
-            tree.sort_children(i as u32);
+    Some(s.finish())
+}
+
+/// [`scan`] of a folder inside an archive (or a whole archive, `root` being
+/// the archive file) or on a server, read through `vfs` (the one serving
+/// `root`) one folder at a time, so `cancel` and `progress` work between
+/// folders. Hidden items count; links to folders on a server (FTP) count as
+/// files and aren't entered ([`Vfs::list_unfollowed`]). A folder below the
+/// root that can't be listed is skipped and counted in [`Tree::errors`];
+/// `Err` when the root itself can't be. Only logical sizes are known:
+/// `alloc` equals `size` everywhere, and there are no hard links.
+pub fn scan_vfs(
+    root: &Path,
+    vfs: &dyn Vfs,
+    cancel: &AtomicBool,
+    mut progress: impl FnMut(Progress),
+) -> std::io::Result<Option<Tree>> {
+    let mut s = Scanner::new(root, 1);
+    let mut last_report = Instant::now();
+    while let Some((dir_index, dir)) = s.stack.pop() {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(None);
         }
+        if last_report.elapsed() >= PROGRESS_EVERY {
+            progress(Progress { files: s.files, bytes: s.bytes, current: dir.clone() });
+            last_report = Instant::now();
+        }
+        let entries = match vfs.list_unfollowed(&dir) {
+            Ok(entries) => entries,
+            Err(e) if dir_index == ROOT => return Err(e),
+            Err(_) => {
+                s.tree.errors += 1;
+                continue;
+            }
+        };
+        let mut children = Vec::with_capacity(entries.len());
+        for e in entries {
+            if s.next_index().is_none() {
+                break;
+            }
+            let name: Box<str> = e.name.into();
+            let index = match e.kind {
+                EntryKind::Parent => continue,
+                EntryKind::Dir => s.add_dir(dir_index, name, e.path),
+                EntryKind::File => s.add_file(dir_index, name, e.size, e.size, None),
+            };
+            children.push(index);
+        }
+        s.tree.nodes[dir_index as usize].children = children;
     }
-    Some(tree)
+    if cancel.load(Ordering::Relaxed) {
+        return Ok(None);
+    }
+    Ok(Some(s.finish()))
+}
+
+/// [`scan`] for a local `root`, [`scan_vfs`] for one inside an archive (or
+/// an archive file) or on a server. `Err`: the archive or server couldn't
+/// be opened, or `root` couldn't be listed there.
+pub fn scan_path(root: &Path, cancel: &AtomicBool, progress: impl FnMut(Progress)) -> std::io::Result<Option<Tree>> {
+    if vfs::in_archive(root) {
+        let vfs = vfs::open(root)?;
+        return scan_vfs(root, vfs.as_ref(), cancel, progress);
+    }
+    Ok(scan(root, cancel, progress))
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
 
     fn temp(name: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!("rc-du-{name}-{}", std::process::id()));
@@ -1283,5 +1382,190 @@ mod tests {
             assert!(tree.surviving(link) == link && tree.surviving(h.counted) == h.counted);
         }
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Every node below `i` as "path size files dirs ext" in child order,
+    /// without the root's name and the allocated size (for comparing trees
+    /// scanned from different places).
+    pub(crate) fn sizes(tree: &Tree) -> Vec<String> {
+        fn walk(tree: &Tree, i: u32, prefix: &str, out: &mut Vec<String>) {
+            let n = tree.node(i);
+            let path = if i == ROOT { String::new() } else { format!("{prefix}/{}", n.name) };
+            out.push(format!("{path} {} {} {} {:?}", n.size, n.files, n.dirs, tree.ext_name(i)));
+            for &c in &n.children {
+                walk(tree, c, &path, out);
+            }
+        }
+        let mut out = Vec::new();
+        walk(tree, ROOT, "", &mut out);
+        out
+    }
+
+    /// The extensions with files: name -> (bytes, files).
+    pub(crate) fn ext_sizes(tree: &Tree) -> Vec<(String, u64, u32)> {
+        let mut v: Vec<_> = tree.exts.iter().filter(|e| e.2 > 0).map(|e| (e.0.to_string(), e.1, e.2)).collect();
+        v.sort();
+        v
+    }
+
+    /// Zips the folder `src` into `zip` with the same names; the folder
+    /// `a/b/deep` gets no entry of its own (implicit, as some zips have).
+    fn zip_folder(src: &Path, zip: &Path) {
+        use std::io::Write;
+        fn add(w: &mut zip::ZipWriter<fs::File>, src: &Path, rel: &str) {
+            let opts = zip::write::SimpleFileOptions::default();
+            let mut items: Vec<_> = fs::read_dir(src.join(rel)).unwrap().map(|e| e.unwrap()).collect();
+            items.sort_by_key(|e| e.file_name());
+            for item in items {
+                let name = item.file_name().to_string_lossy().into_owned();
+                let inner = if rel.is_empty() { name } else { format!("{rel}/{name}") };
+                if item.file_type().unwrap().is_dir() {
+                    if inner != "a/b/deep" {
+                        w.add_directory(format!("{inner}/"), opts).unwrap();
+                    }
+                    add(w, src, &inner);
+                } else {
+                    w.start_file(inner.as_str(), opts).unwrap();
+                    w.write_all(&fs::read(item.path()).unwrap()).unwrap();
+                }
+            }
+        }
+        let mut w = zip::ZipWriter::new(fs::File::create(zip).unwrap());
+        add(&mut w, src, "");
+        w.finish().unwrap();
+    }
+
+    /// [`subtree_fixture`] plus a hidden file, a file without an extension
+    /// and an empty folder, zipped next to it; returns (folder, zip).
+    fn zip_fixture(name: &str) -> (PathBuf, PathBuf) {
+        let dir = subtree_fixture(name);
+        let src = dir.join("src");
+        fs::create_dir_all(&src).unwrap();
+        for item in ["a", "d", "x.txt"] {
+            fs::rename(dir.join(item), src.join(item)).unwrap();
+        }
+        fs::write(src.join(".hidden"), [0u8; 9]).unwrap();
+        fs::write(src.join("a/noext"), [0u8; 11]).unwrap();
+        fs::create_dir_all(src.join("empty")).unwrap();
+        let zip = dir.join("t.zip");
+        zip_folder(&src, &zip);
+        (src, zip)
+    }
+
+    #[test]
+    fn an_archive_scans_like_the_folder_it_was_made_from() {
+        let (src, zip) = zip_fixture("vfs-zip");
+        let no = AtomicBool::new(false);
+        let local = scan(&src, &no, |_| {}).unwrap();
+        let packed = scan_path(&zip, &no, |_| {}).unwrap().unwrap();
+        assert_eq!(packed.errors, 0);
+        assert_eq!(sizes(&packed), sizes(&local));
+        assert_eq!(ext_sizes(&packed), ext_sizes(&local));
+        let r = packed.root();
+        assert_eq!((r.size, r.files, r.dirs), (488, 8, 5));
+        assert!(packed.nodes.iter().all(|n| n.alloc == n.size), "no size on disk inside archives");
+        assert!(packed.hard_links.is_empty());
+        assert_eq!(&*r.name, zip.to_string_lossy());
+        // A folder inside the archive, and paths back from the tree.
+        let a = scan_path(&zip.join("a"), &no, |_| {}).unwrap().unwrap();
+        assert_eq!(sizes(&a), sizes(&scan(&src.join("a"), &no, |_| {}).unwrap()));
+        let deep = packed.locate(&zip, &zip.join("a").join("b").join("deep").join("w.rs"));
+        assert_eq!(packed.node(deep).size, 40);
+        assert_eq!(packed.path(&zip, deep), zip.join("a").join("b").join("deep").join("w.rs"));
+        // Not there: an error, not an empty tree.
+        assert!(scan_path(&zip.join("nope"), &no, |_| {}).is_err());
+        fs::remove_dir_all(src.parent().unwrap()).unwrap();
+    }
+
+    /// A [`Vfs`] over another that counts its listings, fails listing
+    /// folders named "bad" and sets `cancel` after `cancel_after` listings.
+    struct Probe {
+        inner: Arc<dyn Vfs>,
+        lists: AtomicUsize,
+        cancel: Arc<AtomicBool>,
+        cancel_after: usize,
+    }
+
+    impl Vfs for Probe {
+        fn list(&self, dir: &Path) -> std::io::Result<Vec<crate::entry::Entry>> {
+            let n = self.lists.fetch_add(1, Ordering::Relaxed) + 1;
+            if n >= self.cancel_after {
+                self.cancel.store(true, Ordering::Relaxed);
+            }
+            if dir.file_name().is_some_and(|n| n == "bad") {
+                return Err(std::io::Error::other("can't list"));
+            }
+            self.inner.list(dir)
+        }
+        fn walk(&self, path: &Path) -> std::io::Result<Vec<crate::entry::Entry>> {
+            self.inner.walk(path)
+        }
+        fn read_files(
+            &self,
+            files: &[PathBuf],
+            each: &mut dyn FnMut(usize, &mut dyn std::io::Read) -> std::io::Result<bool>,
+        ) -> std::io::Result<()> {
+            self.inner.read_files(files, each)
+        }
+        fn stat(&self, path: &Path) -> std::io::Result<Option<crate::entry::Entry>> {
+            self.inner.stat(path)
+        }
+        fn writable(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn an_archive_scan_stops_between_folders_and_skips_unreadable_ones() {
+        let (src, zip) = zip_fixture("vfs-cancel");
+        let probe = |cancel_after| Probe {
+            inner: vfs::open(&zip).unwrap(),
+            lists: AtomicUsize::new(0),
+            cancel: Arc::new(AtomicBool::new(false)),
+            cancel_after,
+        };
+        let p = probe(2);
+        assert!(scan_vfs(&zip, &p, &p.cancel, |_| {}).unwrap().is_none(), "cancelled");
+        assert_eq!(p.lists.load(Ordering::Relaxed), 2, "no folder listed after the cancel");
+        let p = probe(usize::MAX);
+        assert!(scan_vfs(&zip, &p, &AtomicBool::new(true), |_| {}).unwrap().is_none());
+        assert_eq!(p.lists.load(Ordering::Relaxed), 0);
+        // A folder that can't be listed is counted and left empty; the rest is there.
+        drop(p);
+        fs::create_dir_all(src.join("a/bad")).unwrap();
+        fs::write(src.join("a/bad/f.txt"), [0u8; 4]).unwrap();
+        let zip2 = src.parent().unwrap().join("t2.zip");
+        zip_folder(&src, &zip2);
+        let p = Probe { inner: vfs::open(&zip2).unwrap(), ..probe(usize::MAX) };
+        let tree = scan_vfs(&zip2, &p, &AtomicBool::new(false), |_| {}).unwrap().unwrap();
+        assert_eq!(tree.errors, 1);
+        let bad = tree.locate(&zip2, &zip2.join("a").join("bad"));
+        assert_eq!((tree.node(bad).name.as_ref(), tree.node(bad).size), ("bad", 0));
+        assert_eq!(tree.root().size, 488);
+        // The root itself: an error.
+        let bad_root = zip2.join("a").join("bad");
+        assert!(scan_vfs(&bad_root, &p, &AtomicBool::new(false), |_| {}).is_err());
+        fs::remove_dir_all(src.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn rescanning_inside_an_archive_tells_folders_files_and_gone() {
+        let (src, zip) = zip_fixture("vfs-rescan");
+        let no = AtomicBool::new(false);
+        let mut tree = scan_path(&zip, &no, |_| {}).unwrap().unwrap();
+        let fresh = tree.clone();
+        let ai = tree.locate(&zip, &zip.join("a"));
+        let Some(Rescan::Tree(sub)) = rescan(&zip.join("a"), &no, |_| {}) else { panic!("a folder") };
+        let ai = tree.splice(ai, Rescan::Tree(sub)).unwrap();
+        assert_eq!(sizes(&tree), sizes(&fresh));
+        let xi = tree.locate(&zip, &zip.join("x.txt"));
+        assert!(matches!(rescan(&zip.join("x.txt"), &no, |_| {}), Some(Rescan::File)));
+        assert_eq!(tree.splice(xi, Rescan::File), Some(xi), "a file still there stays");
+        assert!(tree.splice(ai, Rescan::File).is_none(), "a folder that became a file: scan again");
+        assert!(matches!(rescan(&zip.join("gone"), &no, |_| {}), Some(Rescan::Gone)));
+        assert_eq!(tree.splice(xi, Rescan::Gone), Some(ROOT));
+        assert_eq!(tree.root().size, 488 - 100);
+        assert!(rescan(&zip.join("a"), &AtomicBool::new(true), |_| {}).is_none(), "cancelled");
+        fs::remove_dir_all(src.parent().unwrap()).unwrap();
     }
 }

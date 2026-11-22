@@ -640,6 +640,22 @@ impl Vfs for Connection {
         Ok(entries)
     }
 
+    fn list_unfollowed(&self, dir: &Path) -> io::Result<Vec<Entry>> {
+        let dir = self.remote(dir)?;
+        let items = self.with(|s| s.list(&dir))?;
+        Ok(items
+            .into_iter()
+            .map(|item| {
+                let link = item.link;
+                let mut e = self.entry(&dir, item);
+                if link && e.kind == EntryKind::Dir {
+                    e.kind = EntryKind::File;
+                }
+                e
+            })
+            .collect())
+    }
+
     fn walk(&self, path: &Path) -> io::Result<Vec<Entry>> {
         let first = self.stat(path)?.ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, format!("Not found: {}", display(path)))

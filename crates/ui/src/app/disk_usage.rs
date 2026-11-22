@@ -10,6 +10,13 @@
 //! click or Shift+F10 shows the shell menu. Closing keeps the tree, so
 //! reopening the same folder is instant (F5 scans again). Files are never
 //! opened from here.
+//!
+//! A folder inside an archive, a whole archive (the cursor on one) or a
+//! folder on a server is scanned through its `Vfs` (`disk_usage::scan_path`):
+//! sizes are logical only (no size on disk, S says so), there is no shell
+//! menu, and deletes go through the same job as the panels' (a folder whose
+//! delete didn't finish, or anything whose state isn't clear, is checked
+//! again on a worker, never on the UI thread).
 
 use super::*;
 use crate::theme::filled;
@@ -294,6 +301,7 @@ impl std::fmt::Debug for RescanBox {
         match &*self.0 {
             disk_usage::Rescan::Gone => write!(f, "Gone"),
             disk_usage::Rescan::Tree(t) => write!(f, "Tree({} nodes)", t.nodes.len()),
+            disk_usage::Rescan::File => write!(f, "File"),
         }
     }
 }
@@ -303,6 +311,9 @@ pub enum DuEvent {
     Progress(disk_usage::Progress),
     /// `None`: cancelled.
     Done(Option<TreeBox>, Duration),
+    /// The archive or server couldn't be opened, or the scanned folder
+    /// couldn't be listed there.
+    Failed(String),
     /// A folder scanned again (`DiskUsage::rescanning`); `None`: cancelled.
     Rescanned(Option<RescanBox>),
 }
@@ -370,6 +381,10 @@ pub(super) struct DiskUsage {
     /// Message in the footer (the panels' status bar isn't shown here),
     /// until the next key.
     note: Option<(String, Tone)>,
+    /// Why the last scan of an archive or server folder failed.
+    failed: Option<String>,
+    /// `root` is inside an archive (or is one) or on a server.
+    in_vfs: bool,
 }
 
 /// See `DiskUsage::rescanning`.
@@ -382,6 +397,12 @@ struct Rescanning {
 }
 
 impl DiskUsage {
+    /// The tree is inside an archive (or is one) or on a server: read
+    /// through a `Vfs`, without sizes on disk or a shell menu.
+    fn is_virtual(&self) -> bool {
+        self.in_vfs
+    }
+
     /// The cursor is the tree row and the chosen extension. A note stays while a scan runs ("… scanning
     /// again").
     pub(super) fn note_state(&mut self) -> NoteState<'_> {
@@ -473,18 +494,24 @@ impl App {
         let side = self.active;
         self.leave_edits();
         let panel = self.panel(side);
+        // An archive under the cursor is scanned like a folder when the panel
+        // could enter it (not one on a server).
         let root = match panel.current() {
             Some(e) if e.kind == EntryKind::Dir => e.path.clone(),
+            Some(e) if e.kind == EntryKind::File && vfs::is_archive_name(&e.name) && !remote::is_remote(&e.path) => {
+                e.path.clone()
+            }
             _ => panel.path.clone(),
         };
-        if remote::is_remote(&root) || vfs::in_archive(&root) || vfs::is_virtual(&root) {
-            self.info("Disk usage works on local folders only");
+        if vfs::is_net_listing(&root) {
+            self.info("Disk usage scans a folder or a share, not the network list");
             return Task::none();
         }
         let last = self.disk_usage_last.take().filter(|d| d.root == root && d.scanned.is_some());
         let reuse = last.is_some();
-        let mut du = last.unwrap_or(DiskUsage {
+        let mut du = last.unwrap_or_else(|| DiskUsage {
             side,
+            in_vfs: vfs::in_archive(&root),
             root,
             scanned: None,
             running: None,
@@ -502,10 +529,14 @@ impl App {
             deleting: None,
             rescanning: None,
             note: None,
+            failed: None,
         });
         du.hover = None;
         du.note = None;
         du.side = side;
+        if du.is_virtual() {
+            du.measure = Measure::Size;
+        }
         self.screen = Some(Screen::DiskUsage(Box::new(du)));
         if reuse { Task::none() } else { self.start_disk_usage() }
     }
@@ -539,14 +570,19 @@ impl App {
         d.delete_ask = None;
         d.deleting = None;
         d.rescanning = None;
+        d.failed = None;
         let root = d.root.clone();
         let (tx, rx) = iced::futures::channel::mpsc::unbounded();
         std::thread::spawn(move || {
             let start = Instant::now();
-            let tree = disk_usage::scan(&root, &cancel, |p| {
+            let scanned = disk_usage::scan_path(&root, &cancel, |p| {
                 let _ = tx.unbounded_send(DuEvent::Progress(p));
             });
-            let _ = tx.unbounded_send(DuEvent::Done(tree.map(|t| TreeBox(Arc::new(t))), start.elapsed()));
+            let event = match scanned {
+                Ok(tree) => DuEvent::Done(tree.map(|t| TreeBox(Arc::new(t))), start.elapsed()),
+                Err(e) => DuEvent::Failed(e.to_string()),
+            };
+            let _ = tx.unbounded_send(event);
         });
         Task::run(rx, move |e| Message::DiskUsage(DuMsg::Event(seq, e)))
     }
@@ -653,6 +689,18 @@ impl App {
         };
         let Some(d) = d else { return Task::none() };
         let Some((_, seq, node, path)) = d.deleting.take() else { return Task::none() };
+        if d.is_virtual() {
+            // Whether it's gone is asked on a worker (a server is slow, an
+            // archive is read again); `du_rescanned` applies the answer.
+            return match (in_screen, seq == d.seq) {
+                (true, true) => self.du_start_rescan(node, path, summary),
+                (true, false) => self.du_scan_again(summary),
+                (false, _) => {
+                    self.disk_usage_last = None;
+                    Task::none()
+                }
+            };
+        }
         let gone = std::fs::symlink_metadata(&path).is_err();
         let removed = gone && seq == d.seq && d.scanned.as_mut().is_some_and(|s| s.remove(node, gen));
         if removed {
@@ -680,20 +728,26 @@ impl App {
         {
             self.du_start_rescan(node, path, summary)
         } else if in_screen {
-            let task = self.start_disk_usage();
-            if let Some(d) = self.screen.disk_usage_mut() {
-                let what = summary.map_or(String::new(), |(t, _)| format!("{t} \u{b7} "));
-                d.note = Some((format!("{what}scanning again"), Tone::Info));
-            }
-            task
+            self.du_scan_again(summary)
         } else {
             self.disk_usage_last = None;
             Task::none()
         }
     }
 
+    /// Scans the whole tree again after a delete, with its summary in the footer.
+    fn du_scan_again(&mut self, summary: Option<(String, Tone)>) -> Task<Message> {
+        let task = self.start_disk_usage();
+        if let Some(d) = self.screen.disk_usage_mut() {
+            let what = summary.map_or(String::new(), |(t, _)| format!("{t} \u{b7} "));
+            d.note = Some((format!("{what}scanning again"), Tone::Info));
+        }
+        task
+    }
+
     /// Scans folder `node` (at `path`) again on a worker, keeping the tree on
-    /// screen; `du_rescanned` puts the result in.
+    /// screen; `du_rescanned` puts the result in. Inside an archive or on a
+    /// server `node` may also be a file (kept if it's still there).
     fn du_start_rescan(&mut self, node: u32, path: PathBuf, summary: Option<(String, Tone)>) -> Task<Message> {
         self.next_listing += 1;
         let seq = self.next_listing;
@@ -703,7 +757,9 @@ impl App {
         d.running = Some(cancel.clone());
         d.progress = None;
         let what = summary.as_ref().map_or(String::new(), |(t, _)| format!("{t} \u{b7} "));
-        d.note = Some((format!("{what}scanning the folder again"), Tone::Info));
+        let checking = d.scanned.as_ref().is_some_and(|s| s.tree.node(node).kind == NodeKind::File);
+        let doing = if checking { "checking the file" } else { "scanning the folder again" };
+        d.note = Some((format!("{what}{doing}"), Tone::Info));
         d.rescanning = Some(Rescanning { seq, node, path: path.clone(), summary });
         let (tx, rx) = iced::futures::channel::mpsc::unbounded();
         std::thread::spawn(move || {
@@ -772,6 +828,10 @@ impl App {
         let Some(d) = self.screen.disk_usage_mut() else { return Task::none() };
         let Some(s) = &d.scanned else { return Task::none() };
         let Some(&(node, _)) = s.outline.rows.get(d.cursor) else { return Task::none() };
+        if d.is_virtual() {
+            d.note = Some(("No shell menu inside archives and on servers".to_owned(), Tone::Info));
+            return Task::none();
+        }
         let path = s.tree.path(&d.root, node);
         let Some(folder) = path.parent().map(Path::to_path_buf) else {
             d.note = Some(("No context menu for a drive here".to_owned(), Tone::Info));
@@ -798,7 +858,8 @@ impl App {
     }
 
     /// Renders the map as shown (zoomed folder, measure, colours, extension highlight) into a PNG in the
-    /// other panel's folder, on a worker thread.
+    /// other panel's folder (or the scanned one when that isn't a local folder), on a worker thread. A
+    /// tree in an archive or on a server needs the other panel on a local folder.
     fn du_export(&mut self) -> Task<Message> {
         let other = self.screen.disk_usage_mut().map_or(0, |d| 1 - d.side.min(1));
         let other_path = self.panel(other).path.clone();
@@ -806,8 +867,16 @@ impl App {
         let Some(s) = &d.scanned else { return Task::none() };
         let (tree, zoom, ext_colors, ext_sel) = (s.tree.clone(), s.zoom, s.ext_colors.clone(), d.ext_sel);
         let root = d.root.clone();
+        let dir = match () {
+            _ if !vfs::in_archive(&other_path) && other_path.is_dir() => other_path,
+            _ if !d.is_virtual() => root.clone(),
+            _ => {
+                let msg = "To save the map, open a local folder in the other panel (it goes there)";
+                d.note = Some((msg.to_owned(), Tone::Info));
+                return Task::none();
+            }
+        };
         d.note = Some(("Saving the map\u{2026}".to_owned(), Tone::Info));
-        let dir = if other_path.is_dir() { other_path } else { root.clone() };
         let bg = color_rgba(theme::c().panel);
         Task::perform(
             async move {
@@ -836,6 +905,11 @@ impl App {
         self.next_listing += 1;
         let gen = self.next_listing;
         let Some(d) = self.screen.disk_usage_mut() else { return };
+        if d.is_virtual() && d.measure == Measure::Size {
+            let msg = "Size on disk isn't known inside archives and on servers: the sizes shown are the files' own";
+            d.note = Some((msg.to_owned(), Tone::Info));
+            return;
+        }
         d.measure = if d.measure == Measure::Size { Measure::Alloc } else { Measure::Size };
         let measure = d.measure;
         if let Some(s) = &mut d.scanned {
@@ -867,7 +941,12 @@ impl App {
                 match e {
                     DuEvent::Rescanned(result) if rescan => return self.du_rescanned(result),
                     DuEvent::Rescanned(_) => {}
-                    DuEvent::Done(..) if rescan => {}
+                    DuEvent::Done(..) | DuEvent::Failed(_) if rescan => {}
+                    DuEvent::Failed(e) => {
+                        d.running = None;
+                        d.progress = None;
+                        d.failed = Some(e);
+                    }
                     DuEvent::Progress(p) => d.progress = Some(p),
                     DuEvent::Done(tree, took) => {
                         d.running = None;
@@ -972,9 +1051,16 @@ impl App {
              only it scans again)",
         ),
         ("Shift+Delete", "Delete the item permanently (asks first)"),
-        ("Shift+F10, Menu key, right click", "Shell context menu of the item (list row or map tile)"),
+        (
+            "Shift+F10, Menu key, right click",
+            "Shell context menu of the item (list row or map tile; not in archives or on servers)",
+        ),
         ("Z", "Map: show only the folder under the cursor (a file: its folder)"),
-        ("S", "Switch between size and size on disk (compressed, sparse and online-only files, cluster rounding)"),
+        (
+            "S",
+            "Switch between size and size on disk (compressed, sparse and online-only files, cluster rounding; \
+             local folders only)",
+        ),
         ("E", "Save the map as a PNG (1920x1080) in the other panel's folder"),
         ("Backspace", "Map: one folder level out"),
         ("Shift+Z", "Map: the whole tree again"),
@@ -1064,26 +1150,29 @@ impl App {
         let colors = theme::c();
         let (stats, stats_color) = match (&d.scanned, &d.progress) {
             _ if d.rescanning.is_some() => {
-                let path = d.rescanning.as_ref().map_or(String::new(), |r| r.path.display().to_string());
+                let path = d.rescanning.as_ref().map_or(String::new(), |r| remote::display(&r.path));
                 let t = match &d.progress {
                     Some(p) => format!("Rescanning {path}\u{2026} {} files \u{b7} {}", p.files, format::size(p.bytes)),
                     None => format!("Rescanning {path}\u{2026}"),
                 };
                 (t, colors.text)
             }
-            (_, Some(p)) if d.running.is_some() => (
-                format!("Scanning\u{2026} {} files \u{b7} {} \u{b7} {}", p.files, format::size(p.bytes), p.current.display()),
-                colors.text,
-            ),
+            (_, Some(p)) if d.running.is_some() => {
+                let (files, bytes, at) = (p.files, format::size(p.bytes), remote::display(&p.current));
+                (format!("Scanning\u{2026} {files} files \u{b7} {bytes} \u{b7} {at}"), colors.text)
+            }
             _ if d.running.is_some() => ("Scanning\u{2026}".to_owned(), colors.text),
             (Some(s), _) => (header_text(&s.tree, s.took), colors.text),
+            (None, _) if d.failed.is_some() => {
+                (format!("Couldn't scan: {}", d.failed.as_deref().unwrap_or_default()), colors.error)
+            }
             (None, _) => ("Not scanned (F5 scans)".to_owned(), colors.muted),
         };
         let header = container(
             column![
                 row![
                     text("Disk usage").size(16),
-                    container(text(d.root.display().to_string()).size(13).color(colors.muted).wrapping(Wrapping::None))
+                    container(text(remote::display(&d.root)).size(13).color(colors.muted).wrapping(Wrapping::None))
                         .width(Length::Fill)
                         .clip(true),
                 ]
@@ -1200,7 +1289,7 @@ impl App {
         let map_title = match &d.scanned {
             Some(s) if s.zoom != ROOT => format!(
                 "Map: {} \u{b7} Backspace one level out \u{b7} Shift+Z whole tree",
-                s.tree.path(&d.root, s.zoom).display()
+                remote::display(&s.tree.path(&d.root, s.zoom))
             ),
             Some(_) => "Map: whole tree \u{b7} Z on a folder shows only that folder".to_owned(),
             None => "Map".to_owned(),
@@ -1227,19 +1316,20 @@ impl App {
                 let text = if let Some(link) = s.tree.hard_link(n) {
                     format!(
                         "{} \u{b7} {} \u{b7} hard link, counted once at {}",
-                        path.display(),
+                        remote::display(&path),
                         format::size(s.tree.link_bytes(link)),
-                        s.tree.path(&d.root, link.counted).display()
+                        remote::display(&s.tree.path(&d.root, link.counted))
                     )
                 } else if node.kind == NodeKind::Dir && n != ROOT && !node.children.is_empty() {
-                    format!("{} \u{b7} {} \u{b7} {} files", path.display(), format::size(s.tree.bytes(n)), node.files)
+                    let (shown, bytes) = (remote::display(&path), format::size(s.tree.bytes(n)));
+                    format!("{shown} \u{b7} {bytes} \u{b7} {} files", node.files)
                 } else {
-                    format!("{} \u{b7} {}", path.display(), format::size(s.tree.bytes(n)))
+                    format!("{} \u{b7} {}", remote::display(&path), format::size(s.tree.bytes(n)))
                 };
                 (text, colors.text)
             }
             None if d.deleting.is_some() => {
-                let path = d.deleting.as_ref().map_or(String::new(), |x| x.3.display().to_string());
+                let path = d.deleting.as_ref().map_or(String::new(), |x| remote::display(&x.3));
                 (format!("Deleting {path}\u{2026}"), colors.text)
             }
             None if d.note.is_some() => {
@@ -1263,8 +1353,13 @@ impl App {
             (&["F5"], "scan again"),
             (&["Esc"], "close"),
         ];
+        // Archives and servers: no shell menu, no size on disk.
+        let hints: Vec<theme::Hint> = match d.is_virtual() {
+            true => HINTS.iter().copied().filter(|h| !matches!(h.0, ["Shift+F10"] | ["S"])).collect(),
+            false => HINTS.to_vec(),
+        };
         let left: Element<'a, Message> = if note.is_empty() {
-            theme::key_hints_row(HINTS, self.window_width - 340.0)
+            theme::key_hints_row(&hints, self.window_width - 340.0)
         } else {
             text(note).size(12).color(note_color).wrapping(Wrapping::None).into()
         };
@@ -1278,7 +1373,7 @@ impl App {
         if d.scanned.is_some() {
             buttons = buttons.push(action("Go to", DuMsg::GoTo, false));
         }
-        if d.scanned.is_some() {
+        if d.scanned.is_some() && !d.is_virtual() {
             let label = if d.measure == Measure::Alloc { "Show size" } else { "Show size on disk" };
             buttons = buttons.push(action(label, DuMsg::Measure, false));
         }

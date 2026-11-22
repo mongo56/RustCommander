@@ -1559,6 +1559,60 @@ fn find_files_on_sftp_server() {
     exercise_find(&root, &disk.0);
 }
 
+// ---- Disk usage of a server folder ----------------------------------------------
+
+/// Disk usage of a small tree on a connected server whose files live in
+/// `disk`: the same tree as a local scan of `disk`.
+fn exercise_disk_usage(root: &Path, disk: &Path) {
+    use crate::disk_usage::{self, tests::{ext_sizes, sizes}};
+    use std::sync::atomic::AtomicBool;
+    fs::create_dir_all(disk.join("sub/deep")).unwrap();
+    fs::create_dir_all(disk.join("empty")).unwrap();
+    fs::write(disk.join("a.txt"), [1u8; 300]).unwrap();
+    fs::write(disk.join("b.log"), [1u8; 20]).unwrap();
+    fs::write(disk.join("sub/c.txt"), [1u8; 50]).unwrap();
+    fs::write(disk.join("sub/deep/d.bin"), [1u8; 7000]).unwrap();
+    let no = AtomicBool::new(false);
+    let local = disk_usage::scan(disk, &no, |_| {}).unwrap();
+    let remote = disk_usage::scan_path(root, &no, |_| {}).unwrap().unwrap();
+    assert_eq!(remote.errors, 0);
+    assert_eq!(sizes(&remote), sizes(&local));
+    assert_eq!(ext_sizes(&remote), ext_sizes(&local));
+    assert_eq!(remote.root().size, 7370);
+    assert!(remote.nodes.iter().all(|n| n.alloc == n.size));
+    let d = remote.locate(root, &root.join("sub").join("deep").join("d.bin"));
+    assert_eq!(remote.path(root, d), root.join("sub").join("deep").join("d.bin"));
+    assert!(disk_usage::scan_path(root, &AtomicBool::new(true), |_| {}).unwrap().is_none(), "cancelled");
+    // A folder deleted on the server is gone on a rescan.
+    fs::remove_dir_all(disk.join("sub/deep")).unwrap();
+    assert!(matches!(
+        disk_usage::rescan(&root.join("sub").join("deep"), &no, |_| {}),
+        Some(disk_usage::Rescan::Gone)
+    ));
+    assert!(matches!(disk_usage::rescan(&root.join("a.txt"), &no, |_| {}), Some(disk_usage::Rescan::File)));
+}
+
+#[test]
+fn disk_usage_on_ftp_server() {
+    let disk = TempDir::new("ftp-du");
+    let root = start_ftp(&disk.0);
+    exercise_disk_usage(&root, &disk.0);
+    disconnect(&root);
+}
+
+#[test]
+fn disk_usage_on_sftp_server() {
+    let _settings = settings();
+    let disk = TempDir::new("sftp-du");
+    let port = start_sftp(disk.0.clone(), 11);
+    let login = sftp_login(port, sftp_server::PASSWORD);
+    assert!(connect(login.clone(), "").is_err());
+    trust_host_key(&login).unwrap();
+    let root = connect(login, "").unwrap();
+    exercise_disk_usage(&root, &disk.0);
+    disconnect(&root);
+}
+
 #[test]
 fn partial_files_kept_only_when_resumable() {
     // A resumed transfer never removes what was there before.
