@@ -32,6 +32,24 @@ const BAR_W: f32 = 70.0;
 const COL_FILES: f32 = 90.0;
 /// Height of the header, list and map headers and footer (for paging estimates).
 const DU_CHROME_H: f32 = 160.0;
+
+/// Default share of the height the list area gets (the treemap gets the rest).
+pub const DU_DEFAULT_SPLIT: f32 = 0.5;
+/// Smallest and largest share of the list area.
+const DU_SPLIT_RANGE: (f32, f32) = (0.2, 0.8);
+/// Ctrl+Up / Ctrl+Down move the split by this much.
+const DU_SPLIT_STEP: f32 = 0.05;
+
+/// `ratio` limited to the allowed range (NaN gives the default).
+pub fn du_clamp_split(ratio: f32) -> f32 {
+    if ratio.is_nan() { DU_DEFAULT_SPLIT } else { ratio.clamp(DU_SPLIT_RANGE.0, DU_SPLIT_RANGE.1) }
+}
+
+/// `FillPortion` values (per mille) of the list area and the treemap.
+fn du_portions(ratio: f32) -> (u16, u16) {
+    let top = (du_clamp_split(ratio) * 1000.0).round() as u16;
+    (top, 1000 - top)
+}
 /// Width of the extension list.
 const EXT_W: f32 = 320.0;
 const EXT_SWATCH: f32 = 10.0;
@@ -500,9 +518,9 @@ impl App {
         Task::run(rx, move |e| Message::DiskUsage(DuMsg::Event(seq, e)))
     }
 
-    /// Rows of the list, which gets half the space (the treemap the other half).
+    /// Rows of the list, which gets `du_split` of the space (the treemap the rest).
     fn du_rows(&self) -> usize {
-        ((self.window_height - DU_CHROME_H) / 2.0 / ROW_H).floor().max(1.0) as usize
+        ((self.window_height - DU_CHROME_H) * du_clamp_split(self.du_split) / ROW_H).floor().max(1.0) as usize
     }
 
     fn du_move(&mut self, delta: isize) {
@@ -785,6 +803,7 @@ impl App {
         ("Shift+Z", "Map: the whole tree again"),
         ("Click on an extension", "Highlight its files on the map (click again: clear)"),
         ("Tab", "Keys move in the extension list / the tree"),
+        ("Ctrl+Up, Ctrl+Down", "Give the list less / more height (the map gets the rest; remembered)"),
         ("F5", "Scan again"),
         ("Esc", "Clear the extension highlight; else stop the scan / close"),
     ];
@@ -798,6 +817,11 @@ impl App {
         let page = self.du_rows().saturating_sub(1).max(1) as isize;
         let Some(d) = self.screen.disk_usage_mut() else { return Task::none() };
         d.note = None;
+        if mods.control() && !mods.alt() && !mods.shift() && matches!(named, Some(Named::ArrowUp | Named::ArrowDown)) {
+            let step = if named == Some(Named::ArrowDown) { DU_SPLIT_STEP } else { -DU_SPLIT_STEP };
+            self.du_split = du_clamp_split(((self.du_split + step) * 100.0).round() / 100.0);
+            return Task::none();
+        }
         if named == Some(Named::Escape) && d.ext_sel.is_some() {
             d.ext_sel = None;
             return Task::none();
@@ -1001,7 +1025,7 @@ impl App {
             .padding([3, 14])
             .style(filled(colors.header));
         let map = container(map).width(Length::Fill).height(Length::Fill).padding(6).style(filled(colors.panel));
-        let map = column![map_header, map].height(Length::FillPortion(1));
+        let map = column![map_header, map].height(Length::FillPortion(du_portions(self.du_split).1));
 
         // The tile under the mouse, else a running delete, a message, the keys.
         let hovered = d.scanned.as_ref().zip(d.hover).filter(|(s, n)| (*n as usize) < s.tree.nodes.len());
@@ -1048,6 +1072,7 @@ impl App {
             (&["Z"], "zoom map"),
             (&["S"], "size on disk"),
             (&["Tab"], "extensions"),
+            (&["Ctrl+\u{2191}\u{2193}"], "resize"),
             (&["F5"], "scan again"),
             (&["Esc"], "close"),
         ];
@@ -1086,7 +1111,7 @@ impl App {
         .style(filled(colors.header));
 
         let list = column![list_header, list].width(Length::Fill);
-        let top = row![list, exts].spacing(1).height(Length::FillPortion(1));
+        let top = row![list, exts].spacing(1).height(Length::FillPortion(du_portions(self.du_split).0));
         container(column![header, top, map, footer])
             .width(Length::Fill)
             .height(Length::Fill)
@@ -1498,6 +1523,18 @@ impl<Renderer: renderer::Renderer> Widget<Message, Theme, Renderer> for Treemap<
 mod tests {
     use super::*;
     use rc_core::disk_usage::{Node, EXT_DIR, EXT_NONE};
+
+    #[test]
+    fn split_is_clamped_and_portioned() {
+        assert_eq!(du_clamp_split(0.5), 0.5);
+        assert_eq!(du_clamp_split(0.0), 0.2);
+        assert_eq!(du_clamp_split(1.0), 0.8);
+        assert_eq!(du_clamp_split(f32::NAN), DU_DEFAULT_SPLIT);
+        assert_eq!(du_portions(0.5), (500, 500));
+        assert_eq!(du_portions(0.3), (300, 700));
+        assert_eq!(du_portions(-4.0), (200, 800));
+        assert_eq!(du_portions(9.0), (800, 200));
+    }
 
     /// root(0) -> a(1) [a1(3), a2(4) -> x(6)], b(2) [b1(5)]; files are leaves.
     fn tree() -> Tree {

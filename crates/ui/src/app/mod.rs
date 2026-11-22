@@ -174,6 +174,8 @@ pub struct App {
     mouse: Point,
     /// Share of the width the left panel gets (0.5 = equal).
     split: f32,
+    /// Share of the height the disk usage tool's list gets (Ctrl+Up / Ctrl+Down there).
+    du_split: f32,
     /// The divider between the panels is being dragged.
     split_drag: bool,
     /// When the divider was last pressed (double click resets it).
@@ -761,6 +763,7 @@ impl App {
             drop_right: false,
             mouse: Point::ORIGIN,
             split: session.as_ref().map_or(0.5, |s| s.split).clamp(0.0, 1.0),
+            du_split: session.as_ref().map_or(disk_usage::DU_DEFAULT_SPLIT, |s| disk_usage::du_clamp_split(s.du_split)),
             split_drag: false,
             split_click: None,
             split_ghost: None,
@@ -3841,6 +3844,7 @@ impl App {
             terminal_zoom: self.term_zoom,
             panel_zoom: self.panel_zoom,
             split: self.split,
+            du_split: self.du_split,
             columns: self.columns,
             window: self.placement.map(Into::into),
             editor: String::new(),
