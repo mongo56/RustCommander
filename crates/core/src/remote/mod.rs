@@ -614,6 +614,7 @@ impl Connection {
         let remote = remote_join(dir, &item.name);
         Entry {
             hidden: item.name.starts_with('.'),
+            comment: None,
             path: path_of(&self.key, &remote),
             kind: if item.dir { EntryKind::Dir } else { EntryKind::File },
             size: if item.dir { 0 } else { item.size },
@@ -705,7 +706,7 @@ impl Vfs for Connection {
         let remote = self.remote(path)?;
         let Some(parent) = remote_parent(&remote) else {
             let name = self.key.clone();
-            return Ok(Some(Entry { name, path: path.to_path_buf(), kind: EntryKind::Dir, size: 0, modified: None, hidden: false }));
+            return Ok(Some(Entry { name, path: path.to_path_buf(), kind: EntryKind::Dir, size: 0, modified: None, hidden: false, comment: None }));
         };
         let item = self.with(|s| s.stat(&remote))?;
         Ok(item.map(|i| self.entry(parent, i)))

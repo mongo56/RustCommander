@@ -747,6 +747,19 @@ impl App {
                 r.select,
                 r.selection(),
             )),
+            None if entry.comment.is_some() => {
+                // A share's remark: dimmed, after the name (which keeps the room it needs, up to a half).
+                let remark = entry.comment.as_deref().unwrap_or_default();
+                let shown = elide_middle(&entry.name, name_chars.min(entry.name.chars().count()));
+                let left = name_chars.saturating_sub(shown.chars().count() + 2).max(4);
+                let remark = text(elide_end(remark, left))
+                    .size(text_size)
+                    .color(theme::c().muted)
+                    .wrapping(Wrapping::None)
+                    .width(Length::Fill);
+                let name = name.push(cell(shown, Length::Shrink)).push(remark);
+                if cols.ext { name.push(cell(String::new(), Length::Fixed(widths[0]))) } else { name }
+            }
             None if cols.ext => name
                 .push(cell(fit_stem(stem), Length::Fill))
                 .push(cell(ext.to_string(), Length::Fixed(widths[0]))),

@@ -175,6 +175,7 @@ pub fn find(opts: &Options, cancel: &AtomicBool, report: impl FnMut(Progress)) -
                     size: meta.len(),
                     modified: meta.modified().ok().map(DateTime::<Local>::from),
                     hidden: false,
+                    comment: None,
                 },
             });
         }

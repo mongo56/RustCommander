@@ -514,6 +514,7 @@ mod tests {
             size: 0,
             modified: None,
             hidden: false,
+            comment: None,
         }
     }
 

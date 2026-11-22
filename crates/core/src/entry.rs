@@ -17,6 +17,8 @@ pub struct Entry {
     pub size: u64,
     pub modified: Option<DateTime<Local>>,
     pub hidden: bool,
+    /// A remark shown after the name (the description of a network share).
+    pub comment: Option<Box<str>>,
 }
 
 impl Entry {
@@ -28,6 +30,7 @@ impl Entry {
             size: 0,
             modified: None,
             hidden: false,
+            comment: None,
         }
     }
 

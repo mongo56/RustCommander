@@ -120,7 +120,7 @@ impl LocalFs {
         let kind = if meta.is_dir() { EntryKind::Dir } else { EntryKind::File };
         let size = if meta.is_dir() { 0 } else { meta.len() };
         let modified = meta.modified().ok().map(DateTime::<Local>::from);
-        Ok(Entry { name, path: path.to_path_buf(), kind, size, modified, hidden: false })
+        Ok(Entry { name, path: path.to_path_buf(), kind, size, modified, hidden: false, comment: None })
     }
 }
 
@@ -460,6 +460,7 @@ fn list_network() -> Vec<Entry> {
         size: 0,
         modified: None,
         hidden: false,
+        comment: None,
     };
     names.into_iter().map(entry).collect()
 }
@@ -486,18 +487,20 @@ pub fn unc_share_parent(path: &Path) -> Option<(PathBuf, String)> {
 /// ones ending in `$` are hidden.
 fn list_shares(server: &str) -> io::Result<Vec<Entry>> {
     let shares = rc_platform::shares(server)?;
-    let entries = shares
-        .into_iter()
-        .map(|s| Entry {
-            path: PathBuf::from(format!(r"\\{server}\{}", s.name)),
-            name: s.name,
-            kind: EntryKind::Dir,
-            size: 0,
-            modified: None,
-            hidden: s.hidden,
-        })
-        .collect();
-    Ok(entries)
+    Ok(shares.into_iter().map(|s| share_entry(server, s)).collect())
+}
+
+/// One share as a folder entry; its remark (if any) becomes the comment.
+fn share_entry(server: &str, s: rc_platform::Share) -> Entry {
+    Entry {
+        path: PathBuf::from(format!(r"\\{server}\{}", s.name)),
+        name: s.name,
+        kind: EntryKind::Dir,
+        size: 0,
+        modified: None,
+        hidden: s.hidden,
+        comment: Some(s.remark).filter(|r| !r.is_empty()).map(String::into_boxed_str),
+    }
 }
 
 /// Lists the folder `path` wherever it lives (local folder or a folder in
@@ -1123,6 +1126,7 @@ impl Archive {
             size: item.size,
             modified: item.modified,
             hidden: item.hidden,
+            comment: None,
         }
     }
 
@@ -1313,7 +1317,7 @@ impl Vfs for Archive {
             Ok((_, Some(i))) => Ok(Some(self.entry(i))),
             Ok((_, None)) => {
                 let name = self.file.file_name().unwrap_or_default().to_string_lossy().into_owned();
-                Ok(Some(Entry { name, path: self.file.clone(), kind: EntryKind::Dir, size: 0, modified: None, hidden: false }))
+                Ok(Some(Entry { name, path: self.file.clone(), kind: EntryKind::Dir, size: 0, modified: None, hidden: false, comment: None }))
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e),
@@ -1329,6 +1333,15 @@ impl Vfs for Archive {
 pub(crate) mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn share_entries_carry_the_remark() {
+        let share = |remark: &str| rc_platform::Share { name: "docs".into(), remark: remark.into(), hidden: false };
+        let e = share_entry("srv", share("Team documents"));
+        assert_eq!(e.comment.as_deref(), Some("Team documents"));
+        assert_eq!(e.path, PathBuf::from(r"\\srv\docs"));
+        assert_eq!(share_entry("srv", share("")).comment, None);
+    }
 
     pub(crate) struct TempDir(pub PathBuf);
 

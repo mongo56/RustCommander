@@ -58,6 +58,7 @@ pub fn list_dir(path: &Path, show_hidden: bool) -> io::Result<Vec<Entry>> {
             size,
             modified,
             hidden,
+            comment: None,
         });
     }
 

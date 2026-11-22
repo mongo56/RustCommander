@@ -209,6 +209,7 @@ mod tests {
             size,
             modified: Local.timestamp_opt(secs, 0).single(),
             hidden: false,
+            comment: None,
         }
     }
 

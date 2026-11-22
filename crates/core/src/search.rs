@@ -333,6 +333,7 @@ pub fn search(query: &Query, cancel: &AtomicBool, mut report: impl FnMut(Batch) 
                 size: if is_dir { 0 } else { meta.len() },
                 modified: meta.modified().ok().map(DateTime::<Local>::from),
                 hidden,
+                comment: None,
             });
             summary.hits += 1;
             if summary.hits >= MAX_HITS {
@@ -450,6 +451,7 @@ pub fn list_branch(
                 size: meta.len(),
                 modified: meta.modified().ok().map(DateTime::<Local>::from),
                 hidden: is_hidden,
+                comment: None,
             });
             summary.hits += 1;
         }
