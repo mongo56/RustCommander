@@ -272,6 +272,33 @@ pub fn disk_space(path: &Path) -> Option<(u64, u64)> {
     }
 }
 
+/// Bytes per cluster of the volume holding `path` (1 where unknown).
+pub fn cluster_size(path: &Path) -> u64 {
+    #[cfg(windows)]
+    {
+        win::cluster_size(path)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        1
+    }
+}
+
+/// Bytes a compressed, sparse or cloud-placeholder file takes on disk
+/// (`None` where unknown or on error).
+pub fn allocated_size(path: &Path) -> Option<u64> {
+    #[cfg(windows)]
+    {
+        win::allocated_size(path)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        None
+    }
+}
+
 /// Cache key for [`file_icon`]: icons that differ per file (programs,
 /// shortcuts, drives) get a per-path key, everything else shares one per
 /// extension.

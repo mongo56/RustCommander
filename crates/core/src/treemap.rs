@@ -36,7 +36,7 @@ pub fn layout(tree: &Tree, node: u32, rect: Rect, min_px: f32, out: &mut Vec<Til
 
 fn place(tree: &Tree, node: u32, rect: Rect, depth: u8, min_px: f32, out: &mut Vec<Tile>) {
     let n = tree.node(node);
-    if n.size == 0 || !(rect.w > 0.0 && rect.h > 0.0) {
+    if tree.bytes(node) == 0 || !(rect.w > 0.0 && rect.h > 0.0) {
         return;
     }
     if n.kind == NodeKind::File || rect.w < min_px || rect.h < min_px {
@@ -48,7 +48,7 @@ fn place(tree: &Tree, node: u32, rect: Rect, depth: u8, min_px: f32, out: &mut V
         r = Rect::new(r.x + 1.0, r.y + 1.0, r.w - 2.0, r.h - 2.0);
     }
     let items: Vec<(u32, f64)> =
-        n.children.iter().map(|&c| (c, tree.node(c).size as f64)).filter(|&(_, s)| s > 0.0).collect();
+        n.children.iter().map(|&c| (c, tree.bytes(c) as f64)).filter(|&(_, s)| s > 0.0).collect();
     if items.is_empty() {
         out.push(Tile { node, rect, depth });
         return;
@@ -122,7 +122,7 @@ mod tests {
     use crate::disk_usage::{Node, ROOT};
 
     fn node(name: &str, size: u64, kind: NodeKind, parent: u32, children: Vec<u32>) -> Node {
-        Node { name: name.into(), size, files: 0, dirs: 0, kind, ext_id: 0, parent, children }
+        Node { name: name.into(), size, alloc: size, files: 0, dirs: 0, kind, ext_id: 0, parent, children }
     }
 
     /// Root with the given file sizes (sorted descending here).

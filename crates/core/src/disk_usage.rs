@@ -37,6 +37,8 @@ pub struct Node {
     pub name: Box<str>,
     /// Bytes: a file's logical length, or the sum of everything under a folder.
     pub size: u64,
+    /// Bytes allocated on disk: a file's own, or the sum under a folder.
+    pub alloc: u64,
     /// Files under a folder, recursively (0 for a file).
     pub files: u32,
     /// Folders under a folder, recursively, not counting itself (0 for a file).
@@ -61,6 +63,45 @@ pub struct Tree {
     pub exts: Vec<(Box<str>, u64, u32)>,
     /// Number of folders that couldn't be read (fully or partly) and were skipped.
     pub errors: u32,
+    /// Allocated bytes per extension, parallel to `exts`.
+    pub ext_alloc: Vec<u64>,
+    /// Which size children are sorted by and the UI shows.
+    pub measure: Measure,
+}
+
+/// Which size to show and sort by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Measure {
+    /// Logical length.
+    #[default]
+    Size,
+    /// Bytes allocated on disk.
+    Alloc,
+}
+
+/// `size` rounded up to whole clusters (0 stays 0).
+pub fn round_to_cluster(size: u64, cluster: u64) -> u64 {
+    let c = cluster.max(1);
+    size.div_ceil(c).saturating_mul(c)
+}
+
+/// Bytes a file takes on disk. Compressed, sparse and cloud files ask the
+/// system; the rest are rounded up to whole clusters (no extra call).
+fn allocated(meta: &fs::Metadata, path: impl FnOnce() -> PathBuf, cluster: u64) -> u64 {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        // COMPRESSED, SPARSE_FILE, OFFLINE, RECALL_ON_OPEN, RECALL_ON_DATA_ACCESS.
+        const SPECIAL: u32 = 0x800 | 0x200 | 0x1000 | 0x40000 | 0x400000;
+        if meta.file_attributes() & SPECIAL != 0 {
+            if let Some(a) = rc_platform::allocated_size(&path()) {
+                return a;
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = &path;
+    round_to_cluster(meta.len(), cluster)
 }
 
 #[derive(Debug, Clone)]
@@ -72,6 +113,36 @@ pub struct Progress {
 }
 
 impl Tree {
+    /// Node `index`'s bytes by the active measure.
+    pub fn bytes(&self, index: u32) -> u64 {
+        let n = &self.nodes[index as usize];
+        match self.measure {
+            Measure::Size => n.size,
+            Measure::Alloc => n.alloc,
+        }
+    }
+
+    /// Bytes per extension (parallel to `exts`) by the active measure.
+    pub fn ext_bytes(&self) -> Vec<u64> {
+        match self.measure {
+            Measure::Size => self.exts.iter().map(|e| e.1).collect(),
+            Measure::Alloc => (0..self.exts.len()).map(|i| self.ext_alloc.get(i).copied().unwrap_or(0)).collect(),
+        }
+    }
+
+    /// Switches the measure and sorts every folder's children again.
+    pub fn set_measure(&mut self, measure: Measure) {
+        if self.measure == measure {
+            return;
+        }
+        self.measure = measure;
+        for i in 0..self.nodes.len() {
+            if self.nodes[i].children.len() >= 2 {
+                self.sort_children(i as u32);
+            }
+        }
+    }
+
     pub fn root(&self) -> &Node {
         &self.nodes[ROOT as usize]
     }
@@ -123,9 +194,9 @@ impl Tree {
         };
         self.nodes[parent as usize].children.remove(pos);
         let node = self.node(index);
-        let (size, files, dirs) = match node.kind {
-            NodeKind::File => (node.size, 1, 0),
-            NodeKind::Dir => (node.size, node.files, node.dirs + 1),
+        let (size, alloc, files, dirs) = match node.kind {
+            NodeKind::File => (node.size, node.alloc, 1, 0),
+            NodeKind::Dir => (node.size, node.alloc, node.files, node.dirs + 1),
         };
         // Its files leave the extension table.
         let mut stack = vec![index];
@@ -135,6 +206,9 @@ impl Tree {
                 NodeKind::File => {
                     if let Some(e) = self.exts.get_mut(n.ext_id as usize) {
                         e.1 = e.1.saturating_sub(n.size);
+                        if let Some(a) = self.ext_alloc.get_mut(n.ext_id as usize) {
+                            *a = a.saturating_sub(n.alloc);
+                        }
                         e.2 = e.2.saturating_sub(1);
                     }
                 }
@@ -146,6 +220,7 @@ impl Tree {
         loop {
             let p = &mut self.nodes[i as usize];
             p.size = p.size.saturating_sub(size);
+            p.alloc = p.alloc.saturating_sub(alloc);
             p.files = p.files.saturating_sub(files);
             p.dirs = p.dirs.saturating_sub(dirs);
             self.sort_children(i);
@@ -185,9 +260,11 @@ impl Tree {
     fn sort_children(&mut self, index: u32) {
         let mut children = std::mem::take(&mut self.nodes[index as usize].children);
         let nodes = &self.nodes;
+        let by_alloc = self.measure == Measure::Alloc;
         children.sort_by(|&a, &b| {
             let (a, b) = (&nodes[a as usize], &nodes[b as usize]);
-            b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name))
+            let (x, y) = if by_alloc { (a.alloc, b.alloc) } else { (a.size, b.size) };
+            y.cmp(&x).then_with(|| a.name.cmp(&b.name))
         });
         self.nodes[index as usize].children = children;
     }
@@ -202,15 +279,17 @@ fn extension(name: &str) -> Option<String> {
 
 /// Scans `root` recursively. Links and junctions count as themselves and are
 /// not followed; unreadable folders are skipped and counted in
-/// [`Tree::errors`]. Sizes are logical lengths: hard links count once per
-/// link, and compressed or sparse files show their full size, not the space
-/// they take on disk. `progress` is called at most every ~100 ms. Returns
+/// [`Tree::errors`]. `size` is the logical length and `alloc` the space taken
+/// on disk (whole clusters; the system's figure for compressed, sparse and
+/// cloud files). Hard links count once per link. `progress` is called at most
+/// every ~100 ms. Returns
 /// `None` once `cancel` is set.
 pub fn scan(root: &Path, cancel: &AtomicBool, mut progress: impl FnMut(Progress)) -> Option<Tree> {
     let mut tree = Tree {
         nodes: vec![Node {
             name: root.to_string_lossy().into(),
             size: 0,
+            alloc: 0,
             files: 0,
             dirs: 0,
             kind: NodeKind::Dir,
@@ -220,8 +299,11 @@ pub fn scan(root: &Path, cancel: &AtomicBool, mut progress: impl FnMut(Progress)
         }],
         exts: vec![("".into(), 0, 0), ("*".into(), 0, 0)],
         errors: 0,
+        ext_alloc: vec![0, 0],
+        measure: Measure::Size,
     };
     let mut ext_ids: HashMap<String, u16> = HashMap::new();
+    let cluster = rc_platform::cluster_size(root);
     let (mut files, mut bytes) = (0u64, 0u64);
     let mut last_report = Instant::now();
     let mut stack = vec![(ROOT, root.to_path_buf())];
@@ -260,6 +342,7 @@ pub fn scan(root: &Path, cancel: &AtomicBool, mut progress: impl FnMut(Progress)
                 tree.nodes.push(Node {
                     name,
                     size: 0,
+                    alloc: 0,
                     files: 0,
                     dirs: 0,
                     kind: NodeKind::Dir,
@@ -269,11 +352,11 @@ pub fn scan(root: &Path, cancel: &AtomicBool, mut progress: impl FnMut(Progress)
                 });
             } else {
                 // On Windows `DirEntry::metadata` is the link's own, without following it.
-                let size = match item.metadata() {
-                    Ok(meta) => meta.len(),
+                let (size, alloc) = match item.metadata() {
+                    Ok(meta) => (meta.len(), allocated(&meta, || item.path(), cluster)),
                     Err(_) => {
                         failed = true;
-                        0
+                        (0, 0)
                     }
                 };
                 let ext_id = match extension(&name) {
@@ -283,6 +366,7 @@ pub fn scan(root: &Path, cancel: &AtomicBool, mut progress: impl FnMut(Progress)
                         None if tree.exts.len() < EXT_DIR as usize => {
                             let id = tree.exts.len() as u16;
                             tree.exts.push((ext.as_str().into(), 0, 0));
+                            tree.ext_alloc.push(0);
                             ext_ids.insert(ext, id);
                             id
                         }
@@ -292,11 +376,13 @@ pub fn scan(root: &Path, cancel: &AtomicBool, mut progress: impl FnMut(Progress)
                 let entry = &mut tree.exts[ext_id as usize];
                 entry.1 += size;
                 entry.2 += 1;
+                tree.ext_alloc[ext_id as usize] += alloc;
                 files += 1;
                 bytes += size;
                 tree.nodes.push(Node {
                     name,
                     size,
+                    alloc,
                     files: 0,
                     dirs: 0,
                     kind: NodeKind::File,
@@ -317,13 +403,14 @@ pub fn scan(root: &Path, cancel: &AtomicBool, mut progress: impl FnMut(Progress)
     // every folder before its own parent sees it.
     for i in (1..tree.nodes.len()).rev() {
         let node = &tree.nodes[i];
-        let (size, parent) = (node.size, node.parent as usize);
+        let (size, alloc, parent) = (node.size, node.alloc, node.parent as usize);
         let (files, dirs) = match node.kind {
             NodeKind::File => (1, 0),
             NodeKind::Dir => (node.files, node.dirs + 1),
         };
         let p = &mut tree.nodes[parent];
         p.size += size;
+        p.alloc += alloc;
         p.files = p.files.saturating_add(files);
         p.dirs = p.dirs.saturating_add(dirs);
     }
@@ -486,5 +573,61 @@ mod tests {
         assert_eq!((jn.kind, jn.children.len()), (NodeKind::File, 0));
         fs::remove_dir(root.join("jn")).unwrap();
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn rounding_to_clusters() {
+        assert_eq!(round_to_cluster(0, 4096), 0);
+        assert_eq!(round_to_cluster(1, 4096), 4096);
+        assert_eq!(round_to_cluster(4096, 4096), 4096);
+        assert_eq!(round_to_cluster(4097, 4096), 8192);
+        assert_eq!(round_to_cluster(5, 0), 5, "unknown cluster size");
+    }
+
+    #[test]
+    fn alloc_is_summed_removed_and_sortable() {
+        let root = temp("alloc");
+        fs::create_dir_all(root.join("d")).unwrap();
+        fs::write(root.join("d/a"), [0u8; 10]).unwrap();
+        fs::write(root.join("b"), [0u8; 3]).unwrap();
+        fs::write(root.join("empty"), []).unwrap();
+        let mut tree = scan(&root, &AtomicBool::new(false), |_| {}).unwrap();
+        let c = rc_platform::cluster_size(&root);
+        let (di, d) = child(&tree, ROOT, "d");
+        assert_eq!(d.alloc, round_to_cluster(10, c));
+        assert_eq!(child(&tree, ROOT, "empty").1.alloc, 0);
+        let want = round_to_cluster(10, c) + round_to_cluster(3, c);
+        assert_eq!(tree.root().alloc, want);
+        assert_eq!(tree.ext_bytes()[EXT_NONE as usize], 13);
+        tree.set_measure(Measure::Alloc);
+        assert_eq!(tree.ext_bytes()[EXT_NONE as usize], want);
+        assert_eq!(tree.bytes(ROOT), want);
+        assert!(tree.remove(di));
+        assert_eq!(tree.root().alloc, round_to_cluster(3, c));
+        assert_eq!((tree.root().size, tree.ext_bytes()[EXT_NONE as usize]), (3, round_to_cluster(3, c)));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn measure_changes_the_child_order() {
+        let mk = |name: &str, size, alloc, parent| Node {
+            name: name.into(),
+            size,
+            alloc,
+            files: 0,
+            dirs: 0,
+            kind: NodeKind::File,
+            ext_id: 0,
+            parent,
+            children: Vec::new(),
+        };
+        let mut root = mk("r", 30, 20, ROOT);
+        root.kind = NodeKind::Dir;
+        root.children = vec![1, 2];
+        let mut tree = Tree { nodes: vec![root, mk("big", 20, 4, ROOT), mk("small", 10, 16, ROOT)], ..Tree::default() };
+        tree.set_measure(Measure::Alloc);
+        assert_eq!(tree.root().children, [2, 1]);
+        tree.set_measure(Measure::Size);
+        assert_eq!(tree.root().children, [1, 2]);
     }
 }

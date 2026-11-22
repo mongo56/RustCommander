@@ -18,7 +18,7 @@ use iced::advanced::layout::{self, Layout};
 use iced::advanced::widget::{self, Widget};
 use iced::advanced::{renderer, Clipboard, Shell};
 use iced::{event, Alignment, Background, Border, Color, Element, Event, Length, Rectangle, Size, Theme};
-use rc_core::disk_usage::{self, NodeKind, Tree, ROOT};
+use rc_core::disk_usage::{self, Measure, NodeKind, Tree, ROOT};
 use rc_core::treemap::{self, Rect, Tile};
 use rc_core::format;
 use rc_core::panel::visible_start;
@@ -205,16 +205,40 @@ pub(super) struct Scanned {
     ext_colors: Vec<u8>,
     /// Extension ids with files, most bytes first ([`ext_order`]).
     ext_order: Vec<u16>,
+    /// Bytes per extension id by the active measure.
+    ext_bytes: Vec<u64>,
     /// Folder the treemap shows (the root unless zoomed).
     zoom: u32,
 }
 
 impl Scanned {
-    fn new(tree: Arc<Tree>, took: Duration, gen: u64) -> Self {
+    fn new(mut tree: Arc<Tree>, took: Duration, gen: u64, measure: Measure) -> Self {
+        if tree.measure != measure {
+            Arc::make_mut(&mut tree).set_measure(measure);
+        }
         let outline = Outline::new(&tree);
-        let ext_colors = ext_colors(&tree.exts);
-        let ext_order = ext_order(&tree.exts);
-        Self { tree, outline, took, gen, ext_colors, ext_order, zoom: ROOT }
+        let ext_bytes = tree.ext_bytes();
+        let ext_colors = ext_colors(&tree.exts, &ext_bytes);
+        let ext_order = ext_order(&tree.exts, &ext_bytes);
+        Self { tree, outline, took, gen, ext_colors, ext_order, ext_bytes, zoom: ROOT }
+    }
+
+    fn refresh_exts(&mut self) {
+        self.ext_bytes = self.tree.ext_bytes();
+        self.ext_colors = ext_colors(&self.tree.exts, &self.ext_bytes);
+        self.ext_order = ext_order(&self.tree.exts, &self.ext_bytes);
+    }
+
+    /// Switches between logical and on-disk sizes: sorts the tree again and
+    /// refreshes everything derived from it; `gen` is the new tree id.
+    fn set_measure(&mut self, measure: Measure, gen: u64) {
+        if self.tree.measure == measure {
+            return;
+        }
+        Arc::make_mut(&mut self.tree).set_measure(measure);
+        self.outline.rebuild(&self.tree);
+        self.refresh_exts();
+        self.gen = gen;
     }
 
     /// Takes `node` out after it was deleted from disk (see
@@ -223,11 +247,9 @@ impl Scanned {
         if !Arc::make_mut(&mut self.tree).remove(node) {
             return false;
         }
-        let tree = &*self.tree;
-        self.outline.rebuild(tree);
-        self.ext_colors = ext_colors(&tree.exts);
-        self.ext_order = ext_order(&tree.exts);
-        self.zoom = tree.surviving(self.zoom);
+        self.outline.rebuild(&self.tree);
+        self.refresh_exts();
+        self.zoom = self.tree.surviving(self.zoom);
         self.gen = gen;
         true
     }
@@ -273,6 +295,8 @@ pub enum DuMsg {
     ExtClick(u16),
     ExtWheel(f32),
     ExtScrollTo(usize, usize),
+    /// Toggle between size and size on disk.
+    Measure,
     GoTo,
     Rescan,
     Close,
@@ -298,6 +322,8 @@ pub(super) struct DiskUsage {
     ext_top: usize,
     /// The keyboard moves in the extension list (Tab), not the tree.
     on_exts: bool,
+    /// Logical size or size on disk.
+    measure: Measure,
     /// Delete asked for (waiting for the confirmation): scan seq, node, path.
     delete_ask: Option<(u64, u32, PathBuf)>,
     /// Delete job running: job id, scan seq, node, path.
@@ -344,9 +370,9 @@ fn zoom_out_target(tree: &Tree, zoom: u32) -> u32 {
 }
 
 /// The extension list: ids with files, most bytes first (ties by id).
-fn ext_order(exts: &[(Box<str>, u64, u32)]) -> Vec<u16> {
+fn ext_order(exts: &[(Box<str>, u64, u32)], bytes: &[u64]) -> Vec<u16> {
     let mut order: Vec<u16> = (0..exts.len()).filter(|&i| exts[i].2 > 0).map(|i| i as u16).collect();
-    order.sort_by(|&a, &b| exts[b as usize].1.cmp(&exts[a as usize].1).then(a.cmp(&b)));
+    order.sort_by(|&a, &b| bytes[b as usize].cmp(&bytes[a as usize]).then(a.cmp(&b)));
     order
 }
 
@@ -375,12 +401,15 @@ fn header_text(tree: &Tree, took: Duration) -> String {
     let root = tree.root();
     let mut t = format!(
         "{} \u{b7} {} files \u{b7} {} folders",
-        format::size(root.size),
+        format::size(tree.bytes(ROOT)),
         root.files,
         root.dirs
     );
     if tree.errors > 0 {
         t.push_str(&format!(" \u{b7} {} unreadable", tree.errors));
+    }
+    if tree.measure == Measure::Alloc {
+        t.push_str(" on disk");
     }
     t.push_str(&format!(" \u{b7} scanned in {:.1} s", took.as_secs_f32()));
     t
@@ -415,6 +444,7 @@ impl App {
             ext_sel: None,
             ext_top: 0,
             on_exts: false,
+            measure: Measure::Size,
             delete_ask: None,
             deleting: None,
             note: None,
@@ -617,6 +647,18 @@ impl App {
         d.hover = None;
     }
 
+    fn du_toggle_measure(&mut self) {
+        self.next_listing += 1;
+        let gen = self.next_listing;
+        let Some(d) = self.screen.disk_usage_mut() else { return };
+        d.measure = if d.measure == Measure::Size { Measure::Alloc } else { Measure::Size };
+        let measure = d.measure;
+        if let Some(s) = &mut d.scanned {
+            s.set_measure(measure, gen);
+            d.hover = None;
+        }
+    }
+
     /// Moves the extension selection (Tab focus on the extension list).
     fn du_ext_move(&mut self, delta: isize) {
         let rows = self.du_rows();
@@ -642,7 +684,7 @@ impl App {
                         d.running = None;
                         d.progress = None;
                         if let Some(TreeBox(tree)) = tree {
-                            d.scanned = Some(Scanned::new(tree, took, seq));
+                            d.scanned = Some(Scanned::new(tree, took, seq, d.measure));
                         }
                     }
                 }
@@ -714,6 +756,7 @@ impl App {
                 d.ext_top = start.min(len.saturating_sub(rows));
             }
             DuMsg::GoTo => return self.du_go_to(),
+            DuMsg::Measure => self.du_toggle_measure(),
             DuMsg::Rescan => return self.start_disk_usage(),
             DuMsg::Close => self.close_disk_usage(),
         }
@@ -732,6 +775,7 @@ impl App {
         ("Shift+Delete", "Delete the item permanently (asks first)"),
         ("Shift+F10, Menu key, right click", "Shell context menu of the item (list row or map tile)"),
         ("Z", "Map: show only the folder under the cursor (a file: its folder)"),
+        ("S", "Switch between size and size on disk (compressed, sparse and online-only files, cluster rounding)"),
         ("Backspace", "Map: one folder level out"),
         ("Shift+Z", "Map: the whole tree again"),
         ("Click on an extension", "Highlight its files on the map (click again: clear)"),
@@ -798,6 +842,7 @@ impl App {
                 keyboard::Key::Character(c) if !mods.control() && !mods.alt() => match c.as_str() {
                     "+" => self.du_outline(|o, t, c| o.right(t, c, false)),
                     "-" => self.du_outline(|o, _, c| o.left(c, false)),
+                    "s" | "S" => self.du_toggle_measure(),
                     "z" | "Z" if mods.shift() => self.du_zoom(|_, _, _| ROOT),
                     "z" | "Z" => self.du_zoom(|t, n, _| zoom_in_target(t, n)),
                     _ => {}
@@ -836,6 +881,7 @@ impl App {
         .padding(14)
         .style(filled(colors.header));
 
+        let size_label = if d.measure == Measure::Alloc { "On disk" } else { "Size" };
         let head_cell = |s: &'a str, w: Length, right: bool| {
             let c = container(text(s).size(12).color(colors.muted)).width(w);
             if right { c.align_x(Alignment::End) } else { c }
@@ -843,7 +889,7 @@ impl App {
         let list_header = container(
             row![
                 head_cell("Name", Length::Fill, false),
-                head_cell("Size", Length::Fixed(COL_SIZE), true),
+                head_cell(size_label, Length::Fixed(COL_SIZE), true),
                 head_cell("% of folder", Length::Fixed(COL_PCT + 6.0 + BAR_W), false),
                 head_cell("Files", Length::Fixed(COL_FILES), true),
             ]
@@ -890,7 +936,7 @@ impl App {
                     row![
                         Space::with_width(Length::Fixed(EXT_SWATCH)),
                         head_cell("Type", Length::Fill, false),
-                        head_cell("Size", Length::Fixed(EXT_SIZE), true),
+                        head_cell(size_label, Length::Fixed(EXT_SIZE), true),
                         head_cell("%", Length::Fixed(EXT_PCT), true),
                         head_cell("Files", Length::Fixed(EXT_COUNT), true),
                     ]
@@ -968,7 +1014,7 @@ impl App {
                     String::new()
                 };
                 (
-                    format!("{} \u{b7} {}{what}", s.tree.path(&d.root, n).display(), format::size(node.size)),
+                    format!("{} \u{b7} {}{what}", s.tree.path(&d.root, n).display(), format::size(s.tree.bytes(n))),
                     colors.text,
                 )
             }
@@ -990,6 +1036,7 @@ impl App {
             (&["F8"], "delete"),
             (&["Shift+F10"], "menu"),
             (&["Z"], "zoom map"),
+            (&["S"], "size on disk"),
             (&["Tab"], "extensions"),
             (&["F5"], "scan again"),
             (&["Esc"], "close"),
@@ -1008,6 +1055,10 @@ impl App {
         let mut buttons = Row::new().spacing(8);
         if d.scanned.is_some() {
             buttons = buttons.push(action("Go to", DuMsg::GoTo, false));
+        }
+        if d.scanned.is_some() {
+            let label = if d.measure == Measure::Alloc { "Show size" } else { "Show size on disk" };
+            buttons = buttons.push(action(label, DuMsg::Measure, false));
         }
         buttons = buttons.push(action("Close", DuMsg::Close, false));
         if d.running.is_none() {
@@ -1037,11 +1088,12 @@ impl App {
     fn du_ext_line<'a>(&'a self, s: &'a Scanned, d: &'a DiskUsage, i: usize) -> Element<'a, Message> {
         let colors = theme::c();
         let id = s.ext_order[i];
-        let (_, bytes, count) = s.tree.exts[id as usize];
+        let count = s.tree.exts[id as usize].2;
+        let bytes = s.ext_bytes[id as usize];
         let cell = |t: String| text(t).size(13).wrapping(Wrapping::None);
         let swatch = container(Space::new(Length::Fixed(EXT_SWATCH), Length::Fixed(EXT_SWATCH)))
             .style(filled(hex_color(MAP_FILLS[color_slot(&s.ext_colors, id)])));
-        let pct = share(bytes, s.tree.root().size) * 100.0;
+        let pct = share(bytes, s.tree.bytes(ROOT)) * 100.0;
         let right = |t: String, w: f32, color: Color| {
             container(cell(t).color(color)).width(Length::Fixed(w)).align_x(Alignment::End)
         };
@@ -1087,8 +1139,9 @@ impl App {
         } else {
             Space::with_width(Length::Fixed(ARROW_W)).into()
         };
-        let parent = tree.parent(node).map_or(n.size, |p| tree.node(p).size);
-        let frac = share(n.size, parent);
+        let own = tree.bytes(node);
+        let parent = tree.parent(node).map_or(own, |p| tree.bytes(p));
+        let frac = share(own, parent);
         let bar = container(
             container(Space::new(Length::Fixed((BAR_W * frac).round()), Length::Fixed(4.0))).style(filled(colors.accent)),
         )
@@ -1105,7 +1158,7 @@ impl App {
             Space::with_width(Length::Fixed(INDENT * depth as f32)),
             arrow,
             name,
-            container(cell(format::size(n.size))).width(Length::Fixed(COL_SIZE)).align_x(Alignment::End),
+            container(cell(format::size(own))).width(Length::Fixed(COL_SIZE)).align_x(Alignment::End),
             row![pct, bar].spacing(6).align_y(Alignment::Center),
             container(cell(files).color(colors.muted)).width(Length::Fixed(COL_FILES)).align_x(Alignment::End),
         ]
@@ -1175,10 +1228,10 @@ fn hex_color(hex: u32) -> Color {
 
 /// Palette index per extension id (`MAP_GREY` for the rest): the
 /// `MAP_TOP_EXTS` extensions with the most bytes, the "other" bucket excluded.
-fn ext_colors(exts: &[(Box<str>, u64, u32)]) -> Vec<u8> {
+fn ext_colors(exts: &[(Box<str>, u64, u32)], bytes: &[u64]) -> Vec<u8> {
     let mut order: Vec<usize> =
-        (0..exts.len()).filter(|&i| i != disk_usage::EXT_OTHER as usize && exts[i].1 > 0).collect();
-    order.sort_by(|&a, &b| exts[b].1.cmp(&exts[a].1).then(a.cmp(&b)));
+        (0..exts.len()).filter(|&i| i != disk_usage::EXT_OTHER as usize && bytes[i] > 0).collect();
+    order.sort_by(|&a, &b| bytes[b].cmp(&bytes[a]).then(a.cmp(&b)));
     let mut colors = vec![MAP_GREY; exts.len()];
     for (k, &i) in order.iter().take(MAP_TOP_EXTS).enumerate() {
         colors[i] = k as u8;
@@ -1436,6 +1489,7 @@ mod tests {
         let node = |name: &str, size: u64, dir: bool, parent: u32, children: Vec<u32>| Node {
             name: name.into(),
             size,
+            alloc: size,
             files: 0,
             dirs: 0,
             kind: if dir { NodeKind::Dir } else { NodeKind::File },
@@ -1455,6 +1509,8 @@ mod tests {
             ],
             exts: vec![("".into(), 0, 0), ("*".into(), 0, 0)],
             errors: 0,
+            ext_alloc: vec![0, 0],
+            measure: Measure::Size,
         }
     }
 
@@ -1557,7 +1613,7 @@ mod tests {
             exts.push((format!("e{i}").into(), 100 + i, 1));
         }
         exts.push(("empty".into(), 0, 3));
-        let c = ext_colors(&exts);
+        let c = ext_colors(&exts, &exts.iter().map(|e| e.1).collect::<Vec<_>>());
         assert_eq!(c.len(), exts.len());
         assert_eq!(c[1], MAP_GREY, "the other bucket");
         assert_eq!(c[0], MAP_GREY, "no extension: smallest");
@@ -1624,7 +1680,7 @@ mod tests {
 
     #[test]
     fn removing_an_item_updates_the_outline_and_the_zoom() {
-        let mut s = Scanned::new(Arc::new(tree()), Duration::ZERO, 1);
+        let mut s = Scanned::new(Arc::new(tree()), Duration::ZERO, 1, Measure::Size);
         s.outline.expand(&s.tree, 1);
         assert_eq!(nodes(&s.outline), [0, 1, 3, 4, 2]);
         s.zoom = 4;
@@ -1650,7 +1706,7 @@ mod tests {
             ("md".into(), 0, 0),
             ("png".into(), 50, 1),
         ];
-        let order = ext_order(&exts);
+        let order = ext_order(&exts, &exts.iter().map(|e| e.1).collect::<Vec<_>>());
         assert_eq!(order, [5, 2, 3, 0]);
         assert_eq!(ext_step(&order, None, 1), Some(5));
         assert_eq!(ext_step(&order, None, -1), Some(0));

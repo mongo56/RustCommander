@@ -15,7 +15,7 @@ use windows::Win32::Graphics::Gdi::{
     BI_RGB, DIB_RGB_COLORS, HBITMAP, HDC,
 };
 use windows::Win32::Storage::FileSystem::{
-    GetDiskFreeSpaceExW, GetLogicalDrives, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
+    GetCompressedFileSizeW, GetDiskFreeSpaceExW, GetDiskFreeSpaceW, GetLogicalDrives, GetVolumePathNameW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
 };
 use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::System::Com::{CoInitializeEx, IDataObject, COINIT_APARTMENTTHREADED};
@@ -63,6 +63,29 @@ pub fn disk_space(path: &Path) -> Option<(u64, u64)> {
     unsafe { GetDiskFreeSpaceExW(PCWSTR(w.as_ptr()), Some(&mut free), Some(&mut total), None) }
         .ok()?;
     Some((free, total))
+}
+
+/// Bytes per cluster of the volume holding `path` (1 when unknown).
+pub fn cluster_size(path: &Path) -> u64 {
+    let w = wide(path.as_os_str());
+    let mut root = [0u16; 261];
+    if unsafe { GetVolumePathNameW(PCWSTR(w.as_ptr()), &mut root) }.is_err() {
+        return 1;
+    }
+    let (mut sectors, mut bytes) = (0u32, 0u32);
+    let ok = unsafe { GetDiskFreeSpaceW(PCWSTR(root.as_ptr()), Some(&mut sectors), Some(&mut bytes), None, None) };
+    if ok.is_err() { 1 } else { (sectors as u64 * bytes as u64).max(1) }
+}
+
+/// Bytes a compressed, sparse or cloud file really takes on disk.
+pub fn allocated_size(path: &Path) -> Option<u64> {
+    let w = wide(path.as_os_str());
+    let mut high = 0u32;
+    let low = unsafe { GetCompressedFileSizeW(PCWSTR(w.as_ptr()), Some(&mut high)) };
+    if low == u32::MAX && std::io::Error::last_os_error().raw_os_error().is_some_and(|e| e != 0) {
+        return None;
+    }
+    Some(((high as u64) << 32) | low as u64)
 }
 
 // ---- icons ------------------------------------------------------------------
