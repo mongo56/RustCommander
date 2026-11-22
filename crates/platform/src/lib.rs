@@ -18,7 +18,7 @@ mod shares;
 mod terminals;
 pub use attrib::set_file_attributes;
 pub use editors::{detect_editors, pick_program, FoundEditor};
-pub use fileid::file_id;
+pub use fileid::{file_id, read_dir_ids, DirItem, DirRead};
 pub use flash::flash_taskbar;
 pub use netuse::{connect_share, is_logon_code, share_error, share_root, ShareError};
 pub use process_info::{foreground_child, process_cwd};

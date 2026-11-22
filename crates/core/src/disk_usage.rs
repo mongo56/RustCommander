@@ -67,6 +67,9 @@ pub struct Tree {
     pub ext_alloc: Vec<u64>,
     /// Which size children are sorted by and the UI shows.
     pub measure: Measure,
+    /// File nodes that are further hard links of a file already counted at
+    /// another node (they count 0 bytes everywhere), by node index.
+    pub hard_links: HashMap<u32, HardLink>,
 }
 
 /// Which size to show and sort by.
@@ -87,21 +90,26 @@ pub fn round_to_cluster(size: u64, cluster: u64) -> u64 {
 
 /// Bytes a file takes on disk. Compressed, sparse and cloud files ask the
 /// system; the rest are rounded up to whole clusters (no extra call).
-fn allocated(meta: &fs::Metadata, path: impl FnOnce() -> PathBuf, cluster: u64) -> u64 {
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        // COMPRESSED, SPARSE_FILE, OFFLINE, RECALL_ON_OPEN, RECALL_ON_DATA_ACCESS.
-        const SPECIAL: u32 = 0x800 | 0x200 | 0x1000 | 0x40000 | 0x400000;
-        if meta.file_attributes() & SPECIAL != 0 {
-            if let Some(a) = rc_platform::allocated_size(&path()) {
-                return a;
-            }
+/// `attributes` are the Windows `FILE_ATTRIBUTE_*` bits (0 elsewhere).
+fn allocated(len: u64, attributes: u32, path: impl FnOnce() -> PathBuf, cluster: u64) -> u64 {
+    // COMPRESSED, SPARSE_FILE, OFFLINE, RECALL_ON_OPEN, RECALL_ON_DATA_ACCESS.
+    const SPECIAL: u32 = 0x800 | 0x200 | 0x1000 | 0x40000 | 0x400000;
+    if attributes & SPECIAL != 0 {
+        if let Some(a) = rc_platform::allocated_size(&path()) {
+            return a;
         }
     }
-    #[cfg(not(windows))]
-    let _ = &path;
-    round_to_cluster(meta.len(), cluster)
+    round_to_cluster(len, cluster)
+}
+
+/// A hard link whose file is counted at another link in the tree: its own
+/// node has 0 bytes, these are the bytes it would have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HardLink {
+    pub size: u64,
+    pub alloc: u64,
+    /// The node that counts the file's bytes.
+    pub counted: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -140,6 +148,22 @@ impl Tree {
             if self.nodes[i].children.len() >= 2 {
                 self.sort_children(i as u32);
             }
+        }
+    }
+
+    /// Set when node `index` is a hard link counted at another node.
+    pub fn hard_link(&self, index: u32) -> Option<&HardLink> {
+        if self.hard_links.is_empty() {
+            return None;
+        }
+        self.hard_links.get(&index)
+    }
+
+    /// A hard link's own bytes by the active measure.
+    pub fn link_bytes(&self, link: &HardLink) -> u64 {
+        match self.measure {
+            Measure::Size => link.size,
+            Measure::Alloc => link.alloc,
         }
     }
 
@@ -182,8 +206,10 @@ impl Tree {
     /// counts off every folder above it, takes its files off the extension
     /// table and sorts the children of the changed folders again. The nodes
     /// stay in [`Tree::nodes`] (indices don't move) but can't be reached from
-    /// the root any more. Returns false (and changes nothing) for the root, a
-    /// node out of range, or one already removed.
+    /// the root any more. A removed hard link that counted a file still linked
+    /// elsewhere in the tree passes its bytes on to that link. Returns false
+    /// (and changes nothing) for the root, a node out of range, or one already
+    /// removed.
     pub fn remove(&mut self, index: u32) -> bool {
         if index == ROOT || index as usize >= self.nodes.len() {
             return false;
@@ -199,11 +225,16 @@ impl Tree {
             NodeKind::Dir => (node.size, node.alloc, node.files, node.dirs + 1),
         };
         // Its files leave the extension table.
+        let track_links = !self.hard_links.is_empty();
+        let mut removed_files = Vec::new();
         let mut stack = vec![index];
         while let Some(i) = stack.pop() {
             let n = &self.nodes[i as usize];
             match n.kind {
                 NodeKind::File => {
+                    if track_links {
+                        removed_files.push(i);
+                    }
                     if let Some(e) = self.exts.get_mut(n.ext_id as usize) {
                         e.1 = e.1.saturating_sub(n.size);
                         if let Some(a) = self.ext_alloc.get_mut(n.ext_id as usize) {
@@ -216,20 +247,67 @@ impl Tree {
             }
         }
         // Up the chain: smaller folders, which may move down in their own folder.
-        let mut i = parent;
-        loop {
-            let p = &mut self.nodes[i as usize];
+        self.update_up(parent, |p| {
             p.size = p.size.saturating_sub(size);
             p.alloc = p.alloc.saturating_sub(alloc);
             p.files = p.files.saturating_sub(files);
             p.dirs = p.dirs.saturating_sub(dirs);
-            self.sort_children(i);
-            if i == ROOT {
-                break;
-            }
-            i = self.nodes[i as usize].parent;
+        });
+        if track_links {
+            self.pass_on_hard_links(&removed_files);
         }
         true
+    }
+
+    /// After [`Tree::remove`] took `removed` files out: a removed file that
+    /// counted the bytes of a file with other links still in the tree passes
+    /// them on to the first of those (deleting one link frees nothing while
+    /// others remain), so totals stay right.
+    fn pass_on_hard_links(&mut self, removed: &[u32]) {
+        let removed: std::collections::HashSet<u32> = removed.iter().copied().collect();
+        self.hard_links.retain(|link, _| !removed.contains(link));
+        // Removed counting node -> the remaining link (lowest index) that takes over.
+        let mut heirs: HashMap<u32, u32> = HashMap::new();
+        for (&link, h) in &self.hard_links {
+            if removed.contains(&h.counted) {
+                heirs.entry(h.counted).and_modify(|n| *n = (*n).min(link)).or_insert(link);
+            }
+        }
+        for &heir in heirs.values() {
+            let Some(h) = self.hard_links.remove(&heir) else { continue };
+            let node = &mut self.nodes[heir as usize];
+            node.size = h.size;
+            node.alloc = h.alloc;
+            let (ext, parent) = (node.ext_id as usize, node.parent);
+            if let Some(e) = self.exts.get_mut(ext) {
+                e.1 += h.size;
+            }
+            if let Some(a) = self.ext_alloc.get_mut(ext) {
+                *a += h.alloc;
+            }
+            self.update_up(parent, |p| {
+                p.size += h.size;
+                p.alloc += h.alloc;
+            });
+        }
+        for h in self.hard_links.values_mut() {
+            if let Some(&heir) = heirs.get(&h.counted) {
+                h.counted = heir;
+            }
+        }
+    }
+
+    /// Applies `f` to folder `index` and every folder above it, sorting each
+    /// one's children again.
+    fn update_up(&mut self, mut index: u32, f: impl Fn(&mut Node)) {
+        loop {
+            f(&mut self.nodes[index as usize]);
+            self.sort_children(index);
+            if index == ROOT {
+                break;
+            }
+            index = self.nodes[index as usize].parent;
+        }
     }
 
     /// `index` if it can still be reached from the root, else the nearest
@@ -277,15 +355,232 @@ fn extension(name: &str) -> Option<String> {
     Some(ext.to_lowercase())
 }
 
+/// State of a running [`scan`].
+struct Scanner {
+    tree: Tree,
+    ext_ids: HashMap<String, u16>,
+    cluster: u64,
+    files: u64,
+    bytes: u64,
+    /// Folders still to read: (node, path).
+    stack: Vec<(u32, PathBuf)>,
+    /// (file id, node) of every file that may have other hard links: ids
+    /// that fit in 64 bits (NTFS) here, wider ones (ReFS, Unix device+inode)
+    /// in `wide`, so the common case takes 16 bytes per file.
+    ids: Vec<(u64, u32)>,
+    wide: Vec<(u128, u32)>,
+}
+
+impl Scanner {
+    /// The next node's index, or `None` once the tree is full.
+    fn next_index(&self) -> Option<u32> {
+        u32::try_from(self.tree.nodes.len()).ok()
+    }
+
+    fn add_dir(&mut self, parent: u32, name: Box<str>, path: PathBuf) -> u32 {
+        let index = self.tree.nodes.len() as u32;
+        self.stack.push((index, path));
+        self.tree.nodes.push(Node {
+            name,
+            size: 0,
+            alloc: 0,
+            files: 0,
+            dirs: 0,
+            kind: NodeKind::Dir,
+            ext_id: EXT_DIR,
+            parent,
+            children: Vec::new(),
+        });
+        index
+    }
+
+    /// Adds a file; `id` identifies it on the volume when it may have other
+    /// hard links in the tree.
+    fn add_file(&mut self, parent: u32, name: Box<str>, size: u64, alloc: u64, id: Option<u128>) -> u32 {
+        let index = self.tree.nodes.len() as u32;
+        let tree = &mut self.tree;
+        let ext_id = match extension(&name) {
+            None => EXT_NONE,
+            Some(ext) => match self.ext_ids.get(&ext) {
+                Some(&id) => id,
+                None if tree.exts.len() < EXT_DIR as usize => {
+                    let id = tree.exts.len() as u16;
+                    tree.exts.push((ext.as_str().into(), 0, 0));
+                    tree.ext_alloc.push(0);
+                    self.ext_ids.insert(ext, id);
+                    id
+                }
+                None => EXT_OTHER,
+            },
+        };
+        let entry = &mut tree.exts[ext_id as usize];
+        entry.1 += size;
+        entry.2 += 1;
+        tree.ext_alloc[ext_id as usize] += alloc;
+        self.files += 1;
+        self.bytes += size;
+        match id {
+            Some(id) if id >> 64 == 0 => self.ids.push((id as u64, index)),
+            Some(id) => self.wide.push((id, index)),
+            None => {}
+        }
+        tree.nodes.push(Node {
+            name,
+            size,
+            alloc,
+            files: 0,
+            dirs: 0,
+            kind: NodeKind::File,
+            ext_id,
+            parent,
+            children: Vec::new(),
+        });
+        index
+    }
+
+    /// Reads folder `dir` (node `dir_index`) with `std::fs::read_dir`.
+    /// Returns its children and whether everything could be read, or `None`
+    /// when it can't be listed at all.
+    fn read_std(&mut self, dir_index: u32, dir: &Path, cancel: &AtomicBool) -> Option<(Vec<u32>, bool)> {
+        let items = fs::read_dir(dir).ok()?;
+        let mut complete = true;
+        let mut children = Vec::new();
+        for item in items {
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            let Ok(item) = item else {
+                complete = false;
+                continue;
+            };
+            // `DirEntry::file_type` doesn't follow links: a link or junction to a
+            // folder isn't `is_dir` here.
+            let Ok(file_type) = item.file_type() else {
+                complete = false;
+                continue;
+            };
+            if self.next_index().is_none() {
+                break;
+            }
+            let name: Box<str> = item.file_name().to_string_lossy().into();
+            let index = if file_type.is_dir() {
+                self.add_dir(dir_index, name, item.path())
+            } else {
+                // On Windows `DirEntry::metadata` is the link's own, without following it.
+                let (size, alloc, id) = match item.metadata() {
+                    Ok(meta) => {
+                        #[cfg(windows)]
+                        let attributes = std::os::windows::fs::MetadataExt::file_attributes(&meta);
+                        #[cfg(not(windows))]
+                        let attributes = 0;
+                        (meta.len(), allocated(meta.len(), attributes, || item.path(), self.cluster), unix_id(&meta))
+                    }
+                    Err(_) => {
+                        complete = false;
+                        (0, 0, None)
+                    }
+                };
+                self.add_file(dir_index, name, size, alloc, id)
+            };
+            children.push(index);
+        }
+        Some((children, complete))
+    }
+
+    /// Reads folder `dir` with [`rc_platform::read_dir_ids`], which also
+    /// gives every file's id. Files get an id only when the folder is on
+    /// `volume` (set from the first folder read), so ids never mix volumes.
+    fn read_fast(
+        &mut self,
+        dir_index: u32,
+        dir: &Path,
+        volume: &mut Option<u64>,
+        cancel: &AtomicBool,
+    ) -> (rc_platform::DirRead, Vec<u32>) {
+        let mut children = Vec::new();
+        let read = rc_platform::read_dir_ids(dir, |item| {
+            if cancel.load(Ordering::Relaxed) || self.next_index().is_none() {
+                return false;
+            }
+            let name: Box<str> = String::from_utf16_lossy(item.name).into();
+            let index = if item.is_dir() {
+                self.add_dir(dir_index, name.clone(), dir.join(&*name))
+            } else {
+                if volume.is_none() {
+                    *volume = item.volume;
+                }
+                let id = item.id.filter(|_| item.volume.is_some() && item.volume == *volume);
+                let alloc = allocated(item.len, item.attributes, || dir.join(&*name), self.cluster);
+                self.add_file(dir_index, name, item.len, alloc, id)
+            };
+            children.push(index);
+            true
+        });
+        (read, children)
+    }
+
+    /// Counts every file with several hard links in the tree once: the link
+    /// found first keeps its bytes, the others get 0 and an entry in
+    /// [`Tree::hard_links`]. Their bytes also leave the extension table.
+    fn count_hard_links_once(&mut self) {
+        let mut pairs = Vec::new();
+        duplicates(&mut self.ids, &mut pairs);
+        duplicates(&mut self.wide, &mut pairs);
+        let tree = &mut self.tree;
+        for (link, counted) in pairs {
+            let node = &mut tree.nodes[link as usize];
+            let (size, alloc) = (node.size, node.alloc);
+            node.size = 0;
+            node.alloc = 0;
+            let ext = node.ext_id as usize;
+            tree.exts[ext].1 -= size;
+            tree.ext_alloc[ext] -= alloc;
+            tree.hard_links.insert(link, HardLink { size, alloc, counted });
+        }
+    }
+}
+
+/// Sorts `ids` and appends (later link, first link) for every node whose id
+/// an earlier node (lower index, found first) has too. Frees `ids`.
+fn duplicates<K: Ord + Copy>(ids: &mut Vec<(K, u32)>, out: &mut Vec<(u32, u32)>) {
+    ids.sort_unstable();
+    for run in ids.chunk_by(|a, b| a.0 == b.0) {
+        out.extend(run[1..].iter().map(|&(_, link)| (link, run[0].1)));
+    }
+    *ids = Vec::new();
+}
+
+/// Device and inode of a file with more than one hard link (Unix); `None`
+/// elsewhere or for a single link.
+fn unix_id(meta: &fs::Metadata) -> Option<u128> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        (meta.nlink() > 1).then(|| ((meta.dev() as u128) << 64) | meta.ino() as u128)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        None
+    }
+}
+
 /// Scans `root` recursively. Links and junctions count as themselves and are
 /// not followed; unreadable folders are skipped and counted in
 /// [`Tree::errors`]. `size` is the logical length and `alloc` the space taken
 /// on disk (whole clusters; the system's figure for compressed, sparse and
-/// cloud files). Hard links count once per link. `progress` is called at most
-/// every ~100 ms. Returns
-/// `None` once `cancel` is set.
+/// cloud files). A file with several hard links in the tree counts once (see
+/// [`Tree::hard_links`]). `progress` is called at most every ~100 ms.
+/// Returns `None` once `cancel` is set.
+///
+/// On Windows folders are listed with their files' ids
+/// ([`rc_platform::read_dir_ids`]), which costs no extra call per file; hard
+/// links are then found by sorting the ids once at the end (16 bytes per
+/// file while scanning). Where that listing isn't supported (FAT, some
+/// network shares) `std::fs::read_dir` is used and hard links aren't
+/// detected. On Unix only files with a link count above 1 are tracked.
 pub fn scan(root: &Path, cancel: &AtomicBool, mut progress: impl FnMut(Progress)) -> Option<Tree> {
-    let mut tree = Tree {
+    let tree = Tree {
         nodes: vec![Node {
             name: root.to_string_lossy().into(),
             size: 0,
@@ -298,107 +593,56 @@ pub fn scan(root: &Path, cancel: &AtomicBool, mut progress: impl FnMut(Progress)
             children: Vec::new(),
         }],
         exts: vec![("".into(), 0, 0), ("*".into(), 0, 0)],
-        errors: 0,
         ext_alloc: vec![0, 0],
-        measure: Measure::Size,
+        ..Tree::default()
     };
-    let mut ext_ids: HashMap<String, u16> = HashMap::new();
-    let cluster = rc_platform::cluster_size(root);
-    let (mut files, mut bytes) = (0u64, 0u64);
+    let mut s = Scanner {
+        tree,
+        ext_ids: HashMap::new(),
+        cluster: rc_platform::cluster_size(root),
+        files: 0,
+        bytes: 0,
+        stack: vec![(ROOT, root.to_path_buf())],
+        ids: Vec::new(),
+        wide: Vec::new(),
+    };
+    let mut fast = cfg!(windows);
+    let mut volume = None;
     let mut last_report = Instant::now();
-    let mut stack = vec![(ROOT, root.to_path_buf())];
-    while let Some((dir_index, dir)) = stack.pop() {
+    while let Some((dir_index, dir)) = s.stack.pop() {
         if cancel.load(Ordering::Relaxed) {
             return None;
         }
         if last_report.elapsed() >= PROGRESS_EVERY {
-            progress(Progress { files, bytes, current: dir.clone() });
+            progress(Progress { files: s.files, bytes: s.bytes, current: dir.clone() });
             last_report = Instant::now();
         }
-        let Ok(items) = fs::read_dir(&dir) else {
-            tree.errors += 1;
+        let mut listed = None;
+        if fast {
+            match s.read_fast(dir_index, &dir, &mut volume, cancel) {
+                (rc_platform::DirRead::Done(complete), children) => listed = Some((children, complete)),
+                (rc_platform::DirRead::Fallback(never), _) => fast = !never,
+            }
+        }
+        let listed = match listed {
+            Some(l) => Some(l),
+            None => s.read_std(dir_index, &dir, cancel),
+        };
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        let Some((mut children, complete)) = listed else {
+            s.tree.errors += 1;
             continue;
         };
-        let mut failed = false;
-        let mut children = Vec::new();
-        for item in items {
-            if cancel.load(Ordering::Relaxed) {
-                return None;
-            }
-            let Ok(item) = item else {
-                failed = true;
-                continue;
-            };
-            // `DirEntry::file_type` doesn't follow links: a link or junction to a
-            // folder isn't `is_dir` here.
-            let Ok(file_type) = item.file_type() else {
-                failed = true;
-                continue;
-            };
-            let Ok(index) = u32::try_from(tree.nodes.len()) else { break };
-            let name: Box<str> = item.file_name().to_string_lossy().into();
-            if file_type.is_dir() {
-                stack.push((index, item.path()));
-                tree.nodes.push(Node {
-                    name,
-                    size: 0,
-                    alloc: 0,
-                    files: 0,
-                    dirs: 0,
-                    kind: NodeKind::Dir,
-                    ext_id: EXT_DIR,
-                    parent: dir_index,
-                    children: Vec::new(),
-                });
-            } else {
-                // On Windows `DirEntry::metadata` is the link's own, without following it.
-                let (size, alloc) = match item.metadata() {
-                    Ok(meta) => (meta.len(), allocated(&meta, || item.path(), cluster)),
-                    Err(_) => {
-                        failed = true;
-                        (0, 0)
-                    }
-                };
-                let ext_id = match extension(&name) {
-                    None => EXT_NONE,
-                    Some(ext) => match ext_ids.get(&ext) {
-                        Some(&id) => id,
-                        None if tree.exts.len() < EXT_DIR as usize => {
-                            let id = tree.exts.len() as u16;
-                            tree.exts.push((ext.as_str().into(), 0, 0));
-                            tree.ext_alloc.push(0);
-                            ext_ids.insert(ext, id);
-                            id
-                        }
-                        None => EXT_OTHER,
-                    },
-                };
-                let entry = &mut tree.exts[ext_id as usize];
-                entry.1 += size;
-                entry.2 += 1;
-                tree.ext_alloc[ext_id as usize] += alloc;
-                files += 1;
-                bytes += size;
-                tree.nodes.push(Node {
-                    name,
-                    size,
-                    alloc,
-                    files: 0,
-                    dirs: 0,
-                    kind: NodeKind::File,
-                    ext_id,
-                    parent: dir_index,
-                    children: Vec::new(),
-                });
-            }
-            children.push(index);
-        }
-        if failed {
-            tree.errors += 1;
+        if !complete {
+            s.tree.errors += 1;
         }
         children.shrink_to_fit();
-        tree.nodes[dir_index as usize].children = children;
+        s.tree.nodes[dir_index as usize].children = children;
     }
+    s.count_hard_links_once();
+    let mut tree = s.tree;
     // Children always come after their parent, so one pass from the end sums
     // every folder before its own parent sees it.
     for i in (1..tree.nodes.len()).rev() {
@@ -629,5 +873,99 @@ mod tests {
         assert_eq!(tree.root().children, [2, 1]);
         tree.set_measure(Measure::Size);
         assert_eq!(tree.root().children, [1, 2]);
+    }
+
+    #[test]
+    fn duplicates_pair_later_links_with_the_first() {
+        let mut ids = vec![(7u64, 5), (3, 1), (7, 2), (9, 4), (7, 8)];
+        let mut out = Vec::new();
+        duplicates(&mut ids, &mut out);
+        assert_eq!(out, [(5, 2), (8, 2)]);
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn hard_links_count_once_and_pass_their_bytes_on_when_removed() {
+        let root = temp("hardlink");
+        fs::create_dir_all(root.join("d")).unwrap();
+        fs::create_dir_all(root.join("e")).unwrap();
+        fs::write(root.join("a.bin"), [0u8; 100]).unwrap();
+        fs::write(root.join("other.bin"), [0u8; 7]).unwrap();
+        if fs::hard_link(root.join("a.bin"), root.join("d/b.bin")).is_err()
+            || fs::hard_link(root.join("a.bin"), root.join("e/c.bin")).is_err()
+        {
+            eprintln!("skipped: can't create hard links here");
+            let _ = fs::remove_dir_all(&root);
+            return;
+        }
+        let mut tree = scan(&root, &AtomicBool::new(false), |_| {}).unwrap();
+        if tree.hard_links.is_empty() {
+            eprintln!("skipped: the file system gives no file ids");
+            let _ = fs::remove_dir_all(&root);
+            return;
+        }
+        let r = tree.root();
+        assert_eq!((r.size, r.files, r.dirs), (107, 4, 2));
+        let (ai, _) = child(&tree, ROOT, "a.bin");
+        let (di, _) = child(&tree, ROOT, "d");
+        let (ei, _) = child(&tree, ROOT, "e");
+        let (bi, _) = child(&tree, di, "b.bin");
+        let (ci, _) = child(&tree, ei, "c.bin");
+        let links = [ai, bi, ci];
+        let counted: Vec<u32> = links.iter().copied().filter(|&i| tree.node(i).size == 100).collect();
+        assert_eq!(counted.len(), 1, "one link keeps the bytes");
+        assert_eq!(tree.hard_links.len(), 2);
+        for &i in links.iter().filter(|&&i| i != counted[0]) {
+            assert_eq!(tree.node(i).size, 0);
+            let h = tree.hard_link(i).unwrap();
+            assert_eq!((h.size, h.counted), (100, counted[0]));
+            assert_eq!(tree.link_bytes(h), 100);
+        }
+        assert!(tree.hard_link(counted[0]).is_none());
+        let bin = tree.exts.iter().find(|e| &*e.0 == "bin").map(|e| (e.1, e.2));
+        assert_eq!(bin, Some((107, 4)));
+        // The counting link goes: another one takes over, the total stays.
+        assert!(tree.remove(counted[0]));
+        assert_eq!((tree.root().size, tree.root().files), (107, 3));
+        assert_eq!(tree.hard_links.len(), 1);
+        let left: Vec<u32> = links.iter().copied().filter(|&i| i != counted[0]).collect();
+        let heir = *left.iter().find(|&&i| tree.node(i).size == 100).unwrap();
+        let other = *left.iter().find(|&&i| i != heir).unwrap();
+        assert_eq!(tree.hard_link(other).map(|h| h.counted), Some(heir));
+        assert_eq!(tree.bytes(tree.node(heir).parent), 100 + if tree.node(heir).parent == ROOT { 7 } else { 0 });
+        // An uncounted link goes: nothing changes but the file count.
+        assert!(tree.remove(other));
+        assert_eq!((tree.root().size, tree.root().files), (107, 2));
+        assert!(tree.hard_links.is_empty());
+        // The last one frees the bytes.
+        assert!(tree.remove(heir));
+        assert_eq!(tree.root().size, 7);
+        assert_eq!(tree.exts.iter().find(|e| &*e.0 == "bin").map(|e| (e.1, e.2)), Some((7, 1)));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn removing_a_folder_with_the_counting_link_passes_it_on() {
+        let root = temp("hardlink-dir");
+        fs::create_dir_all(root.join("d")).unwrap();
+        fs::write(root.join("d/a"), [0u8; 50]).unwrap();
+        if fs::hard_link(root.join("d/a"), root.join("b")).is_err() {
+            eprintln!("skipped: can't create hard links here");
+            let _ = fs::remove_dir_all(&root);
+            return;
+        }
+        let mut tree = scan(&root, &AtomicBool::new(false), |_| {}).unwrap();
+        if tree.hard_links.is_empty() {
+            eprintln!("skipped: the file system gives no file ids");
+            let _ = fs::remove_dir_all(&root);
+            return;
+        }
+        assert_eq!(tree.root().size, 50);
+        let (di, _) = child(&tree, ROOT, "d");
+        let (bi, _) = child(&tree, ROOT, "b");
+        assert!(tree.remove(di));
+        assert_eq!((tree.root().size, tree.node(bi).size), (50, 50));
+        assert!(tree.hard_links.is_empty());
+        fs::remove_dir_all(&root).unwrap();
     }
 }

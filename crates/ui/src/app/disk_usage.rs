@@ -408,6 +408,11 @@ fn header_text(tree: &Tree, took: Duration) -> String {
     if tree.errors > 0 {
         t.push_str(&format!(" \u{b7} {} unreadable", tree.errors));
     }
+    match tree.hard_links.len() {
+        0 => {}
+        1 => t.push_str(" \u{b7} 1 hard link counted once"),
+        n => t.push_str(&format!(" \u{b7} {n} hard links counted once")),
+    }
     if tree.measure == Measure::Alloc {
         t.push_str(" on disk");
     }
@@ -1008,15 +1013,20 @@ impl App {
         let (note, note_color) = match hovered {
             Some((s, n)) => {
                 let node = s.tree.node(n);
-                let what = if node.kind == NodeKind::Dir && n != ROOT && !node.children.is_empty() {
-                    format!(" \u{b7} {} files", node.files)
+                let path = s.tree.path(&d.root, n);
+                let text = if let Some(link) = s.tree.hard_link(n) {
+                    format!(
+                        "{} \u{b7} {} \u{b7} hard link, counted once at {}",
+                        path.display(),
+                        format::size(s.tree.link_bytes(link)),
+                        s.tree.path(&d.root, link.counted).display()
+                    )
+                } else if node.kind == NodeKind::Dir && n != ROOT && !node.children.is_empty() {
+                    format!("{} \u{b7} {} \u{b7} {} files", path.display(), format::size(s.tree.bytes(n)), node.files)
                 } else {
-                    String::new()
+                    format!("{} \u{b7} {}", path.display(), format::size(s.tree.bytes(n)))
                 };
-                (
-                    format!("{} \u{b7} {}{what}", s.tree.path(&d.root, n).display(), format::size(s.tree.bytes(n))),
-                    colors.text,
-                )
+                (text, colors.text)
             }
             None if d.deleting.is_some() => {
                 let path = d.deleting.as_ref().map_or(String::new(), |x| x.3.display().to_string());
@@ -1153,12 +1163,17 @@ impl App {
             .align_x(Alignment::End);
         let files = if is_dir { n.files.to_string() } else { String::new() };
         let name = container(cell(n.name.to_string())).width(Length::Fill).clip(true);
+        // A further hard link: its own size, dimmed (it counts 0 bytes).
+        let size = match tree.hard_link(node) {
+            Some(link) => cell(format::size(tree.link_bytes(link))).color(colors.muted),
+            None => cell(format::size(own)),
+        };
 
         let content = row![
             Space::with_width(Length::Fixed(INDENT * depth as f32)),
             arrow,
             name,
-            container(cell(format::size(own))).width(Length::Fixed(COL_SIZE)).align_x(Alignment::End),
+            container(size).width(Length::Fixed(COL_SIZE)).align_x(Alignment::End),
             row![pct, bar].spacing(6).align_y(Alignment::Center),
             container(cell(files).color(colors.muted)).width(Length::Fixed(COL_FILES)).align_x(Alignment::End),
         ]
@@ -1510,7 +1525,7 @@ mod tests {
             exts: vec![("".into(), 0, 0), ("*".into(), 0, 0)],
             errors: 0,
             ext_alloc: vec![0, 0],
-            measure: Measure::Size,
+            ..Tree::default()
         }
     }
 
@@ -1730,6 +1745,17 @@ mod tests {
         assert_eq!(MAP_FILLS[color_slot(&colors, 3)], MAP_PALETTE[3]);
         assert_eq!(MAP_FILLS[color_slot(&colors, 1)], MAP_OTHER);
         assert_eq!(MAP_FILLS[color_slot(&colors, EXT_DIR)], MAP_FOLDER);
+    }
+
+    #[test]
+    fn header_mentions_hard_links_counted_once() {
+        use rc_core::disk_usage::HardLink;
+        let mut t = tree();
+        assert!(!header_text(&t, Duration::ZERO).contains("hard link"));
+        t.hard_links.insert(6, HardLink { size: 10, alloc: 10, counted: 3 });
+        assert!(header_text(&t, Duration::ZERO).contains(" \u{b7} 1 hard link counted once"));
+        t.hard_links.insert(5, HardLink { size: 40, alloc: 40, counted: 3 });
+        assert!(header_text(&t, Duration::ZERO).contains(" \u{b7} 2 hard links counted once"));
     }
 
     #[test]
