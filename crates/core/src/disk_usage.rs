@@ -259,6 +259,148 @@ impl Tree {
         true
     }
 
+    /// True when a hard link inside the subtree at `index` is counted at a
+    /// node outside it, or one outside is counted inside. A rescan of that
+    /// subtree alone can't tell which of its files are linked outside (the
+    /// file ids aren't kept), so [`Tree::replace_subtree`] refuses then and the
+    /// whole tree has to be scanned again.
+    pub fn links_cross(&self, index: u32) -> bool {
+        let inside = |mut i: u32| -> bool {
+            loop {
+                if i == index {
+                    return true;
+                }
+                if i == ROOT {
+                    return false;
+                }
+                i = self.nodes[i as usize].parent;
+            }
+        };
+        self.hard_links.iter().any(|(&link, h)| inside(link) != inside(h.counted))
+    }
+
+    /// Replaces the folder `index` (and everything under it) with `sub`, a
+    /// fresh [`scan`] of that folder, e.g. after a delete in it failed
+    /// partway. The old nodes are taken out as by [`Tree::remove`] (they stay
+    /// in [`Tree::nodes`], unreachable) and `sub`'s nodes are appended, so a
+    /// child's index stays greater than its parent's. The folders above get
+    /// the new sums and sort their children again, the new files go into the
+    /// extension table, `sub`'s hard links (recomputed within the folder)
+    /// join [`Tree::hard_links`] and its unreadable folders add to
+    /// [`Tree::errors`] (the old subtree's errors aren't known, so they stay
+    /// counted). Returns the folder's new index, or `None` (and changes
+    /// nothing) for the root, a file, a removed node, a tree that would grow
+    /// too large, or a folder with hard links across its boundary
+    /// ([`Tree::links_cross`]).
+    pub fn replace_subtree(&mut self, index: u32, mut sub: Tree) -> Option<u32> {
+        if index == ROOT
+            || index as usize >= self.nodes.len()
+            || self.node(index).kind != NodeKind::Dir
+            || self.surviving(index) != index
+            || self.links_cross(index)
+            || sub.nodes.is_empty()
+        {
+            return None;
+        }
+        let base = u32::try_from(self.nodes.len()).ok()?;
+        base.checked_add(u32::try_from(sub.nodes.len()).ok()?)?;
+        let parent = self.node(index).parent;
+        let name = self.node(index).name.clone();
+        self.remove(index);
+        sub.set_measure(self.measure);
+        // `sub`'s extension ids -> this tree's (by name; new ones are added).
+        let mut by_name: HashMap<Box<str>, u16> =
+            self.exts.iter().enumerate().skip(2).map(|(i, e)| (e.0.clone(), i as u16)).collect();
+        let mut ext_map = Vec::with_capacity(sub.exts.len());
+        for (i, e) in sub.exts.iter().enumerate() {
+            let id = match i {
+                0 => EXT_NONE,
+                1 => EXT_OTHER,
+                _ => match by_name.get(&e.0) {
+                    Some(&id) => id,
+                    None if self.exts.len() < EXT_DIR as usize => {
+                        let id = self.exts.len() as u16;
+                        self.exts.push((e.0.clone(), 0, 0));
+                        self.ext_alloc.resize(self.exts.len(), 0);
+                        by_name.insert(e.0.clone(), id);
+                        id
+                    }
+                    None => EXT_OTHER,
+                },
+            };
+            if let Some(t) = self.exts.get_mut(id as usize) {
+                t.1 += e.1;
+                t.2 += e.2;
+            }
+            if let (Some(a), Some(&b)) = (self.ext_alloc.get_mut(id as usize), sub.ext_alloc.get(i)) {
+                *a += b;
+            }
+            ext_map.push(id);
+        }
+        let r = &sub.nodes[ROOT as usize];
+        let (size, alloc, files, dirs) = (r.size, r.alloc, r.files, r.dirs.saturating_add(1));
+        self.nodes.reserve(sub.nodes.len());
+        for (i, mut n) in sub.nodes.into_iter().enumerate() {
+            if i == ROOT as usize {
+                n.name = name.clone();
+                n.parent = parent;
+            } else {
+                n.parent += base;
+            }
+            for c in &mut n.children {
+                *c += base;
+            }
+            if n.ext_id != EXT_DIR {
+                n.ext_id = ext_map.get(n.ext_id as usize).copied().unwrap_or(EXT_OTHER);
+            }
+            self.nodes.push(n);
+        }
+        for (link, mut h) in sub.hard_links {
+            h.counted += base;
+            self.hard_links.insert(link + base, h);
+        }
+        self.errors = self.errors.saturating_add(sub.errors);
+        self.nodes[parent as usize].children.push(base);
+        self.update_up(parent, |p| {
+            p.size += size;
+            p.alloc += alloc;
+            p.files = p.files.saturating_add(files);
+            p.dirs = p.dirs.saturating_add(dirs);
+        });
+        Some(base)
+    }
+
+    /// Applies a [`rescan`] of folder `index`: a folder gone from disk is
+    /// removed ([`Tree::remove`]) and its parent returned; a scanned one
+    /// replaces the old subtree ([`Tree::replace_subtree`]) and its new index
+    /// is returned. `None`: nothing changed (see those two); scan everything
+    /// again then.
+    pub fn splice(&mut self, index: u32, rescan: Rescan) -> Option<u32> {
+        match rescan {
+            Rescan::Gone => {
+                let parent = self.parent(index)?;
+                self.remove(index).then_some(parent)
+            }
+            Rescan::Tree(sub) => self.replace_subtree(index, sub),
+        }
+    }
+
+    /// The deepest node on the way to `path` (a path under `root`, the
+    /// folder the tree was scanned from), by name: `path`'s own node when it
+    /// is in the tree, else the nearest folder above it that is.
+    pub fn locate(&self, root: &Path, path: &Path) -> u32 {
+        let mut node = ROOT;
+        let Ok(rel) = path.strip_prefix(root) else { return ROOT };
+        for part in rel.components() {
+            let name = part.as_os_str().to_string_lossy();
+            match self.node(node).children.iter().find(|&&c| *self.node(c).name == *name) {
+                Some(&c) => node = c,
+                None => break,
+            }
+        }
+        node
+    }
+
     /// After [`Tree::remove`] took `removed` files out: a removed file that
     /// counted the bytes of a file with other links still in the tree passes
     /// them on to the first of those (deleting one link frees nothing while
@@ -562,6 +704,24 @@ fn unix_id(meta: &fs::Metadata) -> Option<u128> {
     {
         let _ = meta;
         None
+    }
+}
+
+/// Result of [`rescan`].
+#[derive(Debug, Clone)]
+pub enum Rescan {
+    /// The folder isn't there (or isn't a folder) any more.
+    Gone,
+    Tree(Tree),
+}
+
+/// Scans folder `path` again (a folder already in a tree, for
+/// [`Tree::splice`]), or tells it is gone. `None` once `cancel` is set.
+pub fn rescan(path: &Path, cancel: &AtomicBool, progress: impl FnMut(Progress)) -> Option<Rescan> {
+    match fs::symlink_metadata(path) {
+        Ok(m) if !m.is_dir() => Some(Rescan::Gone),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(Rescan::Gone),
+        _ => scan(path, cancel, progress).map(Rescan::Tree),
     }
 }
 
@@ -966,6 +1126,162 @@ mod tests {
         assert!(tree.remove(di));
         assert_eq!((tree.root().size, tree.node(bi).size), (50, 50));
         assert!(tree.hard_links.is_empty());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Everything reachable from `i`, in child order: name, sizes, counts.
+    fn shape(tree: &Tree, i: u32, out: &mut Vec<String>) {
+        let n = tree.node(i);
+        out.push(format!("{} {} {} {} {} {:?}", n.name, n.size, n.alloc, n.files, n.dirs, tree.ext_name(i)));
+        for &c in &n.children {
+            shape(tree, c, out);
+        }
+    }
+
+    /// The extensions with files: name -> (bytes, allocated, files).
+    fn ext_table(tree: &Tree) -> Vec<(String, u64, u64, u32)> {
+        let mut v: Vec<_> = (0..tree.exts.len())
+            .filter(|&i| tree.exts[i].2 > 0)
+            .map(|i| (tree.exts[i].0.to_string(), tree.exts[i].1, tree.ext_alloc[i], tree.exts[i].2))
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn assert_same(spliced: &Tree, fresh: &Tree) {
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        shape(spliced, ROOT, &mut a);
+        shape(fresh, ROOT, &mut b);
+        assert_eq!(a, b);
+        assert_eq!(ext_table(spliced), ext_table(fresh));
+        assert_eq!(spliced.hard_links.len(), fresh.hard_links.len());
+        assert_eq!(spliced.errors, fresh.errors);
+    }
+
+    fn subtree_fixture(name: &str) -> PathBuf {
+        let root = temp(name);
+        fs::create_dir_all(root.join("a/b/deep")).unwrap();
+        fs::create_dir_all(root.join("d")).unwrap();
+        fs::write(root.join("a/b/z.rs"), [0u8; 300]).unwrap();
+        fs::write(root.join("a/b/deep/w.rs"), [0u8; 40]).unwrap();
+        fs::write(root.join("a/y.txt"), [0u8; 20]).unwrap();
+        fs::write(root.join("a/c.log"), [0u8; 5]).unwrap();
+        fs::write(root.join("x.txt"), [0u8; 100]).unwrap();
+        fs::write(root.join("d/k.md"), [0u8; 3]).unwrap();
+        root
+    }
+
+    #[test]
+    fn a_rescanned_subtree_matches_a_full_scan() {
+        for measure in [Measure::Size, Measure::Alloc] {
+            let root = subtree_fixture(&format!("splice-{measure:?}"));
+            let no = AtomicBool::new(false);
+            let mut tree = scan(&root, &no, |_| {}).unwrap();
+            tree.set_measure(measure);
+            assert_eq!(tree.node(tree.root().children[0]).name.as_ref(), "a");
+            // Part of "a" goes (a delete that stopped partway), a new file appears.
+            fs::remove_file(root.join("a/b/z.rs")).unwrap();
+            fs::remove_dir_all(root.join("a/b/deep")).unwrap();
+            fs::write(root.join("a/b/new.dat"), [0u8; 7]).unwrap();
+            let ai = tree.locate(&root, &root.join("a"));
+            let bi = tree.locate(&root, &root.join("a/b"));
+            assert_eq!(tree.locate(&root, &root.join("a/b/nope/x")), bi, "nearest folder above");
+            assert!(!tree.links_cross(ai));
+            let Some(Rescan::Tree(sub)) = rescan(&root.join("a"), &no, |_| {}) else { panic!("a is there") };
+            let new = tree.splice(ai, Rescan::Tree(sub)).unwrap();
+            assert!(new > ai);
+            assert_eq!((tree.node(new).name.as_ref(), tree.parent(new)), ("a", Some(ROOT)));
+            assert_eq!(tree.surviving(ai), ROOT, "the old node is out");
+            assert_eq!(tree.locate(&root, &root.join("a")), new);
+            assert_eq!(tree.path(&root, tree.locate(&root, &root.join("a/b/new.dat"))), root.join("a/b/new.dat"));
+            let mut fresh = scan(&root, &no, |_| {}).unwrap();
+            fresh.set_measure(measure);
+            assert_same(&tree, &fresh);
+            if measure == Measure::Size {
+                // "a" (32 bytes now) went below "x.txt".
+                assert_eq!(tree.node(tree.root().children[0]).name.as_ref(), "x.txt");
+            }
+            // A second splice of the same folder works on the new index.
+            let Some(again) = rescan(&root.join("a"), &no, |_| {}) else { panic!() };
+            assert!(tree.splice(ai, again.clone()).is_none(), "the old index is gone");
+            assert!(tree.splice(new, again).is_some());
+            assert_same(&tree, &fresh);
+            fs::remove_dir_all(&root).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_rescanned_folder_that_is_gone_is_removed() {
+        let root = subtree_fixture("splice-gone");
+        let no = AtomicBool::new(false);
+        let mut tree = scan(&root, &no, |_| {}).unwrap();
+        let ai = tree.locate(&root, &root.join("a"));
+        fs::remove_dir_all(root.join("a")).unwrap();
+        let r = rescan(&root.join("a"), &no, |_| {}).unwrap();
+        assert!(matches!(r, Rescan::Gone));
+        assert_eq!(tree.splice(ai, r), Some(ROOT));
+        assert_same(&tree, &scan(&root, &no, |_| {}).unwrap());
+        // A file in its place is "gone" as a folder too.
+        fs::write(root.join("a"), [0u8; 1]).unwrap();
+        assert!(matches!(rescan(&root.join("a"), &no, |_| {}), Some(Rescan::Gone)));
+        assert!(rescan(&root.join("d"), &AtomicBool::new(true), |_| {}).is_none(), "cancelled");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn the_root_and_files_are_not_replaced() {
+        let root = subtree_fixture("splice-bad");
+        let no = AtomicBool::new(false);
+        let mut tree = scan(&root, &no, |_| {}).unwrap();
+        let Some(Rescan::Tree(sub)) = rescan(&root, &no, |_| {}) else { panic!() };
+        assert!(tree.replace_subtree(ROOT, sub.clone()).is_none());
+        let xi = tree.locate(&root, &root.join("x.txt"));
+        assert!(tree.replace_subtree(xi, sub.clone()).is_none());
+        assert!(tree.replace_subtree(9999, sub).is_none());
+        assert_same(&tree, &scan(&root, &no, |_| {}).unwrap());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn hard_links_inside_a_rescanned_folder_are_kept_across_ones_refuse() {
+        let root = temp("splice-links");
+        fs::create_dir_all(root.join("d/s")).unwrap();
+        fs::write(root.join("d/a.bin"), [0u8; 50]).unwrap();
+        fs::write(root.join("d/gone.bin"), [0u8; 9]).unwrap();
+        fs::write(root.join("e.bin"), [0u8; 60]).unwrap();
+        fs::create_dir_all(root.join("f")).unwrap();
+        if fs::hard_link(root.join("d/a.bin"), root.join("d/s/b.bin")).is_err()
+            || fs::hard_link(root.join("e.bin"), root.join("f/e2.bin")).is_err()
+        {
+            eprintln!("skipped: can't create hard links here");
+            let _ = fs::remove_dir_all(&root);
+            return;
+        }
+        let no = AtomicBool::new(false);
+        let mut tree = scan(&root, &no, |_| {}).unwrap();
+        if tree.hard_links.is_empty() {
+            eprintln!("skipped: the file system gives no file ids");
+            let _ = fs::remove_dir_all(&root);
+            return;
+        }
+        assert_eq!(tree.hard_links.len(), 2);
+        // "f" holds a link of a file counted outside it: no splice.
+        let fi = tree.locate(&root, &root.join("f"));
+        assert!(tree.links_cross(fi));
+        let Some(Rescan::Tree(sub)) = rescan(&root.join("f"), &no, |_| {}) else { panic!() };
+        assert!(tree.replace_subtree(fi, sub).is_none());
+        // "d" has both links of its file: recomputed inside, totals as a full scan.
+        let di = tree.locate(&root, &root.join("d"));
+        assert!(!tree.links_cross(di));
+        fs::remove_file(root.join("d/gone.bin")).unwrap();
+        let r = rescan(&root.join("d"), &no, |_| {}).unwrap();
+        let new = tree.splice(di, r).unwrap();
+        let fresh = scan(&root, &no, |_| {}).unwrap();
+        assert_same(&tree, &fresh);
+        assert_eq!((tree.root().size, tree.node(new).size), (110, 50));
+        for (&link, h) in &tree.hard_links {
+            assert!(tree.surviving(link) == link && tree.surviving(h.counted) == h.counted);
+        }
         fs::remove_dir_all(&root).unwrap();
     }
 }

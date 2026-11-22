@@ -5,7 +5,8 @@
 //! treemap (one tile per file, coloured by extension; Z zooms it to a folder),
 //! with a list of the extensions on the right (a click highlights its tiles).
 //! Ctrl+Enter shows the item in the panel; F8 / Delete deletes it through the
-//! normal delete job and takes it out of the tree without a rescan; a right
+//! normal delete job and takes it out of the tree without a rescan (a folder
+//! that is partly left scans again on its own and goes back in); a right
 //! click or Shift+F10 shows the shell menu. Closing keeps the tree, so
 //! reopening the same folder is instant (F5 scans again). Files are never
 //! opened from here.
@@ -284,11 +285,26 @@ impl std::fmt::Debug for TreeBox {
     }
 }
 
+/// A folder scanned again after a delete in it didn't finish.
+#[derive(Clone)]
+pub struct RescanBox(Arc<disk_usage::Rescan>);
+
+impl std::fmt::Debug for RescanBox {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &*self.0 {
+            disk_usage::Rescan::Gone => write!(f, "Gone"),
+            disk_usage::Rescan::Tree(t) => write!(f, "Tree({} nodes)", t.nodes.len()),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum DuEvent {
     Progress(disk_usage::Progress),
     /// `None`: cancelled.
     Done(Option<TreeBox>, Duration),
+    /// A folder scanned again (`DiskUsage::rescanning`); `None`: cancelled.
+    Rescanned(Option<RescanBox>),
 }
 
 #[derive(Debug, Clone)]
@@ -346,9 +362,21 @@ pub(super) struct DiskUsage {
     delete_ask: Option<(u64, u32, PathBuf)>,
     /// Delete job running: job id, scan seq, node, path.
     deleting: Option<(u64, u64, u32, PathBuf)>,
+    /// A folder whose delete didn't finish, being scanned again (`running`
+    /// is its cancel flag).
+    rescanning: Option<Rescanning>,
     /// Message in the footer (the panels' status bar isn't shown here),
     /// until the next key.
     note: Option<(String, Tone)>,
+}
+
+/// See `DiskUsage::rescanning`.
+struct Rescanning {
+    seq: u64,
+    node: u32,
+    path: PathBuf,
+    /// The delete's summary, for the footer when done.
+    summary: Option<(String, Tone)>,
 }
 
 impl DiskUsage {
@@ -470,6 +498,7 @@ impl App {
             measure: Measure::Size,
             delete_ask: None,
             deleting: None,
+            rescanning: None,
             note: None,
         });
         du.hover = None;
@@ -484,7 +513,8 @@ impl App {
     fn close_disk_usage(&mut self) {
         if let Some(mut d) = self.screen.take_disk_usage() {
             d.stop();
-            self.disk_usage_last = d.scanned.is_some().then_some(d);
+            // A folder still being scanned again leaves the tree out of date.
+            self.disk_usage_last = (d.scanned.is_some() && d.rescanning.is_none()).then_some(d);
         }
     }
 
@@ -506,6 +536,7 @@ impl App {
         d.ext_top = 0;
         d.delete_ask = None;
         d.deleting = None;
+        d.rescanning = None;
         let root = d.root.clone();
         let (tx, rx) = iced::futures::channel::mpsc::unbounded();
         std::thread::spawn(move || {
@@ -571,6 +602,10 @@ impl App {
             d.note = Some(("Wait for the delete that is running".to_owned(), Tone::Info));
             return Task::none();
         }
+        if d.rescanning.is_some() {
+            d.note = Some(("Wait for the folder to be scanned again".to_owned(), Tone::Info));
+            return Task::none();
+        }
         if node == ROOT {
             d.note = Some(("The scanned folder itself isn't deleted from here".to_owned(), Tone::Info));
             return Task::none();
@@ -598,10 +633,12 @@ impl App {
     }
 
     /// Job `id` finished: if it is the tool's delete, takes the item out of
-    /// the tree when it is gone from disk. Otherwise (failed, cancelled,
-    /// partly deleted) the sizes may be off anywhere under it, so the tool
-    /// scans again (a closed tool forgets its tree). `summary` goes in the
-    /// footer.
+    /// the tree when it is gone from disk. A file still there is unchanged; a
+    /// folder still there (failed, cancelled, partly deleted) is scanned
+    /// again on its own and put back in (`du_rescanned`), unless it has hard
+    /// links counted across its boundary or the tree changed since: then the
+    /// tool scans everything again. A closed tool forgets its tree. `summary`
+    /// goes in the footer.
     pub(super) fn du_job_done(&mut self, id: u64, summary: Option<(String, Tone)>) -> Task<Message> {
         let rows = self.du_rows();
         self.next_listing += 1;
@@ -626,6 +663,20 @@ impl App {
             }
             d.note = summary;
             Task::none()
+        } else if in_screen && !gone && seq == d.seq && d.scanned.as_ref().is_some_and(|s| {
+            s.tree.node(node).kind == NodeKind::File && s.tree.surviving(node) == node
+        }) {
+            // A file that wasn't deleted is as it was.
+            d.note = summary;
+            Task::none()
+        } else if in_screen
+            && seq == d.seq
+            && std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir())
+            && d.scanned.as_ref().is_some_and(|s| {
+                s.tree.node(node).kind == NodeKind::Dir && s.tree.surviving(node) == node && !s.tree.links_cross(node)
+            })
+        {
+            self.du_start_rescan(node, path, summary)
         } else if in_screen {
             let task = self.start_disk_usage();
             if let Some(d) = self.screen.disk_usage_mut() {
@@ -637,6 +688,80 @@ impl App {
             self.disk_usage_last = None;
             Task::none()
         }
+    }
+
+    /// Scans folder `node` (at `path`) again on a worker, keeping the tree on
+    /// screen; `du_rescanned` puts the result in.
+    fn du_start_rescan(&mut self, node: u32, path: PathBuf, summary: Option<(String, Tone)>) -> Task<Message> {
+        self.next_listing += 1;
+        let seq = self.next_listing;
+        let Some(d) = self.screen.disk_usage_mut() else { return Task::none() };
+        d.stop();
+        let cancel = Arc::new(AtomicBool::new(false));
+        d.running = Some(cancel.clone());
+        d.progress = None;
+        let what = summary.as_ref().map_or(String::new(), |(t, _)| format!("{t} \u{b7} "));
+        d.note = Some((format!("{what}scanning the folder again"), Tone::Info));
+        d.rescanning = Some(Rescanning { seq, node, path: path.clone(), summary });
+        let (tx, rx) = iced::futures::channel::mpsc::unbounded();
+        std::thread::spawn(move || {
+            let result = disk_usage::rescan(&path, &cancel, |p| {
+                let _ = tx.unbounded_send(DuEvent::Progress(p));
+            });
+            let _ = tx.unbounded_send(DuEvent::Rescanned(result.map(|r| RescanBox(Arc::new(r)))));
+        });
+        Task::run(rx, move |e| Message::DiskUsage(DuMsg::Event(seq, e)))
+    }
+
+    /// The folder `du_start_rescan` scanned again: replaces its subtree (or
+    /// removes it when it is gone), keeping open folders open and the cursor
+    /// and the map on the same paths. Scans everything again if that fails.
+    fn du_rescanned(&mut self, result: Option<RescanBox>) -> Task<Message> {
+        let rows = self.du_rows();
+        self.next_listing += 1;
+        let gen = self.next_listing;
+        let Some(d) = self.screen.disk_usage_mut() else { return Task::none() };
+        let Some(Rescanning { node, summary, .. }) = d.rescanning.take() else { return Task::none() };
+        d.running = None;
+        d.progress = None;
+        let (Some(result), Some(s)) = (result, d.scanned.as_mut()) else { return self.start_disk_usage() };
+        let result = Arc::try_unwrap(result.0).unwrap_or_else(|r| (*r).clone());
+        let root = d.root.clone();
+        let cursor = s.outline.rows.get(d.cursor).map(|&(n, _)| s.tree.path(&root, n));
+        let zoom = s.tree.path(&root, s.zoom);
+        // Folders open in the old subtree.
+        let mut open = Vec::new();
+        let mut stack = vec![node];
+        while let Some(i) = stack.pop() {
+            if s.outline.is_expanded(i) {
+                open.push(s.tree.path(&root, i));
+                stack.extend(s.tree.node(i).children.iter().copied());
+            }
+        }
+        if Arc::make_mut(&mut s.tree).splice(node, result).is_none() {
+            return self.start_disk_usage();
+        }
+        s.outline.expanded.resize(s.tree.nodes.len(), false);
+        for p in &open {
+            let n = s.tree.locate(&root, p);
+            if s.tree.path(&root, n) == *p {
+                s.outline.expanded[n as usize] = true;
+            }
+        }
+        s.outline.rebuild(&s.tree);
+        s.refresh_exts();
+        s.zoom = s.tree.locate(&root, &zoom);
+        s.gen = gen;
+        let tree = s.tree.clone();
+        let at = cursor.map_or(ROOT, |p| tree.locate(&root, &p));
+        let row = s.outline.reveal(&tree, at).unwrap_or(0);
+        let len = s.outline.rows.len();
+        d.cursor = row.min(len.saturating_sub(1));
+        d.top = visible_start(d.top, d.cursor, rows, len);
+        d.hover = None;
+        d.ext_sel = d.ext_sel.filter(|e| s.ext_order.contains(e));
+        d.note = summary;
+        Task::none()
     }
 
     /// The shell context menu of the item under the cursor (at the mouse).
@@ -698,10 +823,14 @@ impl App {
         let Some(d) = self.screen.disk_usage_mut() else { return Task::none() };
         match msg {
             DuMsg::Event(seq, e) => {
-                if seq != d.seq {
+                let rescan = d.rescanning.as_ref().is_some_and(|r| r.seq == seq);
+                if seq != d.seq && !rescan {
                     return Task::none();
                 }
                 match e {
+                    DuEvent::Rescanned(result) if rescan => return self.du_rescanned(result),
+                    DuEvent::Rescanned(_) => {}
+                    DuEvent::Done(..) if rescan => {}
                     DuEvent::Progress(p) => d.progress = Some(p),
                     DuEvent::Done(tree, took) => {
                         d.running = None;
@@ -794,7 +923,11 @@ impl App {
         ("Enter, double-click", "Expand / collapse the folder"),
         ("Ctrl+Enter", "Go to the item in the panel (its folder, cursor on it)"),
         ("Click on the map", "Select that file or folder in the list"),
-        ("F8, Delete", "Delete the item (recycle bin; asks first); the tree updates without a rescan"),
+        (
+            "F8, Delete",
+            "Delete the item (recycle bin; asks first); the tree updates without a rescan (a folder partly left: \
+             only it scans again)",
+        ),
         ("Shift+Delete", "Delete the item permanently (asks first)"),
         ("Shift+F10, Menu key, right click", "Shell context menu of the item (list row or map tile)"),
         ("Z", "Map: show only the folder under the cursor (a file: its folder)"),
@@ -885,6 +1018,14 @@ impl App {
     pub(super) fn disk_usage_view<'a>(&'a self, d: &'a DiskUsage) -> Element<'a, Message> {
         let colors = theme::c();
         let (stats, stats_color) = match (&d.scanned, &d.progress) {
+            _ if d.rescanning.is_some() => {
+                let path = d.rescanning.as_ref().map_or(String::new(), |r| r.path.display().to_string());
+                let t = match &d.progress {
+                    Some(p) => format!("Rescanning {path}\u{2026} {} files \u{b7} {}", p.files, format::size(p.bytes)),
+                    None => format!("Rescanning {path}\u{2026}"),
+                };
+                (t, colors.text)
+            }
             (_, Some(p)) if d.running.is_some() => (
                 format!("Scanning\u{2026} {} files \u{b7} {} \u{b7} {}", p.files, format::size(p.bytes), p.current.display()),
                 colors.text,
