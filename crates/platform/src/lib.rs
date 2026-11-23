@@ -32,6 +32,10 @@ mod drive_win;
 #[cfg(windows)]
 mod thumb_win;
 #[cfg(windows)]
+mod virtual_clip;
+#[cfg(windows)]
+pub use virtual_clip::{VirtualFiles, VirtualItem};
+#[cfg(windows)]
 mod win;
 
 /// An RGBA icon bitmap (straight alpha).
@@ -479,6 +483,19 @@ pub fn clipboard_files() -> Option<(Vec<PathBuf>, bool)> {
     #[cfg(not(windows))]
     {
         None
+    }
+}
+
+/// Whether the system clipboard holds virtual files (see [`VirtualFiles`]):
+/// files without a path here, e.g. copied in a remote desktop session.
+pub fn clipboard_has_virtual_files() -> bool {
+    #[cfg(windows)]
+    {
+        virtual_clip::available()
+    }
+    #[cfg(not(windows))]
+    {
+        false
     }
 }
 

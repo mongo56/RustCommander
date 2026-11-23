@@ -3080,11 +3080,22 @@ impl App {
     /// Ctrl+V: copies (or, if they were cut, moves) the files on the system
     /// clipboard into the active panel, through the usual transfer dialog.
     fn paste_files(&mut self) -> Task<Message> {
-        let Some((sources, cut)) = rc_platform::clipboard_files() else {
-            self.info("No files on the clipboard");
-            return Task::none();
-        };
         let target = self.panel(self.active).path.clone();
+        let Some((sources, cut)) = rc_platform::clipboard_files() else {
+            if !rc_platform::clipboard_has_virtual_files() {
+                self.info("No files on the clipboard");
+                return Task::none();
+            }
+            // Files without a path here (copied in a remote desktop session,
+            // Outlook attachments, ...): their contents are read and written
+            // into the folder.
+            if vfs::in_archive(&target) || vfs::is_net_listing(&target) || !target.is_dir() {
+                self.info("These files can only be pasted into a local folder");
+                return Task::none();
+            }
+            let title = format!("Pasting from the clipboard → {}", target.display());
+            return self.start_job(Job::PasteVirtual { target }, title);
+        };
         self.open_transfer(cut, sources, &target)
     }
 

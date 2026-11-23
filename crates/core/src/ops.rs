@@ -68,6 +68,10 @@ pub enum Job {
     /// Changes attributes and dates of local `paths` (and, with `recursive`,
     /// of everything inside the folders; links are not followed).
     SetAttrib { paths: Vec<PathBuf>, change: crate::attrib::Change, recursive: bool },
+    /// Copies the virtual files on the clipboard (files without a path
+    /// here, e.g. copied in a remote desktop session) into the local folder
+    /// `target`.
+    PasteVirtual { target: PathBuf },
 }
 
 /// A password, shown as `***` in `Debug` output.
@@ -124,6 +128,7 @@ impl Job {
             Job::Split { .. } => "Split",
             Job::Combine { .. } => "Combined",
             Job::SetAttrib { .. } => "Changed",
+            Job::PasteVirtual { .. } => "Pasted",
         }
     }
 
@@ -141,6 +146,7 @@ impl Job {
             Job::Split { .. } => "Splitting",
             Job::Combine { .. } => "Combining",
             Job::SetAttrib { .. } => "Changing",
+            Job::PasteVirtual { .. } => "Pasting",
         }
     }
 }
@@ -420,19 +426,7 @@ pub fn run(job: &Job, control: &Control, reporter: &mut dyn Reporter) -> Outcome
 
 /// [`run`]; with `overwrite` conflicts are answered Overwrite without asking.
 pub fn run_with(job: &Job, overwrite: bool, control: &Control, reporter: &mut dyn Reporter) -> Outcome {
-    let mut runner = Runner {
-        control,
-        reporter,
-        progress: Progress::default(),
-        outcome: Outcome::default(),
-        sticky: overwrite.then_some(Resolution::OverwriteAll),
-        buffer: vec![0; BUFFER_SIZE],
-        last_report: Instant::now(),
-        staged: Vec::new(),
-        relayed: 0,
-        password: None,
-        overwrote: false,
-    };
+    let mut runner = Runner::new(control, reporter, overwrite);
     let mut undo = None;
 
     match job {
@@ -611,6 +605,7 @@ pub fn run_with(job: &Job, overwrite: bool, control: &Control, reporter: &mut dy
             runner.update_entry(src, dst, expect);
         }
         Job::Split { src, target, part_size } => runner.split(src, target, *part_size),
+        Job::PasteVirtual { target } => runner.paste_virtual(target),
         Job::Combine { first, target } => runner.combine(first, target),
         Job::SetAttrib { paths, change, recursive } => {
             for path in paths {
@@ -692,6 +687,24 @@ struct Runner<'a> {
     /// Some conflict was answered with Overwrite or Resume (the job can't
     /// be undone then).
     overwrote: bool,
+}
+
+impl<'a> Runner<'a> {
+    fn new(control: &'a Control, reporter: &'a mut dyn Reporter, overwrite: bool) -> Self {
+        Runner {
+            control,
+            reporter,
+            progress: Progress::default(),
+            outcome: Outcome::default(),
+            sticky: overwrite.then_some(Resolution::OverwriteAll),
+            buffer: vec![0; BUFFER_SIZE],
+            last_report: Instant::now(),
+            staged: Vec::new(),
+            relayed: 0,
+            password: None,
+            overwrote: false,
+        }
+    }
 }
 
 impl Runner<'_> {
@@ -1452,6 +1465,130 @@ impl Runner<'_> {
             }
         }
         result
+    }
+
+    /// [`Job::PasteVirtual`]: reads the clipboard here, on the worker
+    /// thread (its data object stays on the thread that opened it).
+    fn paste_virtual(&mut self, target: &Path) {
+        #[cfg(windows)]
+        {
+            let files = match rc_platform::VirtualFiles::from_clipboard() {
+                Ok(Some(files)) => files,
+                Ok(None) => {
+                    self.fail_msg(target, "No files on the clipboard");
+                    return;
+                }
+                Err(e) => {
+                    self.fail(target, e);
+                    return;
+                }
+            };
+            let items: Vec<VirtualItem> = files
+                .items()
+                .iter()
+                .map(|i| VirtualItem { name: i.name.clone(), is_dir: i.is_dir, size: i.size, modified: i.modified })
+                .collect();
+            self.paste_items(target, &items, &mut |i| files.open(i));
+        }
+        #[cfg(not(windows))]
+        {
+            self.fail_msg(target, "Pasting these files is not available on this platform");
+        }
+    }
+
+    /// Writes `items` (relative names, folders before their contents) into
+    /// `target`, reading file `i` from `open(i)`. Asks before replacing a
+    /// file; a file that comes out shorter than its stated size is an
+    /// error and removed (a remote desktop connection can drop midway).
+    fn paste_items<'r>(
+        &mut self,
+        target: &Path,
+        items: &[VirtualItem],
+        open: &mut dyn FnMut(usize) -> io::Result<Box<dyn Read + 'r>>,
+    ) {
+        self.progress.total_items = items.len() as u64;
+        self.progress.total_bytes = items.iter().filter(|i| !i.is_dir).filter_map(|i| i.size).sum();
+        self.report(true);
+        // Folders made here, to get their dates once their files are in.
+        let mut made = Vec::new();
+        for (index, item) in items.iter().enumerate() {
+            if !self.alive() {
+                break;
+            }
+            let Some(rel) = safe_relative(&item.name) else {
+                self.fail_msg(&target.join(&item.name), "Not a valid file name here");
+                continue;
+            };
+            let dst = target.join(&rel);
+            self.progress.current = Some(rel.clone());
+            let existing = fs::symlink_metadata(&dst);
+            if item.is_dir {
+                match existing {
+                    Ok(m) if !m.is_dir() => {
+                        self.fail_msg(&dst, "A file with this name already exists");
+                    }
+                    Ok(_) => self.item_done(0),
+                    Err(_) => match fs::create_dir_all(&dst) {
+                        Ok(()) => {
+                            if let Some(m) = item.modified {
+                                made.push((dst, m));
+                            }
+                            self.item_done(0)
+                        }
+                        Err(e) => {
+                            self.fail(&dst, e);
+                        }
+                    },
+                }
+                continue;
+            }
+            let size = item.size.unwrap_or(0);
+            if let Ok(dst_meta) = existing {
+                if dst_meta.is_dir() {
+                    self.fail_msg(&dst, "A folder with this name already exists");
+                    continue;
+                }
+                match self.resolve(&rel, (size, item.modified), &dst, stat_of(&dst_meta)) {
+                    Resolution::Overwrite => {}
+                    Resolution::Cancel => {
+                        self.control.cancel();
+                        break;
+                    }
+                    _ => {
+                        self.outcome.skipped += 1;
+                        self.item_done(size);
+                        continue;
+                    }
+                }
+            } else if let Some(parent) = dst.parent() {
+                if let Err(e) = fs::create_dir_all(parent) {
+                    self.fail(parent, e);
+                    continue;
+                }
+            }
+            let before = self.progress.done_bytes;
+            let result = open(index).and_then(|mut input| self.write_out(&mut *input, &dst, item.modified, None));
+            let written = self.progress.done_bytes - before;
+            let result = result.and_then(|done| match item.size {
+                Some(want) if done && written < want => {
+                    let _ = fs::remove_file(&dst);
+                    Err(io::Error::other(format!("Only {written} of {want} bytes arrived")))
+                }
+                _ => Ok(done),
+            });
+            match result {
+                Ok(true) => self.item_done(0),
+                Ok(false) => break,
+                Err(e) => {
+                    // Count the file as gone through, so the bar stays right.
+                    self.progress.done_bytes = before + size.max(written);
+                    self.fail(&dst, e);
+                }
+            }
+        }
+        for (dir, modified) in made.iter().rev() {
+            let _ = set_dir_modified(dir, *modified);
+        }
     }
 
     /// Tries a cheap rename first; falls back to copy + delete (e.g. across
@@ -2337,6 +2474,28 @@ impl Runner<'_> {
 }
 
 /// Whether all transfers stay on one server.
+/// One item of [`Job::PasteVirtual`]'s source.
+struct VirtualItem {
+    name: String,
+    is_dir: bool,
+    size: Option<u64>,
+    modified: Option<SystemTime>,
+}
+
+/// A pasted item's name (`dir\sub\file.txt` or with `/`) as a relative
+/// path, or `None` if it would leave the target folder or isn't a plain
+/// name (a drive, `..`, `:` for alternate data streams).
+fn safe_relative(name: &str) -> Option<PathBuf> {
+    let mut path = PathBuf::new();
+    for part in name.split(['\\', '/']) {
+        if part.is_empty() || part == "." || part == ".." || part.contains([':', '\0']) {
+            return None;
+        }
+        path.push(part);
+    }
+    (!path.as_os_str().is_empty()).then_some(path)
+}
+
 fn same_server(transfers: &[Transfer]) -> bool {
     let key = |p: &Path| remote::split(p).map(|(k, _)| k.to_lowercase());
     transfers.iter().all(|t| key(&t.src).is_some() && key(&t.src) == key(&t.dst))
@@ -2663,6 +2822,62 @@ mod tests {
         let mut r = Auto { answer, asked: 0 };
         let outcome = run(&job, &Control::default(), &mut r);
         (outcome, r.asked)
+    }
+
+    fn virtual_item(name: &str, is_dir: bool, size: Option<u64>) -> VirtualItem {
+        VirtualItem { name: name.into(), is_dir, size, modified: None }
+    }
+
+    /// Pastes `items` (file contents from `data` by index) into `target`.
+    fn paste(target: &Path, items: &[VirtualItem], data: &[&[u8]], answer: Resolution) -> (Outcome, usize) {
+        let control = Control::default();
+        let mut r = Auto { answer, asked: 0 };
+        let mut runner = Runner::new(&control, &mut r, false);
+        runner.paste_items(target, items, &mut |i| Ok(Box::new(io::Cursor::new(data[i].to_vec()))));
+        let outcome = runner.outcome;
+        (outcome, r.asked)
+    }
+
+    #[test]
+    fn safe_relative_names() {
+        assert_eq!(safe_relative("a.txt"), Some(PathBuf::from("a.txt")));
+        assert_eq!(safe_relative(r"dir\sub/a.txt"), Some(Path::new("dir").join("sub").join("a.txt")));
+        for bad in ["", "..", r"a\..\..\b", r"C:\x", r"\\server\share", "a.txt:stream", r"\a", r"a\\b", "a\0b"] {
+            assert_eq!(safe_relative(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn paste_virtual_files() {
+        let tmp = TempDir::new("paste-virtual");
+        let items = [
+            virtual_item("dir", true, None),
+            virtual_item(r"dir\a.txt", false, Some(5)),
+            virtual_item("b.txt", false, None),
+            virtual_item(r"..\evil.txt", false, Some(1)),
+            virtual_item("short.txt", false, Some(10)),
+        ];
+        let data: [&[u8]; 5] = [b"", b"hello", b"no size", b"x", b"cut"];
+        let (o, asked) = paste(&tmp.0, &items, &data, Resolution::Skip);
+        assert_eq!(asked, 0);
+        assert_eq!(fs::read(tmp.0.join("dir").join("a.txt")).unwrap(), b"hello");
+        assert_eq!(fs::read(tmp.0.join("b.txt")).unwrap(), b"no size");
+        assert!(!tmp.0.parent().unwrap().join("evil.txt").exists());
+        // Shorter than announced: an error, and no partial file.
+        assert!(!tmp.0.join("short.txt").exists());
+        assert_eq!(o.errors.len(), 2, "{:?}", o.errors);
+
+        // Existing file: asked; Skip keeps it, Overwrite replaces it.
+        let (o, asked) = paste(&tmp.0, &items[2..3], &[b"new"], Resolution::Skip);
+        assert_eq!((asked, o.skipped), (1, 1));
+        assert_eq!(fs::read(tmp.0.join("b.txt")).unwrap(), b"no size");
+        let (o, _) = paste(&tmp.0, &items[2..3], &[b"new"], Resolution::Overwrite);
+        assert!(o.errors.is_empty());
+        assert_eq!(fs::read(tmp.0.join("b.txt")).unwrap(), b"new");
+        // A file without its folder item: the folder is made.
+        let (o, _) = paste(&tmp.0, &[virtual_item(r"x\y\z.txt", false, Some(1))], &[b"z"], Resolution::Skip);
+        assert!(o.errors.is_empty());
+        assert_eq!(fs::read(tmp.0.join("x").join("y").join("z.txt")).unwrap(), b"z");
     }
 
     fn split_round_trip(len: usize, part: u64) {
